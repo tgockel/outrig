@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`style = "responses"` in `outrig config init` and `outrig run`.** The picker offers it beside
+  `chat-completions` and `anthropic`, and a `responses` provider runs a model against
+  `{base-url}/responses`: see the library's changelog for what a call sends.
 - **`outrig run-new`, a preview session whose agent acts by writing Python.** The model's one
   tool runs source in a persistent interpreter inside the session's container, so names it binds
   carry from one message to the next. The image needs no Python. Each submission is shown on
@@ -176,6 +179,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`style = "openai"` is `style = "chat-completions"`** in `outrig config init`, the configs
+  `outrig init` writes, the startup banner and the docs. The old spelling still loads, as the new
+  one, with a warning that names it; `outrig mcp`'s `validate_config` reports it as
+  `deprecated_config_value`.
 - **`outrig discard` and `outrig clean` remove a session's whole directory.** 0.2.2 removed only
   `session.json`, `logs/` and `outrig-enter`, and kept a directory holding anything else, because
   a `--session-dir` once took any existing directory. It takes only a new or empty one now, so
@@ -283,6 +290,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forwarded SIGINT and SIGTERM to the program's process group but left SIGHUP at its default, so a
   closed terminal ended outrig along with the engine that stops the sessions the program left
   open. It is now forwarded as a SIGTERM, starting the same grace.
+
+### Deprecated
+
+- **`style = "openai"`** loads as `chat-completions` with a warning. A later release will remove
+  the spelling.
 
 ## [0.2.2](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.2) - 2026-10-20
 

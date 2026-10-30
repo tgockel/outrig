@@ -24,7 +24,7 @@ async fn writes_minimal_openai_config() {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("config.toml");
 
-    // 11 prompts, all defaults: style=openai, name=openai, base-url, env-var,
+    // 11 prompts, all defaults: style=chat-completions, name=openai, base-url, env-var,
     // no extra provider, define a model, model name + identifier + provider,
     // no extra models, use as default-model.
     let script = b"\n\n\n\n\n\n\n\n\n\n\n";
@@ -203,8 +203,8 @@ async fn a_repeated_provider_name_is_asked_again() {
         .unwrap();
 
     for expected in [
-        "[providers.openai]\nstyle = \"openai\"\nbase-url = \"https://a.example/v1\"",
-        "[providers.openai-2]\nstyle = \"openai\"\nbase-url = \"https://b.example/v1\"",
+        "[providers.openai]\nstyle = \"chat-completions\"\nbase-url = \"https://a.example/v1\"",
+        "[providers.openai-2]\nstyle = \"chat-completions\"\nbase-url = \"https://b.example/v1\"",
     ] {
         assert!(text.contains(expected), "missing {expected}:\n{text}");
     }

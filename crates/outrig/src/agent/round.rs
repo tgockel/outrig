@@ -397,6 +397,11 @@ struct Journal {
     ran: bool,
     /// The latest model call. Taken when what it ran is kept.
     latest: Latest,
+    /// The `[models.<name>]` row that wrote each reply of the round, as it
+    /// arrived, whether or not rig went on to accept it as a turn.
+    issuers: Vec<Option<String>>,
+    /// How many of the round's turns [`Journal::commit`] has committed.
+    turns: usize,
     /// Each of the round's model calls rig accepted: its place, the model that
     /// answered it, and what it used, as the provider reported it.
     calls: Vec<CallUsage>,
@@ -439,7 +444,12 @@ impl Journal {
         let rest: Vec<Message> = round.skip(self.committed).cloned().collect();
         for turn in history::split_turns(rest) {
             self.committed += turn.len();
-            history.commit(turn, false);
+            // A turn is one model reply, so the round's nth turn is the nth
+            // reply that arrived -- one rig answered itself, as it does a call
+            // to no tool, included.
+            let issuer = self.issuers.get(self.turns).cloned().flatten();
+            self.turns += 1;
+            history.commit_by(issuer, turn, false);
         }
     }
 }
@@ -459,6 +469,8 @@ impl RoundHook {
             journal: Arc::new(Mutex::new(Journal {
                 committed: 1,
                 ran: false,
+                issuers: Vec::new(),
+                turns: 0,
                 latest: Latest::default(),
                 calls: Vec::new(),
             })),
@@ -583,7 +595,8 @@ impl RoundHook {
             if !answers.is_empty() {
                 turn.push(Message::User { content: answers });
             }
-            self.history.commit(turn, incomplete);
+            let issuer = journal.issuers.last().cloned().flatten();
+            self.history.commit_by(issuer, turn, incomplete);
         }
         journal.ran
     }
@@ -709,8 +722,11 @@ impl AgentHook for RoundHook {
                 .results
                 .push((call.clone(), result.output().render()));
         } else if let Some(response) = event.completion() {
-            self.journal().latest.answer = Some(Answer {
-                model: self.slot.answered_model(),
+            let model = self.slot.answered_model();
+            let mut journal = self.journal();
+            journal.issuers.push(model.clone());
+            journal.latest.answer = Some(Answer {
+                model,
                 ids: self.slot.answered_by(),
                 origin: response.origin.clone(),
             });

@@ -33,7 +33,7 @@ fn cfg_with_key_var(env_name: &str, top: &str, agents: &str) -> String {
 {top}
 
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${{{env_name}}}"
 
@@ -70,11 +70,14 @@ max-tokens  = 4096
     assert_eq!(r.model_name(), "fast");
     assert_eq!(r.model_identifier(), "gpt-4o-mini");
     assert_eq!(r.provider_name(), "openai");
-    let ResolvedProvider::OpenAi {
+    let ResolvedProvider::ChatCompletions {
         base_url, api_key, ..
     } = r.provider()
     else {
-        panic!("expected OpenAi resolved-provider, got {:?}", r.provider());
+        panic!(
+            "expected ChatCompletions resolved-provider, got {:?}",
+            r.provider()
+        );
     };
     assert_eq!(base_url, "https://api.openai.com/v1");
     assert_eq!(api_key, "test-key");
@@ -514,7 +517,7 @@ fn missing_model_errors() {
     let cfg = parse(
         r#"
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OUTRIG_TEST_UNUSED_MISSING_MODEL}"
 
@@ -539,7 +542,7 @@ fn agent_without_model_or_default_errors() {
     let cfg = parse(
         r#"
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OUTRIG_TEST_UNUSED_NO_MODEL}"
 
@@ -705,7 +708,7 @@ fn unset_api_key_errors() {
 default-model = "fast"
 
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${{{var}}}"
 
@@ -745,7 +748,7 @@ fn three_vendor_alias_cfg(vars: [&str; 3]) -> Config {
 default-model = "smart"
 
 [providers.bedrock]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://bedrock.example.invalid/v1"
 api-key  = "${{{a}}}"
 
@@ -755,7 +758,7 @@ base-url = "https://api.anthropic.com"
 api-key  = "${{{b}}}"
 
 [providers.azure]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://azure.example.invalid/v1"
 api-key  = "${{{c}}}"
 

@@ -154,7 +154,7 @@ async fn skips_global_phase_when_global_exists() {
     let pre_global = "default-model = \"fast\"\n\
                       \n\
                       [providers.openai]\n\
-                      style = \"openai\"\n\
+                      style = \"chat-completions\"\n\
                       base-url = \"https://api.openai.com/v1\"\n\
                       api-key = \"${OPENAI_API_KEY}\"\n\
                       \n\
@@ -210,7 +210,7 @@ async fn the_repo_phase_refuses_a_provider_the_global_config_lacks() {
         "default-model = \"fast\"\n\
          \n\
          [providers.openai]\n\
-         style = \"openai\"\n\
+         style = \"chat-completions\"\n\
          base-url = \"https://api.openai.com/v1\"\n\
          api-key = \"${OPENAI_API_KEY}\"\n\
          \n\
@@ -264,7 +264,7 @@ async fn the_repo_phase_asks_again_for_a_workspace_path_the_load_would_refuse() 
         "default-model = \"fast\"\n\
          \n\
          [providers.openai]\n\
-         style = \"openai\"\n\
+         style = \"chat-completions\"\n\
          base-url = \"https://api.openai.com/v1\"\n\
          api-key = \"${OPENAI_API_KEY}\"\n\
          \n\
@@ -316,7 +316,7 @@ async fn the_repo_phase_writes_nothing_the_next_load_would_refuse() {
         "default-model = \"ghost\"\n\
          \n\
          [providers.openai]\n\
-         style = \"openai\"\n\
+         style = \"chat-completions\"\n\
          base-url = \"https://api.openai.com/v1\"\n\
          api-key = \"${OPENAI_API_KEY}\"\n\
          \n\
@@ -360,7 +360,7 @@ async fn the_repo_phase_names_a_broken_global_model_rather_than_the_agent() {
     std::fs::write(
         &global,
         "[providers.openai]\n\
-         style = \"openai\"\n\
+         style = \"chat-completions\"\n\
          base-url = \"https://api.openai.com/v1\"\n\
          api-key = \"${OPENAI_API_KEY}\"\n\
          \n\
@@ -396,7 +396,7 @@ fn global_with_reviewer_image(image: &str) -> String {
         "default-model = \"fast\"\n\
          \n\
          [providers.openai]\n\
-         style = \"openai\"\n\
+         style = \"chat-completions\"\n\
          base-url = \"https://api.openai.com/v1\"\n\
          api-key = \"${{OPENAI_API_KEY}}\"\n\
          \n\

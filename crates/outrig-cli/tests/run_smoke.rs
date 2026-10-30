@@ -113,7 +113,7 @@ fn write_global_config(repo: &Path, mock_addr: &str) {
     let global_toml = format!(
         r#"
 [providers.openai]
-style = "openai"
+style = "chat-completions"
 base-url = "http://{addr}/v1"
 api-key = "${{OUTRIG_TEST_KEY}}"
 request-timeout-secs = 10

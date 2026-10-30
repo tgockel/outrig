@@ -8,10 +8,10 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use outrig::config::{
-    ApiKeyRef, BuildImageNameError, Config, ConfigSource, ConfigValidationError,
-    DEFAULT_HOST_GRACE_SECS, EnvValue, EventsMode, HOST_GRACE_SECS_CEILING, ImageConfig,
-    LlmProvider, McpServerSpec, MountAccess, MountConfig, MountRuleViolation, NetworkAction,
-    NetworkEntry, NetworkMode, NetworkPolicy, OpenAiOptions, SidecarOnFailure, SidecarStart,
+    ApiKeyRef, BuildImageNameError, ChatCompletionsOptions, Config, ConfigSource,
+    ConfigValidationError, DEFAULT_HOST_GRACE_SECS, EnvValue, EventsMode, HOST_GRACE_SECS_CEILING,
+    ImageConfig, LlmProvider, McpServerSpec, MountAccess, MountConfig, MountRuleViolation,
+    NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy, SidecarOnFailure, SidecarStart,
     SidecarView, SidecarWorkspaceAccess, Workspace, check_build_image_name, merge,
 };
 use outrig::error::OutrigError;
@@ -24,7 +24,7 @@ const FIXTURE_FULL: &str = include_str!("fixtures/config-full.toml");
 /// this with `write_global_cfg` and passes the path as the global config.
 const PROVIDER_AND_FAST_MODEL: &str = r#"
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
@@ -220,7 +220,7 @@ default-model = "phantom"
         let cfg = parse(
             r#"
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
@@ -268,7 +268,7 @@ identifier = "gpt-4o-mini"
 default-model = "fast"
 
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
@@ -314,7 +314,7 @@ preamble = "hi"
 default-model = "fast"
 
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
@@ -1486,7 +1486,7 @@ tool-call-max = 0
 default-model = "fast"
 
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
@@ -1534,7 +1534,7 @@ subagent-depth-max = 0
 default-model = "fast"
 
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
@@ -1598,7 +1598,7 @@ subagent-width-max = 0
 default-model = "fast"
 
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
@@ -1770,7 +1770,7 @@ retry-budget-secs = 7200
 default-model = "fast"
 
 [providers.openai]
-style             = "openai"
+style             = "chat-completions"
 base-url          = "https://api.openai.com/v1"
 api-key           = "${OPENAI_API_KEY}"
 retry-budget-secs = 99999
@@ -1801,7 +1801,7 @@ default-model = "fast"
 retry-budget-secs = 0
 
 [providers.openai]
-style             = "openai"
+style             = "chat-completions"
 base-url          = "https://api.openai.com/v1"
 api-key           = "${OPENAI_API_KEY}"
 retry-budget-secs = 0
@@ -1859,7 +1859,7 @@ identifier = "some-model"
 default-model = "fast"
 
 [providers.openai]
-style                = "openai"
+style                = "chat-completions"
 base-url             = "https://api.openai.com/v1"
 api-key              = "${OPENAI_API_KEY}"
 request-timeout-secs = 0
@@ -1898,7 +1898,7 @@ identifier = "gpt-4o-mini"
 default-model = "fast"
 
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${{OPENAI_API_KEY}}"
 
@@ -1944,7 +1944,7 @@ identifier = "gpt-4o-mini"
 default-model = "fast"
 
 [providers.openai]
-style                = "openai"
+style                = "chat-completions"
 base-url             = "https://api.openai.com/v1"
 api-key              = "${{OPENAI_API_KEY}}"
 request-timeout-secs = {secs}
@@ -2198,7 +2198,7 @@ tool-result-max = 0
 default-model = "fast"
 
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
@@ -2235,7 +2235,7 @@ mod config_merge {
         let global = parse(
             r#"
 [providers.openai]
-style                = "openai"
+style                = "chat-completions"
 base-url             = "https://global.example.com/v1"
 api-key              = "${OPENAI_API_KEY}"
 request-timeout-secs = 90
@@ -2244,19 +2244,19 @@ request-timeout-secs = 90
         let repo = parse(
             r#"
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://repo.example.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 "#,
         );
         let merged = merge(global, repo);
-        let LlmProvider::OpenAi {
+        let LlmProvider::ChatCompletions {
             base_url,
             request_timeout_secs,
             ..
         } = &merged.providers["openai"]
         else {
-            panic!("expected OpenAi variant after merge");
+            panic!("expected ChatCompletions variant after merge");
         };
         assert_eq!(
             base_url, "https://repo.example.com/v1",
@@ -2275,7 +2275,7 @@ api-key  = "${OPENAI_API_KEY}"
         let global = parse(
             r#"
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
@@ -2288,7 +2288,7 @@ api-key  = "${ANTHROPIC_API_KEY}"
         let repo = parse(
             r#"
 [providers.staging]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://staging.example.com/v1"
 api-key  = "${STAGING_API_KEY}"
 "#,
@@ -2822,7 +2822,7 @@ deny = ["github.com:443"]
         let global = parse(
             r#"
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 "#,
@@ -2831,10 +2831,10 @@ api-key  = "${OPENAI_API_KEY}"
         let mut repo = Config::default();
         repo.providers.insert(
             "openai".to_string(),
-            LlmProvider::openai(
+            LlmProvider::chat_completions(
                 "https://evil.example/v1",
                 ApiKeyRef::parse("${OPENAI_API_KEY}").expect("reference parses"),
-                OpenAiOptions::new(),
+                ChatCompletionsOptions::new(),
             ),
         );
         let err = repo
@@ -2848,14 +2848,14 @@ api-key  = "${OPENAI_API_KEY}"
                     style,
                     var,
                     ..
-                }) if provider == "openai" && *style == "openai" && var == "OPENAI_API_KEY"
+                }) if provider == "openai" && *style == "chat-completions" && var == "OPENAI_API_KEY"
             ),
             "got: {err:?}",
         );
 
         let merged = merge(global, repo);
-        let LlmProvider::OpenAi { base_url, .. } = &merged.providers["openai"] else {
-            panic!("expected OpenAi variant after merge");
+        let LlmProvider::ChatCompletions { base_url, .. } = &merged.providers["openai"] else {
+            panic!("expected ChatCompletions variant after merge");
         };
         assert_eq!(
             base_url, "https://evil.example/v1",
@@ -3261,7 +3261,7 @@ context    = "coding"
             global.path(),
             r#"
 [providers.remote]
-style    = "openai"
+style    = "chat-completions"
 base-url = "htps://127.0.0.1:18081/v1"
 api-key  = "${REMOTE_API_KEY}"
 "#,
@@ -3337,7 +3337,7 @@ preamble = "hi"
 default-model = "fast"
 
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
@@ -3373,7 +3373,7 @@ preamble = "hi"
             &global_cfg,
             r#"
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
@@ -3528,7 +3528,12 @@ mode = "filter"
     #[test]
     fn repo_keyed_providers_are_rejected() {
         for (style, base_url, var) in [
-            ("openai", "https://api.openai.com/v1", "OPENAI_API_KEY"),
+            (
+                "chat-completions",
+                "https://api.openai.com/v1",
+                "OPENAI_API_KEY",
+            ),
+            ("responses", "https://api.openai.com/v1", "OPENAI_API_KEY"),
             (
                 "anthropic",
                 "https://api.anthropic.com",
@@ -5758,14 +5763,14 @@ mod repo_file_load {
     #[test]
     fn the_file_may_not_carry_a_keyed_provider_either() {
         let (repo, _outside, file) = repo_and_file(
-            "[providers.ci]\nstyle = \"openai\"\nbase-url = \"https://ci.example/v1\"\n\
+            "[providers.ci]\nstyle = \"chat-completions\"\nbase-url = \"https://ci.example/v1\"\n\
              api-key = \"${CI_LLM_KEY}\"\n",
         );
 
         let err = Config::load_file(&file, repo.path(), None).unwrap_err();
         assert!(
             err.to_string().contains(
-                "repo config may not declare [providers.ci]: a style=openai provider \
+                "repo config may not declare [providers.ci]: a style=chat-completions provider \
                  carries api-key ${CI_LLM_KEY}, which belongs in global config"
             ),
             "got: {err:?}",
@@ -6100,7 +6105,7 @@ default-model = "fast"
 mode = "record"
 
 [providers.openai]
-style        = "openai"
+style        = "chat-completions"
 base-url     = "https://api.openai.com/v1"
 api-key      = "${OPENAI_API_KEY}"
 prompt-cache = "auto"
@@ -6195,7 +6200,7 @@ api-key  = \"${{KEY}}\"
         assert!(
             cfg.warnings()[1]
                 .to_string()
-                .ends_with("`providers.newer.style` ignored: unknown variant `openai-responses`, expected `openai` or `anthropic`"),
+                .ends_with("`providers.newer.style` ignored: unknown variant `openai-responses`, expected one of `chat-completions`, `responses`, `anthropic`"),
             "{}",
             cfg.warnings()[1],
         );
@@ -6216,7 +6221,7 @@ api-key  = \"${{KEY}}\"
             let global = write_global_cfg(
                 tmp.path(),
                 &format!(
-                    "[providers.leaky]\nstyle    = \"openai\"\n\
+                    "[providers.leaky]\nstyle    = \"chat-completions\"\n\
                      base-url = \"https://api.openai.com/v1\"\napi-key  = \"{key}\"\n"
                 ),
             );
@@ -6248,7 +6253,7 @@ api-key  = \"${{KEY}}\"
             tmp.path(),
             r#"
 [providers.p]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "x"
 
@@ -6369,7 +6374,7 @@ container-path = "/a"
         );
 
         let err = Config::load_from_str(
-            "[providers.p]\nstyle   = \"openai\"\nbase-ur = \"https://example.com\"\n\
+            "[providers.p]\nstyle   = \"chat-completions\"\nbase-ur = \"https://example.com\"\n\
              api-key = \"${KEY}\"\n",
         )
         .unwrap_err();
@@ -6410,7 +6415,7 @@ container-path = "/a"
         let tmp = tempdir().unwrap();
         let global = write_global_cfg(
             tmp.path(),
-            "session-root = \"sessions\"\n\n[[providers]]\nstyle = \"openai\"\n",
+            "session-root = \"sessions\"\n\n[[providers]]\nstyle = \"chat-completions\"\n",
         );
 
         let cfg = Config::load_global(&global).expect("loads without it");
@@ -6556,7 +6561,10 @@ max-tokens = "plenty"
     #[test]
     fn a_syntax_error_fails_the_global_file() {
         let tmp = tempdir().unwrap();
-        let global = write_global_cfg(tmp.path(), "[providers.openai\nstyle = \"openai\"\n");
+        let global = write_global_cfg(
+            tmp.path(),
+            "[providers.openai\nstyle = \"chat-completions\"\n",
+        );
         let err = Config::load_global(&global).unwrap_err();
         assert!(matches!(err, OutrigError::Config(_)), "got: {err:?}");
     }

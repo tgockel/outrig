@@ -933,7 +933,13 @@ pub(super) fn validate_with_options(
             // new provider style has to stop here and say whether it retries
             // and whether it speaks HTTP at all.
             let (base_url, retry_budget_secs, request_timeout_secs) = match provider {
-                LlmProvider::OpenAi {
+                LlmProvider::ChatCompletions {
+                    base_url,
+                    retry_budget_secs,
+                    request_timeout_secs,
+                    ..
+                }
+                | LlmProvider::Responses {
                     base_url,
                     retry_budget_secs,
                     request_timeout_secs,
@@ -1010,7 +1016,9 @@ pub(super) fn validate_with_options(
             // provider style has to stop here and say which field rules it
             // follows rather than inheriting someone else's by default.
             match provider {
-                LlmProvider::OpenAi { .. } | LlmProvider::Anthropic { .. } => {
+                LlmProvider::ChatCompletions { .. }
+                | LlmProvider::Responses { .. }
+                | LlmProvider::Anthropic { .. } => {
                     validate_remote_model(provider.style(), model_name, model)?
                 }
             }
@@ -1051,8 +1059,9 @@ pub(super) fn validate_as_repo(cfg: &Config) -> Result<(), ConfigValidationError
     if let Some((name, provider)) = cfg.providers.iter().next() {
         // Deliberately without a `_` arm, as in `validate`: a new provider
         // style has to say here whether a repo file may declare it.
-        let (LlmProvider::OpenAi { api_key, .. } | LlmProvider::Anthropic { api_key, .. }) =
-            provider;
+        let (LlmProvider::ChatCompletions { api_key, .. }
+        | LlmProvider::Responses { api_key, .. }
+        | LlmProvider::Anthropic { api_key, .. }) = provider;
         return Err(ConfigValidationError::RepoProviderApiKey {
             provider: name.clone(),
             style: provider.style(),

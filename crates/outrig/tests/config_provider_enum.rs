@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use outrig::config::{
-    AnthropicOptions, ApiKeyRef, Config, ConfigValidationError, ConfigWarningKind, LlmProvider,
-    OpenAiOptions, RoleAlternation,
+    AnthropicOptions, ApiKeyRef, ChatCompletionsOptions, Config, ConfigValidationError,
+    ConfigWarningKind, LlmProvider, RoleAlternation,
 };
 use outrig::error::OutrigError;
 
@@ -180,7 +180,7 @@ fn openai_model_missing_identifier_fails_validate() {
     let cfg = parse(
         r#"
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
@@ -193,19 +193,126 @@ provider = "openai"
         matches!(
             err,
             ConfigValidationError::RemoteModelMissingIdentifier { ref model, style, .. }
-                if model == "fast" && style == "openai"
+                if model == "fast" && style == "chat-completions"
         ),
         "got: {err:?}",
     );
 }
 
+/// `style = "responses"` takes the keys `chat-completions` does, loads as its
+/// own variant, and survives a serialize/parse round trip.
+#[test]
+fn responses_provider_parses_validates_and_round_trips() {
+    let cfg = parse(
+        r#"
+[providers.openai-new]
+style                = "responses"
+base-url             = "https://api.openai.com/v1"
+api-key              = "${OPENAI_API_KEY}"
+request-timeout-secs = 120
+retry-budget-secs    = 300
+role-alternation     = "strict"
+
+[models.fast]
+provider   = "openai-new"
+identifier = "gpt-5.4"
+"#,
+    );
+    cfg.validate(None).expect("validates");
+    assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+
+    let LlmProvider::Responses {
+        base_url,
+        api_key,
+        request_timeout_secs,
+        retry_budget_secs,
+        role_alternation,
+        ..
+    } = &cfg.providers["openai-new"]
+    else {
+        panic!("expected the Responses variant, got: {:?}", cfg.providers);
+    };
+    assert_eq!(base_url, "https://api.openai.com/v1");
+    assert_eq!(api_key.var_name(), "OPENAI_API_KEY");
+    assert_eq!(*request_timeout_secs, Some(120));
+    assert_eq!(*retry_budget_secs, Some(300));
+    assert_eq!(*role_alternation, Some(RoleAlternation::Strict));
+    assert_eq!(cfg.providers["openai-new"].style(), "responses");
+
+    let text = toml::to_string(&cfg).expect("serializes");
+    assert!(text.contains(r#"style = "responses""#), "{text}");
+    assert_eq!(parse(&text).providers, cfg.providers);
+}
+
+/// A model on a `responses` provider holds the rows to the same field rules
+/// a `chat-completions` one is held to.
+#[test]
+fn responses_model_missing_identifier_fails_validate() {
+    let cfg = parse(
+        r#"
+[providers.openai]
+style    = "responses"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+
+[models.fast]
+provider = "openai"
+"#,
+    );
+    let err = expect_validation_err(&cfg, None);
+    assert!(
+        matches!(
+            err,
+            ConfigValidationError::RemoteModelMissingIdentifier { ref model, style, .. }
+                if model == "fast" && style == "responses"
+        ),
+        "got: {err:?}",
+    );
+}
+
+/// A 0.2.x config says `style = "openai"`. It loads as `chat-completions`, the
+/// provider is not dropped and the models on it validate, and the warning
+/// names the spelling to use now.
+#[test]
+fn the_deprecated_openai_style_loads_as_chat_completions_and_warns() {
+    let cfg = parse(
+        r#"
+[providers.old]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+
+[models.fast]
+provider   = "old"
+identifier = "gpt-4o-mini"
+"#,
+    );
+    cfg.validate(None).expect("the model on it validates");
+    let LlmProvider::ChatCompletions { .. } = &cfg.providers["old"] else {
+        panic!("expected chat-completions, got: {:?}", cfg.providers);
+    };
+    assert_eq!(cfg.providers["old"].style(), "chat-completions");
+    let [warning] = cfg.warnings() else {
+        panic!("one warning, got: {:?}", cfg.warnings());
+    };
+    assert_eq!(warning.key(), "providers.old.style");
+    assert_eq!(warning.line(), 3);
+    let ConfigWarningKind::Deprecated { replacement, .. } = warning.kind() else {
+        panic!("a deprecation, got: {:?}", warning.kind());
+    };
+    assert_eq!(*replacement, "chat-completions");
+    assert!(
+        warning.to_string().contains(r#"use "chat-completions""#),
+        "{warning}"
+    );
+}
+
 /// Pin the unknown-style error so a teammate's typo (`open-ai` vs `openai`)
-/// lands on a useful message rather than a cryptic serde dump. `open-ai` is the
-/// realistic one: it is what the kebab-case rule would have produced, which is
-/// why the variant carries an explicit rename. The contract is "the message
-/// names what the user typed and at least one legal variant"; we don't pin the
-/// exact phrasing so a serde minor-version rephrasing won't break the
-/// regression test.
+/// lands on a useful message rather than a cryptic serde dump. The contract is
+/// "the message names what the user typed and every legal style" -- the
+/// deprecated `openai` is read before the tag is, so it is not among them; we
+/// don't pin the exact phrasing so a serde minor-version rephrasing won't
+/// break the regression test.
 #[test]
 fn unknown_style_typo_useful_error() {
     let toml = r#"
@@ -221,7 +328,7 @@ api-key  = "${KEY}"
         "error should quote the offending value, got: {msg}",
     );
     assert!(
-        msg.contains("openai") || msg.contains("anthropic"),
+        msg.contains("chat-completions") && msg.contains("responses") && msg.contains("anthropic"),
         "error should name at least one legal variant, got: {msg}",
     );
 }
@@ -242,7 +349,7 @@ fn the_removed_mistralrs_style_is_a_parse_error() {
         "error should quote the offending value, got: {msg}",
     );
     assert!(
-        msg.contains("openai") || msg.contains("anthropic"),
+        msg.contains("chat-completions") && msg.contains("responses") && msg.contains("anthropic"),
         "error should name at least one legal style, got: {msg}",
     );
 }
@@ -326,17 +433,17 @@ fn a_mistralrs_provider_is_set_aside_only_from_the_global_config() {
 #[test]
 fn remote_provider_options_populate_remote_variants() {
     let key = ApiKeyRef::parse("${OPENAI_API_KEY}").expect("api-key ref parses");
-    let openai = LlmProvider::openai(
+    let openai = LlmProvider::chat_completions(
         "https://api.openai.com/v1",
         key,
-        OpenAiOptions::new()
+        ChatCompletionsOptions::new()
             .with_request_timeout_secs(90)
             .with_retry_budget_secs(120),
     );
     assert!(
         matches!(
             openai,
-            LlmProvider::OpenAi {
+            LlmProvider::ChatCompletions {
                 request_timeout_secs: Some(90),
                 retry_budget_secs: Some(120),
                 ..
@@ -369,7 +476,10 @@ fn remote_provider_options_populate_remote_variants() {
     // four other call sites reach through. The fields themselves are covered
     // above: the Anthropic provider was built from a bare `new` plus one setter
     // and came out with `request_timeout_secs: None`.
-    assert_eq!(OpenAiOptions::new(), OpenAiOptions::default());
+    assert_eq!(
+        ChatCompletionsOptions::new(),
+        ChatCompletionsOptions::default()
+    );
     assert_eq!(AnthropicOptions::new(), AnthropicOptions::default());
 }
 
@@ -382,7 +492,7 @@ fn role_alternation_parses_on_both_styles() {
     let cfg = parse(
         r#"
 [providers.gateway]
-style            = "openai"
+style            = "chat-completions"
 base-url         = "https://gateway.example/v1"
 api-key          = "${GATEWAY_KEY}"
 role-alternation = "strict"
@@ -394,14 +504,14 @@ api-key          = "${ANTHROPIC_API_KEY}"
 role-alternation = "relaxed"
 
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 "#,
     );
     cfg.validate(None).expect("validates");
     let alternation = |provider: &LlmProvider| match provider {
-        LlmProvider::OpenAi {
+        LlmProvider::ChatCompletions {
             role_alternation, ..
         }
         | LlmProvider::Anthropic {
@@ -435,7 +545,7 @@ api-key  = "${OPENAI_API_KEY}"
     let err = Config::load_from_str(
         r#"
 [providers.gateway]
-style            = "openai"
+style            = "chat-completions"
 base-url         = "https://gateway.example/v1"
 api-key          = "${GATEWAY_KEY}"
 role-alternation = "loose"
@@ -449,10 +559,10 @@ role-alternation = "loose"
     );
 
     let key = ApiKeyRef::parse("${GATEWAY_KEY}").expect("api-key ref parses");
-    let built = LlmProvider::openai(
+    let built = LlmProvider::chat_completions(
         "https://gateway.example/v1",
         key,
-        OpenAiOptions::new().with_role_alternation(RoleAlternation::Strict),
+        ChatCompletionsOptions::new().with_role_alternation(RoleAlternation::Strict),
     );
     assert_eq!(alternation(&built), Some(RoleAlternation::Strict));
     let key = ApiKeyRef::parse("${ANTHROPIC_API_KEY}").expect("api-key ref parses");

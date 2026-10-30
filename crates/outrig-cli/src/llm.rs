@@ -128,7 +128,13 @@ pub enum LlmResolveError {
 /// Variants are kept in sync with `LlmProvider`'s.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedProvider {
-    OpenAi {
+    ChatCompletions {
+        base_url: String,
+        api_key: String,
+        request_timeout_secs: Option<u64>,
+        retry_budget_secs: Option<u64>,
+    },
+    Responses {
         base_url: String,
         api_key: String,
         request_timeout_secs: Option<u64>,
@@ -147,7 +153,10 @@ impl ResolvedProvider {
     /// `None` is an answer -- "the compiled default" -- not an absence.
     fn retry_budget_secs(&self) -> Option<u64> {
         match self {
-            Self::OpenAi {
+            Self::ChatCompletions {
+                retry_budget_secs, ..
+            }
+            | Self::Responses {
                 retry_budget_secs, ..
             }
             | Self::Anthropic {
@@ -369,7 +378,9 @@ pub(crate) fn selectability(
         })
     })?;
     match provider {
-        LlmProvider::OpenAi { api_key, .. } | LlmProvider::Anthropic { api_key, .. } => {
+        LlmProvider::ChatCompletions { api_key, .. }
+        | LlmProvider::Responses { api_key, .. }
+        | LlmProvider::Anthropic { api_key, .. } => {
             // Through `resolve` rather than `env::var` so "not set" and "not
             // valid UTF-8" read exactly as they will when the session resolves.
             match api_key.resolve() {
@@ -649,13 +660,25 @@ fn resolve_candidate(
             })?;
 
     let resolved_provider = match provider {
-        LlmProvider::OpenAi {
+        LlmProvider::ChatCompletions {
             base_url,
             api_key,
             request_timeout_secs,
             retry_budget_secs,
             ..
-        } => ResolvedProvider::OpenAi {
+        } => ResolvedProvider::ChatCompletions {
+            base_url: base_url.clone(),
+            api_key: api_key.resolve()?,
+            request_timeout_secs: *request_timeout_secs,
+            retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
+        },
+        LlmProvider::Responses {
+            base_url,
+            api_key,
+            request_timeout_secs,
+            retry_budget_secs,
+            ..
+        } => ResolvedProvider::Responses {
             base_url: base_url.clone(),
             api_key: api_key.resolve()?,
             request_timeout_secs: *request_timeout_secs,
@@ -753,7 +776,8 @@ pub struct BuiltAgent {
 /// provider style a lone candidate was, for a caller that checks the style a
 /// model resolved to.
 pub enum RigAgent {
-    OpenAi(BuiltAgent),
+    ChatCompletions(BuiltAgent),
+    Responses(BuiltAgent),
     Anthropic(BuiltAgent),
     /// A multi-candidate alias: a chain that moves between provider-equivalent
     /// rows when one fails mid-turn, which may span both styles.
@@ -865,7 +889,8 @@ pub(crate) async fn build_agent_with_ceilings(
         tool_call_max: resolved.tool_call_max,
     };
     let agent = match (resolved.candidates.len(), resolved.provider()) {
-        (1, ResolvedProvider::OpenAi { .. }) => RigAgent::OpenAi(built),
+        (1, ResolvedProvider::ChatCompletions { .. }) => RigAgent::ChatCompletions(built),
+        (1, ResolvedProvider::Responses { .. }) => RigAgent::Responses(built),
         (1, ResolvedProvider::Anthropic { .. }) => RigAgent::Anthropic(built),
         _ => RigAgent::Failover(built),
     };
@@ -883,7 +908,7 @@ fn build_candidate(
     policy: &retry::RetryPolicy,
 ) -> Result<(Box<dyn failover::Candidate>, EffectiveCeiling)> {
     match &candidate.provider {
-        ResolvedProvider::OpenAi {
+        ResolvedProvider::ChatCompletions {
             base_url,
             api_key,
             request_timeout_secs,
@@ -899,6 +924,32 @@ fn build_candidate(
                 .chat(&candidate.model_identifier);
             Ok((
                 link(candidate, policy, model, candidate.max_tokens, None),
+                EffectiveCeiling::new(candidate, candidate.max_tokens),
+            ))
+        }
+        ResolvedProvider::Responses {
+            base_url,
+            api_key,
+            request_timeout_secs,
+            ..
+        } => {
+            let http = remote_http_client(*request_timeout_secs, policy.clone())?;
+            // `{base-url}/responses`, the whole conversation on every call.
+            let model = OpenAIConfig::new(api_key.as_str())
+                .with_base_url(base_url)
+                .connect(DynHttpClient::new(http))
+                .responses(&candidate.model_identifier);
+            Ok((
+                Box::new(
+                    failover::ModelCandidate::new(
+                        retry::RetryingModel::new(model, policy.clone()),
+                        &candidate.model_name,
+                        &candidate.model_identifier,
+                        candidate.max_tokens,
+                        None,
+                    )
+                    .stateless(),
+                ),
                 EffectiveCeiling::new(candidate, candidate.max_tokens),
             ))
         }
@@ -1098,9 +1149,10 @@ impl RigAgent {
     /// What was built, whichever variant it is.
     fn built(&self) -> &BuiltAgent {
         match self {
-            RigAgent::OpenAi(built) | RigAgent::Anthropic(built) | RigAgent::Failover(built) => {
-                built
-            }
+            RigAgent::ChatCompletions(built)
+            | RigAgent::Responses(built)
+            | RigAgent::Anthropic(built)
+            | RigAgent::Failover(built) => built,
         }
     }
 
@@ -1131,7 +1183,9 @@ impl RigAgent {
             RigAgent::Failover(built) => built.chain.take_answered(),
             // Read anyway, so a lone candidate's record does not grow for the
             // session.
-            RigAgent::OpenAi(built) | RigAgent::Anthropic(built) => {
+            RigAgent::ChatCompletions(built)
+            | RigAgent::Responses(built)
+            | RigAgent::Anthropic(built) => {
                 built.chain.take_answered();
                 Vec::new()
             }
@@ -1208,14 +1262,29 @@ impl RebuildingAgent {
     /// Rebuild the agent if the tool list grew since the last turn, then
     /// delegate to [`RigAgent::run_turn`].
     pub async fn run_turn(&self, prompt: &str, history: &mut Vec<Message>) -> Result<TurnEnd> {
-        if self.dirty.get() {
-            let tools_snapshot = self.tools.borrow().clone();
-            let rebuilt = build_agent(&self.resolved, tools_snapshot).await?;
-            *self.agent.borrow_mut() = Rc::new(rebuilt);
-            self.dirty.set(false);
-        }
+        self.rebuild_if_stale().await?;
         let turn_agent = self.agent.borrow().clone();
         turn_agent.run_turn(prompt, history).await
+    }
+}
+
+impl RebuildingAgent {
+    /// Rebuild the agent over the tool list if it grew since it was built. The
+    /// history the next turn is sent outlives the agent, so the rebuilt chain
+    /// takes up who answered each reply in it.
+    async fn rebuild_if_stale(&self) -> Result<()> {
+        if !self.dirty.get() {
+            return Ok(());
+        }
+        let tools_snapshot = self.tools.borrow().clone();
+        let rebuilt = build_agent(&self.resolved, tools_snapshot).await?;
+        rebuilt
+            .built()
+            .chain
+            .inherit_issuers(&self.agent.borrow().built().chain);
+        *self.agent.borrow_mut() = Rc::new(rebuilt);
+        self.dirty.set(false);
+        Ok(())
     }
 }
 
@@ -2264,7 +2333,7 @@ mod tests {
     }
 
     fn remote(retry_budget_secs: Option<u64>) -> ResolvedProvider {
-        ResolvedProvider::OpenAi {
+        ResolvedProvider::ChatCompletions {
             base_url: "http://127.0.0.1:9".to_string(),
             api_key: "k".to_string(),
             request_timeout_secs: None,
@@ -2715,6 +2784,28 @@ mod tests {
 
         assert_eq!(names(&mcp_tools.snapshot()), expected);
         assert_eq!(names(&agent.tools()), expected);
+    }
+
+    /// The conversation outlives a rebuilt agent, so the rebuilt chain still
+    /// knows which row answered each reply in it: a Responses candidate is
+    /// sent the reasoning of a reply it wrote, not as another's.
+    #[tokio::test]
+    async fn a_rebuilt_agent_still_knows_who_answered_the_replies_before_it() {
+        let resolved = crate::subagent::fixtures::test_resolved(1);
+        let built = build_agent(&resolved, Vec::new())
+            .await
+            .expect("an agent builds without I/O");
+        built.built().chain.note_issuer("resp_1", "head");
+        let agent = RebuildingAgent::new(built, Vec::new(), SharedTools::default(), resolved);
+
+        agent.extend_mcp_tools(crate::self_tool::self_tools());
+        agent.rebuild_if_stale().await.expect("it rebuilds");
+
+        let rebuilt = agent.agent.borrow().clone();
+        assert_eq!(
+            rebuilt.built().chain.issuer_of("resp_1").as_deref(),
+            Some("head")
+        );
     }
 
     /// The display helper only reads the first candidate's name and

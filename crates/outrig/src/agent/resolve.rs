@@ -84,7 +84,14 @@ pub(crate) enum LlmResolveError {
 /// with the `ApiKeyRef` already resolved, through the session's [`Secrets`].
 #[derive(Debug)]
 pub(crate) enum ResolvedProvider {
-    OpenAi {
+    ChatCompletions {
+        base_url: String,
+        api_key: Redacted,
+        request_timeout_secs: Option<u64>,
+        retry_budget_secs: Option<u64>,
+        role_alternation: RoleAlternation,
+    },
+    Responses {
         base_url: String,
         api_key: Redacted,
         request_timeout_secs: Option<u64>,
@@ -133,7 +140,11 @@ impl ResolvedProvider {
     /// This provider's per-request timeout, or `None` for the default.
     pub(crate) fn request_timeout_secs(&self) -> Option<u64> {
         match self {
-            Self::OpenAi {
+            Self::ChatCompletions {
+                request_timeout_secs,
+                ..
+            }
+            | Self::Responses {
                 request_timeout_secs,
                 ..
             }
@@ -148,7 +159,10 @@ impl ResolvedProvider {
     /// `None` is an answer -- "the compiled default" -- not an absence.
     pub(crate) fn retry_budget_secs(&self) -> Option<u64> {
         match self {
-            Self::OpenAi {
+            Self::ChatCompletions {
+                retry_budget_secs, ..
+            }
+            | Self::Responses {
                 retry_budget_secs, ..
             }
             | Self::Anthropic {
@@ -161,7 +175,10 @@ impl ResolvedProvider {
     /// alternate, `Relaxed` when its row does not say.
     pub(crate) fn role_alternation(&self) -> RoleAlternation {
         match self {
-            Self::OpenAi {
+            Self::ChatCompletions {
+                role_alternation, ..
+            }
+            | Self::Responses {
                 role_alternation, ..
             }
             | Self::Anthropic {
@@ -250,7 +267,9 @@ fn selectability(cfg: &Config, model_name: &str, secrets: &dyn Secrets) -> Resul
         }
         .to_string()
     })?;
-    let (LlmProvider::OpenAi { api_key, .. } | LlmProvider::Anthropic { api_key, .. }) = provider;
+    let (LlmProvider::ChatCompletions { api_key, .. }
+    | LlmProvider::Responses { api_key, .. }
+    | LlmProvider::Anthropic { api_key, .. }) = provider;
     // Through `resolve_with` rather than asking `secrets` directly, so "not
     // set" and "not valid UTF-8" read exactly as they will when the session
     // resolves.
@@ -480,14 +499,28 @@ fn resolve_candidate(
             })?;
 
     let resolved_provider = match provider {
-        LlmProvider::OpenAi {
+        LlmProvider::ChatCompletions {
             base_url,
             api_key,
             request_timeout_secs,
             retry_budget_secs,
             role_alternation,
             ..
-        } => ResolvedProvider::OpenAi {
+        } => ResolvedProvider::ChatCompletions {
+            base_url: base_url.clone(),
+            api_key: api_key.resolve_with(secrets)?.into(),
+            request_timeout_secs: *request_timeout_secs,
+            retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
+            role_alternation: role_alternation.unwrap_or_default(),
+        },
+        LlmProvider::Responses {
+            base_url,
+            api_key,
+            request_timeout_secs,
+            retry_budget_secs,
+            role_alternation,
+            ..
+        } => ResolvedProvider::Responses {
             base_url: base_url.clone(),
             api_key: api_key.resolve_with(secrets)?.into(),
             request_timeout_secs: *request_timeout_secs,

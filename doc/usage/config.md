@@ -33,7 +33,7 @@ their options' descriptions before they open, and `?` there is a search characte
 $ outrig config init
 [outrig] writing global config to ~/.outrig/config.toml
 
-? Pick a provider style [default: openai]:
+? Pick a provider style [default: chat-completions]:
 ? Provider name (used in models) [default: openai]:
 ? Base URL [default: https://api.openai.com/v1]:
 ? API key environment variable [default: OPENAI_API_KEY]:
@@ -63,6 +63,10 @@ it is stored -- never the key itself, and its refusal does not repeat what was t
 
 The prompts that follow depend on the style you pick.
 
+`responses` asks the same connection questions as `chat-completions`, with the same defaults
+(`https://api.openai.com/v1`, `OPENAI_API_KEY`). The provider name is suggested as `openai` for
+`chat-completions` and as the style's own name for the others.
+
 `anthropic` asks the same connection questions with its own defaults
 (`https://api.anthropic.com`, `ANTHROPIC_API_KEY`), and its models get one extra prompt:
 
@@ -84,15 +88,16 @@ help; on piped stdin, `?` works at pickers too, as here. The prompt is then re-d
 can answer:
 
 ```
-? Pick a provider style [default: openai]: ?
+? Pick a provider style [default: chat-completions]: ?
 
   Which wire format this provider speaks.
-  openai  OpenAI Chat Completions wire format. Works with OpenAI, OpenRouter, vLLM, Ollama.
+  chat-completions  OpenAI Chat Completions wire format. Works with OpenAI, OpenRouter, vLLM.
+  responses  OpenAI Responses wire format. Works with OpenAI, Ollama, LM Studio.
   anthropic  Anthropic's native Messages wire format. Talks to Claude directly.
 
   See: https://tgockel.github.io/outrig/concepts/llm-providers.html
 
-? Pick a provider style [default: openai]:
+? Pick a provider style [default: chat-completions]:
 ```
 
 The help text comes from the same descriptions used in
@@ -106,7 +111,7 @@ A minimal `~/.outrig/config.toml`:
 default-model = "fast"
 
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 

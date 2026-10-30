@@ -211,19 +211,25 @@ pub(crate) struct LeftOut {
 /// How a call is sent each turn's replies: in its provider's protocol, and,
 /// to Anthropic, without the thinking of a turn in `stale` -- one a later call
 /// changed what came before, which the API would refuse as bound to another
-/// conversation. Leaving out the first such block and every one after it is
+/// conversation -- and, to Responses, without the reasoning of a turn another
+/// `[models.<name>]` row issued, whose ciphertext is bound to the account that
+/// row's provider is. Leaving out the first such block and every one after it is
 /// what `drop_block` does for one request; recorded in the store, it holds
 /// for every later one, and a block produced since stays valid.
 #[derive(Clone, Copy)]
 struct Sending<'a> {
     wire: Wire,
+    /// The `[models.<name>]` row the call goes to.
+    model: &'a str,
+    turns: &'a [Turn],
     stale: &'a BTreeSet<usize>,
 }
 
 impl Sending<'_> {
     /// Whether a call sends `part` of a reply in turn `turn`.
     fn takes(self, turn: usize, part: &AssistantContent) -> bool {
-        self.wire.takes(part, self.stale.contains(&turn))
+        let foreign = self.turns[turn].issuer.as_deref() != Some(self.model);
+        self.wire.takes(part, self.stale.contains(&turn), foreign)
     }
 
     /// Whether a call sends any of `message`, of turn `turn`: a reply none of
@@ -618,8 +624,21 @@ impl History {
     /// An `incomplete` turn is one the round ended while its calls ran, so
     /// some of their results are OutRig's note saying so rather than what the
     /// code did.
+    #[cfg(test)]
     pub(crate) fn commit(&self, messages: Vec<Message>, incomplete: bool) {
-        self.commit_in(&mut self.store(), messages, incomplete);
+        self.commit_by(None, messages, incomplete);
+    }
+
+    /// [`History::commit`], for a reply the `[models.<name>]` row `issuer`
+    /// wrote, which is what lets a call to a Responses provider send its
+    /// reasoning back only to the row that wrote it.
+    pub(crate) fn commit_by(
+        &self,
+        issuer: Option<String>,
+        messages: Vec<Message>,
+        incomplete: bool,
+    ) {
+        self.commit_in(&mut self.store(), issuer, messages, incomplete);
     }
 
     /// End the round in progress. An opening no turn began with -- the model's
@@ -628,14 +647,20 @@ impl History {
     pub(crate) fn finish_round(&self) {
         let mut store = self.store();
         if store.opening.is_some() {
-            self.commit_in(&mut store, Vec::new(), false);
+            self.commit_in(&mut store, None, Vec::new(), false);
         }
     }
 
     /// Under the store's lock, so turns reach the interpreter, and the event
     /// log, in id order.
-    fn commit_in(&self, store: &mut Store, messages: Vec<Message>, incomplete: bool) {
-        let (id, turn) = store.commit(messages);
+    fn commit_in(
+        &self,
+        store: &mut Store,
+        issuer: Option<String>,
+        messages: Vec<Message>,
+        incomplete: bool,
+    ) {
+        let (id, turn) = store.commit_by(issuer, messages);
         self.interpreter
             .events()
             .emit_with(|| Payload::TurnCommitted {
@@ -803,6 +828,9 @@ struct Turn {
     messages: Vec<Message>,
     /// Its estimated tokens, counted once, as it commits.
     tokens: u64,
+    /// The `[models.<name>]` row whose call wrote its reply, when that is
+    /// known.
+    issuer: Option<String>,
 }
 
 struct Opening {
@@ -881,7 +909,13 @@ impl Store {
     /// Commit `messages` as the next turn, after the round's opening if this
     /// is its first. A round is numbered as that turn commits, so one that
     /// commits none leaves no gap.
-    fn commit(&mut self, mut messages: Vec<Message>) -> (usize, &Turn) {
+    #[cfg(test)]
+    fn commit(&mut self, messages: Vec<Message>) -> (usize, &Turn) {
+        self.commit_by(None, messages)
+    }
+
+    /// [`Store::commit`], for a reply the `[models.<name>]` row `issuer` wrote.
+    fn commit_by(&mut self, issuer: Option<String>, mut messages: Vec<Message>) -> (usize, &Turn) {
         let mut round = self.last_round();
         if let Some(opening) = self.opening.take() {
             messages.insert(0, opening.message);
@@ -892,6 +926,7 @@ impl Store {
             round,
             tokens: budget::tokens(&messages),
             messages,
+            issuer,
         });
         (id, &self.turns[id])
     }
@@ -1045,6 +1080,8 @@ impl Store {
         // left out only makes it more conservative.
         let sending = Sending {
             wire: budget.wire,
+            model: &budget.model,
+            turns: &self.turns,
             stale: &stale,
         };
         let turns = carried.iter().map(|&(id, _)| {
@@ -1157,13 +1194,15 @@ impl Store {
                 RoleAlternation::Strict => {
                     let sending = Sending {
                         wire: budget.wire,
+                        model: &budget.model,
+                        turns: &self.turns,
                         stale: &stale,
                     };
                     self.alternate(&selection.carried, prompt, sending)
                 }
             };
             let known = stale.len();
-            self.spoil(&carried, budget.wire, &mut stale);
+            self.spoil(&carried, budget, &mut stale);
             if stale.len() == known {
                 break (carried, withheld);
             }
@@ -1309,8 +1348,14 @@ impl Store {
     /// window. Turns before the change keep their thinking, and so do those
     /// produced after; a turn sent as nothing, such as another provider's
     /// thinking alone, changes nothing.
-    fn spoil(&self, carried: &[(usize, Why)], wire: Wire, stale: &mut BTreeSet<usize>) {
-        let sent = self.sent(carried, Sending { wire, stale });
+    fn spoil(&self, carried: &[(usize, Why)], budget: &Budget, stale: &mut BTreeSet<usize>) {
+        let sending = Sending {
+            wire: budget.wire,
+            model: &budget.model,
+            turns: &self.turns,
+            stale,
+        };
+        let sent = self.sent(carried, sending);
         let same = sent
             .iter()
             .zip(&self.last)

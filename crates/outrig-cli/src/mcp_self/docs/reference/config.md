@@ -513,32 +513,34 @@ A provider tells outrig how to reach a model: an endpoint that speaks a known wi
 style carries an `api-key`, which names a variable in the operator's environment, so providers
 belong to the global config: a repo config that declares one is rejected at load, whatever name
 it uses, and its models name the global config's providers. The accepted `style` values are
-`"openai"` and `"anthropic"`. Which other fields are valid depends on `style`.
+`"chat-completions"`, `"responses"`, and `"anthropic"`. Which other fields are valid depends on
+`style`. `"openai"`, the 0.2.x spelling of `"chat-completions"`, is still read as it, with a
+warning that names the new value; a later release will remove it.
 
-A local model is an ordinary `style = "openai"` provider pointed at a server on `localhost`
-(Ollama, vLLM, `llama.cpp`) -- see
+A local model is an ordinary `style = "chat-completions"` provider pointed at a server on
+`localhost` (Ollama, vLLM, `llama.cpp`) -- see
 [Local models](https://tgockel.github.io/outrig/concepts/llm-providers.html#local-models).
 The in-process `style = "mistralrs"` was removed in 0.3. A global config that still declares one
 loads with that provider [set aside](#what-a-load-sets-aside) and a warning, and any other file
 that declares one is refused.
 
-### `style = "openai"`
+### `style = "chat-completions"`
 
 ```toml
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
 [providers.local-ollama]
-style    = "openai"
+style    = "chat-completions"
 base-url = "http://localhost:11434/v1"
 api-key  = "${OLLAMA_API_KEY}"
 ```
 
 | Key                    | Type         | Required | Default | Description                      |
 |------------------------|--------------|----------|---------|----------------------------------|
-| `style`                | string       | yes      | --      | Must be `"openai"` for this row. |
+| `style`                | string       | yes      | --      | Always `"chat-completions"`.     |
 | `base-url`             | string (URL) | yes      | --      | HTTPS endpoint for the provider. |
 | `api-key`              | string       | yes      | --      | Env-var reference, see below.    |
 | `request-timeout-secs` | integer      | no       | `600`   | HTTP timeout for LLM calls.      |
@@ -597,11 +599,43 @@ which sends whole rounds, ignores it. See
 [`outrig run-new`](https://tgockel.github.io/outrig/reference/cli.html#outrig-run-new) for
 what a shortened conversation looks like to a provider.
 
+### `style = "responses"`
+
+OpenAI's Responses API: requests go to `{base-url}/responses` and authenticate with a bearer
+token. OpenAI recommends it for new projects and some of its models need it to call tools;
+Ollama (0.13.3 and later) and LM Studio (0.3.29 and later) serve it at `/v1/responses` too.
+`base-url` follows the `chat-completions` convention, `https://api.openai.com/v1`: outrig
+appends `/responses`.
+
+```toml
+[providers.openai-responses]
+style    = "responses"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+```
+
+| Key                    | Type         | Required | Default | Description                      |
+|------------------------|--------------|----------|---------|----------------------------------|
+| `style`                | string       | yes      | --      | Always `"responses"`.            |
+| `base-url`             | string (URL) | yes      | --      | HTTPS endpoint for the provider. |
+| `api-key`              | string       | yes      | --      | Env-var reference, see below.    |
+| `request-timeout-secs` | integer      | no       | `600`   | HTTP timeout for LLM calls.      |
+| `retry-budget-secs`    | integer      | no       | `600`   | Transient-retry budget, seconds. |
+| `role-alternation`     | string       | no       | --      | Strict alternation, see below.   |
+
+Timeout, transient-retry, and `role-alternation` behavior match `style = "chat-completions"`
+exactly. Every call sends the whole conversation, cut to the model's allowance, and `store:
+false`: OpenAI keeps nothing, and outrig never sets `previous_response_id` or `conversation`.
+The system prompt goes in `instructions`. The ceiling a call carries is sent as
+`max_output_tokens`. A reasoning item in a reply goes back to the same provider with its
+`encrypted_content`; one a call would carry to a different provider is left out. Hosted tools
+(web search, file search, code interpreter, remote MCP) are not used.
+
 ### `style = "anthropic"`
 
 Anthropic's native Messages API: requests go to `{base-url}/v1/messages` and authenticate
 with the `x-api-key` header. Use this to reach Claude directly. Reaching Claude through an
-OpenAI-compatible bridge (OpenRouter and friends) is a `style = "openai"` provider pointed
+OpenAI-compatible bridge (OpenRouter and friends) is a `style = "chat-completions"` provider pointed
 at that bridge instead -- both work, and they are different rows.
 
 ```toml
@@ -623,7 +657,7 @@ api-key  = "${ANTHROPIC_API_KEY}"
 `base-url` is the API root, without the `/v1/messages` path -- outrig appends that. A
 trailing `/v1`, `/messages`, or `/v1/messages` is trimmed if you write one anyway, so
 `https://api.anthropic.com` and `https://api.anthropic.com/v1` behave identically. Timeout,
-transient-retry, and `role-alternation` behavior match `style = "openai"` exactly.
+transient-retry, and `role-alternation` behavior match `style = "chat-completions"` exactly.
 
 Anthropic requires an output-token ceiling on every request. outrig knows one for the model
 identifiers it recognizes; any other identifier needs `max-tokens` on the model or the
@@ -734,8 +768,8 @@ one in a shared repo config.
 
 ### Remote-provider models
 
-Models on a remote provider -- `style = "openai"` or `style = "anthropic"` -- name their
-model with an `identifier`.
+Models on a remote provider -- `style = "chat-completions"`, `style = "responses"`, or
+`style = "anthropic"` -- name their model with an `identifier`.
 
 ```toml
 [models.fast]
@@ -783,10 +817,10 @@ holds each call to the window it reports. The question is one `GET` against the 
 `base-url`, with the provider's own key, that is not retried and is given 10 seconds:
 
 - `style = "anthropic"`: `{base-url}/v1/models/{identifier}`, and its `max_input_tokens`.
-- `style = "openai"`: `{base-url}/model/info`, which a LiteLLM proxy answers, and the
-  `model_info.max_input_tokens` of the entry whose `model_name` is the `identifier` -- the
-  smallest, when a proxy lists the name once for each deployment behind it. A server without
-  the route does not answer it.
+- `style = "chat-completions"` or `style = "responses"`: `{base-url}/model/info`, which a LiteLLM
+  proxy answers, and the `model_info.max_input_tokens` of the entry whose `model_name` is the
+  `identifier` -- the smallest, when a proxy lists the name once for each deployment behind it.
+  A server without the route does not answer it.
 
 A row that sets `context-window` is not asked. An alias's models, and the children an agent
 launches, are asked about the same way, and a model is asked about once however many agents run
@@ -1610,7 +1644,7 @@ deny  = ["*:22"]                                 # optional; global only
 env-allow = ["GITHUB_TOKEN"]                     # optional; global only
 
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
@@ -1621,7 +1655,7 @@ api-key  = "${ANTHROPIC_API_KEY}"
 
 [providers.local]
 # a model served on this machine, by Ollama here; see LLM providers -> Local models
-style    = "openai"
+style    = "chat-completions"
 base-url = "http://127.0.0.1:11434/v1"
 api-key  = "${OLLAMA_API_KEY}"
 
@@ -1758,8 +1792,10 @@ image-config in the merged config but does not require agent/model/provider wiri
 - An `alias` chain may be at most 32 hops deep. A graph that deep is a mistake rather than a
   configuration, and the limit is what makes it report as one.
 - Every `agents.<name>.image` (if set) must name an existing `[images.<name>]`.
-- Every `providers.<name>.style` must be one of `{"openai", "anthropic"}`. Other styles are
-  reserved for future Rig adapters and listed as TODO in the providers concept page.
+- Every `providers.<name>.style` must be one of `{"chat-completions", "responses",
+  "anthropic"}`, or the deprecated `"openai"`, which loads as `"chat-completions"` with a
+  warning. Other styles are reserved for future Rig adapters and listed as TODO in the providers
+  concept page.
 - Every `providers.<name>.api-key` (on a remote style) must match
   `^\$\{[A-Z_][A-Z0-9_]*\}$`.
 - Every `providers.<name>.base-url` (on a remote style) must be an `http://` or `https://` URL.
@@ -1789,9 +1825,9 @@ image-config in the merged config but does not require agent/model/provider wiri
   requires at least one global `allow` or `deny` entry.
 - A repo config may set `[network].mode` only; `[network].default`, `[network].allow`, and
   `[network].deny` are rejected there.
-- A repo config may declare no provider: an `openai` or `anthropic` provider in
-  `.agents/outrig/config.toml`, or in a `--config` file, is rejected there, naming the provider
-  and the variable its key references.
+- A repo config may declare no provider: a `chat-completions`, `responses`, or `anthropic`
+  provider in `.agents/outrig/config.toml`, or in a `--config` file, is rejected there, naming the
+  provider and the variable its key references.
 - `[repo].env-allow` may be set only in the global config; a repo config that declares it, even
   as `env-allow = []`, is rejected there. Each entry must be a variable name, matching
   `^[A-Z_][A-Z0-9_]*$`; in the global config a bad entry sets the whole key aside with a warning.

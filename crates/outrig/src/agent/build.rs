@@ -170,7 +170,7 @@ fn build_candidate(
         &retries,
     )?);
     match &candidate.provider {
-        ResolvedProvider::OpenAi {
+        ResolvedProvider::ChatCompletions {
             base_url, api_key, ..
         } => {
             // Chat Completions, never Responses: an OpenAI-compatible proxy
@@ -180,6 +180,26 @@ fn build_candidate(
                 .with_base_url(base_url)
                 .connect(http)
                 .chat(&candidate.model_identifier);
+            link(
+                candidate,
+                policy,
+                retries,
+                overhead,
+                model,
+                candidate.max_tokens,
+                None,
+            )
+        }
+        ResolvedProvider::Responses {
+            base_url, api_key, ..
+        } => {
+            // `{base-url}/responses`. The whole conversation goes out on each
+            // call: nothing sets `previous_response_id`, and the failover
+            // loop sends `store: false`.
+            let model = OpenAIConfig::new(api_key.expose())
+                .with_base_url(base_url)
+                .connect(http)
+                .responses(&candidate.model_identifier);
             link(
                 candidate,
                 policy,

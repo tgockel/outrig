@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use outrig::config::Config;
+use outrig::config::{Config, ConfigWarningKind};
 use outrig::container::embedded::parse_standalone_image_toml;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -70,14 +70,22 @@ pub fn validate_dockerfile(dockerfile: &str) -> DockerfileValidation {
 
 pub fn validate_config(toml: &str) -> ConfigValidation {
     let (warnings, result) = match Config::load_from_str(toml) {
-        // `load_from_str` sets aside nothing but unknown keys.
+        // `load_from_str` sets aside nothing but unknown keys, and notes a
+        // value that has a newer spelling.
         Ok(cfg) => (
             cfg.warnings()
                 .iter()
-                .map(|w| ValidationMessage {
-                    code: "unknown_config_key",
-                    message: format!("unknown key `{}`, ignored", w.key()),
-                    line: Some(w.line()),
+                .map(|w| match w.kind() {
+                    ConfigWarningKind::Deprecated { replacement, .. } => ValidationMessage {
+                        code: "deprecated_config_value",
+                        message: format!("`{}` is deprecated, use \"{replacement}\"", w.key()),
+                        line: Some(w.line()),
+                    },
+                    _ => ValidationMessage {
+                        code: "unknown_config_key",
+                        message: format!("unknown key `{}`, ignored", w.key()),
+                        line: Some(w.line()),
+                    },
                 })
                 .collect(),
             cfg.validate(None),

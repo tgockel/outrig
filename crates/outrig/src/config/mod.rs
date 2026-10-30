@@ -690,8 +690,9 @@ impl Config {
     /// environment inherits it without them.
     pub(crate) fn env_refs(&self) -> BTreeSet<String> {
         let keys = self.providers.values().map(|provider| {
-            let (LlmProvider::OpenAi { api_key, .. } | LlmProvider::Anthropic { api_key, .. }) =
-                provider;
+            let (LlmProvider::ChatCompletions { api_key, .. }
+            | LlmProvider::Responses { api_key, .. }
+            | LlmProvider::Anthropic { api_key, .. }) = provider;
             api_key.var_name().to_string()
         });
         let values = self.images.values().flat_map(|image| {
@@ -1040,12 +1041,12 @@ pub enum RoleAlternation {
 /// Optional settings for an OpenAI-compatible provider.
 ///
 /// Non-exhaustive, so a future connection setting is an addition rather than a
-/// change to [`LlmProvider::openai`]'s signature -- which also means the fields
+/// change to [`LlmProvider::chat_completions`]'s signature -- which also means the fields
 /// alone cannot construct this from outside the crate. Start from
 /// [`new`](Self::new) and set what you need with `with_*`.
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
-pub struct OpenAiOptions {
+pub struct ChatCompletionsOptions {
     /// Per-request HTTP timeout in seconds. `None` uses the client default.
     pub request_timeout_secs: Option<u64>,
     /// Transient-retry budget in seconds. `None` uses the top-level setting,
@@ -1056,7 +1057,7 @@ pub struct OpenAiOptions {
     pub role_alternation: Option<RoleAlternation>,
 }
 
-impl OpenAiOptions {
+impl ChatCompletionsOptions {
     /// Options that override nothing: every field below stays `None`.
     pub fn new() -> Self {
         Self::default()
@@ -1086,7 +1087,7 @@ impl OpenAiOptions {
 
 /// Optional settings for an Anthropic provider.
 ///
-/// The twin of [`OpenAiOptions`], and deliberately a separate type rather than
+/// The twin of [`ChatCompletionsOptions`], and deliberately a separate type rather than
 /// one shared with it: either provider is free to grow a setting the other has
 /// no meaning for, which a shared struct could only ignore in silence on one of
 /// the two paths. Construct it the same way: [`new`](Self::new), then `with_*`.
@@ -1131,6 +1132,51 @@ impl AnthropicOptions {
     }
 }
 
+/// Optional settings for a Responses provider.
+///
+/// The twin of [`ChatCompletionsOptions`], and a separate type for the same reason as
+/// [`AnthropicOptions`]. Construct it the same way: [`new`](Self::new), then `with_*`.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct ResponsesOptions {
+    /// Per-request HTTP timeout in seconds. `None` uses the client default.
+    pub request_timeout_secs: Option<u64>,
+    /// Transient-retry budget in seconds. `None` uses the top-level setting,
+    /// then [`DEFAULT_RETRY_BUDGET_SECS`].
+    pub retry_budget_secs: Option<u64>,
+    /// Whether the provider requires the user's and the model's turns to
+    /// alternate. `None` is [`RoleAlternation::Relaxed`].
+    pub role_alternation: Option<RoleAlternation>,
+}
+
+impl ResponsesOptions {
+    /// Options that override nothing: every field below stays `None`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bound each HTTP request to this provider at `secs`, rather than the
+    /// client default.
+    pub fn with_request_timeout_secs(mut self, secs: u64) -> Self {
+        self.request_timeout_secs = Some(secs);
+        self
+    }
+
+    /// Keep retrying a transiently-failing call to this provider for at most
+    /// `secs`, rather than for the top-level budget. `0` disables retries.
+    pub fn with_retry_budget_secs(mut self, secs: u64) -> Self {
+        self.retry_budget_secs = Some(secs);
+        self
+    }
+
+    /// Say whether the provider requires the user's and the model's turns to
+    /// alternate: see [`RoleAlternation`].
+    pub fn with_role_alternation(mut self, alternation: RoleAlternation) -> Self {
+        self.role_alternation = Some(alternation);
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "style",
@@ -1140,11 +1186,24 @@ impl AnthropicOptions {
 )]
 #[non_exhaustive]
 pub enum LlmProvider {
-    // The kebab-case rule auto-converts `OpenAi` to `open-ai`; the doc'd
-    // tag is `openai`, so override per-variant.
-    #[serde(rename = "openai")]
+    /// OpenAI's Chat Completions API: `POST {base-url}/chat/completions` with
+    /// bearer auth. The loader reads the 0.2.x spelling, `openai`, as this.
     #[non_exhaustive]
-    OpenAi {
+    ChatCompletions {
+        base_url: String,
+        api_key: ApiKeyRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_budget_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_alternation: Option<RoleAlternation>,
+    },
+    /// OpenAI's Responses API: `POST {base-url}/responses` with bearer auth.
+    /// The whole conversation goes out on every call, never
+    /// `previous_response_id`.
+    #[non_exhaustive]
+    Responses {
         base_url: String,
         api_key: ApiKeyRef,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1156,7 +1215,7 @@ pub enum LlmProvider {
     },
     /// Anthropic's native Messages API: `POST {base-url}/v1/messages` with
     /// `x-api-key` auth. Distinct from reaching Claude through an
-    /// OpenAI-compatible bridge, which is a `style = "openai"` provider
+    /// OpenAI-compatible bridge, which is a `style = "chat-completions"` provider
     /// pointed at that bridge.
     #[non_exhaustive]
     Anthropic {
@@ -1178,14 +1237,34 @@ impl LlmProvider {
     /// accept sends the reader looking for the wrong key.
     pub fn style(&self) -> &'static str {
         match self {
-            Self::OpenAi { .. } => "openai",
+            Self::ChatCompletions { .. } => "chat-completions",
+            Self::Responses { .. } => "responses",
             Self::Anthropic { .. } => "anthropic",
         }
     }
 
-    /// An OpenAI-compatible provider at `base_url`.
-    pub fn openai(base_url: impl Into<String>, api_key: ApiKeyRef, options: OpenAiOptions) -> Self {
-        Self::OpenAi {
+    /// A Chat Completions provider at `base_url`.
+    pub fn chat_completions(
+        base_url: impl Into<String>,
+        api_key: ApiKeyRef,
+        options: ChatCompletionsOptions,
+    ) -> Self {
+        Self::ChatCompletions {
+            base_url: base_url.into(),
+            api_key,
+            request_timeout_secs: options.request_timeout_secs,
+            retry_budget_secs: options.retry_budget_secs,
+            role_alternation: options.role_alternation,
+        }
+    }
+
+    /// A Responses provider at `base_url`.
+    pub fn responses(
+        base_url: impl Into<String>,
+        api_key: ApiKeyRef,
+        options: ResponsesOptions,
+    ) -> Self {
+        Self::Responses {
             base_url: base_url.into(),
             api_key,
             request_timeout_secs: options.request_timeout_secs,

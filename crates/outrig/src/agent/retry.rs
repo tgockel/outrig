@@ -755,11 +755,11 @@ fn undecodable(error: ProviderError) -> Result<String, ProviderError> {
 }
 
 /// Whether `reason`, a provider's finish reason, says the model chose to stop:
-/// OpenAI's `stop` and Anthropic's `end_turn`. Every other reason of an empty
+/// OpenAI's `stop`, Anthropic's `end_turn` and a Responses reply's `completed`. Every other reason of an empty
 /// reply -- a truncation, a filter -- is a turn that was cut short, and the
 /// provider's defect to retry.
 pub(crate) fn is_normal_stop(reason: &str) -> bool {
-    matches!(reason, "stop" | "end_turn")
+    matches!(reason, "stop" | "end_turn" | "completed")
 }
 
 /// Whether `reason`, a provider's finish reason, says the provider would not
@@ -822,6 +822,30 @@ fn body_token_usage(body: &[u8]) -> Option<rig::completion::Usage> {
         #[serde(default)]
         reasoning_tokens: Option<u64>,
     }
+    // Responses counts `input_tokens` as Anthropic does, but carries what
+    // Chat Completions does beside them: a total and the two detail objects.
+    #[derive(Deserialize)]
+    struct Responses {
+        input_tokens: u64,
+        #[serde(default)]
+        output_tokens: Option<u64>,
+        #[serde(default)]
+        total_tokens: Option<u64>,
+        #[serde(default)]
+        input_tokens_details: Option<ResponsesInputDetails>,
+        #[serde(default)]
+        output_tokens_details: Option<ResponsesOutputDetails>,
+    }
+    #[derive(Deserialize)]
+    struct ResponsesInputDetails {
+        #[serde(default)]
+        cached_tokens: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    struct ResponsesOutputDetails {
+        #[serde(default)]
+        reasoning_tokens: Option<u64>,
+    }
     #[derive(Deserialize)]
     struct Anthropic {
         input_tokens: u64,
@@ -851,6 +875,28 @@ fn body_token_usage(body: &[u8]) -> Option<rig::completion::Usage> {
                 .reasoning_tokens(
                     openai
                         .completion_tokens_details
+                        .and_then(|d| d.reasoning_tokens),
+                ),
+        );
+    }
+    // Anthropic's usage has none of the three keys that mark a Responses one.
+    let is_responses = [
+        "total_tokens",
+        "input_tokens_details",
+        "output_tokens_details",
+    ]
+    .iter()
+    .any(|key| usage.get(key).is_some());
+    if is_responses && let Ok(responses) = Responses::deserialize(&usage) {
+        return Some(
+            rig::completion::Usage::new()
+                .input_tokens(responses.input_tokens)
+                .output_tokens(responses.output_tokens)
+                .total_tokens(responses.total_tokens)
+                .cached_input_tokens(responses.input_tokens_details.and_then(|d| d.cached_tokens))
+                .reasoning_tokens(
+                    responses
+                        .output_tokens_details
                         .and_then(|d| d.reasoning_tokens),
                 ),
         );
@@ -919,17 +965,34 @@ fn provider_finish_reason(raw: &serde_json::Value) -> Option<String> {
         .get("choices")
         .and_then(|choices| choices.get(0))
         .and_then(|choice| choice.get("finish_reason"))
-        .or_else(|| raw.get("stop_reason"))?
-        .as_str()?;
-    Some(word.to_string())
+        .or_else(|| raw.get("stop_reason"))
+        .and_then(serde_json::Value::as_str);
+    match word {
+        Some(word) => Some(word.to_string()),
+        None => responses_word(
+            raw.get("status").and_then(serde_json::Value::as_str),
+            raw.pointer("/incomplete_details/reason")
+                .and_then(serde_json::Value::as_str),
+        ),
+    }
+}
+
+/// A Responses reply's word for why generation stopped: its `status`, which is
+/// `completed` for a reply that ran its course, and for one `incomplete` the
+/// reason it gives, `max_output_tokens` or `content_filter`.
+fn responses_word(status: Option<&str>, incomplete_reason: Option<&str>) -> Option<String> {
+    match (status?, incomplete_reason) {
+        ("incomplete", Some(reason)) => Some(reason.to_string()),
+        (status, _) => Some(status.to_string()),
+    }
 }
 
 /// The provider's own word for why generation stopped, from a `200`'s body:
 /// `None` when it names none, or is of neither provider's shape.
 ///
-/// Both dialects are checked because both are reachable:
-/// `choices[0].finish_reason` is the OpenAI shape and `stop_reason` the
-/// Anthropic one. It is read for every attempt that is answered, so it names
+/// Every dialect is checked because all are reachable:
+/// `choices[0].finish_reason` is the Chat Completions shape, `stop_reason` the
+/// Anthropic one and `status` the Responses one. It is read for every attempt that is answered, so it names
 /// only the two fields and builds nothing of the reply.
 pub(crate) fn body_finish_reason(body: &[u8]) -> Option<String> {
     #[derive(Deserialize)]
@@ -937,9 +1000,15 @@ pub(crate) fn body_finish_reason(body: &[u8]) -> Option<String> {
         finish_reason: Option<String>,
     }
     #[derive(Deserialize)]
+    struct Incomplete {
+        reason: Option<String>,
+    }
+    #[derive(Deserialize)]
     struct Envelope {
         choices: Option<Vec<Choice>>,
         stop_reason: Option<String>,
+        status: Option<String>,
+        incomplete_details: Option<Incomplete>,
     }
     let envelope: Envelope = serde_json::from_slice(body).ok()?;
     envelope
@@ -947,6 +1016,15 @@ pub(crate) fn body_finish_reason(body: &[u8]) -> Option<String> {
         .and_then(|choices| choices.into_iter().next())
         .and_then(|choice| choice.finish_reason)
         .or(envelope.stop_reason)
+        .or_else(|| {
+            responses_word(
+                envelope.status.as_deref(),
+                envelope
+                    .incomplete_details
+                    .as_ref()
+                    .and_then(|details| details.reason.as_deref()),
+            )
+        })
 }
 
 /// The retry loop. A free function rather than a method because the future
@@ -1726,7 +1804,7 @@ mod tests {
                 }),
             ),
             (
-                Style::OpenAi,
+                Style::ChatCompletions,
                 serde_json::json!({
                     "prompt_tokens": 12,
                     "completion_tokens": 7,
@@ -1735,15 +1813,25 @@ mod tests {
                     "completion_tokens_details": { "reasoning_tokens": 2 },
                 }),
             ),
+            (
+                Style::Responses,
+                serde_json::json!({
+                    "input_tokens": 12,
+                    "output_tokens": 7,
+                    "total_tokens": 19,
+                    "input_tokens_details": { "cached_tokens": 4 },
+                    "output_tokens_details": { "reasoning_tokens": 2 },
+                }),
+            ),
             // A gateway that reports the total but not the output: the output
             // is the remainder.
             (
-                Style::OpenAi,
+                Style::ChatCompletions,
                 serde_json::json!({ "prompt_tokens": 120, "total_tokens": 200 }),
             ),
             // One that reports no total: the total is the sum.
             (
-                Style::OpenAi,
+                Style::ChatCompletions,
                 serde_json::json!({ "prompt_tokens": 12, "completion_tokens": 7 }),
             ),
             // Anthropic with no output count, as a reply cut off before any
@@ -1761,9 +1849,16 @@ mod tests {
                         .completion(crate::agent::mock_http::MODEL);
                     decode_reply(&wire, &request, Mode::Unary, [WireFrame::Bytes(bytes)])
                 }
-                Style::OpenAi => {
+                Style::ChatCompletions => {
                     let wire = rig::providers::openai::OpenAIConfig::new("k")
                         .chat(crate::agent::mock_http::MODEL);
+                    decode_reply(&wire, &request, Mode::Unary, [WireFrame::Bytes(bytes)])
+                }
+                Style::Responses => {
+                    let wire = rig::providers::openai::responses_api::wire::Responses::new(
+                        rig::providers::openai::OpenAIConfig::new("k"),
+                        crate::agent::mock_http::MODEL,
+                    );
                     decode_reply(&wire, &request, Mode::Unary, [WireFrame::Bytes(bytes)])
                 }
             }

@@ -757,7 +757,7 @@ fn the_latest_turn_is_never_evicted_and_too_large_names_it() {
         scale: Scale::RULE,
         max_tokens: None,
         provider: "p".into(),
-        wire: crate::agent::budget::Wire::OpenAi,
+        wire: crate::agent::budget::Wire::ChatCompletions,
         alternation: crate::config::RoleAlternation::Relaxed,
     };
     let err = store.assemble(&budget, None).expect_err("450 of room");
@@ -1468,7 +1468,7 @@ fn a_call_is_sent_only_the_reasoning_its_provider_takes() {
                 },
             ],
         ),
-        (Wire::OpenAi, Vec::new()),
+        (Wire::ChatCompletions, Vec::new()),
     ] {
         let budget = Budget {
             wire,
@@ -1479,7 +1479,11 @@ fn a_call_is_sent_only_the_reasoning_its_provider_takes() {
         let unsigned_sent = sent.iter().any(|message| {
             matches!(message, Message::Assistant(reply) if reply.content.contains(&unsigned))
         });
-        assert_eq!(unsigned_sent, wire == Wire::OpenAi, "{wire:?}: {sent:#?}");
+        assert_eq!(
+            unsigned_sent,
+            wire == Wire::ChatCompletions,
+            "{wire:?}: {sent:#?}"
+        );
         assert_eq!(
             store.reconstruct(&manifest),
             sent,

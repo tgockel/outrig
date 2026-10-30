@@ -58,6 +58,10 @@ pub enum ConfigWarningKind {
     /// A value that failed to deserialize. Only the global config skips one.
     #[non_exhaustive]
     InvalidValue { reason: String },
+    /// A value this outrig still takes under an older spelling. It is loaded
+    /// as `replacement`.
+    #[non_exhaustive]
+    Deprecated { replacement: &'static str },
 }
 
 impl ConfigWarning {
@@ -93,6 +97,9 @@ impl fmt::Display for ConfigWarning {
             ConfigWarningKind::InvalidValue { reason } => {
                 write!(f, "`{}` ignored: {reason}", self.key)
             }
+            ConfigWarningKind::Deprecated { replacement } => {
+                write!(f, "`{}` is deprecated, use \"{replacement}\"", self.key)
+            }
         }
     }
 }
@@ -109,7 +116,10 @@ enum Seg {
 /// naming `file`.
 pub(super) fn parse(text: &str, file: Option<&Path>, skip_bad_values: bool) -> Result<Config> {
     let doc = DeTable::parse(text)?;
-    let doc = Spanned::new(doc.span(), DeValue::Table(doc.into_inner()));
+    let mut doc = Spanned::new(doc.span(), DeValue::Table(doc.into_inner()));
+    // Before the loop, so a style the loader does not know is reported as one
+    // without listing the old spelling among the ones it takes.
+    let deprecated = rename_deprecated_styles(&mut doc);
     let newlines: Vec<usize> = text.match_indices('\n').map(|(i, _)| i).collect();
     let warning = |path: &[Seg], offset: usize, kind| ConfigWarning {
         file: file.map(Path::to_path_buf),
@@ -133,6 +143,20 @@ pub(super) fn parse(text: &str, file: Option<&Path>, skip_bad_values: bool) -> R
         let pruned = Spanned::new(doc.span(), prune(doc.get_ref(), &dropped));
         let err = match Config::deserialize(ValueDeserializer::from(pruned)) {
             Ok(mut cfg) => {
+                for (name, offset) in &deprecated {
+                    if dropped.contains(&offset.0) {
+                        continue;
+                    }
+                    let path = [
+                        Seg::Key("providers".to_string()),
+                        Seg::Key(name.clone()),
+                        Seg::Key("style".to_string()),
+                    ];
+                    let kind = ConfigWarningKind::Deprecated {
+                        replacement: "chat-completions",
+                    };
+                    warnings.push(warning(&path, offset.1, kind));
+                }
                 warnings.sort_by_key(|w| w.line);
                 cfg.warnings = warnings;
                 return Ok(cfg);
@@ -223,6 +247,36 @@ fn prune<'i>(node: &DeValue<'i>, dropped: &HashSet<usize>) -> DeValue<'i> {
         ),
         other => other.clone(),
     }
+}
+
+/// Read each `style = "openai"` -- the 0.2.x spelling of `"chat-completions"`
+/// -- as the new one. Returns each such provider's name with the offsets of
+/// its key and of the value, for a warning once the provider is known to load.
+fn rename_deprecated_styles(doc: &mut Spanned<DeValue<'_>>) -> Vec<(String, (usize, usize))> {
+    let DeValue::Table(top) = doc.get_mut() else {
+        return Vec::new();
+    };
+    let Some(DeValue::Table(providers)) = top.get_mut("providers").map(|p| p.get_mut()) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for (name, provider) in providers.iter_mut() {
+        let DeValue::Table(table) = provider.get_mut() else {
+            continue;
+        };
+        let Some(key) = table.get_key_value("style").map(|(k, _)| k.span().start) else {
+            continue;
+        };
+        let Some(style) = table.get_mut("style") else {
+            continue;
+        };
+        if matches!(style.get_ref(), DeValue::String(s) if s == "openai") {
+            let at = style.span().start;
+            *style.get_mut() = DeValue::String("chat-completions".into());
+            found.push((name.get_ref().to_string(), (key, at)));
+        }
+    }
+    found
 }
 
 /// Whether the key at `offset` follows an unquoted `.` inside a `[...]`
@@ -409,7 +463,7 @@ mod tests {
 
     #[test]
     fn an_unknown_key_is_skipped_in_any_table() {
-        let provider = "[providers.p]\nstyle = \"openai\"\nbase-url = \"u\"\n\
+        let provider = "[providers.p]\nstyle = \"chat-completions\"\nbase-url = \"u\"\n\
                         api-key = \"${KEY}\"\nprompt-cache = \"auto\"\n";
         assert_eq!(
             warned(provider, false),
@@ -432,7 +486,7 @@ mod tests {
     #[test]
     fn a_bad_value_is_skipped_only_when_asked() {
         let text = "[providers.newer]\nstyle = \"openai-responses\"\nbase-url = \"u\"\n\
-                    [providers.leaky]\nstyle = \"openai\"\nbase-url = \"u\"\n\
+                    [providers.leaky]\nstyle = \"chat-completions\"\nbase-url = \"u\"\n\
                     api-key = \"sk-literal-key-123\"\n";
         let warnings = warned(text, true);
         let keys: Vec<_> = warnings.iter().map(|w| w.0.as_str()).collect();
@@ -520,7 +574,7 @@ mod tests {
                 "host-pth",
             ),
             (
-                "[providers.p]\nstyle = \"openai\"\nbase-ur = \"u\"\napi-key = \"${KEY}\"\n",
+                "[providers.p]\nstyle = \"chat-completions\"\nbase-ur = \"u\"\napi-key = \"${KEY}\"\n",
                 "base-ur",
             ),
         ] {

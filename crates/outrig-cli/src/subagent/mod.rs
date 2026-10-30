@@ -1108,7 +1108,9 @@ fn validate_name(name: &str) -> Result<(), String> {
 pub(crate) mod fixtures {
     use super::*;
     use crate::llm::{ResolvedCandidate, ResolvedProvider};
-    use outrig::config::{Agent, AnthropicOptions, ApiKeyRef, LlmProvider, Model, OpenAiOptions};
+    use outrig::config::{
+        Agent, AnthropicOptions, ApiKeyRef, ChatCompletionsOptions, LlmProvider, Model,
+    };
 
     /// The env var the fixture provider's api-key points at. Unique to this
     /// module so concurrent tests cannot race another fixture on the same key.
@@ -1135,10 +1137,10 @@ pub(crate) mod fixtures {
 
     /// An OpenAI-style provider at the discard port, keyed by `key_var`.
     fn discard_port_openai(key_var: &str) -> LlmProvider {
-        LlmProvider::openai(
+        LlmProvider::chat_completions(
             "http://127.0.0.1:9",
             ApiKeyRef::parse(&format!("${{{key_var}}}")).expect("api-key ref parses"),
-            OpenAiOptions::new().with_request_timeout_secs(1),
+            ChatCompletionsOptions::new().with_request_timeout_secs(1),
         )
     }
 
@@ -1202,10 +1204,10 @@ pub(crate) mod fixtures {
         ] {
             cfg.providers.insert(
                 provider.to_string(),
-                LlmProvider::openai(
+                LlmProvider::chat_completions(
                     url,
                     ApiKeyRef::parse(&format!("${{{KEY_VAR}}}")).expect("api-key ref parses"),
-                    OpenAiOptions::new()
+                    ChatCompletionsOptions::new()
                         .with_request_timeout_secs(60)
                         .with_retry_budget_secs(0),
                 ),
@@ -1309,7 +1311,7 @@ pub(crate) mod fixtures {
                 model_name: "smart".to_string(),
                 model_identifier: "gpt-4o".to_string(),
                 provider_name: "openai".to_string(),
-                provider: ResolvedProvider::OpenAi {
+                provider: ResolvedProvider::ChatCompletions {
                     base_url: base_url.to_string(),
                     api_key: "test-key".to_string(),
                     request_timeout_secs,
@@ -4164,7 +4166,7 @@ mod tests {
         assert!(
             matches!(
                 registry.ctx.resolved.provider(),
-                crate::llm::ResolvedProvider::OpenAi { .. }
+                crate::llm::ResolvedProvider::ChatCompletions { .. }
             ),
             "the parent is hosted"
         );

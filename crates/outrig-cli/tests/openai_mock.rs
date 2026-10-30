@@ -70,7 +70,7 @@ fn mock_config(addr: SocketAddr, var: &str, model: &str) -> Config {
 default-model = "{model}"
 
 [providers.mock]
-style                = "openai"
+style                = "chat-completions"
 base-url             = "http://{addr}"
 api-key              = "${{{var}}}"
 request-timeout-secs = 10

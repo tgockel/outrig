@@ -40,7 +40,7 @@ kind:
   gateway-shaped (`aws/anthropic/bedrock-claude-opus-5`), so this needs a parse that would have to
   keep pace with every gateway's naming -- the thing
   `plan/next/validate-max-tokens-against-the-ceiling.md` is already wary of.
-- **Require `max-tokens` for `style = "openai"` at config load.** Honest and static, but breaks
+- **Require `max-tokens` for `style = "chat-completions"` at config load.** Honest and static, but breaks
   every existing config, and `config-init` would have to pick a number it equally cannot know.
 
 ## See also

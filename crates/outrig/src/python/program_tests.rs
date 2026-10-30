@@ -717,7 +717,7 @@ const CONFIG: &str = r#"
 default-model = "fast"
 
 [providers.local]
-style    = "openai"
+style    = "chat-completions"
 base-url = "http://127.0.0.1:1/v1"
 api-key  = "${OUTRIG_TEST_PROGRAM_KEY}"
 
@@ -792,7 +792,7 @@ async fn the_view_holds_the_configuration_and_no_secret() {
             "Model(name='slow', provider='local', identifier='slow-wire-name', \
              context_window=None, max_tokens=None)",
             "Alias(name='chain', candidates=('fast', 'slow'))",
-            "Provider(name='local', style='openai', base_url='http://127.0.0.1:1/v1')",
+            "Provider(name='local', style='chat-completions', base_url='http://127.0.0.1:1/v1')",
             &format!("fast {} Events(mode='record')", workspace.display()),
             "read-only",
             "frozen",

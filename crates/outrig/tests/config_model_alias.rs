@@ -29,7 +29,7 @@ fn expect_validation_err(cfg: &Config, repo_root: Option<&Path>) -> ConfigValida
 /// without restating the plumbing.
 const CONCRETE: &str = r#"
 [providers.p]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://example.invalid/v1"
 api-key  = "${OUTRIG_TEST_ALIAS_KEY}"
 
@@ -521,10 +521,10 @@ fn many_roots_over_one_shared_alias_validate_quickly() {
     let mut cfg = Config::default();
     cfg.providers.insert(
         "p".to_string(),
-        outrig::config::LlmProvider::openai(
+        outrig::config::LlmProvider::chat_completions(
             "https://example.invalid/v1",
             outrig::config::ApiKeyRef::parse("${OUTRIG_TEST_ALIAS_KEY}").expect("api-key ref"),
-            outrig::config::OpenAiOptions::new(),
+            outrig::config::ChatCompletionsOptions::new(),
         ),
     );
     let leaves: Vec<String> = (0..N).map(|i| format!("leaf{i}")).collect();
@@ -617,10 +617,10 @@ fn validate_and_model_candidates_agree_on_an_over_deep_bottom_up_chain() {
     let mut cfg = Config::default();
     cfg.providers.insert(
         "p".to_string(),
-        outrig::config::LlmProvider::openai(
+        outrig::config::LlmProvider::chat_completions(
             "https://example.invalid/v1",
             outrig::config::ApiKeyRef::parse("${OUTRIG_TEST_ALIAS_KEY}").expect("api-key ref"),
-            outrig::config::OpenAiOptions::new(),
+            outrig::config::ChatCompletionsOptions::new(),
         ),
     );
     let mut leaf = Model::new("p");

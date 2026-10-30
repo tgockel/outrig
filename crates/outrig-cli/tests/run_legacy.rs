@@ -21,7 +21,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// never contacted.
 const GLOBAL: &str = r#"
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "http://127.0.0.1:1/v1"
 api-key  = "${OUTRIG_TEST_KEY}"
 "#;

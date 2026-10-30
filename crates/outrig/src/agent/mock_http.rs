@@ -108,6 +108,16 @@ impl CannedResponse {
     pub(super) fn with_reasoning(mut self, text: &str) -> Self {
         if self.body.get("choices").is_some() {
             self.body["choices"][0]["message"]["reasoning_content"] = json!(text);
+        } else if let Some(output) = self.body["output"].as_array_mut() {
+            output.insert(
+                0,
+                json!({
+                    "type": "reasoning",
+                    "id": "rs_mock",
+                    "encrypted_content": "sealed",
+                    "summary": [{ "type": "summary_text", "text": text }],
+                }),
+            );
         } else if let Some(content) = self.body["content"].as_array_mut() {
             content.insert(
                 0,
@@ -213,17 +223,19 @@ pub(super) fn submit(id: &str, source: &str) -> CannedResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Style {
     Anthropic,
-    OpenAi,
+    ChatCompletions,
+    Responses,
 }
 
 impl Style {
-    pub(super) const ALL: [Style; 2] = [Style::Anthropic, Style::OpenAi];
+    pub(super) const ALL: [Style; 3] = [Style::Anthropic, Style::ChatCompletions, Style::Responses];
 
     /// What `[providers.<name>].style` says for it.
     pub(super) fn name(self) -> &'static str {
         match self {
             Style::Anthropic => "anthropic",
-            Style::OpenAi => "openai",
+            Style::ChatCompletions => "chat-completions",
+            Style::Responses => "responses",
         }
     }
 
@@ -231,7 +243,17 @@ impl Style {
     pub(super) fn text(self, text: &str) -> CannedResponse {
         match self {
             Style::Anthropic => text_reply(text),
-            Style::OpenAi => chat(json!({"role": "assistant", "content": text}), "stop"),
+            Style::ChatCompletions => chat(json!({"role": "assistant", "content": text}), "stop"),
+            Style::Responses => responses(
+                json!([{
+                    "type": "message",
+                    "id": "msg_mock",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "annotations": [], "text": text}],
+                }]),
+                "stop",
+            ),
         }
     }
 
@@ -239,7 +261,7 @@ impl Style {
     pub(super) fn unusable(self) -> CannedResponse {
         match self {
             Style::Anthropic => self.empty("max_tokens"),
-            Style::OpenAi => self.empty("length"),
+            Style::ChatCompletions | Style::Responses => self.empty("length"),
         }
     }
 
@@ -248,7 +270,10 @@ impl Style {
     pub(super) fn empty(self, finish_reason: &str) -> CannedResponse {
         match self {
             Style::Anthropic => message(json!([]), finish_reason),
-            Style::OpenAi => chat(json!({"role": "assistant", "content": ""}), finish_reason),
+            Style::ChatCompletions => {
+                chat(json!({"role": "assistant", "content": ""}), finish_reason)
+            }
+            Style::Responses => responses(json!([]), finish_reason),
         }
     }
 
@@ -257,7 +282,7 @@ impl Style {
     pub(super) fn empty_stop(self) -> CannedResponse {
         match self {
             Style::Anthropic => self.empty("end_turn"),
-            Style::OpenAi => self.empty("stop"),
+            Style::ChatCompletions | Style::Responses => self.empty("stop"),
         }
     }
 
@@ -283,7 +308,7 @@ impl Style {
                     .collect(),
                 "tool_use",
             ),
-            Style::OpenAi => chat(
+            Style::ChatCompletions => chat(
                 json!({
                     "role": "assistant",
                     "tool_calls": calls
@@ -298,6 +323,22 @@ impl Style {
                         }))
                         .collect::<Vec<_>>(),
                 }),
+                "tool_calls",
+            ),
+            Style::Responses => responses(
+                calls
+                    .iter()
+                    .map(|(id, source)| {
+                        json!({
+                            "type": "function_call",
+                            "id": format!("fc_{id}"),
+                            "call_id": id,
+                            "status": "completed",
+                            "name": super::tool::NAME,
+                            "arguments": json!({"source": source}).to_string(),
+                        })
+                    })
+                    .collect(),
                 "tool_calls",
             ),
         }
@@ -319,7 +360,7 @@ impl Style {
                     "max_tokens": 64_000,
                 }),
             ),
-            Style::OpenAi => proxy_listing(&[(identifier, tokens)]),
+            Style::ChatCompletions | Style::Responses => proxy_listing(&[(identifier, tokens)]),
         }
     }
 
@@ -327,7 +368,7 @@ impl Style {
     pub(super) fn failure(self, status: u16) -> CannedResponse {
         match self {
             Style::Anthropic => failure(status),
-            Style::OpenAi => CannedResponse::new(
+            Style::ChatCompletions | Style::Responses => CannedResponse::new(
                 status,
                 json!({
                     "error": {
@@ -347,7 +388,7 @@ impl Style {
             Style::Anthropic => {
                 CannedResponse::new(200, json!({ "type": "error", "message": "Overloaded" }))
             }
-            Style::OpenAi => CannedResponse::new(
+            Style::ChatCompletions | Style::Responses => CannedResponse::new(
                 200,
                 json!({ "error": { "code": 502, "message": "Provider returned error" } }),
             ),
@@ -377,6 +418,74 @@ pub(super) fn chat(message: Value, finish_reason: &str) -> CannedResponse {
     )
 }
 
+/// A Responses reply holding `output`, in the shape rig's Responses decoder
+/// reads. `finish_reason` is spelled as the other styles' are: `length` and
+/// `content_filter` cut the reply short, and anything else completes it.
+pub(super) fn responses(output: Value, finish_reason: &str) -> CannedResponse {
+    let (status, incomplete) = match finish_reason {
+        "length" | "max_output_tokens" => ("incomplete", json!({"reason": "max_output_tokens"})),
+        "content_filter" => ("incomplete", json!({"reason": "content_filter"})),
+        _ => ("completed", Value::Null),
+    };
+    CannedResponse::new(
+        200,
+        json!({
+            "id": "resp_mock",
+            "object": "response",
+            "created_at": 0,
+            "status": status,
+            "incomplete_details": incomplete,
+            "model": "gpt-mock",
+            "output": output,
+            "tools": [],
+            "usage": {
+                "input_tokens": 12,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 7,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 19,
+            },
+        }),
+    )
+}
+
+/// The conversation of a request `body` as a list of Chat Completions-shaped
+/// messages: its `messages`, or a Responses request's `input` read the same
+/// way -- a run of `function_call` items is one assistant message's
+/// `tool_calls`, a `function_call_output` is a `tool` message, and a
+/// reasoning item is no message at all. The `instructions` lead as the system
+/// message Chat Completions would carry them in.
+pub(super) fn conversation_of(body: &Value) -> Vec<Value> {
+    let Some(items) = body["input"].as_array() else {
+        return body["messages"].as_array().cloned().unwrap_or_default();
+    };
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(instructions) = body["instructions"].as_str() {
+        messages.push(json!({"role": "system", "content": instructions}));
+    }
+    for item in items {
+        match item["type"].as_str() {
+            Some("function_call") => {
+                let call = json!({"id": item["call_id"]});
+                match messages.last_mut() {
+                    Some(last) if last["tool_calls"].is_array() => {
+                        last["tool_calls"].as_array_mut().unwrap().push(call)
+                    }
+                    _ => messages.push(json!({"role": "assistant", "tool_calls": [call]})),
+                }
+            }
+            Some("function_call_output") => messages.push(json!({
+                "role": "tool",
+                "tool_call_id": item["call_id"],
+                "content": item["output"],
+            })),
+            Some("reasoning") => {}
+            _ => messages.push(item.clone()),
+        }
+    }
+    messages
+}
+
 /// What [`check_wire`] found in one request's `messages`.
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct Wire {
@@ -394,11 +503,11 @@ pub(super) struct Wire {
 /// - Anthropic: each `tool_use` block is answered by a `tool_result` in the
 ///   very next message, and each `tool_result` answers a `tool_use` in the one
 ///   before.
-/// - OpenAI: each of an assistant message's `tool_calls` is answered by a
+/// - OpenAI, either API: each of an assistant message's `tool_calls` is answered by a
 ///   `tool` message before the next message of any other role, and each
 ///   `tool` message answers a call of the assistant message before its run.
 pub(super) fn check_wire(style: Style, body: &Value) -> Wire {
-    let messages = body["messages"].as_array().cloned().unwrap_or_default();
+    let messages = conversation_of(body);
     let role = |n: usize| messages[n]["role"].as_str().unwrap_or("").to_string();
     let mut wire = Wire::default();
     match style {
@@ -435,7 +544,7 @@ pub(super) fn check_wire(style: Style, body: &Value) -> Wire {
                 }
             }
         }
-        Style::OpenAi => {
+        Style::ChatCompletions | Style::Responses => {
             let mut asked: Vec<String> = Vec::new();
             for message in &messages {
                 if message["role"] == "tool" {
@@ -473,11 +582,9 @@ pub(super) fn check_wire(style: Style, body: &Value) -> Wire {
 /// `tool` messages -- one turn's results -- as the one user message it
 /// becomes. Anthropic's wire already carries results in user messages, so its
 /// roles come through as they are.
-fn gateway_roles(body: &Value) -> Vec<&str> {
-    let mut roles: Vec<&str> = body["messages"]
-        .as_array()
-        .into_iter()
-        .flatten()
+fn gateway_roles(messages: &[Value]) -> Vec<&str> {
+    let mut roles: Vec<&str> = messages
+        .iter()
         .filter_map(|message| message["role"].as_str())
         .filter(|role| *role != "system")
         .collect();
@@ -493,7 +600,8 @@ fn gateway_roles(body: &Value) -> Vec<&str> {
 /// that repeats, or the first message when it is not the user's. `None` when
 /// the request is one it takes.
 pub(super) fn strict_refusal(body: &Value) -> Option<CannedResponse> {
-    let roles = gateway_roles(body);
+    let messages = conversation_of(body);
+    let roles = gateway_roles(&messages);
     let message = match roles.first() {
         Some(&first) if first != "user" => {
             r#"messages: first message must use the "user" role"#.to_string()
@@ -626,7 +734,7 @@ fn content_refusal(body: &Value) -> Option<CannedResponse> {
     }
     Some(match body.get("system") {
         Some(_) => Style::Anthropic.empty("refusal"),
-        None => Style::OpenAi.empty("content_filter"),
+        None => Style::ChatCompletions.empty("content_filter"),
     })
 }
 

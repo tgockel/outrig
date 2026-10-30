@@ -123,7 +123,10 @@ async fn lookup(candidate: &ResolvedCandidate, timeout: Duration) -> Reported {
             )?)
             .header("x-api-key", api_key.expose())
             .header("anthropic-version", ANTHROPIC_VERSION_LATEST),
-        ResolvedProvider::OpenAi {
+        ResolvedProvider::ChatCompletions {
+            base_url, api_key, ..
+        }
+        | ResolvedProvider::Responses {
             base_url, api_key, ..
         } => http
             .get(url(base_url, &["model", "info"])?)
@@ -139,7 +142,9 @@ async fn lookup(candidate: &ResolvedCandidate, timeout: Duration) -> Reported {
         serde_json::from_slice(&body).map_err(|_| "the reply is not JSON".to_string())?;
     match candidate.provider {
         ResolvedProvider::Anthropic { .. } => max_input_tokens(&body),
-        ResolvedProvider::OpenAi { .. } => proxy_window(&body, identifier),
+        ResolvedProvider::ChatCompletions { .. } | ResolvedProvider::Responses { .. } => {
+            proxy_window(&body, identifier)
+        }
     }
 }
 

@@ -24,7 +24,7 @@ The check the symptom argues for -- "reject `max-tokens` above the model's ceili
 cannot cover the case that motivated it. Validation runs in the `outrig` crate against `Config`,
 and the ceiling table lives in rig, reached by constructing a completion model against a
 *provider*, which validation does not do and should not start doing. Worse, the failing config
-was `style = "openai"` with `identifier = "azure/anthropic/claude-haiku-4-5"`: nothing in outrig
+was `style = "chat-completions"` with `identifier = "azure/anthropic/claude-haiku-4-5"`: nothing in outrig
 knows a ceiling for that string, and inventing a rule that pattern-matches `claude-` inside an
 arbitrary gateway identifier is guessing dressed as validation.
 

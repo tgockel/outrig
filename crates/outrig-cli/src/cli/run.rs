@@ -1056,7 +1056,8 @@ fn render_banner(banner: StartupBanner<'_>) -> String {
         session_id,
     } = banner;
     let provider_label = match resolved.provider() {
-        llm::ResolvedProvider::OpenAi { .. } => "openai",
+        llm::ResolvedProvider::ChatCompletions { .. } => "chat-completions",
+        llm::ResolvedProvider::Responses { .. } => "responses",
         llm::ResolvedProvider::Anthropic { .. } => "anthropic",
     };
     let mut buf = String::new();
@@ -1091,7 +1092,8 @@ fn render_banner(banner: StartupBanner<'_>) -> String {
     // two endpoints speaking one wire format, so the endpoint itself is the
     // row that tells them apart. A repo config cannot declare a provider, so
     // this is always a `base-url` the operator's own file set.
-    let (llm::ResolvedProvider::OpenAi { base_url, .. }
+    let (llm::ResolvedProvider::ChatCompletions { base_url, .. }
+    | llm::ResolvedProvider::Responses { base_url, .. }
     | llm::ResolvedProvider::Anthropic { base_url, .. }) = resolved.provider();
     let _ = writeln!(
         buf,
@@ -1236,7 +1238,7 @@ mod tests {
                 model_identifier: "gpt-4o-mini".to_string(),
                 provider_name: "openai".to_string(),
                 // The discard port, so building an agent over this does no I/O.
-                provider: llm::ResolvedProvider::OpenAi {
+                provider: llm::ResolvedProvider::ChatCompletions {
                     base_url: "http://127.0.0.1:9".to_string(),
                     api_key: "test-key".to_string(),
                     request_timeout_secs: None,
@@ -1318,7 +1320,7 @@ mod tests {
         };
         let banner = render_test_banner(&resolved, "rust-dev", false);
         assert!(
-            banner.starts_with("[outrig] model:             fast (provider: openai / "),
+            banner.starts_with("[outrig] model:             fast (provider: chat-completions / "),
             "an agentless banner leads with the model: {banner}"
         );
         assert!(
@@ -1362,7 +1364,7 @@ mod tests {
     #[test]
     fn the_banner_names_the_base_url() {
         let mut remote = test_resolved_agent();
-        remote.candidates[0].provider = llm::ResolvedProvider::OpenAi {
+        remote.candidates[0].provider = llm::ResolvedProvider::ChatCompletions {
             base_url: "http://127.0.0.1:18081/v1".to_string(),
             api_key: "sk-PROBE-KEY-123".to_string(),
             request_timeout_secs: None,
@@ -1512,7 +1514,7 @@ mod tests {
         }
 
         impl Fixture {
-            /// Async because [`llm::build_agent`] is; the OpenAi arm does
+            /// Async because [`llm::build_agent`] is; the ChatCompletions arm does
             /// no I/O, so the dummy agent builds instantly.
             async fn new(config_toml: &str) -> Self {
                 let cfg: Config = toml::from_str(config_toml).expect("config parses");

@@ -31,7 +31,14 @@ fn candidate_on(style: Style, base_url: String, context_window: Option<u32>) -> 
             retry_budget_secs,
             role_alternation,
         },
-        Style::OpenAi => ResolvedProvider::OpenAi {
+        Style::ChatCompletions => ResolvedProvider::ChatCompletions {
+            base_url,
+            api_key: KEY.into(),
+            request_timeout_secs,
+            retry_budget_secs,
+            role_alternation,
+        },
+        Style::Responses => ResolvedProvider::Responses {
             base_url,
             api_key: KEY.into(),
             request_timeout_secs,
@@ -51,7 +58,7 @@ fn candidate_on(style: Style, base_url: String, context_window: Option<u32>) -> 
 fn base(style: Style, addr: SocketAddr) -> String {
     match style {
         Style::Anthropic => format!("http://{addr}"),
-        Style::OpenAi => format!("http://{addr}/v1"),
+        Style::ChatCompletions | Style::Responses => format!("http://{addr}/v1"),
     }
 }
 
@@ -94,7 +101,7 @@ async fn a_provider_is_asked_for_the_window_of_the_model_it_serves() {
                 assert_eq!(asked[0].header("x-api-key"), Some(KEY));
                 assert!(asked[0].header("anthropic-version").is_some());
             }
-            Style::OpenAi => {
+            Style::ChatCompletions | Style::Responses => {
                 assert_eq!(asked[0].path, "/v1/model/info");
                 assert_eq!(
                     asked[0].header("authorization"),
@@ -136,7 +143,11 @@ async fn a_proxy_that_lists_a_model_twice_is_held_to_the_smaller_window() {
         (IDENTIFIER, Some(229_376)),
     ]);
     let (addr, _requests) = mock_http::start_reporting(vec![], listing).await;
-    let mut candidate = candidate_on(Style::OpenAi, base(Style::OpenAi, addr), None);
+    let mut candidate = candidate_on(
+        Style::ChatCompletions,
+        base(Style::ChatCompletions, addr),
+        None,
+    );
     ask(&mut candidate).await;
 
     assert_eq!(candidate.reported_window, Some(Ok(229_376)));
@@ -167,7 +178,7 @@ async fn a_provider_that_reports_no_window_leaves_the_assumption_and_says_why() 
                 "reports no max_input_tokens".to_string(),
             ),
         ];
-        if style == Style::OpenAi {
+        if style == Style::ChatCompletions {
             cases.push((
                 "another model's row",
                 style.window("other", Some(8_000)),

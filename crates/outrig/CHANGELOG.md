@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`style = "responses"`, a provider that speaks OpenAI's Responses API.** A call posts to
+  `{base-url}/responses` with the whole conversation as `input`, the output ceiling as
+  `max_output_tokens`, and `store: false`; it never sets `previous_response_id`. The row takes the
+  keys `chat-completions` does. A reasoning item goes back only to a provider that issued one with
+  `encrypted_content`, so an alias chain that moves between providers sends none a candidate
+  cannot use. New: `LlmProvider::Responses`, `LlmProvider::responses` and `ResponsesOptions`.
 - **`harness`, an agent session that acts by writing Python.** A `SessionBuilder` takes
   everything a session needs from outside before it starts: the `Config`, the agent and model, the
   container as a `LaunchSpec`, a `Secrets` resolver for the keys its model calls need, event
@@ -609,6 +615,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: `style = "openai"` is `style = "chat-completions"`.** The style is named for its
+  protocol now that a second OpenAI request format is a style. The Rust names follow:
+  `LlmProvider::OpenAi` is `LlmProvider::ChatCompletions`, `LlmProvider::openai` is
+  `LlmProvider::chat_completions`, and `OpenAiOptions` is `ChatCompletionsOptions`.
+  `LlmProvider::style` returns `"chat-completions"`, and the unknown-style error lists
+  `chat-completions`, `responses` and `anthropic`.
 - **The agent loop runs on rig 0.45** (`rig-core` 0.40 before), through the `rig` facade over
   `rig-core`, `rig-agent`, `rig-reqwest` and `rig-http`, and the minimum supported Rust is 1.97.1.
   No type of rig's crosses the public API, as before. What a session's record and its rounds show
@@ -766,6 +778,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Run local models under an OpenAI-compatible server and point a `style = "openai"` provider at
   its `localhost` `base-url` -- see
   [Local models](../../doc/concepts/llm-providers.md#local-models).
+
+### Deprecated
+
+- **`style = "openai"`** is still read, as `chat-completions`, with a `ConfigWarningKind::Deprecated`
+  warning that names the new value. A later release will remove the spelling. Without it a 0.2.x
+  global config would lose its `openai` provider and every model on it.
 
 ## [0.2.2](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.2) - 2026-10-20
 

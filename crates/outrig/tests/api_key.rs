@@ -101,7 +101,7 @@ mod api_key {
     fn config_load_rejects_literal_api_key() {
         let bad = r#"
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "sk-abc123"
 "#;

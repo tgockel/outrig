@@ -445,8 +445,9 @@ it accepts two replies in a row. Both adapters are exercised against a mock, not
 endpoint. A provider or gateway that requires turns to alternate -- a Bedrock-backed Claude
 behind an OpenAI-compatible gateway is known to -- can refuse such a call, and when a refused
 call carried one, the error says where, and what to set: `role-alternation = "strict"` on the
-provider's row (see [`role-alternation`](config.md#style--openai)). For an alias of several
-models, that holds for the first model that refused such a call, and names its provider's row.
+provider's row (see
+[`role-alternation`](config.md#style--chat-completions)). For an alias of several models, that
+holds for the first model that refused such a call, and names its provider's row.
 With that set, each call is sent a conversation that alternates by construction, at the cost of
 the turns that would not. A turn brought back without the rest of its round is left out where it
 would follow the model's own reply, so promote whole rounds on such a provider. A round that

@@ -37,7 +37,7 @@ print their options' descriptions before they open.
 ```
 [outrig] no global config found at ~/.outrig/config.toml -- let's create one.
 
-? Pick a provider style [default: openai]:
+? Pick a provider style [default: chat-completions]:
 ? Provider name (used in models) [default: openai]:
 ? Base URL [default: https://api.openai.com/v1]:
 ? API key environment variable [default: OPENAI_API_KEY]:

@@ -666,7 +666,7 @@ pub const GLOBAL_WITH_MODEL: &str = r#"
 default-model = "fast"
 
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "http://127.0.0.1:1/v1"
 api-key  = "${OUTRIG_TEST_KEY}"
 

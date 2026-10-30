@@ -67,16 +67,18 @@
 // would only move the size.
 #![allow(clippy::result_large_err)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use rig::completion::message::{Api, AssistantContent};
 use rig::completion::{
-    CompletionRequest, CompletionResponse, ModelRef, PromptError, ProviderCapabilities,
+    CompletionRequest, CompletionResponse, Message, ModelRef, PromptError, ProviderCapabilities,
 };
 use rig::effect::{Answered, EffectKind, FamilyDescriptor, HandlerDescriptor, family, model_key};
 use rig::error::{ErrorKind, ErrorReport, ProviderError};
+use rig::providers::openai::extension::OpenAiOptions;
 use rig::serve::{Dispatch, Reply, Serve};
 
 use super::retry::{self, RetryPolicy, RetryingModel, candidate_failure_label};
@@ -120,6 +122,13 @@ pub(crate) trait Candidate: Send + Sync {
         false
     }
 
+    /// Whether this candidate's wire replays reasoning only as ciphertext it
+    /// issued itself, which is bound to its account: a Responses candidate's.
+    /// Its calls are sent the reasoning of the replies it wrote and no other's.
+    fn replays_only_own_reasoning(&self) -> bool {
+        false
+    }
+
     /// Run one completion against this candidate.
     fn completion(
         &self,
@@ -128,6 +137,9 @@ pub(crate) trait Candidate: Send + Sync {
         Box<dyn Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>,
     >;
 }
+
+/// The wire format whose reasoning items carry `encrypted_content`.
+const RESPONSES_API: Api = Api::from_static("openai.responses");
 
 /// A [`Candidate`] over a provider's model, its wire erased.
 ///
@@ -139,6 +151,9 @@ pub(crate) struct ModelCandidate {
     model_name: String,
     model_identifier: String,
     max_tokens: Option<u64>,
+    /// Whether its calls tell the provider not to keep what it is sent, as a
+    /// Responses candidate's do: the conversation is OutRig's to carry.
+    stateless: bool,
     /// For an Anthropic candidate, the same model built not to ask for
     /// `drop_block`, which its calls go through once its endpoint has refused
     /// that.
@@ -158,8 +173,15 @@ impl ModelCandidate {
             model_name: model_name.into(),
             model_identifier: model_identifier.into(),
             max_tokens: max_tokens.map(u64::from),
+            stateless: false,
             binding,
         }
+    }
+
+    /// This candidate's calls send `store: false`.
+    pub(crate) fn stateless(mut self) -> Self {
+        self.stateless = true;
+        self
     }
 }
 
@@ -199,6 +221,10 @@ impl Candidate for ModelCandidate {
         self.model.capabilities()
     }
 
+    fn replays_only_own_reasoning(&self) -> bool {
+        self.stateless
+    }
+
     fn unbind(&self) -> bool {
         self.binding
             .as_ref()
@@ -214,6 +240,11 @@ impl Candidate for ModelCandidate {
         let model = match &self.binding {
             Some(binding) if binding.refused.load(Ordering::Relaxed) => &binding.unbound,
             _ => &self.model,
+        };
+        let request = if self.stateless {
+            request.provider_option(OpenAiOptions::new().store(false))
+        } else {
+            request
         };
         Box::pin(model.completion(request))
     }
@@ -260,6 +291,14 @@ pub struct FailoverModel {
     /// clones, as the policy's chain deadline is, so whoever holds the model
     /// sees what any clone recorded. Never held across an await.
     answered: Arc<Mutex<BTreeSet<usize>>>,
+    /// The `[models.<name>]` row that answered each reply, by the response id
+    /// the provider named it with. What lets a candidate that replays
+    /// reasoning only as its own ciphertext tell the replies it wrote from
+    /// another's: rig compares the wire, the provider and the model, which two
+    /// accounts' candidates can share. By row, not place in the chain, so a
+    /// chain built again over the same rows can take it up: see
+    /// [`FailoverModel::inherit_issuers`].
+    issued: Arc<Mutex<HashMap<String, String>>>,
     /// Reduced across the chain, computed once at build time -- see
     /// [`FailoverModel::new`].
     capabilities: ProviderCapabilities,
@@ -291,6 +330,7 @@ impl FailoverModel {
             candidates: Arc::new(candidates),
             policy,
             answered: Arc::default(),
+            issued: Arc::default(),
             capabilities,
         }
     }
@@ -302,6 +342,75 @@ impl FailoverModel {
     pub(crate) fn take_answered(&self) -> Vec<usize> {
         std::mem::take(&mut *self.answered.lock().expect("answered record"))
             .into_iter()
+            .collect()
+    }
+
+    /// Record that the row `model_name` answered the reply `response_id`.
+    pub(crate) fn note_issuer(&self, response_id: &str, model_name: &str) {
+        self.issued
+            .lock()
+            .expect("issued record")
+            .insert(response_id.to_string(), model_name.to_string());
+    }
+
+    /// The row that answered the reply `response_id`, if this chain knows.
+    #[cfg(test)]
+    pub(crate) fn issuer_of(&self, response_id: &str) -> Option<String> {
+        self.issued
+            .lock()
+            .expect("issued record")
+            .get(response_id)
+            .cloned()
+    }
+
+    /// Take up who answered each reply `earlier` knew, for a chain built again
+    /// over the same rows: the conversation outlives the chain that had the
+    /// replies answered, and without it each reply of the earlier one reads as
+    /// another candidate's.
+    pub(crate) fn inherit_issuers(&self, earlier: &FailoverModel) {
+        let known = earlier.issued.lock().expect("issued record").clone();
+        self.issued.lock().expect("issued record").extend(known);
+    }
+
+    /// `history` as the candidate `model_name` is sent it, for a candidate that replays
+    /// reasoning only as ciphertext it issued: a reply's reasoning stays only
+    /// when it carries that ciphertext and that candidate wrote the reply. rig would
+    /// send any other -- another candidate's, or one with no ciphertext -- as
+    /// the model's own words, or the ciphertext to an account that rejects it.
+    /// What is left of a reply, its tool calls included, is sent as it was, and
+    /// a reply of nothing else is left out.
+    fn own_reasoning_only(
+        &self,
+        model_name: &str,
+        history: Vec<Arc<Message>>,
+    ) -> Vec<Arc<Message>> {
+        let issued = self.issued.lock().expect("issued record");
+        history
+            .into_iter()
+            .filter_map(|message| {
+                let Message::Assistant(reply) = &*message else {
+                    return Some(message);
+                };
+                let own = reply
+                    .origin
+                    .as_ref()
+                    .and_then(|origin| origin.response_id.as_ref())
+                    .is_some_and(|id| issued.get(id).is_some_and(|row| row == model_name));
+                let takes = |part: &AssistantContent| match part {
+                    AssistantContent::Reasoning(reasoning) => {
+                        own && reasoning.native.as_ref().is_some_and(|native| {
+                            native.reasoning_blob(&RESPONSES_API).is_some()
+                        })
+                    }
+                    _ => true,
+                };
+                if reply.content.iter().all(takes) {
+                    return Some(message);
+                }
+                let kept: Vec<_> = reply.content.iter().filter(|part| takes(part)).cloned().collect();
+                (!kept.is_empty())
+                    .then(|| Arc::new(Message::Assistant(reply.clone().with_content(kept))))
+            })
             .collect()
     }
 
@@ -333,6 +442,10 @@ impl FailoverModel {
                 // and free.
                 attempt.model = Some(candidate.model_identifier().to_string());
                 attempt.max_tokens = candidate.max_tokens();
+                if candidate.replays_only_own_reasoning() {
+                    attempt.chat_history =
+                        self.own_reasoning_only(candidate.model_name(), attempt.chat_history);
+                }
 
                 match candidate.completion(attempt).await {
                     Ok(response) => {
@@ -340,6 +453,9 @@ impl FailoverModel {
                             .lock()
                             .expect("answered record")
                             .insert(index);
+                        if let Some(id) = &response.origin.response_id {
+                            self.note_issuer(id, candidate.model_name());
+                        }
                         // As the candidate's wire decoded it, its provider and
                         // model kept.
                         return Ok(response);
@@ -720,6 +836,120 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// A Responses-like candidate: it names each reply with a response id, and
+    /// records the history of every request it is sent. After `answers`
+    /// replies it fails, so a test can move a call to the next candidate.
+    struct Sealing {
+        name: &'static str,
+        answers: usize,
+        calls: AtomicUsize,
+        seen: Arc<std::sync::Mutex<Vec<Vec<Arc<Message>>>>>,
+    }
+
+    impl Sealing {
+        fn new(name: &'static str, answers: usize) -> Self {
+            Self {
+                name,
+                answers,
+                calls: AtomicUsize::new(0),
+                seen: Arc::default(),
+            }
+        }
+    }
+
+    impl Candidate for Sealing {
+        fn model_name(&self) -> &str {
+            self.name
+        }
+
+        fn model_identifier(&self) -> &str {
+            "gpt-same"
+        }
+
+        fn max_tokens(&self) -> Option<u64> {
+            None
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::new()
+        }
+
+        fn replays_only_own_reasoning(&self) -> bool {
+            true
+        }
+
+        fn completion(
+            &self,
+            request: CompletionRequest,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>,
+        > {
+            let nth = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen.lock().expect("seen").push(request.chat_history);
+            let outcome = if nth < self.answers {
+                let mut origin = Origin::new("openai.responses", "openai", "gpt-same");
+                origin.response_id = Some(format!("resp_{}", self.name));
+                Ok(CompletionResponse::new(
+                    vec![sealed("weighing it"), AssistantContent::text("hi")],
+                    Usage::new(),
+                    origin,
+                    serde_json::Value::Null,
+                ))
+            } else {
+                Err(http_status(503))
+            };
+            Box::pin(async move { outcome })
+        }
+    }
+
+    fn sealed(text: &str) -> AssistantContent {
+        AssistantContent::Reasoning(rig::completion::message::Reasoning::new(text)).with_native(
+            serde_json::json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "c2ln"}),
+        )
+    }
+
+    fn has_reasoning(history: &[Arc<Message>]) -> bool {
+        history.iter().any(|message| match &**message {
+            Message::Assistant(reply) => reply
+                .content
+                .iter()
+                .any(|part| matches!(part, AssistantContent::Reasoning(_))),
+            _ => false,
+        })
+    }
+
+    /// Reasoning's ciphertext is bound to the account that issued it, which
+    /// rig does not compare: two candidates over the same model identifier
+    /// share the wire, the provider and the model. A call moved to the second
+    /// is sent the first's reply without its reasoning, its text kept; the
+    /// first, asked again, is sent its own.
+    #[tokio::test]
+    async fn a_move_between_responses_candidates_sends_no_reasoning_the_tail_did_not_issue() {
+        let head = Sealing::new("head", 1);
+        let tail = Sealing::new("tail", usize::MAX);
+        let (head_seen, tail_seen) = (head.seen.clone(), tail.seen.clone());
+        let chain = chain(vec![Box::new(head), Box::new(tail)]);
+
+        let first = chain.completion(request()).await.expect("the head answers");
+        let mut reply = rig::completion::message::AssistantMessage::new(first.choice.clone());
+        reply = reply.with_origin(Some(first.origin.clone()));
+        let mut moved = request();
+        moved.chat_history = vec![
+            Arc::new(Message::user("go")),
+            Arc::new(Message::Assistant(reply)),
+            Arc::new(Message::user("on")),
+        ];
+        chain.completion(moved).await.expect("the tail answers");
+
+        let head_seen = head_seen.lock().expect("seen");
+        assert_eq!(head_seen.len(), 2);
+        assert!(has_reasoning(&head_seen[1]), "its own reply keeps its reasoning");
+        let tail_seen = tail_seen.lock().expect("seen");
+        assert_eq!(tail_seen.len(), 1);
+        assert!(!has_reasoning(&tail_seen[0]));
+        assert_eq!(tail_seen[0].len(), 3, "the reply's text stays");
     }
 
     /// `ProviderError` is not `Clone`, and the *variant* matters here -- a

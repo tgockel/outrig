@@ -287,7 +287,7 @@ class Alias:
 
 @dataclasses.dataclass(frozen=True)
 class Provider:
-    """A `[providers.<name>]` table: its `style`, `"openai"` or `"anthropic"`, and its `base-url`.
+    """A `[providers.<name>]` table: its `style`, `"chat-completions"`, `"responses"` or `"anthropic"`, and its `base-url`.
     Its key is not here, nor the variable that holds it."""
 
     name: str

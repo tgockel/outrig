@@ -37,7 +37,7 @@ async fn a_repo_config_declaring_a_keyed_provider_is_refused_before_any_containe
     let tmp = tempfile::tempdir().unwrap();
     let (repo, global, sessions) = fixture(
         tmp.path(),
-        "[providers.openai]\nstyle = \"openai\"\nbase-url = \"http://127.0.0.1:2/v1\"\n\
+        "[providers.openai]\nstyle = \"chat-completions\"\nbase-url = \"http://127.0.0.1:2/v1\"\n\
          api-key = \"${OUTRIG_TEST_KEY}\"\n",
     );
 
@@ -56,7 +56,7 @@ async fn a_repo_config_declaring_a_keyed_provider_is_refused_before_any_containe
     assert!(!ok, "the repo provider must be refused:\n{stderr}");
     assert!(
         stderr.contains(
-            "repo config may not declare [providers.openai]: a style=openai provider \
+            "repo config may not declare [providers.openai]: a style=chat-completions provider \
              carries api-key ${OUTRIG_TEST_KEY}, which belongs in global config"
         ),
         "the error names the provider and where it belongs:\n{stderr}"

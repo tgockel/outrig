@@ -578,7 +578,7 @@ mod tests {
         let summary = summary_of(
             r#"
 [providers.p]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://example.invalid/v1"
 api-key  = "${OUTRIG_TEST_INIT_KEY}"
 
@@ -629,7 +629,7 @@ alias = "shapeless"
 default-model = "good"
 
 [providers.p]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://example.invalid/v1"
 api-key  = "${OUTRIG_TEST_INIT_KEY}"
 

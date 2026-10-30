@@ -363,8 +363,9 @@ pub(crate) fn view(config: &Config, repo_root: &Path) -> Result<Value, OutrigErr
         .providers
         .iter()
         .map(|(name, provider)| {
-            let (LlmProvider::OpenAi { base_url, .. } | LlmProvider::Anthropic { base_url, .. }) =
-                provider;
+            let (LlmProvider::ChatCompletions { base_url, .. }
+            | LlmProvider::Responses { base_url, .. }
+            | LlmProvider::Anthropic { base_url, .. }) = provider;
             let row = json!({ "style": provider.style(), "base_url": base_url });
             (name.clone(), row)
         })

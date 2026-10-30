@@ -87,7 +87,7 @@ Dockerfile and `[images.<name>]` block. The MCP path gives the AI validators;
 
 ```
 [outrig] no global config found at ~/.outrig/config.toml -- let's create one.
-? Provider style [default: openai]:
+? Provider style [default: chat-completions]:
 ? Provider name [default: openai]:
 ? Base URL [default: https://api.openai.com/v1]:
 ? API key environment variable [default: OPENAI_API_KEY]:
@@ -161,7 +161,7 @@ secrets via env-var substitution.
 default-model = "fast"
 
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 

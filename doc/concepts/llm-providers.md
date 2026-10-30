@@ -43,15 +43,17 @@ A provider is a wire-format + endpoint + API key.
 
 ```toml
 [providers.openai]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 ```
 
-`style` is the protocol. v0 wires `"openai"` for any OpenAI-compatible endpoint -- a model
-served on your own machine included, see [Local models](#local-models) -- and `"anthropic"`
-for Anthropic's native Messages API (see
-[Native Anthropic](#native-anthropic-style--anthropic) below). `base-url` is the HTTPS
+`style` is the protocol. v0 wires `"chat-completions"` for any endpoint that speaks OpenAI's
+Chat Completions API -- a model served on your own machine included, see
+[Local models](#local-models) -- `"responses"` for OpenAI's Responses API (see
+[Responses](#responses-style--responses) below), and `"anthropic"` for Anthropic's native
+Messages API (see [Native Anthropic](#native-anthropic-style--anthropic) below). `openai`, the
+0.2.x name of `"chat-completions"`, is still read as it, with a warning. `base-url` is the HTTPS
 endpoint. `api-key` **must** be the `${ENV_VAR}` form -- outrig resolves it at run time,
 never reads a key from disk. See
 [Reference -> Config](../reference/config.md#api-key-syntax) for the exact rules.
@@ -184,7 +186,8 @@ candidate.
 The history travels with the chain, with one exception: an Anthropic candidate is sent only the
 reasoning Anthropic issued itself. It refuses anyone else's -- a local model's, or an OpenAI-style
 endpoint's `reasoning_content` -- so the turns another candidate answered reach it as their text
-and tool calls alone.
+and tool calls alone. A `responses` candidate is sent only reasoning that carries its
+`encrypted_content`, which is what it issued; the same goes for it.
 
 `outrig run-new` fails over the same way, with three differences. A call that moves is sent a
 conversation chosen for the window of the model it moves to, since each model's `context-window`
@@ -252,22 +255,22 @@ over both defaults.
 
 ## Pointing at OpenAI-compatible endpoints
 
-Anything that speaks the OpenAI Chat Completions wire format works as a `style = "openai"`
+Anything that speaks the OpenAI Chat Completions wire format works as a `style = "chat-completions"`
 provider:
 
 ```toml
 [providers.together]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.together.xyz/v1"
 api-key  = "${TOGETHER_API_KEY}"
 
 [providers.openrouter]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://openrouter.ai/api/v1"
 api-key  = "${OPENROUTER_API_KEY}"
 
 [providers.local-ollama]
-style    = "openai"
+style    = "chat-completions"
 base-url = "http://localhost:11434/v1"
 api-key  = "${OLLAMA_API_KEY}"   # set to anything; some servers ignore the header
 ```
@@ -301,13 +304,13 @@ leaves it. Set `role-alternation = "strict"` on the provider's row, and `run-new
 conversation that alternates by construction, leaving out the turns that would not: a turn
 promoted without the rest of its round, and a round that ended on tool results once the next
 round opens. Promote whole rounds on such a provider. See
-[`role-alternation`](../reference/config.md#style--openai) for the key and
+[`role-alternation`](../reference/config.md#style--chat-completions) for the key and
 [`outrig run-new`](../reference/cli.md#outrig-run-new) for what is left out.
 
 ### Local models
 
 A model running on your own machine is reached the same way: serve it with a local server that
-speaks the OpenAI wire format, and point a `style = "openai"` provider at its `localhost`
+speaks the OpenAI wire format, and point a `style = "chat-completions"` provider at its `localhost`
 `base-url`, in your global config like any other provider. Start the model however that tool
 wants -- note the tool-calling flags, which outrig's agent loop needs and none of these servers
 turn on by default:
@@ -320,7 +323,7 @@ ollama serve                 # then: ollama pull qwen3:4b
 
 ```toml
 [providers.local]
-style    = "openai"
+style    = "chat-completions"
 base-url = "http://127.0.0.1:11434/v1"   # Ollama's default; vLLM 8000, llama-server 8080
 api-key  = "${OLLAMA_API_KEY}"           # see the note below
 
@@ -367,6 +370,29 @@ counterpart on purpose -- the server owns all of them, which is the point of the
 tells `outrig run-new` the limit the server already has. The
 `[models.<name>]` key is yours: keep whatever the old row was called and every `model = ...`
 reference to it keeps working. Only the row's contents change.
+
+## Responses (`style = "responses"`)
+
+OpenAI's Responses API is `POST {base-url}/responses`, authenticated with a bearer token.
+OpenAI recommends it for new projects and some of its models need it to call tools; Ollama
+(0.13.3 and later) and LM Studio (0.3.29 and later) serve it at `/v1/responses` as well. The
+row takes the keys `chat-completions` does, and `base-url` is written the same way, with the
+`/v1`: outrig appends `/responses`.
+
+```toml
+[providers.openai-responses]
+style    = "responses"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+```
+
+Every call sends the whole conversation, cut to the model's allowance as for any style, with
+`store: false`: the provider keeps nothing, and outrig never sets `previous_response_id` or
+`conversation`, so a chain can move the same conversation to another provider. The system prompt
+goes in `instructions`, and the call's output ceiling in `max_output_tokens`. Reasoning comes
+back in the reply as items, and `store: false` means each is replayed with its
+`encrypted_content`; a call sends only those. Hosted tools -- web search, file search, the code
+interpreter, remote MCP -- are not used.
 
 ## Native Anthropic (`style = "anthropic"`)
 
@@ -440,7 +466,8 @@ header, and every later call to it goes without, with a warning on stderr.
 
 Everything else is shared with the other remote styles: `request-timeout-secs`,
 `retry-budget-secs`, `role-alternation`, tool-call limits, tool-result truncation, conversation
-history, and subagents all behave identically. Turns are non-streaming, as for `openai`.
+history, and subagents all behave identically. Turns are non-streaming, as for
+`chat-completions`.
 
 ## Transient failures
 
@@ -538,10 +565,10 @@ stay up.
 
 ## Other Rig provider styles
 
-> **TODO: Incomplete** -- v0 wires `"openai"` and `"anthropic"`. The other styles Rig ships
-> adapters for (Cohere, Gemini, and friends) are not exposed yet, and neither are the
-> Anthropic-specific extras -- citations, configurable API versions, and prompt caching in
-> `run-new` and the library loop.
+> **TODO: Incomplete** -- v0 wires `"chat-completions"`, `"responses"`, and `"anthropic"`. The
+> other styles Rig ships adapters for (Cohere, Gemini, and friends) are not exposed yet, and
+> neither are the Anthropic-specific extras -- citations, configurable API versions, and prompt
+> caching in `run-new` and the library loop.
 
 ## Tool calling
 
@@ -577,12 +604,12 @@ env-var names:
 
 ```toml
 [providers.cheap]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.together.xyz/v1"
 api-key  = "${TOGETHER_API_KEY}"
 
 [providers.expensive]
-style    = "openai"
+style    = "chat-completions"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 ```

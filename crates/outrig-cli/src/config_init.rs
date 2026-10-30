@@ -17,7 +17,9 @@ use serde::Serialize;
 use crate::error::{OutrigError, Result};
 use crate::init::prompt::{self, Field, PromptSource};
 use crate::paths::{global_config_path, write_atomic};
-use outrig::config::{AnthropicOptions, ApiKeyRef, Config, LlmProvider, Model, OpenAiOptions};
+use outrig::config::{
+    AnthropicOptions, ApiKeyRef, ChatCompletionsOptions, Config, LlmProvider, Model, ResponsesOptions,
+};
 
 /// Public entry: resolve the path, pick a `PromptSource` via
 /// `prompt::auto()` (dialoguer on a TTY, line-based on piped stdin), and
@@ -64,8 +66,12 @@ pub async fn run_with(force: bool, path: &Path, prompt: &mut impl PromptSource) 
 
 const STYLES: &[(&str, &str)] = &[
     (
-        "openai",
-        "OpenAI Chat Completions wire format. Works with OpenAI, OpenRouter, vLLM, Ollama.",
+        "chat-completions",
+        "OpenAI Chat Completions wire format. Works with OpenAI, OpenRouter, vLLM.",
+    ),
+    (
+        "responses",
+        "OpenAI Responses wire format. Works with OpenAI, Ollama, LM Studio.",
     ),
     (
         "anthropic",
@@ -217,7 +223,14 @@ async fn prompt_providers(prompt: &mut impl PromptSource) -> Result<BTreeMap<Str
     loop {
         let style_idx = prompt.ask_select(&STYLE_FIELD, 0).await?;
         let style = STYLES[style_idx].0;
-        let name = ask_unused_name(prompt, &PROVIDER_NAME_FIELD, style, &out, "provider").await?;
+        let name = ask_unused_name(
+            prompt,
+            &PROVIDER_NAME_FIELD,
+            suggested_provider_name(style),
+            &out,
+            "provider",
+        )
+        .await?;
         let provider = prompt_provider_body(prompt, &name, style).await?;
         out.insert(name, provider);
 
@@ -248,19 +261,39 @@ async fn prompt_provider_body(
     style: &str,
 ) -> Result<LlmProvider> {
     match style {
-        "openai" => prompt_openai_provider(prompt, name).await,
+        "chat-completions" => prompt_chat_completions_provider(prompt, name).await,
+        "responses" => prompt_responses_provider(prompt, name).await,
         "anthropic" => prompt_anthropic_provider(prompt, name).await,
         other => Err(OutrigError::Configuration(format!("unknown provider style: {other}")).into()),
     }
 }
 
-async fn prompt_openai_provider(prompt: &mut impl PromptSource, name: &str) -> Result<LlmProvider> {
+/// The provider name a style's row is offered under: the style's own, except
+/// Chat Completions, whose rows are named for the service they usually reach.
+fn suggested_provider_name(style: &str) -> &str {
+    match style {
+        "chat-completions" => "openai",
+        other => other,
+    }
+}
+
+async fn prompt_responses_provider(prompt: &mut impl PromptSource, name: &str) -> Result<LlmProvider> {
     let base_url = ask_base_url(prompt, &BASE_URL_FIELD, "https://api.openai.com/v1", name).await?;
     let api_key = ask_api_key_env(prompt, "OPENAI_API_KEY").await?;
-    Ok(LlmProvider::openai(
+    Ok(LlmProvider::responses(
         base_url,
         api_key,
-        OpenAiOptions::new(),
+        ResponsesOptions::new(),
+    ))
+}
+
+async fn prompt_chat_completions_provider(prompt: &mut impl PromptSource, name: &str) -> Result<LlmProvider> {
+    let base_url = ask_base_url(prompt, &BASE_URL_FIELD, "https://api.openai.com/v1", name).await?;
+    let api_key = ask_api_key_env(prompt, "OPENAI_API_KEY").await?;
+    Ok(LlmProvider::chat_completions(
+        base_url,
+        api_key,
+        ChatCompletionsOptions::new(),
     ))
 }
 
@@ -301,7 +334,7 @@ async fn ask_base_url(
     let api_key = ApiKeyRef::parse("${OPENAI_API_KEY}")?;
     loop {
         let answer = prompt.ask_string(field, default).await?;
-        let provider = LlmProvider::openai(answer.clone(), api_key.clone(), OpenAiOptions::new());
+        let provider = LlmProvider::chat_completions(answer.clone(), api_key.clone(), ChatCompletionsOptions::new());
         probe.providers.insert(name.to_string(), provider);
         match probe.validate(None) {
             Ok(()) => return Ok(answer),

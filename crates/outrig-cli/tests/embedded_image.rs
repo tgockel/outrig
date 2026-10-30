@@ -63,7 +63,7 @@ async fn build_local_image(tag: &str, image_ctx: &std::path::Path) {
 /// an `api-key`, so this always goes to a `--global-config` file.
 const GLOBAL_CONFIG_TOML: &str = r#"
 [providers.openai]
-style = "openai"
+style = "chat-completions"
 base-url = "http://127.0.0.1:1/v1"
 api-key = "${OUTRIG_TEST_KEY}"
 
@@ -87,7 +87,7 @@ const AGENTLESS_CONFIG_TOML: &str = r#"
 default-model = "fast"
 
 [providers.openai]
-style = "openai"
+style = "chat-completions"
 base-url = "http://127.0.0.1:1/v1"
 api-key = "${OUTRIG_TEST_KEY}"
 

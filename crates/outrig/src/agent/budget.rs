@@ -197,21 +197,31 @@ pub(crate) struct Budget {
 /// aloud in its own turn. A call to Anthropic leaves such a block out instead;
 /// Anthropic's own, signed or redacted, goes back whole. rig's OpenAI adapter
 /// sends any reasoning as `reasoning_content` beside its reply, so an
-/// OpenAI-compatible candidate takes everything.
+/// Chat Completions candidate takes everything. A Responses candidate takes a
+/// reasoning item only with its `encrypted_content`, which `store: false`
+/// needs to replay it, and only from the row that wrote it, since the
+/// ciphertext is bound to that row's account; rig would send any other --
+/// another provider's, or one with no ciphertext -- as the model's own words
+/// in an assistant message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Wire {
-    OpenAi,
+    ChatCompletions,
+    Responses,
     Anthropic,
 }
 
 /// The wire format whose provider items carry Anthropic's thinking signatures.
 const ANTHROPIC_API: Api = Api::from_static("anthropic.messages");
 
+/// The wire format whose reasoning items carry `encrypted_content`.
+const RESPONSES_API: Api = Api::from_static("openai.responses");
+
 impl Wire {
     /// Whether a call in this protocol can carry `part` of a model's reply,
     /// in a turn whose thinking is `stale`: bound to a conversation a later
-    /// call changed what came before it in, which Anthropic refuses.
-    pub(crate) fn takes(self, part: &AssistantContent, stale: bool) -> bool {
+    /// call changed what came before it in, which Anthropic refuses. A
+    /// `foreign` turn is one another `[models.<name>]` row wrote.
+    pub(crate) fn takes(self, part: &AssistantContent, stale: bool, foreign: bool) -> bool {
         match (self, part) {
             (Wire::Anthropic, AssistantContent::Reasoning(reasoning)) => {
                 !stale
@@ -219,6 +229,16 @@ impl Wire {
                         .native
                         .as_ref()
                         .is_some_and(|native| native.reasoning_blob(&ANTHROPIC_API).is_some())
+            }
+            // The ciphertext is bound to the account that wrote it, which rig
+            // does not compare: two rows can share a model identifier and
+            // answer for different accounts.
+            (Wire::Responses, AssistantContent::Reasoning(reasoning)) => {
+                !foreign
+                    && reasoning
+                        .native
+                        .as_ref()
+                        .is_some_and(|native| native.reasoning_blob(&RESPONSES_API).is_some())
             }
             _ => true,
         }
@@ -274,7 +294,8 @@ impl Budget {
             scale: Scale::RULE,
             max_tokens,
             wire: match candidate.provider {
-                ResolvedProvider::OpenAi { .. } => Wire::OpenAi,
+                ResolvedProvider::ChatCompletions { .. } => Wire::ChatCompletions,
+                ResolvedProvider::Responses { .. } => Wire::Responses,
                 ResolvedProvider::Anthropic { .. } => Wire::Anthropic,
             },
             alternation: candidate.provider.role_alternation(),
@@ -371,7 +392,7 @@ impl Budget {
             overhead: 0,
             scale: Scale::RULE,
             max_tokens: None,
-            wire: Wire::OpenAi,
+            wire: Wire::ChatCompletions,
             alternation: RoleAlternation::Relaxed,
         }
     }
@@ -420,7 +441,7 @@ pub(crate) fn candidate(model: &str, context_window: Option<u32>) -> ResolvedCan
         model_name: model.into(),
         model_identifier: model.into(),
         provider_name: "p".into(),
-        provider: ResolvedProvider::OpenAi {
+        provider: ResolvedProvider::ChatCompletions {
             base_url: "http://127.0.0.1:1".into(),
             api_key: "k".into(),
             request_timeout_secs: None,
@@ -746,10 +767,28 @@ mod tests {
             .cache_creation_input_tokens(5);
         // Both counters already include what was cached: rig folds Anthropic's
         // cache reads and writes into `input_tokens` as OpenAI's are.
-        assert_eq!(Wire::OpenAi.reported_input(&usage), 100);
+        assert_eq!(Wire::ChatCompletions.reported_input(&usage), 100);
+        assert_eq!(Wire::Responses.reported_input(&usage), 100);
         assert_eq!(Wire::Anthropic.reported_input(&usage), 100);
         // A count nobody gave reads as zero.
         assert_eq!(Wire::Anthropic.reported_input(&Usage::new()), 0);
+    }
+
+    #[test]
+    fn a_responses_call_takes_only_reasoning_that_carries_its_ciphertext() {
+        use rig::completion::message::Reasoning;
+        let plain = AssistantContent::Reasoning(Reasoning::new("hm"));
+        let sealed = AssistantContent::Reasoning(Reasoning::new("hm")).with_native(
+            serde_json::json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "c2ln"}),
+        );
+        let signed = AssistantContent::Reasoning(Reasoning::new("hm"))
+            .with_native(serde_json::json!({"type": "thinking", "signature": "sig"}));
+        assert!(Wire::Responses.takes(&sealed, false, false));
+        assert!(!Wire::Responses.takes(&sealed, false, true));
+        assert!(!Wire::Responses.takes(&plain, false, false));
+        assert!(!Wire::Responses.takes(&signed, false, false));
+        // Anything but reasoning goes through.
+        assert!(Wire::Responses.takes(&AssistantContent::text("hi"), false, false));
     }
 
     #[test]

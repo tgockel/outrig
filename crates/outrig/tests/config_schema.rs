@@ -61,7 +61,7 @@ oops          = "this key is not in the schema"
 mode = "record"
 
 [providers.p]
-style        = "openai"
+style        = "chat-completions"
 base-url     = "https://example.com/v1"
 api-key      = "${KEY}"
 prompt-cache = "auto"
@@ -81,8 +81,11 @@ reasoning-effort = "high"
                 ("models.\"opus-4.8\".reasoning-effort", 14),
             ],
         );
-        let LlmProvider::OpenAi { base_url, .. } = &cfg.providers["p"] else {
-            panic!("expected the OpenAi variant, got {:?}", cfg.providers["p"]);
+        let LlmProvider::ChatCompletions { base_url, .. } = &cfg.providers["p"] else {
+            panic!(
+                "expected the ChatCompletions variant, got {:?}",
+                cfg.providers["p"]
+            );
         };
         assert_eq!(base_url, "https://example.com/v1");
         assert_eq!(cfg.models["opus-4.8"].identifier.as_deref(), Some("opus"));
@@ -117,21 +120,21 @@ beta     = 2
     #[test]
     fn a_dotted_provider_named_like_its_unknown_key_keeps_its_siblings() {
         let root_dotted = r#"
-providers.extra.style    = "openai"
+providers.extra.style    = "chat-completions"
 providers.extra.base-url = "https://example.com/v1"
 providers.extra.api-key  = "${KEY}"
 providers.extra.extra    = 1
-providers.keep.style     = "openai"
+providers.keep.style     = "chat-completions"
 providers.keep.base-url  = "https://example.com/v1"
 providers.keep.api-key   = "${KEY}"
 "#;
         let under_header = r#"
 [providers]
-extra.style    = "openai"
+extra.style    = "chat-completions"
 extra.base-url = "https://example.com/v1"
 extra.api-key  = "${KEY}"
 extra.extra    = 1
-keep.style     = "openai"
+keep.style     = "chat-completions"
 keep.base-url  = "https://example.com/v1"
 keep.api-key   = "${KEY}"
 "#;
@@ -146,9 +149,9 @@ keep.api-key   = "${KEY}"
                 assert_eq!(warned(&cfg), [("providers.extra.extra", line)], "{text}");
                 let names: Vec<_> = cfg.providers.keys().map(String::as_str).collect();
                 assert_eq!(names, ["extra", "keep"], "{text}");
-                let LlmProvider::OpenAi { base_url, .. } = &cfg.providers["extra"] else {
+                let LlmProvider::ChatCompletions { base_url, .. } = &cfg.providers["extra"] else {
                     panic!(
-                        "expected the OpenAi variant, got {:?}",
+                        "expected the ChatCompletions variant, got {:?}",
                         cfg.providers["extra"]
                     );
                 };
@@ -353,7 +356,7 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(cfg.retry_budget_secs, Some(300));
         assert_eq!(cfg.mcp_call_timeout_secs, Some(900));
 
-        let LlmProvider::OpenAi {
+        let LlmProvider::ChatCompletions {
             base_url,
             api_key,
             request_timeout_secs,
@@ -361,7 +364,7 @@ srv = { command = ["bin", "arg1"] }
             ..
         } = &cfg.providers["openai"]
         else {
-            panic!("expected OpenAi variant for [providers.openai]");
+            panic!("expected ChatCompletions variant for [providers.openai]");
         };
         assert_eq!(base_url, "https://api.openai.com/v1");
         assert_eq!(api_key.var_name(), "OPENAI_API_KEY");
@@ -405,13 +408,13 @@ srv = { command = ["bin", "arg1"] }
 
         // A local model is an ordinary `openai` row pointed at a localhost
         // server; nothing about it is local to outrig.
-        let LlmProvider::OpenAi {
+        let LlmProvider::ChatCompletions {
             base_url: local_base_url,
             api_key: local_key,
             ..
         } = &cfg.providers["local"]
         else {
-            panic!("expected OpenAi variant for [providers.local]");
+            panic!("expected ChatCompletions variant for [providers.local]");
         };
         assert_eq!(local_base_url, "http://127.0.0.1:11434/v1");
         assert_eq!(local_key.var_name(), "OLLAMA_API_KEY");

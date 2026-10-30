@@ -106,11 +106,12 @@ use rig::effect::{Answered, EffectKind, FamilyDescriptor, HandlerDescriptor, fam
 use rig::error::{ErrorKind, ErrorReport, ProviderError};
 use rig::serve::{Dispatch, Reply, Serve};
 
-use super::budget::{Budget, Calibration};
+use super::budget::{Budget, Calibration, Wire};
 use super::history::{Adjacent, History, Refused, TooLarge, Why};
 use super::ledger::CallSlot;
 use super::retry::{BudgetSpent, RetryPolicy, RetryingModel, candidate_failure_label};
 use crate::harness::event::{CallId, Payload};
+use rig::providers::openai::extension::OpenAiOptions;
 
 /// The label the chain is registered under in the agent's handler table, which
 /// is what rig names the agent's model.
@@ -818,6 +819,11 @@ impl FailoverModel {
                 // and free.
                 attempt.model = Some(candidate.model_identifier().to_string());
                 attempt.max_tokens = max_tokens.map(u64::from);
+                // Responses keeps what it is sent unless told not to, and the
+                // conversation is OutRig's to carry.
+                if budget.wire == Wire::Responses {
+                    attempt = attempt.provider_option(OpenAiOptions::new().store(false));
+                }
 
                 let (adjacent, estimate, latest) = match viewed {
                     // Not made: the call cannot fit this candidate. Sending it

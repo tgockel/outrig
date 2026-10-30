@@ -61,7 +61,7 @@ const INLINE_SEED: &str = "default-image = \"base\"\n\
 const GLOBAL: &str = "default-model = \"fast\"\n\
      \n\
      [providers.openai]\n\
-     style = \"openai\"\n\
+     style = \"chat-completions\"\n\
      base-url = \"https://api.openai.com/v1\"\n\
      api-key = \"${OPENAI_API_KEY}\"\n\
      \n\

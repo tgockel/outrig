@@ -31,7 +31,7 @@ grace-secs = 10
 env-allow = ["GITHUB_TOKEN", "HTTPS_PROXY", "NO_PROXY"]
 
 [providers.openai]
-style                = "openai"
+style                = "chat-completions"
 base-url             = "https://api.openai.com/v1"
 api-key              = "${OPENAI_API_KEY}"
 request-timeout-secs = 90
@@ -43,7 +43,7 @@ base-url = "https://api.anthropic.com"
 api-key  = "${ANTHROPIC_API_KEY}"
 
 [providers.local]
-style    = "openai"
+style    = "chat-completions"
 base-url = "http://127.0.0.1:11434/v1"
 api-key  = "${OLLAMA_API_KEY}"
 

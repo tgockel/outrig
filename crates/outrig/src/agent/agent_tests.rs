@@ -345,10 +345,8 @@ pub(super) fn system_prompt(request: &RecordedRequest) -> String {
 }
 
 /// The messages `request` carried, as the provider received them.
-pub(super) fn messages(request: &RecordedRequest) -> &[serde_json::Value] {
-    request.body["messages"]
-        .as_array()
-        .expect("a messages array")
+pub(super) fn messages(request: &RecordedRequest) -> Vec<serde_json::Value> {
+    mock_http::conversation_of(&request.body)
 }
 
 /// The text of the `tool_result` for `id` in `request`, as the model reads it.
@@ -1227,7 +1225,8 @@ async fn the_agent_names_its_model_and_its_python() {
 
 /// The text of the last user message `request` carried.
 fn last_user_text(request: &RecordedRequest) -> String {
-    let message = messages(request)
+    let messages = messages(request);
+    let message = messages
         .iter()
         .rev()
         .find(|message| message["role"] == "user")
@@ -2009,14 +2008,14 @@ async fn a_call_rig_answered_unrun_keeps_its_place_when_the_round_is_dropped() {
     let (events, mut submitted) = watched(None).await;
     let (mut agent, mut requests) = agent_with(
         events,
-        Style::OpenAi,
+        Style::ChatCompletions,
         "OUTRIG_TEST_AGENT_UNRUN_PLACE",
         MODEL,
         "",
         "max-tokens = 4096",
         vec![
             an_unrun_call_then("print('started')\nawait asyncio.sleep(3600)"),
-            Style::OpenAi.text("carried on"),
+            Style::ChatCompletions.text("carried on"),
         ],
     )
     .await;
@@ -2044,14 +2043,14 @@ async fn a_call_rig_answered_unrun_keeps_its_place_when_the_round_is_dropped() {
 #[tokio::test]
 async fn a_call_rig_answered_unrun_counts_against_the_cap() {
     let (mut agent, mut requests) = agent_in(
-        Style::OpenAi,
+        Style::ChatCompletions,
         "OUTRIG_TEST_AGENT_UNRUN_CAP",
         MODEL,
         "",
         "max-tokens = 4096\ntool-call-max = 1",
         vec![
             an_unrun_call_then("x = 1"),
-            Style::OpenAi.text("never asked"),
+            Style::ChatCompletions.text("never asked"),
         ],
     )
     .await;
@@ -2114,7 +2113,12 @@ fn manifests(agent: &Session) -> Arc<Mutex<Vec<Manifest>>> {
 
 /// How many times `needle` appears in the messages `request` carried.
 fn count(request: &RecordedRequest, needle: &str) -> usize {
-    request.body["messages"].to_string().matches(needle).count()
+    messages(request)
+        .iter()
+        .map(|message| message.to_string())
+        .collect::<String>()
+        .matches(needle)
+        .count()
 }
 
 /// The failure this task exists to remove: a turn too large for the model's
@@ -2377,12 +2381,19 @@ fn on_the_wire(style: Style, messages: Vec<rig::completion::Message>) -> Vec<ser
             panic!("a JSON body");
         };
         let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
-        body["messages"].as_array().expect("messages").clone()
+        mock_http::conversation_of(&body)
     }
     match style {
         Style::Anthropic => encoded(&AnthropicConfig::new(KEY).completion(MODEL), messages),
-        Style::OpenAi => encoded(
+        Style::ChatCompletions => encoded(
             &rig::providers::openai::OpenAIConfig::new(KEY).chat(MODEL),
+            messages,
+        ),
+        Style::Responses => encoded(
+            &rig::providers::openai::responses_api::wire::Responses::new(
+                rig::providers::openai::OpenAIConfig::new(KEY),
+                MODEL,
+            ),
             messages,
         ),
     }
@@ -2391,7 +2402,7 @@ fn on_the_wire(style: Style, messages: Vec<rig::completion::Message>) -> Vec<ser
 /// The messages `request` carried, without the system prompt OpenAI's
 /// protocol carries among them.
 fn conversation(style: Style, request: &RecordedRequest) -> Vec<serde_json::Value> {
-    let skip = usize::from(style == Style::OpenAi);
+    let skip = usize::from(style != Style::Anthropic);
     messages(request)[skip..].to_vec()
 }
 
@@ -2554,7 +2565,10 @@ async fn every_cut_driven(
 #[tokio::test]
 async fn a_shortened_history_keeps_every_call_beside_its_result_on_both_adapters() {
     for style in Style::ALL {
-        let var = format!("OUTRIG_TEST_AGENT_CUTS_{}", style.name().to_uppercase());
+        let var = format!(
+            "OUTRIG_TEST_AGENT_CUTS_{}",
+            style.name().to_uppercase().replace('-', "_")
+        );
         let (_, recorded, manifests) = every_cut(style, &var).await;
         assert_eq!(
             recorded.len(),
@@ -2601,7 +2615,7 @@ async fn a_shortened_history_keeps_every_call_beside_its_result_on_both_adapters
 
         // The last request carries the incomplete turn, answered in full.
         let last = recorded.last().expect("round 7");
-        let text = last.body["messages"].to_string();
+        let text = serde_json::Value::Array(messages(last)).to_string();
         for id in ["call_g", "call_h", "call_i"] {
             assert!(text.contains(id), "{style:?}: {id}");
         }
@@ -2617,7 +2631,10 @@ async fn a_shortened_history_keeps_every_call_beside_its_result_on_both_adapters
 #[tokio::test]
 async fn each_calls_manifest_reconstructs_what_the_provider_received() {
     for style in Style::ALL {
-        let var = format!("OUTRIG_TEST_AGENT_MANIFEST_{}", style.name().to_uppercase());
+        let var = format!(
+            "OUTRIG_TEST_AGENT_MANIFEST_{}",
+            style.name().to_uppercase().replace('-', "_")
+        );
         let (agent, recorded, manifests) = every_cut(style, &var).await;
         for (n, manifest) in manifests.iter().enumerate() {
             assert_eq!(manifest.call, n as u64);
@@ -2633,7 +2650,10 @@ async fn each_calls_manifest_reconstructs_what_the_provider_received() {
 #[tokio::test]
 async fn a_refused_call_that_carried_a_same_role_pair_says_so() {
     for style in Style::ALL {
-        let var = format!("OUTRIG_TEST_AGENT_REFUSED_{}", style.name().to_uppercase());
+        let var = format!(
+            "OUTRIG_TEST_AGENT_REFUSED_{}",
+            style.name().to_uppercase().replace('-', "_")
+        );
         let (mut agent, _requests) = agent_in(
             style,
             &var,
@@ -2673,7 +2693,10 @@ async fn a_refused_call_that_carried_a_same_role_pair_says_so() {
 #[tokio::test]
 async fn a_strict_provider_is_sent_a_conversation_that_alternates_on_both_adapters() {
     for style in Style::ALL {
-        let var = format!("OUTRIG_TEST_AGENT_STRICT_{}", style.name().to_uppercase());
+        let var = format!(
+            "OUTRIG_TEST_AGENT_STRICT_{}",
+            style.name().to_uppercase().replace('-', "_")
+        );
         let (agent, recorded, manifests) = every_cut_strict(style, &var).await;
         assert_eq!(
             recorded.len(),
@@ -2745,7 +2768,10 @@ async fn a_strict_provider_is_sent_a_conversation_that_alternates_on_both_adapte
 #[tokio::test]
 async fn a_strict_provider_whose_row_does_not_say_so_refuses_and_the_error_names_the_key() {
     for style in Style::ALL {
-        let var = format!("OUTRIG_TEST_AGENT_UNSAID_{}", style.name().to_uppercase());
+        let var = format!(
+            "OUTRIG_TEST_AGENT_UNSAID_{}",
+            style.name().to_uppercase().replace('-', "_")
+        );
         let (mut agent, mut requests) =
             agent_on_a_strict_mock(style, &var, false, Events::off()).await;
         let err = refused_fourth_round(&mut agent).await;
@@ -2754,7 +2780,7 @@ async fn a_strict_provider_whose_row_does_not_say_so_refuses_and_the_error_names
                 "two of the model's replies in a row, where turn 2 begins",
                 9,
             ),
-            Style::OpenAi => (
+            Style::ChatCompletions | Style::Responses => (
                 "a prompt right after a prompt or tool results the model never answered, \
                  where the round's opening begins",
                 8,
@@ -2832,11 +2858,17 @@ async fn a_request_reported_over_its_estimate_scales_the_next_calls_allowance() 
                 "output_tokens": 7,
                 "cache_read_input_tokens": 60_000,
             }),
-            Style::OpenAi => json!({
+            Style::ChatCompletions => json!({
                 "prompt_tokens": 60_000,
                 "completion_tokens": 7,
                 "total_tokens": 60_007,
                 "prompt_tokens_details": { "cached_tokens": 59_000 },
+            }),
+            Style::Responses => json!({
+                "input_tokens": 60_000,
+                "output_tokens": 7,
+                "total_tokens": 60_007,
+                "input_tokens_details": { "cached_tokens": 59_000 },
             }),
         };
         let (mut agent, _requests) = agent_in(
@@ -2880,7 +2912,7 @@ async fn no_context_window_assumes_one_whatever_the_identifier() {
             UNRECOGNIZED_MODEL,
             ASSUMED_CONTEXT_WINDOW / 4,
         ),
-        (Style::OpenAi, "gpt-4o", DEFAULT_REPLY_RESERVE),
+        (Style::ChatCompletions, "gpt-4o", DEFAULT_REPLY_RESERVE),
     ] {
         let (agent, _requests) = agent_in(
             style,
@@ -3589,7 +3621,7 @@ base-url = "http://127.0.0.1:1"
 api-key  = "${{{vars}_FIRST}}"
 
 [providers.second]
-style    = "openai"
+style    = "chat-completions"
 base-url = "http://127.0.0.1:2"
 api-key  = "${{{vars}_SECOND}}"
 
@@ -3652,7 +3684,7 @@ fn a_model_override_wins_over_the_agent_and_the_default() {
     assert_eq!(resolved.head().model_identifier, "gpt-tail");
     assert!(matches!(
         resolved.head().provider,
-        ResolvedProvider::OpenAi { .. }
+        ResolvedProvider::ChatCompletions { .. }
     ));
 }
 
@@ -4049,7 +4081,7 @@ async fn each_call_is_rebuilt_from_the_event_log_alone() {
         let dir = tempfile::tempdir().expect("a log dir");
         let var = format!(
             "OUTRIG_TEST_AGENT_EVENTS_REBUILD_{}",
-            style.name().to_uppercase()
+            style.name().to_uppercase().replace('-', "_")
         );
         let (agent, recorded, _) = every_cut_recorded(style, &var, Some(dir.path())).await;
         shut_down(agent).await;
@@ -4087,7 +4119,9 @@ async fn each_call_is_rebuilt_from_the_event_log_alone() {
             .to_string();
         let sent = match style {
             Style::Anthropic => system_prompt(&recorded[0]),
-            Style::OpenAi => text_of(&messages(&recorded[0])[0]["content"]),
+            Style::ChatCompletions | Style::Responses => {
+                text_of(&messages(&recorded[0])[0]["content"])
+            }
         };
         assert_eq!(
             preamble, sent,
@@ -4253,7 +4287,10 @@ fn retrying(cfg: &mut Config, provider: &str) {
             LlmProvider::Anthropic {
                 retry_budget_secs, ..
             }
-            | LlmProvider::OpenAi {
+            | LlmProvider::Responses {
+                retry_budget_secs, ..
+            }
+            | LlmProvider::ChatCompletions {
                 retry_budget_secs, ..
             },
         ) => *retry_budget_secs = Some(30),
@@ -4269,7 +4306,10 @@ fn strict(cfg: &mut Config, provider: &str) {
             LlmProvider::Anthropic {
                 role_alternation, ..
             }
-            | LlmProvider::OpenAi {
+            | LlmProvider::Responses {
+                role_alternation, ..
+            }
+            | LlmProvider::ChatCompletions {
                 role_alternation, ..
             },
         ) => *role_alternation = Some(RoleAlternation::Strict),
@@ -4483,13 +4523,13 @@ async fn an_unusable_response_that_spends_the_budget_is_not_retried() {
 async fn an_unusable_openai_response_is_counted_unless_its_body_reported_no_usage() {
     let dir = tempfile::tempdir().expect("a log dir");
     let (mut agent, _requests) = retrying_agent_in(
-        Style::OpenAi,
+        Style::ChatCompletions,
         "OUTRIG_TEST_AGENT_UNUSABLE_OPENAI_USAGE",
         events::opened(dir.path()).await,
         vec![
-            Style::OpenAi.unusable(),
-            Style::OpenAi.unusable().without_usage(),
-            Style::OpenAi.text("done"),
+            Style::ChatCompletions.unusable(),
+            Style::ChatCompletions.unusable().without_usage(),
+            Style::ChatCompletions.text("done"),
         ],
     )
     .await;
@@ -4532,7 +4572,7 @@ async fn an_empty_reply_the_model_ended_on_its_own_ends_the_round_without_a_retr
     for style in Style::ALL {
         let var = format!(
             "OUTRIG_TEST_AGENT_EMPTY_STOP_{}",
-            style.name().to_uppercase()
+            style.name().to_uppercase().replace('-', "_")
         );
         let dir = tempfile::tempdir().expect("a log dir");
         let (events, mut submitted) = watched(Some(dir.path())).await;
@@ -4562,7 +4602,8 @@ async fn an_empty_reply_the_model_ended_on_its_own_ends_the_round_without_a_retr
         );
         let (asked, stopped) = match style {
             Style::Anthropic => ("tool_use", "end_turn"),
-            Style::OpenAi => ("tool_calls", "stop"),
+            Style::ChatCompletions => ("tool_calls", "stop"),
+            Style::Responses => ("completed", "completed"),
         };
         let attempts = events::of_kind(&records, "model.attempt");
         assert_eq!(attempts.len(), 2, "{style:?}: {attempts:#?}");
@@ -4594,7 +4635,7 @@ async fn the_round_after_an_empty_reply_is_sent_no_trace_of_it() {
     for style in Style::ALL {
         let var = format!(
             "OUTRIG_TEST_AGENT_AFTER_EMPTY_{}",
-            style.name().to_uppercase()
+            style.name().to_uppercase().replace('-', "_")
         );
         let (mut agent, mut requests) = retrying_agent_in(
             style,
@@ -4620,7 +4661,7 @@ async fn the_round_after_an_empty_reply_is_sent_no_trace_of_it() {
         // which on OpenAI's wire is a `tool` message the opening follows.
         let opening = match style {
             Style::Anthropic => 0,
-            Style::OpenAi => 1,
+            Style::ChatCompletions | Style::Responses => 1,
         };
         assert_eq!(
             messages(&recorded[2]).len(),
@@ -4643,7 +4684,7 @@ async fn a_rejected_reply_that_is_no_empty_stop_fails_the_round(
 ) {
     let var = format!(
         "OUTRIG_TEST_AGENT_EMPTY_{}_{}",
-        style.name().to_uppercase(),
+        style.name().to_uppercase().replace('-', "_"),
         kind.to_uppercase()
     );
     let dir = tempfile::tempdir().expect("a log dir");
@@ -4731,7 +4772,7 @@ async fn an_anthropic_reply_cut_off_with_nothing_in_it_still_fails_the_round() {
 
 #[tokio::test]
 async fn an_openai_reply_cut_off_with_nothing_in_it_still_fails_the_round() {
-    let style = Style::OpenAi;
+    let style = Style::ChatCompletions;
     a_rejected_reply_that_is_no_empty_stop_fails_the_round(
         style,
         "length",
@@ -4743,7 +4784,7 @@ async fn an_openai_reply_cut_off_with_nothing_in_it_still_fails_the_round() {
 
 #[tokio::test]
 async fn an_openai_reply_filtered_to_nothing_still_fails_the_round() {
-    let style = Style::OpenAi;
+    let style = Style::ChatCompletions;
     a_rejected_reply_that_is_no_empty_stop_fails_the_round(
         style,
         "content_filter",
@@ -4762,8 +4803,18 @@ fn said(style: Style, content: &str, finish_reason: &str) -> mock_http::CannedRe
             json!([{ "type": "text", "text": content }]),
             finish_reason,
         )),
-        Style::OpenAi => reasoned(mock_http::chat(
+        Style::ChatCompletions => reasoned(mock_http::chat(
             json!({ "role": "assistant", "content": content }),
+            finish_reason,
+        )),
+        Style::Responses => reasoned(mock_http::responses(
+            json!([{
+                "type": "message",
+                "id": "msg_mock",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "annotations": [], "text": content }],
+            }]),
             finish_reason,
         )),
     }
@@ -4777,7 +4828,8 @@ fn said(style: Style, content: &str, finish_reason: &str) -> mock_http::CannedRe
 async fn a_reply_filtered_after_the_model_reasoned_fails_the_round() {
     for (style, reason) in [
         (Style::Anthropic, "refusal"),
-        (Style::OpenAi, "content_filter"),
+        (Style::ChatCompletions, "content_filter"),
+        (Style::Responses, "content_filter"),
     ] {
         let reasoned = style.empty(reason).with_reasoning("weighing the request");
         a_rejected_reply_that_is_no_empty_stop_fails_the_round(
@@ -4801,7 +4853,7 @@ async fn a_reply_filtered_after_the_model_reasoned_fails_the_round() {
 /// next round is sent what the round before it was, and no trace of the reply.
 #[tokio::test]
 async fn the_round_after_a_filtered_reply_is_sent_no_trace_of_it() {
-    let style = Style::OpenAi;
+    let style = Style::ChatCompletions;
     let (mut agent, mut requests) = retrying_agent_in(
         style,
         "OUTRIG_TEST_AGENT_AFTER_FILTERED",
@@ -4837,12 +4889,12 @@ async fn a_reply_that_stops_or_runs_to_length_with_the_same_content_is_unchanged
     for (style, reason) in [
         (Style::Anthropic, "end_turn"),
         (Style::Anthropic, "max_tokens"),
-        (Style::OpenAi, "stop"),
-        (Style::OpenAi, "length"),
+        (Style::ChatCompletions, "stop"),
+        (Style::ChatCompletions, "length"),
     ] {
         let var = format!(
             "OUTRIG_TEST_AGENT_ORDINARY_{}_{}",
-            style.name().to_uppercase(),
+            style.name().to_uppercase().replace('-', "_"),
             reason.to_uppercase()
         );
         let (mut agent, mut requests) = retrying_agent_in(
@@ -4878,7 +4930,10 @@ const NOTICE: &str = "[outrig: not sent -- the model's provider refused";
 #[tokio::test]
 async fn a_result_the_provider_will_not_read_is_left_out_and_the_round_goes_on() {
     for style in Style::ALL {
-        let var = format!("OUTRIG_TEST_AGENT_WITHHELD_{}", style.name().to_uppercase());
+        let var = format!(
+            "OUTRIG_TEST_AGENT_WITHHELD_{}",
+            style.name().to_uppercase().replace('-', "_")
+        );
         let dir = tempfile::tempdir().expect("a log dir");
         let (events, mut submitted) = watched(Some(dir.path())).await;
         // The marker is only ever whole in what the code printed.
@@ -4924,7 +4979,7 @@ async fn a_result_the_provider_will_not_read_is_left_out_and_the_round_goes_on()
         let records = events::recorded(dir.path());
         let reason = match style {
             Style::Anthropic => "refusal",
-            Style::OpenAi => "content_filter",
+            Style::ChatCompletions | Style::Responses => "content_filter",
         };
         let withheld = events::of_kind(&records, "model.withheld");
         assert_eq!(withheld.len(), 1, "{style:?}: {withheld:#?}");
@@ -4968,7 +5023,7 @@ async fn a_result_the_provider_will_not_read_is_left_out_and_the_round_goes_on()
 /// so the next message's call carries the result whole.
 #[tokio::test]
 async fn a_provider_that_refuses_everything_fails_the_round_and_leaves_nothing_out() {
-    let style = Style::OpenAi;
+    let style = Style::ChatCompletions;
     let (mut agent, mut requests) = retrying_agent_in(
         style,
         "OUTRIG_TEST_AGENT_REFUSES_EVERYTHING",
@@ -5009,7 +5064,7 @@ async fn a_provider_that_refuses_everything_fails_the_round_and_leaves_nothing_o
 /// the round ends on it, and nothing is retried.
 #[tokio::test]
 async fn an_openai_refusal_that_stopped_normally_is_the_models_reply() {
-    let style = Style::OpenAi;
+    let style = Style::ChatCompletions;
     let (mut agent, mut requests) = retrying_agent_in(
         style,
         "OUTRIG_TEST_AGENT_EMPTY_OPENAI_REFUSAL",
@@ -5077,6 +5132,226 @@ async fn an_unreachable_head_moves_to_the_next_model_which_is_named_as_answering
         ended[0]["calls"][0]["model"], "tail",
         "the call is attributed to the model that answered it, not the head"
     );
+}
+
+/// A Responses call posts to `{base-url}/responses` with the whole conversation
+/// as `input`, the output ceiling as `max_output_tokens`, and `store: false`:
+/// the conversation is OutRig's to carry, so nothing is kept by the provider
+/// or chained by `previous_response_id`. A call to a tool is answered by the
+/// next request, each `function_call` with one `function_call_output`.
+#[tokio::test]
+async fn a_responses_call_sends_the_conversation_and_asks_the_provider_to_keep_nothing() {
+    let (mut agent, mut requests) = agent_in(
+        Style::Responses,
+        "OUTRIG_TEST_AGENT_RESPONSES_WIRE",
+        MODEL,
+        "",
+        "max-tokens = 4096",
+        vec![
+            Style::Responses.submit("call_1", "print('ran')"),
+            Style::Responses.text("done"),
+            Style::Responses.text("and again"),
+        ],
+    )
+    .await;
+
+    assert_eq!(round(&mut agent, "run it").await, "done");
+    assert_eq!(round(&mut agent, "once more").await, "and again");
+    shut_down(agent).await;
+
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 3);
+    for request in &recorded {
+        assert_eq!(request.method, "POST");
+        assert!(request.path.ends_with("/responses"), "{}", request.path);
+        assert!(
+            request
+                .header("authorization")
+                .is_some_and(|value| value.starts_with("Bearer ")),
+            "{:?}",
+            request.headers
+        );
+        assert!(request.body["input"].is_array(), "{:#}", request.body);
+        assert_eq!(
+            request.body["max_output_tokens"], 4096,
+            "{:#}",
+            request.body
+        );
+        assert_eq!(request.body["store"], json!(false), "{:#}", request.body);
+        assert!(
+            request.body.get("previous_response_id").is_none(),
+            "{:#}",
+            request.body
+        );
+        assert!(
+            check_wire(Style::Responses, &request.body)
+                .unpaired
+                .is_empty()
+        );
+    }
+    let items = |request: &RecordedRequest, kind: &str| {
+        request.body["input"]
+            .as_array()
+            .expect("input")
+            .iter()
+            .filter(|item| item["type"] == kind)
+            .count()
+    };
+    assert_eq!(items(&recorded[0], "function_call"), 0);
+    assert_eq!(items(&recorded[1], "function_call"), 1);
+    assert_eq!(items(&recorded[1], "function_call_output"), 1);
+    // The second round's request still carries the first, whole.
+    assert_eq!(items(&recorded[2], "function_call_output"), 1);
+}
+
+/// An alias chain moves between providers of every style, in either direction:
+/// the head cannot be reached, and the tail answers in its own wire format.
+#[tokio::test]
+async fn a_chain_moves_between_every_pair_of_styles() {
+    for head_style in Style::ALL {
+        for tail_style in Style::ALL {
+            if head_style == tail_style {
+                continue;
+            }
+            let vars = format!(
+                "OUTRIG_TEST_AGENT_FAILOVER_{}_TO_{}",
+                head_style.name().to_uppercase().replace('-', "_"),
+                tail_style.name().to_uppercase().replace('-', "_")
+            );
+            let (tail, mut requests) =
+                mock_http::start(vec![tail_style.text("from the tail")]).await;
+            let cfg = chain_config(
+                &vars,
+                (head_style, "http://127.0.0.1:9", ""),
+                (tail_style, &format!("http://{tail}"), ""),
+            );
+            let mut agent = chained_agent(&vars, Events::off(), &cfg).await;
+
+            assert_eq!(
+                round(&mut agent, "hi").await,
+                "from the tail",
+                "{head_style:?} -> {tail_style:?}"
+            );
+            shut_down(agent).await;
+            assert_eq!(
+                mock_http::drain(&mut requests).len(),
+                1,
+                "{head_style:?} -> {tail_style:?}"
+            );
+        }
+    }
+}
+
+/// A call that moves to a Responses provider carries the conversation without
+/// the reasoning another provider's model did: the item is not the Responses
+/// provider's, which has no stored item to resolve it against.
+#[tokio::test]
+async fn a_move_to_a_responses_provider_sends_no_reasoning_it_did_not_issue() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_REASONING_TO_RESPONSES";
+    let (head, _head_requests) = mock_http::start(vec![
+        Style::ChatCompletions
+            .submit("call_1", "print('ran')")
+            .with_reasoning("weighing the request"),
+        Style::ChatCompletions.failure(503),
+    ])
+    .await;
+    let (tail, mut tail_requests) =
+        mock_http::start(vec![Style::Responses.text("on the tail")]).await;
+    let cfg = chain_config(
+        vars,
+        (Style::ChatCompletions, &format!("http://{head}"), ""),
+        (Style::Responses, &format!("http://{tail}"), ""),
+    );
+    let mut agent = chained_agent(vars, Events::off(), &cfg).await;
+
+    assert_eq!(round(&mut agent, "run it").await, "on the tail");
+    shut_down(agent).await;
+
+    let moved = mock_http::drain(&mut tail_requests);
+    assert_eq!(moved.len(), 1);
+    let sent = moved[0].body.to_string();
+    assert!(!sent.contains("weighing the request"), "{sent}");
+    assert!(!sent.contains(r#""type":"reasoning""#), "{sent}");
+    assert_eq!(tool_result(&moved[0], "call_1"), "ran\n");
+}
+
+/// Reasoning one Responses row wrote is not sent to another, though both name
+/// the same model: its ciphertext is bound to the account of the row that
+/// wrote it, which the other would reject. The row that wrote it is sent it,
+/// and the tool call beside it goes to both.
+#[tokio::test]
+async fn a_move_between_responses_rows_sends_no_reasoning_the_tail_did_not_issue() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_RESPONSES_TO_RESPONSES";
+    let (head, mut head_requests) = mock_http::start(vec![
+        Style::Responses
+            .submit("call_1", "print('ran')")
+            .with_reasoning("weighing the request"),
+        Style::Responses.failure(503),
+    ])
+    .await;
+    let (tail, mut tail_requests) =
+        mock_http::start(vec![Style::Responses.text("on the tail")]).await;
+    let cfg = chain_config(
+        vars,
+        (Style::Responses, &format!("http://{head}"), ""),
+        (Style::Responses, &format!("http://{tail}"), ""),
+    );
+    let mut agent = chained_agent(vars, Events::off(), &cfg).await;
+
+    assert_eq!(round(&mut agent, "run it").await, "on the tail");
+    shut_down(agent).await;
+
+    let issued = mock_http::drain(&mut head_requests);
+    assert_eq!(issued.len(), 2);
+    let sent = issued[1].body.to_string();
+    assert!(sent.contains(r#""type":"reasoning""#), "{sent}");
+    let moved = mock_http::drain(&mut tail_requests);
+    assert_eq!(moved.len(), 1);
+    let sent = moved[0].body.to_string();
+    assert!(!sent.contains("weighing the request"), "{sent}");
+    assert!(!sent.contains(r#""type":"reasoning""#), "{sent}");
+    assert_eq!(tool_result(&moved[0], "call_1"), "ran\n");
+}
+
+/// A call naming no tool is a turn too, and the turns after it are still
+/// attributed to the row that wrote them: a later reply's reasoning goes back
+/// to that row, beside the tool call whose required item it is.
+#[tokio::test]
+async fn reasoning_after_a_call_naming_no_tool_goes_back_to_its_own_row() {
+    let (mut agent, mut requests) = agent_in(
+        Style::Responses,
+        "OUTRIG_TEST_AGENT_RESPONSES_AFTER_NO_SUCH_TOOL",
+        MODEL,
+        "",
+        "max-tokens = 4096",
+        vec![
+            mock_http::responses(
+                json!([{
+                    "type": "function_call",
+                    "id": "fc_nobody",
+                    "call_id": "call_nobody",
+                    "status": "completed",
+                    "name": "no_such_tool",
+                    "arguments": "{}",
+                }]),
+                "tool_calls",
+            ),
+            Style::Responses
+                .submit("call_1", "print('ran')")
+                .with_reasoning("weighing the request"),
+            Style::Responses.text("done"),
+        ],
+    )
+    .await;
+
+    assert_eq!(round(&mut agent, "run it").await, "done");
+    shut_down(agent).await;
+
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 3);
+    let sent = recorded[2].body.to_string();
+    assert!(sent.contains(r#""type":"reasoning""#), "{sent}");
+    assert_eq!(tool_result(&recorded[2], "call_1"), "ran\n");
 }
 
 /// A move replays one model call against the next model, not the round around
@@ -5541,7 +5816,7 @@ async fn a_move_to_a_strict_model_is_sent_a_conversation_that_alternates() {
     ])
     .await;
     let (tail, mut tail_requests) =
-        mock_http::start_strict(vec![Style::OpenAi.text("promoted")]).await;
+        mock_http::start_strict(vec![Style::ChatCompletions.text("promoted")]).await;
     let mut cfg = chain_config(
         vars,
         (
@@ -5550,7 +5825,7 @@ async fn a_move_to_a_strict_model_is_sent_a_conversation_that_alternates() {
             "max-tokens = 4096",
         ),
         (
-            Style::OpenAi,
+            Style::ChatCompletions,
             &format!("http://{tail}"),
             "max-tokens = 4096",
         ),
@@ -5601,7 +5876,11 @@ async fn a_move_to_a_strict_model_is_sent_a_conversation_that_alternates() {
     assert!(count(headed, "call_b") > 0);
     assert_eq!(count(moved, "call_b"), 0, "{:#}", moved.body);
     assert!(strict_refusal(&moved.body).is_none(), "{:#}", moved.body);
-    assert!(check_wire(Style::OpenAi, &moved.body).unpaired.is_empty());
+    assert!(
+        check_wire(Style::ChatCompletions, &moved.body)
+            .unpaired
+            .is_empty()
+    );
 
     let records = events::recorded(dir.path());
     let kinds = events::kinds(&records);
@@ -5628,7 +5907,7 @@ async fn a_move_to_a_strict_model_is_sent_a_conversation_that_alternates() {
         &records,
         &[
             ("head", Style::Anthropic, &at_head),
-            ("tail", Style::OpenAi, &at_tail),
+            ("tail", Style::ChatCompletions, &at_tail),
         ],
     );
 }
@@ -5873,12 +6152,13 @@ async fn a_turn_no_model_of_the_chain_can_hold_ends_its_round_and_later_rounds_g
 
 /// The blocks of `kind` in the messages `request` carried, as the Anthropic
 /// API received them.
-fn blocks<'a>(request: &'a RecordedRequest, kind: &str) -> Vec<&'a serde_json::Value> {
+fn blocks(request: &RecordedRequest, kind: &str) -> Vec<serde_json::Value> {
     messages(request)
         .iter()
         .filter_map(|message| message["content"].as_array())
         .flatten()
         .filter(|block| block["type"] == kind)
+        .cloned()
         .collect()
 }
 
@@ -5905,7 +6185,7 @@ async fn signed_thinking_goes_back_to_anthropic_whole() {
     let recorded = mock_http::drain(&mut requests);
     assert_eq!(
         blocks(&recorded[1], "thinking"),
-        [&json!({
+        [json!({
             "type": "thinking",
             "thinking": "weighing it",
             "signature": mock_http::SIGNATURE,
@@ -5986,17 +6266,17 @@ async fn a_refused_drop_block_is_sent_again_without_it() {
 async fn reasoning_another_provider_wrote_is_not_sent_to_anthropic() {
     let vars = "OUTRIG_TEST_AGENT_FAILOVER_FOREIGN_REASONING";
     let (head, mut head_requests) = mock_http::start(vec![
-        Style::OpenAi
+        Style::ChatCompletions
             .submit("call_1", "print('ran')")
             .with_reasoning("thinking it over"),
-        Style::OpenAi.failure(503),
+        Style::ChatCompletions.failure(503),
     ])
     .await;
     let (tail, mut tail_requests) =
         mock_http::start(vec![text_reply("finished on Anthropic")]).await;
     let cfg = chain_config(
         vars,
-        (Style::OpenAi, &format!("http://{head}"), ""),
+        (Style::ChatCompletions, &format!("http://{head}"), ""),
         (Style::Anthropic, &format!("http://{tail}"), ""),
     );
     let dir = tempfile::tempdir().expect("a log dir");
@@ -6033,7 +6313,7 @@ async fn reasoning_another_provider_wrote_is_not_sent_to_anthropic() {
     each_call_rebuilds(
         &records,
         &[
-            ("head", Style::OpenAi, &headed),
+            ("head", Style::ChatCompletions, &headed),
             ("tail", Style::Anthropic, &moved),
         ],
     );
@@ -6048,7 +6328,7 @@ async fn the_anthropic_head_is_sent_none_of_the_reasoning_its_fallback_wrote() {
     let (head, mut head_requests) =
         mock_http::start(vec![failure(503), text_reply("finished on the head")]).await;
     let (tail, mut tail_requests) = mock_http::start(vec![
-        Style::OpenAi
+        Style::ChatCompletions
             .submit("call_1", "print('ran')")
             .with_reasoning("thinking it over"),
     ])
@@ -6056,7 +6336,7 @@ async fn the_anthropic_head_is_sent_none_of_the_reasoning_its_fallback_wrote() {
     let cfg = chain_config(
         vars,
         (Style::Anthropic, &format!("http://{head}"), ""),
-        (Style::OpenAi, &format!("http://{tail}"), ""),
+        (Style::ChatCompletions, &format!("http://{tail}"), ""),
     );
     let dir = tempfile::tempdir().expect("a log dir");
     let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
@@ -6088,7 +6368,7 @@ async fn the_anthropic_head_is_sent_none_of_the_reasoning_its_fallback_wrote() {
         &records,
         &[
             ("head", Style::Anthropic, &headed),
-            ("tail", Style::OpenAi, &moved),
+            ("tail", Style::ChatCompletions, &moved),
         ],
     );
 }

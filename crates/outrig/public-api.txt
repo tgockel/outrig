@@ -336,6 +336,8 @@ pub outrig::config::ConfigValidationError::WorkspaceMountHostNotDirectory::path:
 impl outrig::config::ConfigValidationError
 pub fn outrig::config::ConfigValidationError::build_image_name_invalid(impl core::convert::Into<alloc::string::String>, outrig::config::BuildImageNameError) -> Self
 #[non_exhaustive] pub enum outrig::config::ConfigWarningKind
+#[non_exhaustive] pub outrig::config::ConfigWarningKind::Deprecated
+pub outrig::config::ConfigWarningKind::Deprecated::replacement: &'static str
 #[non_exhaustive] pub outrig::config::ConfigWarningKind::InvalidValue
 pub outrig::config::ConfigWarningKind::InvalidValue::reason: alloc::string::String
 pub outrig::config::ConfigWarningKind::UnknownKey
@@ -389,15 +391,22 @@ pub outrig::config::LlmProvider::Anthropic::base_url: alloc::string::String
 pub outrig::config::LlmProvider::Anthropic::request_timeout_secs: core::option::Option<u64>
 pub outrig::config::LlmProvider::Anthropic::retry_budget_secs: core::option::Option<u64>
 pub outrig::config::LlmProvider::Anthropic::role_alternation: core::option::Option<outrig::config::RoleAlternation>
-#[non_exhaustive] pub outrig::config::LlmProvider::OpenAi
-pub outrig::config::LlmProvider::OpenAi::api_key: outrig::config::ApiKeyRef
-pub outrig::config::LlmProvider::OpenAi::base_url: alloc::string::String
-pub outrig::config::LlmProvider::OpenAi::request_timeout_secs: core::option::Option<u64>
-pub outrig::config::LlmProvider::OpenAi::retry_budget_secs: core::option::Option<u64>
-pub outrig::config::LlmProvider::OpenAi::role_alternation: core::option::Option<outrig::config::RoleAlternation>
+#[non_exhaustive] pub outrig::config::LlmProvider::ChatCompletions
+pub outrig::config::LlmProvider::ChatCompletions::api_key: outrig::config::ApiKeyRef
+pub outrig::config::LlmProvider::ChatCompletions::base_url: alloc::string::String
+pub outrig::config::LlmProvider::ChatCompletions::request_timeout_secs: core::option::Option<u64>
+pub outrig::config::LlmProvider::ChatCompletions::retry_budget_secs: core::option::Option<u64>
+pub outrig::config::LlmProvider::ChatCompletions::role_alternation: core::option::Option<outrig::config::RoleAlternation>
+#[non_exhaustive] pub outrig::config::LlmProvider::Responses
+pub outrig::config::LlmProvider::Responses::api_key: outrig::config::ApiKeyRef
+pub outrig::config::LlmProvider::Responses::base_url: alloc::string::String
+pub outrig::config::LlmProvider::Responses::request_timeout_secs: core::option::Option<u64>
+pub outrig::config::LlmProvider::Responses::retry_budget_secs: core::option::Option<u64>
+pub outrig::config::LlmProvider::Responses::role_alternation: core::option::Option<outrig::config::RoleAlternation>
 impl outrig::config::LlmProvider
 pub fn outrig::config::LlmProvider::anthropic(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, outrig::config::AnthropicOptions) -> Self
-pub fn outrig::config::LlmProvider::openai(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, outrig::config::OpenAiOptions) -> Self
+pub fn outrig::config::LlmProvider::chat_completions(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, outrig::config::ChatCompletionsOptions) -> Self
+pub fn outrig::config::LlmProvider::responses(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, outrig::config::ResponsesOptions) -> Self
 pub fn outrig::config::LlmProvider::style(&self) -> &'static str
 #[non_exhaustive] pub enum outrig::config::McpServerSpec
 #[non_exhaustive] pub outrig::config::McpServerSpec::Full
@@ -543,6 +552,15 @@ pub fn outrig::config::Binding::config_source(&self) -> core::option::Option<&ou
 pub fn outrig::config::Binding::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 impl core::convert::From<outrig::config::Binding> for outrig::harness::BindingSpec
 pub fn outrig::harness::BindingSpec::from(outrig::config::Binding) -> Self
+#[non_exhaustive] pub struct outrig::config::ChatCompletionsOptions
+pub outrig::config::ChatCompletionsOptions::request_timeout_secs: core::option::Option<u64>
+pub outrig::config::ChatCompletionsOptions::retry_budget_secs: core::option::Option<u64>
+pub outrig::config::ChatCompletionsOptions::role_alternation: core::option::Option<outrig::config::RoleAlternation>
+impl outrig::config::ChatCompletionsOptions
+pub fn outrig::config::ChatCompletionsOptions::new() -> Self
+pub fn outrig::config::ChatCompletionsOptions::with_request_timeout_secs(self, u64) -> Self
+pub fn outrig::config::ChatCompletionsOptions::with_retry_budget_secs(self, u64) -> Self
+pub fn outrig::config::ChatCompletionsOptions::with_role_alternation(self, outrig::config::RoleAlternation) -> Self
 #[non_exhaustive] pub struct outrig::config::Config
 pub outrig::config::Config::agents: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::Agent>
 pub outrig::config::Config::bindings: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::Binding>
@@ -694,15 +712,6 @@ pub fn outrig::config::NetworkPolicyBuilder::build(self) -> outrig::error::Resul
 pub fn outrig::config::NetworkPolicyBuilder::default_action(self, outrig::config::NetworkAction) -> Self
 pub fn outrig::config::NetworkPolicyBuilder::deny_host(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::config::NetworkPolicyBuilder::deny_host_port(self, impl core::convert::Into<alloc::string::String>, u16) -> Self
-#[non_exhaustive] pub struct outrig::config::OpenAiOptions
-pub outrig::config::OpenAiOptions::request_timeout_secs: core::option::Option<u64>
-pub outrig::config::OpenAiOptions::retry_budget_secs: core::option::Option<u64>
-pub outrig::config::OpenAiOptions::role_alternation: core::option::Option<outrig::config::RoleAlternation>
-impl outrig::config::OpenAiOptions
-pub fn outrig::config::OpenAiOptions::new() -> Self
-pub fn outrig::config::OpenAiOptions::with_request_timeout_secs(self, u64) -> Self
-pub fn outrig::config::OpenAiOptions::with_retry_budget_secs(self, u64) -> Self
-pub fn outrig::config::OpenAiOptions::with_role_alternation(self, outrig::config::RoleAlternation) -> Self
 #[non_exhaustive] pub struct outrig::config::RepoPolicy
 impl outrig::config::RepoPolicy
 pub fn outrig::config::RepoPolicy::env_allow(&self) -> &[alloc::string::String]
@@ -715,6 +724,15 @@ pub fn outrig::config::ResolvedEnvValue::source(&self) -> &outrig::config::EnvVa
 pub fn outrig::config::ResolvedEnvValue::value(&self) -> &str
 impl core::fmt::Debug for outrig::config::ResolvedEnvValue
 pub fn outrig::config::ResolvedEnvValue::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::config::ResponsesOptions
+pub outrig::config::ResponsesOptions::request_timeout_secs: core::option::Option<u64>
+pub outrig::config::ResponsesOptions::retry_budget_secs: core::option::Option<u64>
+pub outrig::config::ResponsesOptions::role_alternation: core::option::Option<outrig::config::RoleAlternation>
+impl outrig::config::ResponsesOptions
+pub fn outrig::config::ResponsesOptions::new() -> Self
+pub fn outrig::config::ResponsesOptions::with_request_timeout_secs(self, u64) -> Self
+pub fn outrig::config::ResponsesOptions::with_retry_budget_secs(self, u64) -> Self
+pub fn outrig::config::ResponsesOptions::with_role_alternation(self, outrig::config::RoleAlternation) -> Self
 #[non_exhaustive] pub struct outrig::config::SidecarConfig
 pub outrig::config::SidecarConfig::args: alloc::vec::Vec<alloc::string::String>
 pub outrig::config::SidecarConfig::image: alloc::string::String
