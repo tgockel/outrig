@@ -74,10 +74,14 @@ pub(crate) fn preamble(
     text.push_str(
         "The user reaches you through messages on `runtime.channels[\"user\"]`. You are told how \
          many are waiting there, not what they say: `await runtime.channels[\"user\"].receive()` \
-         takes the next one, whose `.body` is its text, and `.pending()` counts them. `await \
-         runtime.channels[\"user\"].send(text)` sends the user a message. What you write \
-         yourself is commentary; send what you mean the user to have. A send is also the only \
-         way code still running after you stop writing can reach them.\n\n\
+         takes the next one, whose `.body` is its text, and `runtime.channels[\"user\"].pending()` \
+         counts them. `receive()` removes the message it takes. With none waiting it does not \
+         return until the user sends one, and the `submit_python` call that awaits it does not \
+         finish until then. `await runtime.channels[\"user\"].send(text)` sends the user a \
+         message. What you write yourself is commentary; send what you mean the user to have. \
+         To wait for the user, stop writing -- reply without calling `submit_python` -- and a new \
+         round begins when their next message arrives. A send is also the only way code still \
+         running after you stop writing can reach them.\n\n\
          `runtime.wait` is `asyncio.wait` -- the same arguments, the same `(done, pending)` \
          back, and a timeout that cancels nothing -- except that while a message waits unread, \
          one there before the call included, it raises `runtime.MessageAvailable`, which \

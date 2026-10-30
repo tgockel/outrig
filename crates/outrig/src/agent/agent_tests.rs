@@ -880,6 +880,11 @@ async fn the_system_prompt_is_the_orientation_then_the_configured_preamble() {
     let system = system_prompt(&recorded[0]);
     assert!(
         system.starts_with("You act on this project by writing Python.")
+            && system.contains("`runtime.channels[\"user\"].pending()` counts them")
+            && system.contains("With none waiting it does not return until the user sends one")
+            && system.contains(
+                "To wait for the user, stop writing -- reply without calling `submit_python`",
+            )
             && system.contains("`runtime.wait` is `asyncio.wait`")
             && system.contains("`runtime.MessageAvailable`, which `except Exception` does not")
             && system.contains("Wait with it, with a `timeout=`, for anything that may not return")
