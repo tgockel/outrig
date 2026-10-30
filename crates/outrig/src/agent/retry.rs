@@ -709,8 +709,9 @@ fn unusable_reply(response: &CompletionResponse) -> Option<String> {
         AssistantContent::Text(text) => text.text.trim().is_empty(),
         _ => false,
     });
+    // Not `ToolCalls`: with nothing in the reply, it says a call was made and none came.
     let normal = match &normalized {
-        None | Some(FinishReason::Stop) | Some(FinishReason::ToolCalls) => true,
+        None | Some(FinishReason::Stop) => true,
         Some(FinishReason::Other(word)) => is_normal_stop(word),
         _ => false,
     };
@@ -1530,6 +1531,24 @@ mod tests {
                 raw("length")
             )),
             Some("finish reason length: the reply holds no text and no tool call".into())
+        );
+        // A tool-call reason says the model called a tool, and an empty reply
+        // holds no call: the reply is defective, not a model that stopped.
+        assert_eq!(
+            unusable_reply(&reply(
+                empty.clone(),
+                Some(FinishReason::ToolCalls),
+                serde_json::json!({ "stop_reason": "tool_use" })
+            )),
+            Some("finish reason tool_use: the reply holds no text and no tool call".into())
+        );
+        assert_eq!(
+            unusable_reply(&reply(
+                empty.clone(),
+                Some(FinishReason::ToolCalls),
+                raw("tool_calls")
+            )),
+            Some("finish reason tool_calls: the reply holds no text and no tool call".into())
         );
         assert_eq!(
             unusable_reply(&reply(

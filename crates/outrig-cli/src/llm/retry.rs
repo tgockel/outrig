@@ -556,8 +556,9 @@ fn unusable_reply(response: &CompletionResponse) -> Option<String> {
         AssistantContent::Text(text) => is_blank(&text.text),
         _ => false,
     });
+    // Not `ToolCalls`: with nothing in the reply, it says a call was made and none came.
     let normal = match &normalized {
-        None | Some(FinishReason::Stop) | Some(FinishReason::ToolCalls) => true,
+        None | Some(FinishReason::Stop) => true,
         Some(FinishReason::Other(word)) => is_normal_stop(word),
         _ => false,
     };
@@ -1227,6 +1228,44 @@ mod tests {
         // belongs to none of the three and stays terminal, which is what
         // keeps a bad key an exit-1.
         assert!(chain_label_of(ProviderError::Provider("nope".into())).is_none());
+    }
+
+    /// An empty reply the provider ends in a tool call holds no call: the
+    /// provider says one was made and none came, so the reply is defective, not
+    /// a model that stopped. One it ends `stop` is the model's own.
+    #[test]
+    fn an_empty_reply_that_ends_in_a_tool_call_is_unusable() {
+        let reply = |finish: FinishReason, raw: serde_json::Value| {
+            CompletionResponse::new(
+                Vec::new(),
+                rig::completion::Usage::new(),
+                Origin::new(MOCK_API, MOCK_PROVIDER, ""),
+                raw,
+            )
+            .with_optional_finish_reason(Some(finish))
+        };
+
+        assert_eq!(
+            unusable_reply(&reply(
+                FinishReason::ToolCalls,
+                serde_json::json!({ "stop_reason": "tool_use" })
+            )),
+            Some("finish reason tool_use: the reply holds no text and no tool call".into())
+        );
+        assert_eq!(
+            unusable_reply(&reply(
+                FinishReason::ToolCalls,
+                serde_json::json!({ "choices": [{ "finish_reason": "tool_calls" }] })
+            )),
+            Some("finish reason tool_calls: the reply holds no text and no tool call".into())
+        );
+        assert_eq!(
+            unusable_reply(&reply(
+                FinishReason::Stop,
+                serde_json::json!({ "stop_reason": "end_turn" })
+            )),
+            None
+        );
     }
 
     /// A model that answers every request `200` with a reply nothing can be

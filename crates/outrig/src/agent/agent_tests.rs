@@ -4833,6 +4833,34 @@ async fn an_openai_reply_filtered_to_nothing_still_fails_the_round() {
     .await;
 }
 
+/// A reply the provider ends in a tool call, with no call in it, is not a
+/// model stopping: the provider says a call was made and none came. It is
+/// retried and fails the round as any other defective reply does, rather than
+/// ending the round as an answer and losing the call.
+#[tokio::test]
+async fn an_anthropic_reply_that_ends_in_a_tool_call_and_holds_none_still_fails_the_round() {
+    let style = Style::Anthropic;
+    a_rejected_reply_that_is_no_empty_stop_fails_the_round(
+        style,
+        "tool_use",
+        style.empty("tool_use"),
+        "tool_use",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_openai_reply_that_ends_in_a_tool_call_and_holds_none_still_fails_the_round() {
+    let style = Style::ChatCompletions;
+    a_rejected_reply_that_is_no_empty_stop_fails_the_round(
+        style,
+        "tool_calls",
+        style.empty("tool_calls"),
+        "tool_calls",
+    )
+    .await;
+}
+
 /// A reply with `content` in it, as a provider's `style` sends it, ending in
 /// `finish_reason`: the model's reasoning, and then what it said.
 fn said(style: Style, content: &str, finish_reason: &str) -> mock_http::CannedResponse {
