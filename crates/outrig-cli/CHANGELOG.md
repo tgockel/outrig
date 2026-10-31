@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig run` names the provider's finish reason for a reply it cannot use.** A reply
+  ended with `content_filter` and no content used to read only "Response contained no
+  message or tool call (empty)" in the retry line and the final error, which looked the same
+  as a broken endpoint. Both now lead with `finish reason content_filter:` (or `length`,
+  `refusal`, ...) when the body names one. (#742)
+
 - **`outrig image init` preserves an existing README, even with `--force`.** A project
   README no longer blocks scaffolding or gets replaced by the template. `--force` only
   regenerates `Dockerfile` and `image.toml`; a missing README is still created. (#406)
