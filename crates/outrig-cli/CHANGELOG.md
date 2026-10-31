@@ -262,6 +262,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A child agent is shown by its name as well as its id in `outrig run-new`.** Its rows read
+  `city_fact (c3)`, from the name its `agent.spawned` gave it, and the bare `c3` when that event
+  was missed. `events.jsonl` is unchanged.
 - **`outrig run` follows no redirect from a provider.** reqwest kept `x-api-key`, the header
   Anthropic's wire carries the key in, on a request a redirect sent to another origin, and a
   `307` or `308` sent the conversation there again. A call answered with a redirect now fails as

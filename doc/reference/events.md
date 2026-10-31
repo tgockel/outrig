@@ -83,6 +83,12 @@ subject; `agent.released` carries the subject of the agent that released it. A p
 constructs: their parent is the program, named by the subject `owner` beside the agents', and
 `agent.released` for one it released carries `owner`.
 
+The child's `name` -- the label its launch gave it, which repeats between children -- is in
+`agent.spawned` alone, the first event under its subject, with its parent and kind. A tool that
+labels a child by name joins that event to the rest by subject, and falls back to the bare id when
+it was lost. The ids can skip: a launch refused after its id was taken, an unknown `model` say,
+does not give the number back.
+
 Inside `data`, an execution's `execid` and a message's `message` id come from one counter, which
 also numbers OutRig's own questions to the interpreter, so neither runs in sequence and a gap in
 them means nothing. Turns and calls are each counted from 0 on their own, and requests to
