@@ -13,6 +13,7 @@
 //! a round of its that failed is shown with its error. Its retries and moves
 //! to another model are in the library's log lines, as the main agent's are.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::time::Duration;
 
@@ -143,14 +144,42 @@ pub(super) enum Fact {
 /// What `received` says, or `None` for one the screen does not show: the
 /// conversation as the model was sent it, which `events.jsonl` keeps, and
 /// bookkeeping that changes nothing on screen.
-pub(super) fn fact(received: &Received) -> Option<Fact> {
+pub(super) fn fact(received: &Received, names: &Names) -> Option<Fact> {
     match received {
         Received::Event(event) => match event.subject.as_ref().map(Subject::as_str) {
-            Some(child) if child != MAIN_AGENT => of_child(child, from_payload(&event.payload)?),
+            Some(child) if child != MAIN_AGENT => {
+                of_child(&names.label(child), from_payload(&event.payload)?)
+            }
             _ => from_payload(&event.payload),
         },
         Received::Missed(missed) => Some(Fact::Missed(*missed)),
         _ => None,
+    }
+}
+
+/// The names the children's launches gave them, by id: `agent.spawned` is the
+/// first event under a child's subject, and the only one that carries its name.
+#[derive(Default)]
+pub(super) struct Names(HashMap<String, String>);
+
+impl Names {
+    /// Take the name from `received` when it is a child's launch.
+    pub(super) fn observe(&mut self, received: &Received) {
+        if let Received::Event(event) = received
+            && let Payload::AgentSpawned { name, .. } = &event.payload
+            && let Some(subject) = &event.subject
+        {
+            self.0.insert(subject.as_str().to_string(), name.clone());
+        }
+    }
+
+    /// How the screen calls child `id`: its name and id, or the id alone when
+    /// its launch was not seen, as after a `Received::Missed`.
+    fn label(&self, id: &str) -> String {
+        match self.0.get(id) {
+            Some(name) if !name.is_empty() => format!("{name} ({id})"),
+            _ => id.to_string(),
+        }
     }
 }
 
@@ -513,6 +542,18 @@ mod tests {
             })
         );
         assert_eq!(of_child("helper", ended(None)), None);
+    }
+
+    /// A child is labeled by the name its launch gave it, and by its id alone
+    /// when that launch was missed.
+    #[test]
+    fn a_child_is_labeled_by_its_name() {
+        let mut names = Names::default();
+        names.0.insert("c3".into(), "city_fact".into());
+        names.0.insert("c4".into(), String::new());
+        assert_eq!(names.label("c3"), "city_fact (c3)");
+        assert_eq!(names.label("c4"), "c4");
+        assert_eq!(names.label("c5"), "c5");
     }
 
     #[test]

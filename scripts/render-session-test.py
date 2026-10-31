@@ -1249,6 +1249,17 @@ class RenderSession(unittest.TestCase):
         self.assertNotIn("logs were joined", html)
         self.assertIn("2 starts of one agent: logs were joined", self.page(events[:1] + events))
 
+    def test_a_child_is_labeled_by_the_name_its_launch_gave_it(self) -> None:
+        spawned = {"name": "city_fact", "parent": "agent/primary", "kind": "work", "model": "haiku"}
+        started = {"model": "haiku", "python": "3.13.15", "container": "outrig-x"}
+        events, c = ordinary(), "agent/c1"
+        child = [("agent.spawned", spawned, c), ("agent.started", started, c)]
+        html = self.page(events[:2] + child + events[2:])
+        self.assertIn("launched by agent/primary as city_fact, a work child on haiku", html)
+        self.assertIn("city_fact (c1) on haiku", html)
+        # With the launch missing, the id stands alone.
+        self.assertIn("agent/c1 on haiku", self.page(events[:2] + child[1:] + events[2:]))
+
     def test_missing_ids_are_reported(self) -> None:
         self.write(ordinary())
         log = self.dir / EVENTS
