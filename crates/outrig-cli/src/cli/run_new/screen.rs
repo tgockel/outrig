@@ -127,7 +127,7 @@ fn decide(stdin_tty: bool, controlling: bool, term: Option<&str>, stdout_too: bo
 /// The line the conversation shows of `received`, if it shows one: what the
 /// line mode prints of the session's events, so its notes are the screen's.
 pub(super) fn conversation_line(received: &Received) -> Option<String> {
-    match facts::fact(received)? {
+    match facts::fact(received, &facts::Names::default())? {
         Fact::Note { text, inline: true } => Some(text),
         _ => None,
     }
@@ -159,6 +159,8 @@ pub(super) struct Screen {
     abandoned: AtomicBool,
     finished: bool,
     logs: Option<Diverted>,
+    /// What the children's launches named them, for labeling their events.
+    names: Mutex<facts::Names>,
 }
 
 /// A started screen, and what it hands the loop: the lines typed, each
@@ -221,6 +223,7 @@ impl Screen {
                 abandoned: AtomicBool::new(false),
                 finished: false,
                 logs: Some(logs),
+                names: Mutex::default(),
             },
             typed,
             keys,
@@ -254,7 +257,12 @@ impl Screen {
 
     /// One of the session's events.
     pub(super) fn event(&self, received: &Received) {
-        if let Some(fact) = facts::fact(received) {
+        let fact = {
+            let mut names = lock(&self.names);
+            names.observe(received);
+            facts::fact(received, &names)
+        };
+        if let Some(fact) = fact {
             self.say(ToScreen::Fact(fact));
         }
     }

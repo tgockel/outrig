@@ -396,6 +396,8 @@ class Builder:
         # its subject, in the order they first appeared.
         self.instructions: dict[str, tuple[str, list[Part]]] = {}
         self.agents: set[str] = set()
+        # The name each child's `agent.spawned` gave it, by subject.
+        self.names: dict[str, str] = {}
         self.kind = ""
         self.time = ""
         self.subject = ""
@@ -442,8 +444,13 @@ class Builder:
             block.peak = max(c["input_tokens"] for c in calls)
         self.rounds.append(block)
 
+    def label(self, subject: str) -> str:
+        """`subject`, with the name its launch gave it when that was seen: `city_fact (c3)`."""
+        name = self.names.get(subject)
+        return f"{name} ({subject.removeprefix('agent/')})" if name else subject
+
     def add(self, summary: str, **kw: object) -> Item:
-        item = Item(self.time, self.kind, summary, subject=self.subject, **kw)  # type: ignore[arg-type]
+        item = Item(self.time, self.kind, summary, subject=self.label(self.subject), **kw)  # type: ignore[arg-type]
         self.here().items.append(item)
         self.last = item
         return item
@@ -453,7 +460,7 @@ class Builder:
     def exec(self, value: object) -> Exec:
         k = key(value)
         if k not in self.execs:
-            self.execs[k] = Exec(k, anchor("exec", value), self.subject or "(no subject)")
+            self.execs[k] = Exec(k, anchor("exec", value), self.label(self.subject) or "(no subject)")
         return self.execs[k]
 
     def message(self, value: object, d: dict) -> Msg:
@@ -529,10 +536,19 @@ class Builder:
             )
             for t in tools
         ]
-        heading = f"{self.subject or '(no subject)'}, max tokens {max_tokens}"
+        heading = f"{self.label(self.subject) or '(no subject)'}, max tokens {max_tokens}"
         self.instructions[self.subject] = (heading, parts)
         at = list(self.instructions).index(self.subject)
         self.add(f"{len(tools)} tool(s)", href=f"#instructions-{at}")
+
+    def on_agent_spawned(self, d: dict) -> None:
+        name = text(d.get("name"))
+        if name and self.subject:
+            self.names[self.subject] = name
+        kind = text(d.get("kind"))
+        by = text(d.get("parent"))
+        as_ = f" as {name}" if name else ""
+        self.add(f"launched by {by}{as_}, a {kind} child on {text(d.get('model'))}")
 
     def on_agent_started(self, d: dict) -> None:
         facts = {
@@ -546,7 +562,7 @@ class Builder:
             # A child's, which the facts table does not hold.
             lines = "\n".join(f"{name}: {value}" for name, value in facts.items())
             parts = [Part("what it started with", lines)]
-        self.add(f"{self.subject} on {facts['model']}", parts=parts)
+        self.add(f"{self.label(self.subject)} on {facts['model']}", parts=parts)
 
     def on_agent_stopped(self, d: dict) -> None:
         self.add(self.subject)
