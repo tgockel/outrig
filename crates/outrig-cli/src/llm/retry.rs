@@ -298,11 +298,42 @@ impl Default for RetryPolicy {
 pub struct RetryingHttpClient {
     inner: reqwest::Client,
     policy: RetryPolicy,
+    answered: AnsweredBody,
 }
 
 impl RetryingHttpClient {
     pub fn new(inner: reqwest::Client, policy: RetryPolicy) -> Self {
-        Self { inner, policy }
+        Self {
+            inner,
+            policy,
+            answered: AnsweredBody::default(),
+        }
+    }
+
+    /// The handle on the latest `2xx` body this client has returned, for the
+    /// [`RetryingModel`] built over it ([`RetryingModel::with_answered`]).
+    pub fn answered(&self) -> AnsweredBody {
+        self.answered.clone()
+    }
+}
+
+/// The body of the latest `2xx` response a [`RetryingHttpClient`] returned.
+///
+/// Rig parses a completion out of the body and, when it rejects one, keeps
+/// only its own complaint -- "Response contained no message or tool call" --
+/// so the provider's account of *why* the reply was empty (`content_filter`,
+/// `length`) is gone by the time [`RetryingModel`] sees the error. This is the
+/// way back to it: one slot per client, overwritten by each answered request.
+#[derive(Clone, Debug, Default)]
+pub struct AnsweredBody(Arc<Mutex<Option<Bytes>>>);
+
+impl AnsweredBody {
+    fn set(&self, body: Bytes) {
+        *self.0.lock().expect("answered body") = Some(body);
+    }
+
+    fn latest(&self) -> Option<Bytes> {
+        self.0.lock().expect("answered body").clone()
     }
 }
 
@@ -325,7 +356,16 @@ impl HttpClientExt for RetryingHttpClient {
         // Converted once: `Bytes::clone` is a refcount bump, so replaying the
         // body on each attempt costs nothing.
         let body: Bytes = body.into();
-        send_with_retry(client, policy, parts.method, parts.uri, parts.headers, body)
+        let answered = self.answered.clone();
+        send_with_retry(
+            client,
+            policy,
+            answered,
+            parts.method,
+            parts.uri,
+            parts.headers,
+            body,
+        )
     }
 
     fn send_multipart<U>(
@@ -384,11 +424,24 @@ impl HttpClientExt for RetryingHttpClient {
 pub struct RetryingModel<M> {
     inner: M,
     policy: RetryPolicy,
+    answered: AnsweredBody,
 }
 
 impl<M> RetryingModel<M> {
     pub fn new(inner: M, policy: RetryPolicy) -> Self {
-        Self { inner, policy }
+        Self {
+            inner,
+            policy,
+            answered: AnsweredBody::default(),
+        }
+    }
+
+    /// Name the provider's finish reason in an unusable-response error, read
+    /// from the body `answered` holds -- the one the [`RetryingHttpClient`]
+    /// under this model's provider client returned last.
+    pub fn with_answered(mut self, answered: AnsweredBody) -> Self {
+        self.answered = answered;
+        self
     }
 }
 
@@ -440,6 +493,22 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
 }
 
 impl<M: CompletionModel> RetryingModel<M> {
+    /// Lead an unusable-response message with the finish reason the provider
+    /// gave for it, so the retry line and the final error both say whether
+    /// the reply was filtered or cut off rather than only that it was empty.
+    /// A body that is not JSON, or names no reason, leaves the message as is.
+    fn name_finish_reason(&self, message: String) -> String {
+        let reason = self
+            .answered
+            .latest()
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+            .and_then(|value| finish_reason_of(&value));
+        match reason {
+            Some(reason) => format!("finish reason {reason}: {message}"),
+            None => message,
+        }
+    }
+
     /// The retry loop proper. Split out so [`CompletionModel::completion`] can
     /// inspect what came back without the reporting having to live inside the
     /// loop and fire once per attempt.
@@ -451,7 +520,12 @@ impl<M: CompletionModel> RetryingModel<M> {
         // of the whole conversation for the duration of the call. With retries
         // off there is nothing to replay, so the wrapper costs nothing at all.
         if self.policy.budget.is_zero() {
-            return self.inner.completion(request).await;
+            return match self.inner.completion(request).await {
+                Err(CompletionError::ResponseError(message)) => Err(
+                    CompletionError::ResponseError(self.name_finish_reason(message)),
+                ),
+                outcome => outcome,
+            };
         }
 
         // `tokio::time::Instant` for the same reason `send_with_retry` uses it:
@@ -461,7 +535,7 @@ impl<M: CompletionModel> RetryingModel<M> {
         let mut attempt = 0u32;
         loop {
             let message = match self.inner.completion(request.clone()).await {
-                Err(CompletionError::ResponseError(message)) => message,
+                Err(CompletionError::ResponseError(message)) => self.name_finish_reason(message),
                 // A success, or a failure this layer cannot fix: one the HTTP
                 // client already retried, or a terminal one -- a bad key's
                 // `401` above all, which has to keep ending the process.
@@ -567,7 +641,12 @@ pub(super) fn textless_line(finish_reason: Option<&str>, max_tokens: Option<u64>
 /// Anthropic one. Returns `None` for a provider that names neither, which
 /// costs the report one clause and nothing else.
 fn provider_finish_reason<R: serde::Serialize>(raw: &R) -> Option<String> {
-    let value = serde_json::to_value(raw).ok()?;
+    finish_reason_of(&serde_json::to_value(raw).ok()?)
+}
+
+/// [`provider_finish_reason`] over a value already in hand: a serialized
+/// completion, or the provider's wire body itself, which share both shapes.
+fn finish_reason_of(value: &serde_json::Value) -> Option<String> {
     let openai = value
         .get("choices")
         .and_then(|choices| choices.get(0))
@@ -583,6 +662,7 @@ fn provider_finish_reason<R: serde::Serialize>(raw: &R) -> Option<String> {
 async fn send_with_retry<U>(
     client: reqwest::Client,
     policy: RetryPolicy,
+    answered_body: AnsweredBody,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -627,7 +707,10 @@ where
                 // backoff. The eventual `LazyBody` below is immediately ready
                 // -- these bytes are already in hand.
                 match response.bytes().await {
-                    Ok(bytes) => return ready_lazy_response(status, headers, bytes),
+                    Ok(bytes) => {
+                        answered_body.set(bytes.clone());
+                        return ready_lazy_response(status, headers, bytes);
+                    }
                     Err(error) => (HttpError::Instance(Box::new(error)), None),
                 }
             }
@@ -1175,6 +1258,49 @@ mod tests {
         );
     }
 
+    /// The finish reason lives only in the body rig rejected, so it has to come
+    /// from the slot the HTTP layer fills -- and reach both the final error and
+    /// the retry line, which share the one message (#742).
+    #[tokio::test(start_paused = true)]
+    async fn an_unusable_response_names_the_finish_reason_in_the_body() {
+        let answered = AnsweredBody::default();
+        answered.set(Bytes::from_static(
+            br#"{"choices":[{"finish_reason":"content_filter","message":{"content":null}}]}"#,
+        ));
+        let model = RetryingModel::new(
+            AlwaysUnusableModel(Default::default()),
+            RetryPolicy::default(),
+        )
+        .with_answered(answered);
+
+        let err = model
+            .completion(model.completion_request("hi").build())
+            .await
+            .expect_err("a model that only ever answers empty never recovers");
+
+        assert_eq!(
+            err.to_string(),
+            "ResponseError: finish reason content_filter: Response contained no message or tool \
+             call (empty)",
+        );
+    }
+
+    #[test]
+    fn the_finish_reason_is_read_from_either_dialect_and_only_when_present() {
+        let model = RetryingModel::new(AlwaysUnusableModel(Default::default()), RetryPolicy::default());
+        let named = |body: &'static str| {
+            let answered = AnsweredBody::default();
+            answered.set(Bytes::from_static(body.as_bytes()));
+            RetryingModel::new(AlwaysUnusableModel(Default::default()), RetryPolicy::default())
+                .with_answered(answered)
+                .name_finish_reason("empty".into())
+        };
+        assert_eq!(named(r#"{"stop_reason":"refusal"}"#), "finish reason refusal: empty");
+        assert_eq!(named(r#"{"choices":[{}]}"#), "empty");
+        assert_eq!(named("not json"), "empty");
+        assert_eq!(model.name_finish_reason("empty".into()), "empty");
+    }
+
     /// With retries off the wrapper is a pass-through: one call, no clone of
     /// the request, no wait.
     #[tokio::test]
@@ -1645,6 +1771,7 @@ mod tests {
         let result = send_with_retry::<Bytes>(
             test_client(),
             loop_policy(),
+            AnsweredBody::default(),
             Method::POST,
             format!("http://127.0.0.1:{port}/v1/chat/completions")
                 .parse()
@@ -1810,6 +1937,7 @@ mod tests {
         let result = send_with_retry::<Bytes>(
             test_client(),
             loop_policy(),
+            AnsweredBody::default(),
             Method::POST,
             format!("http://127.0.0.1:{port}/v1/chat/completions")
                 .parse()
@@ -1835,6 +1963,7 @@ mod tests {
         let err = send_with_retry::<Bytes>(
             test_client(),
             loop_policy(),
+            AnsweredBody::default(),
             Method::POST,
             format!("htps://127.0.0.1:{REFUSED_PORT}/v1/chat/completions")
                 .parse()

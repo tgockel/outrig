@@ -1238,11 +1238,12 @@ async fn build_single(
         } => {
             let policy = retry_policy(*retry_budget_secs);
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
+            let answered = http.answered();
             let client = openai_client(base_url, api_key, http)?;
             let model = openai_model(&client, candidate);
             let agent = RigAgent::OpenAi {
                 agent: finish_agent(
-                    retry::RetryingModel::new(model, policy),
+                    retry::RetryingModel::new(model, policy).with_answered(answered),
                     resolved,
                     candidate.max_tokens,
                     tools,
@@ -1259,11 +1260,12 @@ async fn build_single(
         } => {
             let policy = retry_policy(*retry_budget_secs);
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
+            let answered = http.answered();
             let client = anthropic_client(base_url, api_key, http)?;
             let (model, max_tokens) = anthropic_model(&client, candidate);
             let agent = RigAgent::Anthropic {
                 agent: finish_agent(
-                    retry::RetryingModel::new(model, policy),
+                    retry::RetryingModel::new(model, policy).with_answered(answered),
                     resolved,
                     max_tokens,
                     tools,
@@ -1318,11 +1320,12 @@ async fn build_candidate(
             ..
         } => {
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
+            let answered = http.answered();
             let client = openai_client(base_url, api_key, http)?;
             let model = openai_model(&client, candidate);
             Ok((
                 Box::new(failover::ModelCandidate::new(
-                    retry::RetryingModel::new(model, policy.clone()),
+                    retry::RetryingModel::new(model, policy.clone()).with_answered(answered),
                     &candidate.model_name,
                     &candidate.model_identifier,
                     candidate.max_tokens,
@@ -1337,11 +1340,12 @@ async fn build_candidate(
             ..
         } => {
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
+            let answered = http.answered();
             let client = anthropic_client(base_url, api_key, http)?;
             let (model, max_tokens) = anthropic_model(&client, candidate);
             Ok((
                 Box::new(failover::ModelCandidate::new(
-                    retry::RetryingModel::new(model, policy.clone()),
+                    retry::RetryingModel::new(model, policy.clone()).with_answered(answered),
                     &candidate.model_name,
                     &candidate.model_identifier,
                     max_tokens,

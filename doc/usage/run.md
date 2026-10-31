@@ -408,16 +408,17 @@ calls that already ran, where a resent prompt could have it run them a second ti
 [LLM providers](../concepts/llm-providers.md) for which failures count as transient.
 
 A provider that answers with nothing usable is handled the same way, down to what the
-conversation keeps. The call is retried twice before outrig gives up:
+conversation keeps. The call is retried twice before outrig gives up. When the provider named
+a finish reason for the reply, such as `content_filter` or `length`, it leads the message:
 
 ```
-[outrig] model returned an unusable response (Response contained no message or tool call
-        (empty)); retry in 1.4s (attempt 2/3)
+[outrig] model returned an unusable response (finish reason content_filter: Response
+        contained no message or tool call (empty)); retry in 1.4s (attempt 2/3)
 ```
 
 ```
-[outrig] the model returned a response outrig could not use (Response contained no message
-        or tool call (empty)); ending turn
+[outrig] the model returned a response outrig could not use (finish reason content_filter:
+        Response contained no message or tool call (empty)); ending turn
 [outrig] history unchanged -- send the prompt again to retry, or "/quit" to stop.
 ```
 
