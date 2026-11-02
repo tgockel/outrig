@@ -7,14 +7,14 @@ use tracing_subscriber::filter::Directive;
 
 use crate::cli::build::{self, BuildArgs};
 use crate::cli::clean::{self, CleanArgs};
-use crate::cli::design_prompt::{self, DesignArgs};
+use crate::cli::design_prompt::{self, DesignArgs, DesignCommand};
 use crate::cli::discard::{self, DiscardArgs};
 use crate::cli::logs::{self, LogsArgs};
 use crate::cli::ls::{self, LsArgs};
 use crate::cli::mcp::{self, McpArgs};
 use crate::cli::mcp_self as mcp_self_cli;
 use crate::cli::run::{self, RunArgs};
-use crate::error::{CliError, Result};
+use crate::error::{CliError, OutrigError, Result};
 use crate::paths::{
     RepoConfig, resolve_global_config, resolve_repo_config, resolve_repo_config_optional,
 };
@@ -188,7 +188,74 @@ fn block_on_session(
     result
 }
 
+/// The subcommand `--config` is not read by, spelled as `outrig <name>`,
+/// paired with the line that says what it reads instead. `None` is one of the
+/// three that do read the flag: `run`, `mcp` as a server, and `build`.
+fn config_ignored_by(cmd: &Cmd) -> Option<(&'static str, &'static str)> {
+    /// `image add`, which finds the repo config the way a command without
+    /// `--config` finds one: `repo::resolve_or_bootstrap` walks up from cwd.
+    const WALKS_UP: &str = "it writes the repo config it finds by walking up from the current \
+         directory, so run it from the repo you mean";
+    /// `init`, which does not walk: `init::run_with` sets up the directory it
+    /// was run in, whatever an ancestor holds.
+    const CWD_ONLY: &str = "it sets up the current directory, writing \
+         .agents/outrig/config.toml there";
+    const NO_REPO_CONFIG: &str = "it reads no repo config";
+    const GLOBAL_ONLY: &str = "it writes the global config, which --global-config names";
+
+    match cmd {
+        Cmd::Run(_) | Cmd::Build(_) => None,
+        // Only the server reads a config; `mcp self` describes outrig itself.
+        Cmd::Mcp(args) => args
+            .is_self_description()
+            .then_some(("mcp self", NO_REPO_CONFIG)),
+        // Matched through to the leaf, so a subcommand added beside these
+        // has to say its own spelling rather than inherit a wrong one.
+        Cmd::Design(args) => Some(match &args.cmd {
+            DesignCommand::Prompt(_) => ("design prompt", NO_REPO_CONFIG),
+        }),
+        Cmd::Config(args) => Some(match &args.cmd {
+            ConfigCmd::Init { .. } => ("config init", GLOBAL_ONLY),
+        }),
+        Cmd::Init { .. } => Some(("init", CWD_ONLY)),
+        Cmd::Image(args) => Some(match &args.cmd {
+            ImageCmd::Add { .. } => ("image add", WALKS_UP),
+            ImageCmd::Init { .. } => ("image init", NO_REPO_CONFIG),
+            ImageCmd::Build { .. } => ("image build", NO_REPO_CONFIG),
+            ImageCmd::Inspect { .. } => ("image inspect", NO_REPO_CONFIG),
+        }),
+        Cmd::Ls(_) => Some(("ls", NO_REPO_CONFIG)),
+        Cmd::Logs(_) => Some(("logs", NO_REPO_CONFIG)),
+        Cmd::Discard(_) => Some(("discard", NO_REPO_CONFIG)),
+        Cmd::Clean(_) => Some(("clean", NO_REPO_CONFIG)),
+    }
+}
+
+/// Stop a command that would ignore the `--config` it was given.
+///
+/// The flag is global, so every subcommand accepts it, but only `run`, `mcp`,
+/// and `build` read one. The rest used to take it and go on as if it were
+/// absent, which for the commands that write a config meant writing somewhere
+/// else: `outrig --config ci/outrig.toml image add foo` put `[images.foo]`
+/// into the repo's own `.agents/outrig/config.toml`, and the next
+/// `outrig --config ci/outrig.toml build --image foo` read the named file and
+/// reported no such image (#412). Refusing makes the flag mean one thing --
+/// the file the command reads -- and says which commands that is, rather than
+/// leaving the mistake to be noticed a command later.
+fn refuse_ignored_config(cli: &Cli) -> Result<()> {
+    let (Some(path), Some((name, reason))) = (&cli.config, config_ignored_by(&cli.cmd)) else {
+        return Ok(());
+    };
+    Err(OutrigError::Configuration(format!(
+        "`outrig {name}` does not read --config {path}: {reason}\n\
+         help: only `run`, `mcp`, and `build` read the repo config --config names",
+        path = path.display(),
+    ))
+    .into())
+}
+
 fn dispatch(cli: &Cli) -> Result<i32> {
+    refuse_ignored_config(cli)?;
     match &cli.cmd {
         Cmd::Run(args) => {
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
@@ -416,7 +483,7 @@ fn repo_cmd_ctx(
 mod tests {
     use clap::{Parser, error::ErrorKind};
 
-    use super::{Cli, Cmd, EnvFilter, ImageCmd, log_filter_spec, quiet_rustyline};
+    use super::{Cli, Cmd, EnvFilter, ImageCmd, config_ignored_by, log_filter_spec, quiet_rustyline};
 
     /// The `outrig ...` lines of the README's `## Commands` fence, with
     /// trailing comments dropped and an `a|b` alternation in the final word
@@ -516,6 +583,20 @@ mod tests {
     #[test]
     fn log_filter_defaults_to_info() {
         assert_eq!(log_filter_spec(None, None), "info");
+    }
+
+    /// `--config` means the repo config, and `mcp` is the one subcommand that
+    /// reads it in one mode and not in the other: serving a repo reads it,
+    /// `mcp self` describes outrig itself and has nothing to read it for
+    /// (#412).
+    #[test]
+    fn mcp_reads_config_as_a_server_but_not_as_self() {
+        let serving = Cli::try_parse_from(["outrig", "mcp"]).expect("`mcp` parses");
+        assert_eq!(config_ignored_by(&serving.cmd), None);
+
+        let described = Cli::try_parse_from(["outrig", "mcp", "self"]).expect("`mcp self` parses");
+        let (name, _) = config_ignored_by(&described.cmd).expect("`mcp self` reads no config");
+        assert_eq!(name, "mcp self");
     }
 
     #[test]

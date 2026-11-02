@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A subcommand that does not read `--config` now refuses it instead of ignoring it.** The
+  flag is global, so `init`, `config init`, `image add`, `image init`, `image build`,
+  `image inspect`, `design prompt`, `mcp self`, `ls`, `logs`, `discard`, and `clean` all
+  accepted it and carried on as if it were absent -- `outrig --config ci/outrig.toml image
+  add foo` wrote `[images.foo]` into the repo's own `.agents/outrig/config.toml`, and the
+  next `outrig --config ci/outrig.toml build --image foo` read `ci/outrig.toml` and reported
+  no such image. Each now stops before prompting or writing, naming itself and saying that
+  only `run`, `mcp`, and `build` read the repo config. `doc/reference/cli.md` no longer calls
+  `--config` accepted by every subcommand. (#412)
+
 - **`outrig run` names the provider's finish reason for a reply it cannot use.** A reply
   ended with `content_filter` and no content used to read only "Response contained no
   message or tool call (empty)" in the retry line and the final error, which looked the same

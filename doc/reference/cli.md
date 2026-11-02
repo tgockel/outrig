@@ -10,7 +10,9 @@ outrig --help
 
 ## Global flags
 
-These are accepted by every subcommand.
+Every subcommand accepts these, with one exception: `--config` names the repo config, and only
+`run`, `mcp` (serving a repo), and `build` read one. Any other subcommand refuses the flag,
+naming itself, rather than accepting a flag it would ignore.
 
 | Flag                     | Description                                                 |
 |--------------------------|-------------------------------------------------------------|
@@ -47,6 +49,18 @@ config-less run. Which repo the command then runs against depends on where the f
   as a `--global-config` file's do (see [path resolution](config.md#path-resolution)). Where the
   file sits never decides which directory is mounted as the workspace.
 
+Every other subcommand stops with an error naming itself -- `` `outrig image add` does not read
+--config <path> `` -- before it prompts or writes anything. `init`, `config init`, `image add`,
+`image init`, `image build`, `image inspect`, `design prompt`, `mcp self`, `ls`, `logs`,
+`discard`, and `clean` all read no repo config through the flag, and taking it silently meant
+acting on a different file than the one named: `outrig --config ci/outrig.toml image add foo`
+wrote `[images.foo]` into the repo's own `.agents/outrig/config.toml`, which the following
+`outrig --config ci/outrig.toml build --image foo` did not read. `image add` writes the config it
+finds by walking up from the current directory, so run it from the repo whose config is meant;
+`init` does not walk at all -- it sets up the directory it is run in, writing
+`.agents/outrig/config.toml` there even when an ancestor has one -- and `config init` writes the
+global config, which `--global-config` names.
+
 `--global-config` resolves in this order: this flag, then `<XDG_CONFIG_HOME>/outrig/config.toml`
 when `XDG_CONFIG_HOME` is set to an absolute path, then `~/.outrig/config.toml` (the
 outrig-specific fallback -- note this is `~/.outrig/`, not `~/.config/outrig/`). As the XDG Base
@@ -65,7 +79,7 @@ file the flag names, so for them it need not exist yet.
 
 `--session-root` resolves in this order: this flag, then `session-root` in the global config, then
 `<XDG_DATA_HOME>/outrig/sessions/`. The config key is global-only, so `ls`, `logs`, `discard`, and
-`clean` read no repo config at all and ignore `--config`: they find the same root from any
+`clean` read no repo config at all and refuse `--config`: they find the same root from any
 directory. Given `--session-root`, or `--session-dir` for `logs`, they read no
 global config either, so a `--global-config` path is not checked.
 

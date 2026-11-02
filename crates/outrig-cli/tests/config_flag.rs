@@ -116,6 +116,64 @@ async fn a_missing_config_is_refused() {
     }
 }
 
+/// #412: a subcommand that does not read `--config` refuses it, naming
+/// itself, rather than accepting the flag and going on as if it were absent.
+/// `outrig --config <out-of-tree> image add foo` used to walk up from cwd and
+/// write `[images.foo]` into the repo's own config, which the next
+/// `build --config <out-of-tree>` did not read. The refusal lands before any
+/// prompt or write, so an existing file is refused as surely as a missing one
+/// and `image add` needs no input to reach it.
+#[tokio::test]
+async fn a_subcommand_that_ignores_config_refuses_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (proj, named) = issue_fixture(tmp.path());
+
+    // Each subcommand as it is invoked, and the spelling its refusal uses --
+    // the command, without the arguments that follow it.
+    for (args, spelling) in [
+        (&["init"][..], "init"),
+        (&["config", "init"], "config init"),
+        (&["image", "add", "foo"], "image add"),
+        (&["image", "init"], "image init"),
+        (&["image", "build"], "image build"),
+        (
+            &["image", "inspect", "debian:bookworm-slim"],
+            "image inspect",
+        ),
+        (&["design", "prompt"], "design prompt"),
+        (&["mcp", "self"], "mcp self"),
+        (&["ls"], "ls"),
+        (&["logs"], "logs"),
+        (&["discard", "nosuch"], "discard"),
+        (&["clean"], "clean"),
+    ] {
+        let mut argv = vec!["--config", utf8(&named)];
+        argv.extend_from_slice(args);
+        let (ok, stderr) = run_outrig(&proj, &argv).await;
+
+        assert!(
+            !ok,
+            "`outrig {spelling}` must refuse a --config it does not read:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "`outrig {spelling}` does not read --config {}",
+                named.display()
+            )),
+            "`outrig {spelling}` must name itself and the path:\n{stderr}",
+        );
+        assert!(
+            stderr.contains("only `run`, `mcp`, and `build` read"),
+            "`outrig {spelling}` must say which commands read the flag:\n{stderr}",
+        );
+    }
+
+    // The repo config `image add` would have written is untouched -- the
+    // refusal precedes the walk up from cwd as well as the prompts.
+    let planted = fs::read_to_string(tmp.path().join("home/u/.agents/outrig/config.toml")).unwrap();
+    assert!(!planted.contains("foo"), "{planted}");
+}
+
 /// #342's reproduction: the repo's agent runs on a model only the global
 /// config declares, and `--global-config` misspells that file. Every command
 /// that reads the global config stops at the flag and names the path. It
