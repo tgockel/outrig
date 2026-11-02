@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use super::agent_tests::{messages, round};
 use super::children_tests::{
-    Tree, child_runs, data, kind, of_agent, opening, primary_runs, printed, serving, tree_built,
+    Tree, child_runs, data, kind, of_agent, primary_runs, printed, serving, tree_built,
 };
 use super::mock_http::{RecordedRequest, Responder, scripted, submit, system_text, text_reply};
 use crate::harness::event::Event;
@@ -242,8 +242,8 @@ async fn the_parse_is_a_typed_call_and_the_entry_gets_its_binding() {
     assert_eq!(settled["invocation"], id);
     assert_eq!(settled["outcome"], "accepted");
 
-    // Its instructions are the runtime's and the entry's docstring; the schema
-    // of what it completes with opens its round.
+    // Its instructions are the runtime's, the entry's docstring and the schema
+    // of what it completes with.
     let parser = of_agent(&requests, "ROLE parser");
     let system = system_text(&parser[0].body);
     assert!(
@@ -254,7 +254,7 @@ async fn the_parse_is_a_typed_call_and_the_entry_gets_its_binding() {
         system.contains("ROLE parser. Review the diff against `base`, one section at a time."),
         "{system}"
     );
-    let schema = opening(parser[0]);
+    let schema = system_text(&parser[0].body);
     for expected in [
         "ReviewDiffParams",
         "\"base\"",
@@ -1126,7 +1126,7 @@ async fn a_literal_is_an_enum_and_a_surplus_key_is_refused() {
         "{}",
         invalid[1]
     );
-    let schema = opening(of_agent(&requests, "ROLE tagger")[0]);
+    let schema = system_text(&of_agent(&requests, "ROLE tagger")[0].body);
     assert!(schema.contains("\"enum\""), "{schema}");
 }
 

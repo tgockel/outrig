@@ -174,10 +174,10 @@ async fn the_maintainers_analyze_code_returns_a_review_result() {
     let system = system_text(&child[0].body);
     assert!(
         system.contains(
-            "ROLE reviewer. Review one section of a unified diff for correctness and safety.\n\n\
-             The section is available to you as the variable `section`. Report each\n\
-             problem you find under a short problem-forward kebab-case id; {section}\n\
-             and {} here are braces, not placeholders."
+            "    ROLE reviewer. Review one section of a unified diff for correctness and safety.\n\n\
+             \x20   The section is available to you as the variable `section`. Report each\n\
+             \x20   problem you find under a short problem-forward kebab-case id; {section}\n\
+             \x20   and {} here are braces, not placeholders."
         ),
         "the docstring as written: {system}"
     );
@@ -188,9 +188,12 @@ async fn the_maintainers_analyze_code_returns_a_review_result() {
     let opened = opening(child[0]);
     assert!(
         opened.contains("`section` (str): \"diff --git a/src/net/retry.py")
-            && opened.contains("pre-existing-issues")
-            && opened.contains("a `ReviewResult`"),
-        "the manifest and the result's schema open the submission: {opened}"
+            && !opened.contains("pre-existing-issues"),
+        "the manifest alone opens the submission: {opened}"
+    );
+    assert!(
+        system.contains("pre-existing-issues") && system.contains("a `ReviewResult`"),
+        "the result's schema is in the instructions: {system}"
     );
     let started = data(kind(&events, "agent.call.started", None)[0]);
     assert_eq!(started["digest"], sha256_hex(REVIEW_SKILL.as_bytes()));

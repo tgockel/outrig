@@ -3891,9 +3891,10 @@ class Runtime:
         """
         return await self._spawn(name, prompt, model, inputs, requests)
 
-    async def _spawn(self, name, prompt, model, inputs, requests, instance=None):
+    async def _spawn(self, name, prompt, model, inputs, requests, instance=None, call=None):
         # `instance`, an agent class instance's `_Instance`, names its class to the host, which
         # gives the child its orienting round, and brings the record its requests are held on.
+        # `call`, a typed call's `_Call`, tells the host to brief the child as that call.
         kernel = self._kernel
         if type(name) is not str or not name or len(name) > 64:
             raise ValueError(f"a child's name is a non-empty str of at most 64 characters, "
@@ -3943,6 +3944,11 @@ class Runtime:
                 "channels": said,
                 "invocations": [] if _skills is None else _skills._current(),
                 "instance": None if instance is None else instance.said}
+        if call is not None:
+            d = call.declaration
+            line["call"] = {"signature": d.signature,
+                            "result": {"type": d.result_type,
+                                       "schema": d.schema.text()}}
         _refuse_long(line, "spawn", "shorten the prompt, or give fewer inputs or channels")
         _spawning[spawn] = {"parent": kernel, "name": name, "kind": kind, "channels": channels,
                             "inputs": copies, "classes": bound,
@@ -4830,7 +4836,9 @@ def _submit(child, kernel, inputs, result, attempts, call=None):
                  attempts, None if call is None else call.id)
     notice = {"t": "agent.request", "agent": kernel.agent, "request": work.id, "child": child.id,
               "channel": None, "attempts": attempts, "manifest": manifest,
-              "result": {"type": _schema._describe(result), "schema": declared.text()},
+              "result": {"type": _schema._describe(result) if call is None
+                         else call.declaration.result_type,
+                         "schema": declared.text() if call is None else None},
               "body": _agents.preview(encoded) if _observing else None}
     _refuse_long(notice, "submission", "submit fewer inputs, or a smaller result type")
     child.take("submission")
@@ -4947,7 +4955,8 @@ class _Call(_Work):
             if self.state in _ENDED:
                 return  # cancelled before this started: nothing is sent
             try:
-                child = await kernel.runtime.spawn(d.fn.__name__[:64], prompt=d.doc, model=d.model)
+                child = await kernel.runtime._spawn(
+                    d.fn.__name__[:64], d.doc, d.model, inputs=None, requests=None, call=self)
             except Exception as e:
                 self.end(_REFUSED.get(type(e).__name__, "failed"), error=e)
                 return

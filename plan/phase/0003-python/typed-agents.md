@@ -55,8 +55,8 @@ cover `Literal`: checked against the payload, its contract check refuses `Review
 
 Each argument is checked against its parameter's type before any child starts, and is bound into
 the child's namespace as a variable of the parameter's name. The child's instructions are the
-docstring, a generated **input manifest** -- each input's name, type and a bounded preview -- and
-the result type's schema text.
+docstring and the result type's schema text, under the call's signature. The generated **input
+manifest** -- each input's name, type and a bounded preview -- opens the submission's round.
 
 Nothing is interpolated into the docstring, which is not passed through `str.format`. Braces are
 common in code-review prose and would break it, and putting untrusted diff text straight into

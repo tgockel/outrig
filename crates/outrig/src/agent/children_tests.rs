@@ -345,8 +345,8 @@ async fn a_parent_awaits_its_work_childs_typed_result() {
         "{opening}"
     );
     assert!(
-        system_text(&child_opening.body).contains("No user reaches you"),
-        "a child is told it has no user"
+        !system_text(&child_opening.body).contains("channels[\"user\"]"),
+        "a child is not told of a user channel"
     );
 
     let spawned = kind(&events, "agent.spawned", Some("agent/c1"));

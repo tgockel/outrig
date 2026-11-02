@@ -645,6 +645,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A decorated call's child is briefed as that call.** Its instructions name the call
+  (`city_fact(country: str) -> Fact`), hold the docstring and the result type's schema, and speak
+  of one submission; its opening names the submission and inputs only. No child is told it has no
+  user channel.
 - **`RemoteModelMissingIdentifier` names the style the model is called with**, its own or its
   provider's, and its message says `style=` where it said `provider style=`.
 - **Breaking: `style = "openai"` is `style = "chat-completions"`.** The style is named for its

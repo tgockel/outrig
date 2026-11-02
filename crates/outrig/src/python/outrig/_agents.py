@@ -545,6 +545,8 @@ class Declaration:
     validate: object
     model: object
     digest: object  # SHA-256 hex digest of the source that declared `fn`, or None
+    signature: str  # the call as the child is told it: `name(p: T, ...) -> R`
+    result_type: str  # the result's type as named, without its `doc()` text: `R`
 
     @property
     def name(self):
@@ -672,9 +674,14 @@ def _declare(fn, validate, model):
             f"{name}: model names a configured model, a str, not "
             f"{schema._type_qualname(type(model))}"
         )
+    # Named without what `doc()` adds, which the schema carries once.
+    bare = typing.get_type_hints(fn)
+    taken = ", ".join(f"{p}: {schema._describe(bare[p])}" for p in signature.parameters)
+    result_type = schema._describe(bare["return"])
     return Declaration(
         fn, fn.__module__, fn.__qualname__, inspect.cleandoc(fn.__doc__), parameters, result,
         declared, validate, model, _digest(fn),
+        f"{fn.__name__}({taken}) -> {result_type}", result_type,
     )
 
 

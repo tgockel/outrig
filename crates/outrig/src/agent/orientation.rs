@@ -111,6 +111,10 @@ pub(crate) fn preamble(
     text
 }
 
+/// What a child that completes submissions is told of `runtime.wait`.
+const WAIT: &str = "`runtime.wait` is `asyncio.wait`: the same arguments, the same `(done, pending)` \
+                    back, and a timeout that cancels nothing.\n\n";
+
 /// What every agent is told after how it is reached: its conversation, a
 /// round beginning `begins`, its working directory, the interpreter, and the
 /// session's bindings.
@@ -153,6 +157,12 @@ fn rest(workspace: Option<&Path>, bindings: &[Brief], window: Window, begins: &s
 /// them.
 pub(crate) enum ChildBrief<'a> {
     Work,
+    /// The one child of one typed call, which is that call.
+    Call {
+        signature: &'a str,
+        result_type: &'a str,
+        schema: &'a str,
+    },
     Request(&'a [ChannelText]),
     Instance(&'a [ChannelText]),
 }
@@ -180,13 +190,21 @@ pub(crate) fn child_preamble(
     brief: &ChildBrief<'_>,
 ) -> String {
     let mut text = String::from(ACT);
-    text.push_str(
-        "You are a child agent: another agent's code launched you to do work for it, and that \
-         code is who you answer. No user reaches you, and you have no \
-         `runtime.channels[\"user\"]`.\n\n",
-    );
-    text.push_str(prompt.trim());
-    text.push_str("\n\n");
+    if let ChildBrief::Call { signature, .. } = brief {
+        let _ = write!(
+            text,
+            "You are a child agent: another agent's code called `{signature}`, and you are that \
+             call. The function's docstring is your instructions, indented below:\n\n{}\n\n",
+            indented(prompt.trim())
+        );
+    } else {
+        text.push_str(
+            "You are a child agent: another agent's code launched you to do work for it, and \
+             that code is who you answer.\n\n",
+        );
+        text.push_str(prompt.trim());
+        text.push_str("\n\n");
+    }
     if !inputs.is_empty() {
         text.push_str("These names were bound for you before you began:\n");
         for input in inputs {
@@ -199,6 +217,27 @@ pub(crate) fn child_preamble(
         text.push('\n');
     }
     let begins = match brief {
+        ChildBrief::Call {
+            result_type,
+            schema,
+            ..
+        } => {
+            let _ = write!(
+                text,
+                "Your round opens on the call's submission, naming it and binding each argument as \
+                 a variable of its parameter's name. Complete it with `await \
+                 runtime.complete(value)`, `value` a `{result_type}` -- bound under that name, \
+                 with every dataclass it uses -- or its JSON form:\n\n{}\n\n\
+                 It returns once the value is accepted, which ends the call; nothing more is \
+                 asked of you. One that is not accepted raises what is wrong, each problem with \
+                 its path, so correct it and complete again. A round that ends with the \
+                 submission open is followed by one more, and if that one ends with it open too, \
+                 the call fails. `await runtime.channels[\"progress\"].send(text)` tells your \
+                 caller how far you have got, and settles nothing.\n\n{WAIT}",
+                indented(schema)
+            );
+            "on the call's submission, and once more if that round leaves it open"
+        }
         ChildBrief::Work => {
             text.push_str(
                 "Your work arrives as submissions. A round opens on each one, naming it, binding \
@@ -210,10 +249,9 @@ pub(crate) fn child_preamble(
                  and complete again. A round that ends with the submission open is followed by \
                  one more, and if that one ends with it open too, the submission fails. `await \
                  runtime.channels[\"progress\"].send(text)` tells your caller how far you have \
-                 got, and settles nothing.\n\n\
-                 `runtime.wait` is `asyncio.wait`: the same arguments, the same `(done, pending)` \
-                 back, and a timeout that cancels nothing.\n\n",
+                 got, and settles nothing.\n\n",
             );
+            text.push_str(WAIT);
             "each time a submission is given to you, or one stays open"
         }
         ChildBrief::Request(channels) | ChildBrief::Instance(channels) => {
@@ -262,7 +300,10 @@ pub(crate) fn child_preamble(
 fn indented(schema: &str) -> String {
     schema
         .lines()
-        .map(|line| format!("    {line}"))
+        .map(|line| match line {
+            "" => String::new(),
+            _ => format!("    {line}"),
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -374,7 +415,14 @@ pub(crate) fn submission(
     result_type: &str,
     schema: &str,
 ) -> (String, String) {
-    let lead = format!("submission {id} is yours to complete");
+    // A typed call's schema is in its instructions, which call its work the call's submission.
+    let call = schema.is_empty();
+    let which = if call {
+        "the call's submission"
+    } else {
+        "submission"
+    };
+    let lead = format!("{which} {id} is yours to complete");
     let mut detail = String::new();
     if inputs.is_empty() {
         detail.push_str("It has no inputs.\n");
@@ -388,10 +436,12 @@ pub(crate) fn submission(
             );
         }
     }
-    let _ = write!(
-        detail,
-        "Complete it with `await runtime.complete(value)`, `value` a `{result_type}`:\n{schema}"
-    );
+    if !call {
+        let _ = write!(
+            detail,
+            "Complete it with `await runtime.complete(value)`, `value` a `{result_type}`:\n{schema}"
+        );
+    }
     (lead, detail)
 }
 
@@ -445,5 +495,68 @@ pub(crate) fn opening(announcement: &str, omitted: usize) -> String {
         n => format!(
             "[outrig] {announcement}. {n} earlier turns are not shown; runtime.history has them."
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preamble(brief: &ChildBrief<'_>, inputs: &[InputBrief]) -> String {
+        child_preamble(
+            None,
+            &[],
+            Window::DEFAULT,
+            "Name the capital.",
+            inputs,
+            brief,
+        )
+    }
+
+    #[test]
+    fn a_call_child_is_briefed_as_the_call() {
+        let text = preamble(
+            &ChildBrief::Call {
+                signature: "city_fact(country: str) -> Fact",
+                result_type: "Fact",
+                schema: "{\n  \"type\": \"object\"\n}",
+            },
+            &[],
+        );
+        assert!(
+            text.contains("called `city_fact(country: str) -> Fact`"),
+            "{text}"
+        );
+        assert!(text.contains("    Name the capital."), "{text}");
+        assert!(text.contains("`value` a `Fact`"), "{text}");
+        assert!(
+            text.contains("    {\n      \"type\": \"object\"\n    }"),
+            "{text}"
+        );
+        assert!(!text.contains("channels[\"user\"]"), "{text}");
+        assert!(!text.contains("submissions"), "{text}");
+    }
+
+    #[test]
+    fn no_child_is_told_of_the_user_channel() {
+        for brief in [ChildBrief::Work, ChildBrief::Request(&[])] {
+            let text = preamble(&brief, &[]);
+            assert!(!text.contains("channels[\"user\"]"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_call_opening_names_the_inputs_not_the_schema() {
+        let inputs = [InputBrief {
+            name: "country".into(),
+            type_name: "str".into(),
+            preview: "\"Japan\"".into(),
+        }];
+        let (lead, detail) = submission(4, &inputs, "Fact", "");
+        assert_eq!(lead, "the call's submission 4 is yours to complete");
+        assert!(detail.contains("`country` (str)"), "{detail}");
+        assert!(!detail.contains("SCHEMA"), "{detail}");
+        let (_, detail) = submission(4, &inputs, "Fact", "{SCHEMA}");
+        assert!(detail.contains("SCHEMA"), "{detail}");
     }
 }

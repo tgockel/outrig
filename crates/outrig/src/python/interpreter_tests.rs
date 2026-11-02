@@ -5414,6 +5414,33 @@ async def add(xs: list[int], scale: int = 1) -> Total:
     raise AssertionError("the body ran")
 "#;
 
+/// A result whose `doc()` text is large is in the spawn once, as the schema: the signature and
+/// the result's type name it without that text, so the call is launched, not refused for size.
+#[test]
+fn a_calls_documentation_is_sent_once() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        r#"
+import outrig
+from typing import Annotated
+
+@outrig.agent
+async def big(n: int) -> Annotated[str, outrig.schema.doc("x" * 400_000)]:
+    """ROLE big."""
+"#,
+    );
+    let (_, asked, _, request) = k.called(2, "big(1)", "c1");
+    assert_eq!(asked["call"]["signature"], "big(n: int) -> str");
+    assert_eq!(asked["call"]["result"]["type"], "str");
+    assert_eq!(request["result"]["type"], "str");
+    let schema = asked["call"]["result"]["schema"].as_str().expect("schema");
+    assert!(
+        schema.contains("xxxx"),
+        "the documentation is in the schema"
+    );
+}
+
 /// `bytes` as the digest a declaration carries.
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
@@ -5702,6 +5729,22 @@ fn a_call_launches_a_child_gives_it_the_inputs_and_releases_it() {
         ])
     );
     assert_eq!(request["result"]["type"], "Total");
+    assert_eq!(
+        request["result"]["schema"],
+        Value::Null,
+        "the schema is in the instructions, not the opening"
+    );
+    assert_eq!(
+        asked["call"]["signature"],
+        "add(xs: list[int], scale: int) -> Total"
+    );
+    assert_eq!(asked["call"]["result"]["type"], "Total");
+    assert!(
+        asked["call"]["result"]["schema"]
+            .as_str()
+            .is_some_and(|schema| schema.contains("\"total\"")),
+        "{asked}"
+    );
     assert_eq!(request["attempts"], 3);
     assert_eq!(k.output(3, "print(h.status)"), "queued (child idle)\n");
 

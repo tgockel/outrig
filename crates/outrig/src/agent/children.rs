@@ -220,7 +220,8 @@ enum Req {
     Ended(RequestEnd),
 }
 
-/// What a submission's round opens with: its inputs, and its result's type.
+/// What a submission's round opens with: its inputs, and its result's type and schema -- empty
+/// for a typed call's, whose instructions already hold the schema.
 #[derive(Clone)]
 pub(crate) struct Submission {
     pub(crate) inputs: Vec<InputBrief>,
@@ -814,7 +815,13 @@ impl Inner {
         // An agent class instance's child, which has a round of its own as it launches: a root
         // child's instance has the id its kernel gave it, which no other has.
         let instance = minted.or(line["instance"]["id"].as_u64());
+        let call = &line["call"];
         let brief = match kind {
+            ChildKind::Work if call.is_object() => ChildBrief::Call {
+                signature: call["signature"].as_str().unwrap_or_default(),
+                result_type: call["result"]["type"].as_str().unwrap_or_default(),
+                schema: call["result"]["schema"].as_str().unwrap_or_default(),
+            },
             ChildKind::Request if instance.is_some() => ChildBrief::Instance(&channels),
             ChildKind::Request => ChildBrief::Request(&channels),
             _ => ChildBrief::Work,
