@@ -67,6 +67,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A container interception cannot put a resolver in is refused by what it owes, not by an
+  errno.** Attach creates `/etc/resolv.conf` for a container that has none, and a create that
+  failed surfaced as a bare "failed to create" path error whose cause repeated it, naming neither
+  the container nor the one thing the image had to supply. It now refuses the way every other
+  unusable resolver shape does, as `container "x" cannot be network-intercepted: ...`, and says
+  that interception creates the resolver a container does not have, so the image needs an `/etc`
+  outrig can write `/etc/resolv.conf` into. A file that appeared since the probe found none is
+  still a race, and says so. The reference and Containers now state what either mode asks of an
+  image, since nothing in it is run: that `/etc`, for the exec-stdio sidecars whose resolver is
+  not baked in with `--dns`, and nothing else -- a shell-less base intercepts like any other.
+  (#410)
 - **A bracketed IPv6 `Host:` header with a port is read as its address.** The cleartext sniffer
   trimmed `[` and `]` from the ends of the value, so `Host: [2001:db8::1]:443` became
   `2001:db8::1]:443` -- neither an IP nor a name -- and an address deny naming that host could not

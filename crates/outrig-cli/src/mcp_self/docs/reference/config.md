@@ -194,6 +194,20 @@ closed as soon as it is accepted and recorded with `outrig.action = "deny"` and 
 "not-redirected"`, in either mode. If either mode is requested and setup fails, the session fails
 before MCP servers launch.
 
+Nothing from the image runs. The only program either mode enters into a container is the host's
+`nft`, and only into its network namespace; the resolver rewrite is outrig's own code acting on a
+descriptor a forked child opens inside the container's user and mount namespaces. So an image
+with no shell intercepts like any other. What a container does have to supply is the existing,
+writable `/etc` the user bootstrap already asks of it (see
+[Containers](../concepts/containers.md#dont-set-up-a-user-in-the-dockerfile), where the `sleep`
+a minimal base also needs is described), and even that only where the resolver was not baked in
+at create time: the primary under either mode, and every entrypoint-stdio sidecar, is created
+with `--dns` naming the listener, so no file of theirs is touched, while a sidecar whose servers
+are `podman exec`'d into it has its `/etc/resolv.conf` rewritten at attach and put back at
+detach. A resolver that cannot be read, written, or created -- a dangling symlink, something
+that is not a regular file, no `/etc` to create it in -- fails the attach with a refusal naming
+the container and what it needs.
+
 Either mode refuses a container that holds `NET_ADMIN`. `CAP_NET_ADMIN` in a container's own
 network namespace is control of its nftables, so a root process in that container could delete the
 redirect table and leave no record. A container holds it when its `cap-add` lists `NET_ADMIN` --

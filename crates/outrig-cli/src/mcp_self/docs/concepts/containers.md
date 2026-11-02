@@ -538,6 +538,15 @@ Session `[network]` policy applies to every container: the network interceptor a
 one before any MCP server connects. It attaches to the primary and to an entrypoint-stdio
 sidecar before their processes run; an exec-stdio sidecar is already running when it attaches.
 
+Attaching runs nothing from the image. The only program it enters into a container is the host's
+`nft`, in that container's network namespace; the primary and entrypoint-stdio sidecars are
+created with `--dns` naming the interceptor's listener, and an exec-stdio sidecar's
+`/etc/resolv.conf` is rewritten from the host the way the bootstrap writes `/etc/passwd` -- a
+forked child opens the file inside the container's namespaces, and outrig writes through the
+descriptor. So the writable `/etc` above is the whole of what interception asks of an image, and a
+base with no shell is as attachable as any other. See
+[`[network]`](../reference/config.md#network).
+
 ## What outrig sets in the run
 
 outrig adds `--userns=keep-id`, the primary workspace bind-mount, any configured extra
