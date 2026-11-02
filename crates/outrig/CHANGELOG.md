@@ -67,6 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A bracketed IPv6 `Host:` header with a port is read as its address.** The cleartext sniffer
+  trimmed `[` and `]` from the ends of the value, so `Host: [2001:db8::1]:443` became
+  `2001:db8::1]:443` -- neither an IP nor a name -- and an address deny naming that host could not
+  match the claim, which also showed as a wrong `outrig.host`. The address is now what sits inside
+  the brackets and the `:port` after them is dropped. (#409)
 - **Running outrig as uid 0 no longer rehomes the container's `root` entry to `/home/root`.**
   `Container::bootstrap_user` gave the user at the host uid the home `/home/<name>` and rewrote a
   reused `/etc/passwd` entry to name it -- a rule made for the entry podman's `--userns=keep-id`

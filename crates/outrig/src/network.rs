@@ -4453,8 +4453,9 @@ fn http_host(bytes: &[u8]) -> Option<String> {
 }
 
 fn strip_host_port(host: &str) -> &str {
-    if host.starts_with('[') {
-        return host.trim_matches(|c| c == '[' || c == ']');
+    if let Some(rest) = host.strip_prefix('[') {
+        // `[addr]` or `[addr]:port`: the address is what sits inside.
+        return rest.split_once(']').map_or(rest, |(addr, _port)| addr);
     }
     host.rsplit_once(':')
         .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
@@ -10030,6 +10031,24 @@ options edns0
 
         assert_eq!(decision.action, NetworkAction::Deny);
         assert_eq!(decision.rule, "default");
+    }
+
+    /// A bracketed IPv6 literal carries its port after the `]`; the claim is
+    /// the address alone, with or without one.
+    #[test]
+    fn a_host_header_claim_drops_the_port_and_the_brackets() {
+        for (host, claim) in [
+            ("[2001:db8::1]:443", "2001:db8::1"),
+            ("[2001:db8::1]", "2001:db8::1"),
+            ("example.com:8080", "example.com"),
+            ("example.com", "example.com"),
+        ] {
+            assert_eq!(
+                http_host(&http_request(host)).as_deref(),
+                Some(claim),
+                "Host: {host}"
+            );
+        }
     }
 
     #[test]
