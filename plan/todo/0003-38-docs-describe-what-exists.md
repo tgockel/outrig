@@ -15,9 +15,9 @@ and this one and moved `0003-23` through `0003-31` again, which made this task `
 A fifth, in the planning round of 2026-10-26 that promoted `potential/one-shot-nudging.md` to
 `0003-37`, inserted that task before this one, which made this task `0003-38`.
 
-The planning round of 2026-10-28 appended `0003-39` through `0003-69` after this task rather than
+The planning round of 2026-10-28 appended `0003-39` through `0003-70` after this task rather than
 renumbering it a sixth time: thirty tasks from the first embedding application's requirements,
-each documenting its own addition, and `0003-69` as the cross-cutting documentation pass for what
+each documenting its own addition, and `0003-70` as the cross-cutting documentation pass for what
 they add. This task keeps its scope, the system `0003-01` through `0003-37` built; where a later
 task changes a page this one writes, that task edits the page.
 

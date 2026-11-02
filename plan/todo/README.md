@@ -14,7 +14,7 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
   persistent interpreter in its container rather than by calling MCP tools, and the agent loop
   moves into `outrig` behind a public session API. Host objects, a policy over what crosses to
   them, typed child agents and Python skills follow. The planning round of 2026-10-28 appended
-  `0003-39` through `0003-69`, from the requirements of the first application to embed the
+  `0003-39` through `0003-70`, from the requirements of the first application to embed the
   harness: a task-bound agent an application constructs, external channels, MCP services and
   Rust services in the Session, continuation from a save, and diagnostics that correlate. The
   code lands on `version/0.3.x`.
@@ -95,7 +95,7 @@ tasks is an invariant this file holds.
 
 ### Phase 0003 -- python
 
-`0003-01` through `0003-69` cover the phase's user-visible deliverables. The ordering is
+`0003-01` through `0003-70` cover the phase's user-visible deliverables. The ordering is
 chosen so a person can use the thing early: `0003-01` through `0003-05` are the shortest path to
 an interactive `outrig run-new`, and everything after it is additive. A first draft of this queue
 was built from the phase's exit criteria instead and silently omitted discovery, history, and
@@ -184,7 +184,7 @@ phase.
 
 | Task      | What it settles                                     |
 | --------- | ----------------------------------------------------|
-| `0003-69` | The docs describe what the phase added              |
+| `0003-70` | The docs describe what the phase added              |
 
 Cross-cutting notes the individual tasks carry rather than this file:
 
@@ -229,13 +229,20 @@ Cross-cutting notes the individual tasks carry rather than this file:
   work children. It sits after `0003-34` through `0003-36` and before the documentation, which
   became `0003-38`. `0003-34` lands first and its tests assert the ending `0003-37` replaces, an
   idle child with a request open, so `0003-37` rewrites them.
+- [tgockel/outrig#684](https://github.com/tgockel/outrig/issues/684) folded
+  `plan/next/render-session-lays-out-children.md` in as `0003-69`, between the appended set and
+  its documentation task, which moved to `0003-70` to make room. Every field it reads --
+  `descendants` and `total` on every `model.round.*`, the whole `agent.*` family -- was already in
+  `crates/outrig/src/harness/event.rs`, from `0003-19`, `0003-30`, `0003-31`, `0003-34` and
+  `0003-35`; it needed none of `0003-66`, `0003-67` or `0003-68`, so it is a renderer-only change
+  with no ordering dependency on them, and it landed ahead of them.
 - `plan/phase/0003-python/potential/` holds the alternatives the phase did not adopt out of the
   box, each with the evaluation that would decide it, and `/groom-plan` may turn one into a task.
-- The planning round of 2026-10-28 appended `0003-39` through `0003-69` from the OutRig
+- The planning round of 2026-10-28 appended `0003-39` through `0003-70` from the OutRig
   requirements of CocoClaw's phase 0008 -- its numbered set (OR-AG, OR-CH, OR-MCP, OR-SUS, OR-OBS)
   and its A-series (OR-A1 through OR-A8) -- after validating them against the design pages. The
   A-series' own index calls the work a new phase; the maintainer decided it belongs to this one.
-  `0003-38` keeps its place and its scope, and `0003-69` is the second documentation pass, since a
+  `0003-38` keeps its place and its scope, and `0003-70` is the second documentation pass, since a
   thirty-task insertion is not the kind the five earlier renumberings were for. `0003-35` and
   `0003-36` stay as queued: the first application is a Rust embedder and needs neither, and
   another program depends on both.

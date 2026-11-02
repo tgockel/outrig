@@ -96,15 +96,23 @@ WINDOW_SOURCES = {"assumed": " (assumed)", "provider": " (reported by provider)"
 # The token table's columns.
 TOKEN_COLUMNS = (
     ("round", False),
+    ("agent", False),
     ("outcome", False),
     ("calls", True),
     *((label, True) for _, label in USAGE),
     ("largest request", True),
     ("estimated", True),
     ("window", True),
+    ("total (with descendants)", False),
+    ("descendants", False),
 )
 MESSAGE_COLUMNS = tuple(
     (label, False) for label in ("id", "channel", "from", "to", "sent", "then", "body")
+)
+# The Requests table's columns.
+REQUEST_COLUMNS = tuple(
+    (label, False)
+    for label in ("id", "sender", "child", "call", "inputs", "outcome", "attempts", "value", "usage")
 )
 # The network table's columns, in the order `network_rows` gives its cells, and whether each is a
 # number.
@@ -290,6 +298,50 @@ class Block:
     peak: int | float | None = None
     estimate: int | float | None = None
     window: str = ""
+    # The subject whose round this is, and its label once every `agent.spawned` is seen.
+    subject: str = ""
+    agent: str = ""
+    # The round's own usage plus its descendants' -- the children it launched while it ran --
+    # and the requests those descendants made, each attempt counted once. Grown by a
+    # `model.round.usage` that names this round after it closed.
+    total: dict[str, int | float] | None = None
+    descendants: list = field(default_factory=list)
+    total_text: str = ""
+    descendants_text: str = ""
+
+
+@dataclass
+class Section:
+    """One agent's rounds and what happened outside them: the main agent's, or one child's.
+    Holds the same open/closed bookkeeping `Builder` used to do for the single agent it knew."""
+
+    anchor: str
+    subject: str
+    title: str = ""
+    blocks: list[Block] = field(default_factory=list)
+    open: Block | None = None
+    attempts: Counter[str] = field(default_factory=Counter)
+
+
+@dataclass
+class Request:
+    """A request a sender made of a child, or a typed call: gathered on one entry from
+    `agent.request.*`, and, for a decorated call, `agent.call.*` as well."""
+
+    id: int | str
+    anchor: str
+    sender: str = ""
+    child: str = ""
+    channel: str | None = None
+    body: str = ""
+    attempts_max: int | None = None
+    call: str = ""
+    digest: str = ""
+    outcome: str = "open"
+    attempts: int | None = None
+    rounds: list[str] = field(default_factory=list)
+    value: str = ""
+    usage: dict[str, int | float] | None = None
 
 
 @dataclass
@@ -383,13 +435,18 @@ class Builder:
     """The record, read in one pass. Each `on_<type>` handler is given the event's `data`, as a
     `Read`; its type, time, and agent are on `self` while it is handled."""
 
-    def __init__(self) -> None:
-        self.blocks: list[Block] = []
-        self.open: Block | None = None
+    def __init__(self, has_primary: bool = True) -> None:
+        # Whether `agent/primary` ever names a real agent in this record: `False` only for a
+        # session built with `SessionBuilder::no_primary`, which decides what a session-level
+        # event's section is called, and what it joins.
+        self.has_primary = has_primary
+        # One `Section` per subject that had a round or a block of its own: the main agent's,
+        # and one per child, in the order each first appeared.
+        self.sections: dict[str, Section] = {}
         self.rounds: list[Block] = []
-        self.attempts: Counter[str] = Counter()
         self.execs: dict[int | str, Exec] = {}
         self.messages: dict[int | str, Msg] = {}
+        self.requests: dict[int | str, Request] = {}
         self.health: list[str] = []
         self.facts: dict[str, str] = {}
         # Each agent's instructions -- a heading naming it and its max tokens, and the parts -- by
@@ -404,32 +461,63 @@ class Builder:
         # The row the event being handled last added, for the fields its handler did not read.
         self.last: Item | None = None
 
-    # -- blocks -------------------------------------------------------------
+    # -- sections and blocks --------------------------------------------------
 
-    def here(self) -> Block:
-        """The open round, or the block of what happened outside one."""
-        if self.open is not None:
-            return self.open
-        if not self.blocks or self.blocks[-1].round is not None:
-            title = "Before the first round" if not self.blocks else "Outside a round"
-            self.blocks.append(Block(f"block-{len(self.blocks)}", title))
-        return self.blocks[-1]
+    def section(self, subject: str | None = None) -> Section:
+        """The subject's section -- the main agent's, or one child's -- made the first time
+        anything of its is read or added. A session-level event -- `session.state`,
+        `session.report`, and the rest the schema gives no subject -- carries none, and joins
+        the main agent's section when there is one: `MAIN` says the two name the same agent.
+        A session built with no primary (`SessionBuilder::no_primary`) never has an
+        `agent/primary` of its own, so there is no section to join; the shared events get one
+        neutrally titled, rather than one named for an agent that never ran."""
+        subject = self.subject if subject is None else subject
+        if subject in MAIN:
+            subject = MAIN[0] if self.has_primary else MAIN[1]
+        if subject not in self.sections:
+            self.sections[subject] = Section(f"agent-{len(self.sections)}", subject)
+        return self.sections[subject]
 
-    def begin(self, number: object) -> Block:
-        """Open a round. Keyed by when it started, not by its number, which a round that
-        commits no turn leaves to the next."""
-        if self.open is not None:
-            self.close("unfinished: the next round started before it ended")
+    def here(self, subject: str | None = None) -> Block:
+        """`subject`'s open round, or the block of what happened outside one. Each subject's
+        rounds are kept apart, so a child's round neither closes nor joins its parent's. Two
+        subjects never open one at all, so "before the first" and "outside a" round, which both
+        promise one, are wrong for their sections: the shared one a session with no primary
+        agent gets (`section()`'s note), and `owner`, the host program itself
+        (`doc/reference/events.md`, "A child agent") -- reached by a spawn's or a request's
+        cross-post, or directly by the `agent.released` of a child it released itself. Each
+        gets a plain title instead."""
+        sec = self.section(subject)
+        if sec.open is not None:
+            return sec.open
+        if not sec.blocks or sec.blocks[-1].round is not None:
+            if sec.subject == "owner":
+                title = "Owner events"
+            elif sec.subject == MAIN[1] and not self.has_primary:
+                title = "Session events"
+            else:
+                title = "Before the first round" if not sec.blocks else "Outside a round"
+            sec.blocks.append(Block(f"{sec.anchor}-block-{len(sec.blocks)}", title))
+        return sec.blocks[-1]
+
+    def begin(self, number: object, subject: str | None = None) -> Block:
+        """Open a round for `subject`. Keyed by when it started, not by its number, which a
+        round that commits no turn leaves to the next."""
+        subject = self.subject if subject is None else subject
+        sec = self.section(subject)
+        if sec.open is not None:
+            self.close("unfinished: the next round started before it ended", subject=subject)
         label = text(number) or "?"
-        self.attempts[label] += 1
-        attempt = self.attempts[label]
+        sec.attempts[label] += 1
+        attempt = sec.attempts[label]
         title = f"Round {label}" + (f", attempt {attempt}" if attempt > 1 else "")
-        self.open = Block(f"block-{len(self.blocks)}", title, label)
-        self.blocks.append(self.open)
-        return self.open
+        sec.open = Block(f"{sec.anchor}-block-{len(sec.blocks)}", title, label, subject=subject)
+        sec.blocks.append(sec.open)
+        return sec.open
 
-    def close(self, outcome: str, data: dict | None = None) -> None:
-        block, self.open = self.open, None
+    def close(self, outcome: str, data: dict | None = None, subject: str | None = None) -> None:
+        sec = self.section(subject)
+        block, sec.open = sec.open, None
         if block is None:
             return
         block.outcome = outcome
@@ -442,6 +530,12 @@ class Builder:
         block.peak = num(data.get("input_tokens_max"))
         if block.peak is None and calls:
             block.peak = max(c["input_tokens"] for c in calls)
+        # A descendant's spend can reach `model.round.usage` before this round's own close does
+        # (`on_model_round_usage`'s note), so this adds its own `total` to whatever is already
+        # there rather than replacing it, and appends to `descendants` rather than overwriting.
+        own_total = reported(data.get("total"))
+        block.total = summed([u for u in (block.total, own_total) if u is not None])
+        block.descendants = [*block.descendants, *seq(data.get("descendants"))]
         self.rounds.append(block)
 
     def label(self, subject: str) -> str:
@@ -455,6 +549,14 @@ class Builder:
         self.last = item
         return item
 
+    def add_to(self, subject: str, summary: str, **kw: object) -> Item:
+        """A row for something that happened to `subject`, from the point of view of the event
+        being handled -- a cross-link into another subject's section, beside the row `add` put
+        in this event's own."""
+        item = Item(self.time, self.kind, summary, subject=self.label(subject), **kw)  # type: ignore[arg-type]
+        self.here(subject).items.append(item)
+        return item
+
     # -- correlation --------------------------------------------------------
 
     def exec(self, value: object) -> Exec:
@@ -462,6 +564,12 @@ class Builder:
         if k not in self.execs:
             self.execs[k] = Exec(k, anchor("exec", value), self.label(self.subject) or "(no subject)")
         return self.execs[k]
+
+    def request(self, value: object) -> Request:
+        k = key(value)
+        if k not in self.requests:
+            self.requests[k] = Request(k, anchor("req", value))
+        return self.requests[k]
 
     def message(self, value: object, d: dict) -> Msg:
         """The message `value` names. Its ends are its sending's, or, with no sending recorded,
@@ -548,7 +656,168 @@ class Builder:
         kind = text(d.get("kind"))
         by = text(d.get("parent"))
         as_ = f" as {name}" if name else ""
+        section = self.section(self.subject)
         self.add(f"launched by {by}{as_}, a {kind} child on {text(d.get('model'))}")
+        if by:
+            self.add_to(by, f"launched {self.label(self.subject)}", href=link(section.anchor))
+
+    def on_agent_released(self, d: dict) -> None:
+        released = [text(s) for s in seq(d.get("released"))]
+        ended = [text(s) for s in seq(d.get("ended"))]
+        requests = [text(r) for r in seq(d.get("requests"))]
+        summary = f"released {', '.join(released) or 'nothing'}"
+        parts = []
+        if ended and ended != released:
+            parts.append(Part("every child this ended, in their subtrees", "\n".join(ended)))
+        if requests:
+            parts.append(Part("requests this settled", ", ".join(requests)))
+        self.add(summary, parts=parts)
+
+    def on_agent_wedged(self, d: dict) -> None:
+        self.add("did not stop: its code never yielded, so its thread runs on")
+
+    def request_outcome(self, req: Request, outcome: object) -> None:
+        req.outcome = text(outcome)
+
+    def on_agent_request_sent(self, d: dict) -> None:
+        req = self.request(d.get("request"))
+        req.sender = text(d.get("sender"))
+        req.child = self.label(self.subject)
+        channel = d.get("channel")
+        req.channel = text(channel) if channel is not None else None
+        req.body = text(d.get("body"))
+        req.attempts_max = num(d.get("attempts_max"))
+        where = f"on {req.channel}" if channel is not None else "a submission"
+        summary = f"request {req.id} sent by {req.sender} ({where}): {first_line(req.body)}"
+        self.add(summary, href=link(req.anchor))
+        if req.sender:
+            self.add_to(
+                req.sender,
+                f"sent request {req.id} to {self.label(self.subject)} ({where})",
+                href=link(req.anchor),
+            )
+
+    def on_agent_request_received(self, d: dict) -> None:
+        req = self.request(d.get("request"))
+        round_ = d.get("round")
+        self.add(
+            f"request {req.id} taken" + (f" in round {text(round_)}" if round_ is not None else ""),
+            href=link(req.anchor),
+        )
+
+    def on_agent_request_replied(self, d: dict) -> None:
+        """A reply, which may arrive after the request has already settled -- a cancellation
+        racing an answer being checked, say. The aggregate `attempts` the Requests table shows
+        is `agent.request.settled`'s alone, the one event that counts them authoritatively; a
+        reply never sets it, so a late one cannot undo a count already recorded."""
+        req = self.request(d.get("request"))
+        req.value = text(d.get("value"))
+        self.add(
+            f"request {req.id}: replied, attempt {text(d.get('attempt'))}",
+            href=link(req.anchor),
+            parts=[Part("value", req.value)],
+        )
+
+    def on_agent_request_invalid(self, d: dict) -> None:
+        req = self.request(d.get("request"))
+        problems = [text(p) for p in seq(d.get("problems"))]
+        self.add(
+            f"request {req.id}: attempt {text(d.get('attempt'))} failed its check",
+            href=link(req.anchor),
+            parts=[Part("problems", "\n".join(problems), True)],
+        )
+
+    def on_agent_request_progress(self, d: dict) -> None:
+        req = self.request(d.get("request"))
+        self.add(
+            f"request {req.id}: progress",
+            href=link(req.anchor),
+            parts=[Part("progress", text(d.get("body")), True)],
+        )
+
+    def on_agent_request_failed(self, d: dict) -> None:
+        req = self.request(d.get("request"))
+        req.outcome = "failed"
+        req.value = text(d.get("message"))
+        self.add(
+            f"request {req.id}: failed on purpose: {first_line(req.value)}", href=link(req.anchor)
+        )
+
+    def on_agent_request_cancelled(self, d: dict) -> None:
+        req = self.request(d.get("request"))
+        taken = " (already taken)" if d.get("received") else " (not yet taken)"
+        self.add(f"request {req.id}: cancelled by its sender{taken}", href=link(req.anchor))
+
+    def on_agent_request_settled(self, d: dict) -> None:
+        req = self.request(d.get("request"))
+        self.request_outcome(req, d.get("outcome"))
+        req.attempts = num(d.get("attempts"))
+        req.rounds = [text(r) for r in seq(d.get("rounds"))]
+        cause = d.get("cause")
+        summary = (
+            f"request {req.id}: {req.outcome}, {tokens(req.attempts)} attempt(s) over round(s) "
+            f"{', '.join(req.rounds)}"
+        )
+        self.add(
+            summary, href=link(req.anchor), parts=[Part("cause", text(cause), True)] if cause else []
+        )
+
+    def on_agent_request_refused(self, d: dict) -> None:
+        req = self.request(d.get("request"))
+        self.add(
+            f"request {req.id}: an answer arrived after it had already ended "
+            f"({text(d.get('ended'))})",
+            href=link(req.anchor),
+        )
+
+    def on_agent_call_started(self, d: dict) -> None:
+        req = self.request(d.get("request"))
+        req.sender = text(d.get("parent"))
+        req.child = self.label(self.subject)
+        req.call = f"{text(d.get('module'))}.{text(d.get('qualname'))}"
+        req.digest = text(d.get("digest"))
+        self.add(f"typed call {req.call} by {req.sender}", href=link(req.anchor))
+
+    def on_agent_call_settled(self, d: dict) -> None:
+        req = self.request(d.get("request"))
+        self.request_outcome(req, d.get("outcome"))
+        req.usage = reported(d.get("usage"))
+        value = d.get("value")
+        if value is not None:
+            req.value = text(value)
+        summary = f"typed call {req.id}: {req.outcome}"
+        if d.get("usage") is not None:
+            summary += f" -- {usage_summary(d.get('usage'))}"
+        self.add(
+            summary,
+            href=link(req.anchor),
+            parts=[Part("result", text(value))] if value is not None else [],
+        )
+
+    def on_agent_instance_started(self, d: dict) -> None:
+        self.add(
+            f"instance launched by {text(d.get('parent'))}: "
+            f"{text(d.get('module'))}.{text(d.get('qualname'))}"
+        )
+
+    def on_agent_instance_ready(self, d: dict) -> None:
+        error = d.get("error")
+        self.add("ready for its first request" if error is None else f"not ready: {text(error)}")
+
+    def on_agent_instance_released(self, d: dict) -> None:
+        requests = [text(r) for r in seq(d.get("requests"))]
+        summary = f"instance released ({text(d.get('how'))})"
+        if d.get("usage") is not None:
+            summary += f" -- {usage_summary(d.get('usage'))}"
+        self.add(
+            summary, parts=[Part("requests settled", ", ".join(requests))] if requests else []
+        )
+
+    def on_agent_instance_collected(self, d: dict) -> None:
+        self.add("instance collected")
+
+    def on_agent_instance_handle_collected(self, d: dict) -> None:
+        self.add(f"a handle for request {text(d.get('request'))} was collected while it was open")
 
     def on_agent_started(self, d: dict) -> None:
         facts = {
@@ -626,18 +895,20 @@ class Builder:
         self.add("")
 
     def within(self, number: object) -> Block:
-        """The round an event that names round `number` belongs to: the open one, or, where the
-        record lost a boundary, one opened for it and marked as such.
+        """The round an event that names round `number` belongs to, in the current subject's
+        section: the open one, or, where the record lost a boundary, one opened for it and
+        marked as such.
 
         A boundary is inferred only from a different number. The same number twice may be one
         round or two, since a round that commits no turn leaves its number to the next, and a
         round whose own number was never read says nothing either way."""
+        sec = self.section()
         label = text(number)
-        if self.open is not None and label and self.open.round not in (label, "?"):
+        if sec.open is not None and label and sec.open.round not in (label, "?"):
             self.close("unfinished: its end was not recorded")
-        if self.open is None:
+        if sec.open is None:
             self.begin(number).title += " (its start was not recorded)"
-        return self.open
+        return sec.open
 
     def end_round(self, d: dict, outcome: str, parts: list[Part]) -> None:
         self.within(d.get("round"))
@@ -656,6 +927,26 @@ class Builder:
 
     def on_model_round_dropped(self, d: dict) -> None:
         self.end_round(d, "dropped", [])
+
+    def on_model_round_usage(self, d: dict) -> None:
+        """A descendant's spend, counted apart because it was not available when its round's own
+        total was read: ordinarily that is because the round had already closed, but the ledger
+        guards its own state with a lock the event bus does not share, so a descendant can report
+        up after its round's close in real time and still have this reach the log first. Either
+        way the round -- open or already closed -- is found by its number in this subject's own
+        blocks, which hold it from `begin` on, and the spend is added rather than assumed to
+        replace anything: `close` adds its own event's `total` and `descendants` the same way, so
+        whichever of the two is read first, neither is lost to the other."""
+        label = text(d.get("round"))
+        block = next((b for b in reversed(self.section().blocks) if b.round == label), None)
+        usage = reported(d.get("usage"))
+        if block is not None:
+            block.total = summed([u for u in (block.total, usage) if u is not None])
+            block.descendants = [*block.descendants, *seq(d.get("attempts"))]
+        summary = f"usage from a descendant of round {label}, counted apart"
+        if usage is not None:
+            summary += f": {usage_summary(d.get('usage'))}"
+        self.add(summary, href=link(block.anchor) if block is not None else "")
 
     def on_model_retry(self, d: dict) -> None:
         summary = (
@@ -899,9 +1190,11 @@ class Builder:
 
     def finish(self, records: list[dict]) -> None:
         """Close what the record left open, and say what about it as a whole is wrong."""
-        if self.open is not None:
-            self.close("unfinished: the record ends inside it")
-        for item in (i for b in self.blocks for i in b.items if i.kind == "output.unattributed"):
+        for subject, sec in list(self.sections.items()):
+            if sec.open is not None:
+                self.close("unfinished: the record ends inside it", subject=subject)
+        all_blocks = [b for sec in self.sections.values() for b in sec.blocks]
+        for item in (i for b in all_blocks for i in b.items if i.kind == "output.unattributed"):
             item.parts = [Part("text", "\n".join(p.body for p in item.parts), True)]
         if not records:
             self.health.append("The event log is empty: the agent never started.")
@@ -1061,12 +1354,38 @@ def network_rows(records: list[dict]) -> list[list[str]]:
 # The page.
 
 
+def agent_label(builder: Builder, subject: str) -> str:
+    """How a round or a section names the agent it belongs to: `primary` for the main agent
+    (`agent/primary`, or no subject at all) when the record has one, `session` for the same when
+    it does not -- a session built with `no_primary` -- and the name its launch gave it
+    otherwise."""
+    if subject in MAIN:
+        return "primary" if builder.has_primary else "session"
+    return builder.label(subject) or "(no subject)"
+
+
+def usage_text(usage: dict[str, int | float] | None) -> str:
+    return "" if usage is None else f"{tokens(usage['input_tokens'])} in, {tokens(usage['output_tokens'])} out"
+
+
 def build(directory: Path) -> dict:
     records, skipped = read_jsonl(directory / EVENTS)
-    builder = Builder()
+    # Decided before the pass: a session-level event's section joins `agent/primary` only when
+    # the record actually has one, the way `SessionBuilder::no_primary` says it might not.
+    has_primary = any(text(r.get("subject")) == MAIN[0] for r in records)
+    builder = Builder(has_primary)
     for record in records:
         builder.feed(record)
     builder.finish(records)
+
+    for sec in builder.sections.values():
+        sec.title = agent_label(builder, sec.subject)
+    for block in builder.rounds:
+        block.agent = agent_label(builder, block.subject)
+        block.total_text = usage_text(block.total)
+        block.descendants_text = (
+            f"{len(block.descendants)} request(s)" if block.descendants else ""
+        )
 
     session: dict = {}
     try:
@@ -1121,9 +1440,10 @@ def build(directory: Path) -> dict:
         "skipped": skipped,
         "rounds": rounds,
         "session_row": session_row,
-        "blocks": builder.blocks,
+        "sections": list(builder.sections.values()),
         "agents": agents,
         "messages": list(builder.messages.values()),
+        "requests": list(builder.requests.values()),
         "network": network,
         "network_skipped": network_skipped,
         "events": len(records),
@@ -1138,10 +1458,12 @@ def render(page: dict) -> str:
         autoescape=True, undefined=StrictUndefined, trim_blocks=True, lstrip_blocks=True
     )
     env.filters["tokens"] = tokens
+    env.filters["usage_text"] = usage_text
     env.globals.update(
         USAGE=USAGE,
         TOKEN_COLUMNS=TOKEN_COLUMNS,
         MESSAGE_COLUMNS=MESSAGE_COLUMNS,
+        REQUEST_COLUMNS=REQUEST_COLUMNS,
         NETWORK_COLUMNS=NETWORK_COLUMNS,
     )
     return env.from_string(TEMPLATE).render(**page)
@@ -1502,11 +1824,13 @@ nav a { margin-right: 1rem; }
 {% endfor %}
 <td class="n">{{ r.peak|tokens }}</td><td class="n">{{ r.estimate|tokens }}</td>
 <td class="n">{{ r.window }}</td>
+<td>{{ r.total_text }}</td><td>{{ r.descendants_text }}</td>
 {% endmacro %}
 <h1>OutRig session {{ title }}</h1>
 <nav>
 <a href="#health">Record</a><a href="#tokens">Tokens</a><a href="#timeline">Timeline</a>
 <a href="#executions">Executions</a><a href="#messages">Messages</a>
+<a href="#requests">Requests</a>
 {% if network is not none %}<a href="#network">Network</a>{% endif %}
 </nav>
 <table>
@@ -1551,18 +1875,22 @@ on whether reported input counts cached input: Anthropic's does not, OpenAI's do
 {{ head(TOKEN_COLUMNS) }}
 <tbody>
 {% for r in rounds %}
-<tr><td><a href="#{{ r.anchor }}">{{ r.title }}</a></td><td>{{ r.outcome }}</td>
+<tr><td><a href="#{{ r.anchor }}">{{ r.title }}</a></td><td>{{ r.agent }}</td>
+<td>{{ r.outcome }}</td>
 {{ usage(r) }}</tr>
 {% endfor %}
-<tr><th>{{ session_row.title }}</th><td></td>
+<tr><th>{{ session_row.title }}</th><td></td><td></td>
 {{ usage(session_row) }}</tr>
 </tbody>
 </table>
 
 <h2 id="timeline">Timeline</h2>
-{% for b in blocks %}
-<h3 id="{{ b.anchor }}">{{ b.title }}{% if b.outcome %} -- {{ b.outcome }}{% endif %}</h3>
+{% for sec in sections %}
+{% if sections|length > 1 %}<h3 id="{{ sec.anchor }}">{{ sec.title }}</h3>{% endif %}
+{% for b in sec.blocks %}
+<h4 id="{{ b.anchor }}">{{ b.title }}{% if b.outcome %} -- {{ b.outcome }}{% endif %}</h4>
 {% for i in b.items %}{{ row(i) }}{% endfor %}
+{% endfor %}
 {% endfor %}
 
 <h2 id="executions">Executions</h2>
@@ -1610,6 +1938,27 @@ on whether reported input counts cached input: Anthropic's does not, OpenAI's do
 </table>
 {% else %}
 <p>No messages.</p>
+{% endif %}
+
+<h2 id="requests">Requests</h2>
+{% if requests %}
+<table>
+{{ head(REQUEST_COLUMNS) }}
+<tbody>
+{% for r in requests %}
+<tr id="{{ r.anchor }}">
+<td>{{ r.id }}</td><td>{{ r.sender }}</td><td>{{ r.child }}</td>
+<td>{{ r.call }}{% if r.digest %} ({{ r.digest }}){% endif %}</td>
+<td>{% if r.channel %}on {{ r.channel }}{% else %}a submission{% endif %}: {{ r.body }}</td>
+<td>{{ r.outcome }}</td><td class="n">{{ r.attempts }}</td>
+<td>{% if r.value %}<pre>{{ r.value }}</pre>{% endif %}</td>
+<td>{{ r.usage|usage_text }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p>No requests.</p>
 {% endif %}
 
 {% if network is not none %}

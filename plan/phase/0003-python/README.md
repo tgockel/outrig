@@ -48,7 +48,7 @@ process from a declaration. A **root agent** is a child whose parent is the owne
 kernel, in a session with no primary.
 
 More came with the planning round of 2026-10-28, which appended the requirements of the first
-application to embed the harness (`0003-39` through `0003-69`). A **facility** is an object an
+application to embed the harness (`0003-39` through `0003-70`). A **facility** is an object an
 agent is given to act through -- a hosted object, a service, the task object, an ordinary Python
 helper -- supplied to its constructor in a dict under names; the application's word for an entry
 is "capability", and the two mean the same thing. A **facility reference** is what a dict holds
@@ -237,7 +237,7 @@ beside the harness for an application that runs both.
   cut that agrees with history, truthful save and sleep outcomes, a resume that reconciles, and a
   disposition for every piece of open work (`0003-60` through `0003-65`).
 - Records that name their producer, correlate where they can, and are projected by audience
-  (`0003-66` through `0003-68`), and documentation of all of it (`0003-69`).
+  (`0003-66` through `0003-68`), and documentation of all of it (`0003-70`).
 
 ## Exit criteria
 
@@ -330,11 +330,11 @@ and `doc/reference/cli.md` gain the script form. The round of 2026-10-28 adds
 `doc/usage/mcp.md` and `doc/concepts/mcp-servers.md`, which gain the Session's placements;
 `doc/reference/config.md` and `doc/reference/events.md`, which every appended task extends; and
 `SECURITY.md`, which gains what application code, a service and an MCP placement grant
-(`0003-69`).
+(`0003-70`).
 
 ## Tasks
 
-`0003-01` through `0003-69`, in `plan/done/` and `plan/todo/`; `plan/todo/README.md` carries
+`0003-01` through `0003-70`, in `plan/done/` and `plan/todo/`; `plan/todo/README.md` carries
 the per-step index. They cover the deliverables above; the subjects listed as out of scope below
 have design pages or `plan/next/` entries and no tasks. The planning round of 2026-10-15 folded in
 the host-program requirements (R1-R9): six tasks placed by dependency, and `0003-23` through
@@ -343,7 +343,7 @@ the host-program requirements (R1-R9): six tasks placed by dependency, and `0003
 planning round of 2026-10-26 promoted `potential/one-shot-nudging.md` to `0003-37`, ahead of the
 documentation.
 
-The planning round of 2026-10-28 appended `0003-39` through `0003-69` from the OutRig requirements
+The planning round of 2026-10-28 appended `0003-39` through `0003-70` from the OutRig requirements
 of CocoClaw's phase 0008, the first application to embed the harness: its `requirements/outrig/`
 set (OR-AG, OR-CH, OR-MCP, OR-SUS, OR-OBS) and its A-series (OR-A1 through OR-A8), validated
 against these pages before they were written down. The A-series' own index calls the work a new
@@ -359,7 +359,7 @@ leave alone. Six tasks reverse a decision these pages record, each quoting the s
 trait, which `embedding.md` and `hosted-objects.md` rejected for 0.3), `0003-45` (the instance
 as `self`), `0003-58` (a format of OutRig's own where the store held rig JSON), and `0003-62`
 with `0003-65` (a gate that reopens, and a close that records open work before it settles it).
-`0003-38` keeps its place and documents the system the first 37 tasks built; `0003-69` is the
+`0003-38` keeps its place and documents the system the first 37 tasks built; `0003-70` is the
 second documentation pass, for what the appended tasks add, since a 30-task insertion is not the
 kind the earlier renumberings were for. `0003-35` and `0003-36` stay as queued: the first
 application is a Rust embedder and needs neither, and another program depends on both.
@@ -373,7 +373,7 @@ channel that replaces it is `0003-08`.
 processes before the tasks that build on it, and a spike that fails its acceptance stops and
 reports to the maintainer rather than changing the design on its own. Close behavior is built with
 each resource: the task that adds a resource adds its row to `lifecycle.md`'s close table.
-`0003-38` documents what the first 37 tasks built, and `0003-69` what the round of 2026-10-28
+`0003-38` documents what the first 37 tasks built, and `0003-70` what the round of 2026-10-28
 added.
 
 ## Out of scope

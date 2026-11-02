@@ -295,10 +295,12 @@ of one to name a single session, as `outrig logs` does, and finds it under the
 [session root](#where-sessions-live) the way `outrig` does; `--session-root <path>` looks under
 another. It takes a session directory as well. It reads `session.json`, `logs/events.jsonl`, and
 `logs/network.jsonl` when there is one, and shows the session; whether its record is whole; the
-tokens each round used; a timeline of the rounds, with each round's model calls, turns,
-executions, and messages linked by their ids; every execution's source, output, and traceback;
-the messages; and the connections. Nothing on the page runs and nothing on it loads from
-anywhere.
+tokens each round used, which agent it belongs to, and its total with any descendants -- the
+requests its children made while it ran; a timeline laid out one section per agent, the main
+agent's and each child's own, with each round's model calls, turns, executions, and messages
+linked by their ids; every execution's source, output, and traceback; the messages; the requests
+between agents and the typed calls among them; and the connections. Nothing on the page runs and
+nothing on it loads from anywhere.
 
 ```sh
 $ uv run --script scripts/render-session.py 3f2a

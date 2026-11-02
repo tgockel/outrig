@@ -280,6 +280,65 @@ def ordinary(
     ]
 
 
+def no_primary_session() -> list[tuple[str, dict, str | None]]:
+    """A session built with `SessionBuilder::no_primary`: the owner launches an agent-class
+    instance directly, asks it a request, and releases it; `agent/primary` never names anything
+    in the record."""
+    c = "agent/c1"
+    usage = {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
+    return [
+        ("session.state", {"state": "starting"}, None),
+        (
+            "agent.instance.started",
+            {
+                "instance": 1,
+                "parent": "owner",
+                "module": "agents",
+                "qualname": "Root",
+                "digest": "abcd",
+                "inputs": [],
+                "channels": [],
+            },
+            c,
+        ),
+        ("agent.started", {"model": "m", "python": "3.13.15", "container": "x"}, c),
+        (
+            "agent.request.sent",
+            {"request": 1, "channel": "ask", "sender": "owner", "body": "b", "attempts_max": 1},
+            c,
+        ),
+        ("round.started", {"round": 1}, c),
+        ("agent.request.received", {"request": 1, "round": 1}, c),
+        ("agent.request.replied", {"request": 1, "attempt": 1, "value": "v"}, c),
+        (
+            "agent.request.settled",
+            {"request": 1, "outcome": "accepted", "attempts": 1, "rounds": [1], "cause": None},
+            c,
+        ),
+        (
+            "model.round.completed",
+            {"round": 1, "stopped": None, "usage": usage, "calls": [], "input_tokens_max": 10},
+            c,
+        ),
+        ("agent.instance.ready", {"instance": 1, "error": None}, c),
+        ("agent.released", {"released": ["c1"], "ended": ["c1"], "requests": [1]}, "owner"),
+        ("session.state", {"state": "closing"}, None),
+        (
+            "session.report",
+            {
+                "closed_by": {"by": "owner"},
+                "stopped": {"state": "proven"},
+                "executions": [],
+                "hosted": [],
+                "bindings": None,
+                "verdict": "clean",
+            },
+            None,
+        ),
+        ("session.state", {"state": "reported"}, None),
+    ]
+
+
 def token_rows(html: str) -> list[list[str]]:
     """The token table's numeric cells, a row per round and then the session's."""
     tokens = html[html.index('id="tokens"') : html.index('id="timeline"')]
@@ -1076,6 +1135,78 @@ class RenderSession(unittest.TestCase):
         plant = Planter(every_leaf=True)
         self.assert_no_markup(self.page(plant.events(), network=[plant(connection(), "network")]))
 
+    def test_no_agent_event_renders_as_an_unknown_type(self) -> None:
+        """Every `agent.*` kind, and `model.round.usage`, has its own handler: none of them
+        falls back to the raw-data row an unhandled type gets, which names its kind as recorded
+        rather than as the handler renders it."""
+        html = self.page(every_event())
+        for kind, _, _ in every_event():
+            if kind.startswith("agent.") or kind == "model.round.usage":
+                self.assertNotIn(f"org.outrig.{kind}", html)
+
+    def test_a_late_reply_does_not_undo_a_settled_attempt_count(self) -> None:
+        """Cancellation racing an answer being checked can settle a request before a reply the
+        interpreter already sent reaches the log: `settled(attempts=0)`, then `replied`, then
+        `refused` once the late reply is read against the request's already-recorded end. The
+        settled count is authoritative and a later reply must not touch it."""
+        c = "agent/c1"
+        child = [
+            ("agent.spawned", {"name": "n", "parent": "agent/primary", "kind": "request", "model": "m"}, c),
+            ("agent.started", {"model": "m", "python": "3.13.15", "container": "x"}, c),
+            ("agent.request.sent", {"request": 9, "channel": "ch", "sender": "agent/primary",
+                                     "body": "b", "attempts_max": 3}, c),
+            ("round.started", {"round": 1}, c),
+            (
+                "agent.request.settled",
+                {"request": 9, "outcome": "cancelled", "attempts": 0, "rounds": [1], "cause": None},
+                c,
+            ),
+            ("agent.request.replied", {"request": 9, "attempt": 1, "value": "late"}, c),
+            ("agent.request.refused", {"request": 9, "ended": "cancelled"}, c),
+        ]
+        events = ordinary()
+        html = self.page(events[:4] + child + events[4:])
+        requests = html[html.index('id="requests"') :]
+        self.assertIn('<td class="n">0</td>', requests)
+
+    def test_a_session_with_no_primary_titles_its_shared_section_session(self) -> None:
+        """`no_primary()` means `agent/primary` never names a real agent, so the section a
+        shared, subjectless event joins must not claim to be one -- and, since neither that
+        section nor the owner's ever opens a round, each is titled plainly rather than as if one
+        were coming, the way a child's own legitimate prelude still is."""
+        html = self.page(no_primary_session())
+        self.assertNotIn("primary", html)
+        self.assertIn('<h3 id="agent-0">session</h3>', html)
+        self.assertIn('<h3 id="agent-1">agent/c1</h3>', html)
+        self.assertIn('<h3 id="agent-2">owner</h3>', html)
+        self.assertIn("Round 1 -- completed", html)
+        session_section = html[html.index('id="agent-0"') : html.index('id="agent-1"')]
+        self.assertIn("Session events", session_section)
+        self.assertNotIn("Before the first round", session_section)
+        self.assertNotIn("Outside a round", session_section)
+        child_section = html[html.index('id="agent-1"') : html.index('id="agent-2"')]
+        self.assertIn("Before the first round", child_section)
+        owner_section = html[html.index('id="agent-2"') :]
+        self.assertIn("Owner events", owner_section)
+        self.assertNotIn("Before the first round", owner_section)
+        self.assertNotIn("Outside a round", owner_section)
+
+    def test_shared_events_with_no_subject_join_the_primary_section(self) -> None:
+        """`session.state`, `session.report`, and the rest of what the schema gives no subject
+        are session-level, not a second agent's: they join the main agent's own section, the way
+        a single shared timeline held them before sections existed."""
+        events = ordinary()
+        wrapped = [
+            ("session.state", {"state": "starting"}, None),
+            *events,
+            ("session.state", {"state": "closing"}, None),
+        ]
+        html = self.page(wrapped)
+        # One section only: a session-level event joins it rather than starting a second one,
+        # so no per-section heading is needed, the same as for any other single-agent session.
+        self.assertNotIn('<h3 id="agent-', html)
+        self.assertLess(html.rindex("Round 1 -- completed"), html.rindex("closing"))
+
     def test_the_sweep_covers_every_event_there_is(self) -> None:
         swept = {kind for kind, _, _ in every_event()}
         written = set(re.findall(r'Payload::\w+[^=\n]*=> "([a-z.]+)"', CATALOG_RS.read_text()))
@@ -1259,6 +1390,149 @@ class RenderSession(unittest.TestCase):
         self.assertIn("city_fact (c1) on haiku", html)
         # With the launch missing, the id stands alone.
         self.assertIn("agent/c1 on haiku", self.page(events[:2] + child[1:] + events[2:]))
+
+    def test_a_childs_round_does_not_interrupt_its_parents(self) -> None:
+        """Since a child's round can run while its parent's is open, each is tracked by its own
+        subject: the parent's is not closed as unfinished by the child's starting, and each gets
+        its own section."""
+        c = "agent/c1"
+        child_usage = {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10}
+        child = [
+            (
+                "agent.spawned",
+                {"name": "city_fact", "parent": "agent/primary", "kind": "work", "model": "haiku"},
+                c,
+            ),
+            (
+                "agent.started",
+                {"model": "haiku", "python": "3.13.15", "container": "outrig-x"},
+                c,
+            ),
+            ("round.started", {"round": 1}, c),
+            (
+                "model.round.completed",
+                {"round": 1, "stopped": None, "usage": child_usage, "calls": [], "input_tokens_max": 5},
+                c,
+            ),
+        ]
+        events = ordinary()
+        html = self.page(events[:11] + child + events[11:])
+        self.assertNotIn("unfinished", html)
+        self.assertIn("Done.", html)
+        self.assertEqual(html.count("Round 1 -- completed"), 2)
+        self.assertIn('<h3 id="agent-0">primary</h3>', html)
+        self.assertIn('<h3 id="agent-1">city_fact (c1)</h3>', html)
+        self.assertIn("launched city_fact (c1)", html)
+
+    def test_a_requests_outcome_and_value_are_shown(self) -> None:
+        c = "agent/c1"
+        usage = {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        child = [
+            (
+                "agent.spawned",
+                {"name": "city_fact", "parent": "agent/primary", "kind": "request", "model": "haiku"},
+                c,
+            ),
+            ("agent.started", {"model": "haiku", "python": "3.13.15", "container": "outrig-x"}, c),
+            (
+                "agent.call.started",
+                {
+                    "request": 7,
+                    "parent": "agent/primary",
+                    "module": "review",
+                    "qualname": "analyze",
+                    "digest": "abcd1234",
+                    "invocation": None,
+                },
+                c,
+            ),
+            (
+                "agent.request.sent",
+                {"request": 7, "channel": None, "sender": "agent/primary", "body": '{"n": 5}',
+                 "attempts_max": 3},
+                c,
+            ),
+            ("round.started", {"round": 1}, c),
+            ("agent.request.received", {"request": 7, "round": 1}, c),
+            ("agent.request.replied", {"request": 7, "attempt": 1, "value": '{"n": 5}'}, c),
+            (
+                "agent.request.settled",
+                {"request": 7, "outcome": "accepted", "attempts": 1, "rounds": [1], "cause": None},
+                c,
+            ),
+            (
+                "model.round.completed",
+                {"round": 1, "stopped": None, "usage": usage, "calls": [], "input_tokens_max": 1},
+                c,
+            ),
+            (
+                "agent.call.settled",
+                {"request": 7, "outcome": "accepted", "usage": usage, "invocation": None,
+                 "value": '{"n": 5}'},
+                c,
+            ),
+        ]
+        events = ordinary()
+        html = self.page(events[:4] + child + events[4:])
+        requests = html[html.index('id="requests"') :]
+        self.assertIn("accepted", requests)
+        self.assertIn("agent/primary", requests)
+        self.assertIn("city_fact (c1)", requests)
+        self.assertIn("review.analyze", requests)
+        self.assertIn("abcd1234", requests)
+        self.assertIn("&#34;n&#34;: 5", requests)
+
+    def test_a_descendants_usage_reported_before_its_round_closes_still_counts(self) -> None:
+        """`descendant()` in `ledger.rs` emits `model.round.usage` once the round it names is
+        not the one currently open -- which, under its own lock, is true the instant `close_round`
+        runs, strictly before the completing event is published outside it. A concurrent
+        descendant can win that race, so the usage event can reach the log first."""
+        events = ordinary()
+        late = (
+            "model.round.usage",
+            {"round": 1, "attempts": [9], "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}},
+        )
+        at = next(i for i, (kind, _) in enumerate(events) if kind == "model.round.completed")
+        kind, data = events[at]
+        data = dict(data)
+        data["total"] = {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110}
+        data["descendants"] = [7]
+        events[at] = (kind, data)
+        html = self.page(events[:at] + [late] + events[at:])
+        tokens_section = html[html.index('id="tokens"') : html.index('id="timeline"')]
+        self.assertIn("103 in, 12 out", tokens_section)
+        self.assertIn("2 request(s)", tokens_section)
+
+    def test_the_token_table_names_each_rounds_agent_and_its_total(self) -> None:
+        c = "agent/c1"
+        child_usage = {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10}
+        child = [
+            (
+                "agent.spawned",
+                {"name": "city_fact", "parent": "agent/primary", "kind": "work", "model": "haiku"},
+                c,
+            ),
+            ("agent.started", {"model": "haiku", "python": "3.13.15", "container": "outrig-x"}, c),
+            ("round.started", {"round": 1}, c),
+            (
+                "model.round.completed",
+                {"round": 1, "stopped": None, "usage": child_usage, "calls": [], "input_tokens_max": 5},
+                c,
+            ),
+        ]
+        events = ordinary()
+        primary_total = {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110}
+        kind, completed = events[11]
+        completed = dict(completed)
+        completed["total"] = primary_total
+        completed["descendants"] = [9]
+        events[11] = (kind, completed)
+        html = self.page(events[:11] + child + events[11:])
+        tokens_section = html[html.index('id="tokens"') : html.index('id="timeline"')]
+        self.assertIn("primary", tokens_section)
+        self.assertIn("city_fact (c1)", tokens_section)
+        self.assertIn("100 in, 10 out", tokens_section)
+        self.assertIn("1 request(s)", tokens_section)
 
     def test_missing_ids_are_reported(self) -> None:
         self.write(ordinary())
