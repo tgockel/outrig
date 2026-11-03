@@ -1659,6 +1659,23 @@ checks a fragment as a repo config unless it is passed `scope = "global"`, so th
 keys below are refused in the file that may not set them. An `org.outrig.mcp` image label and an
 `image.toml`, which no config load reads, still refuse an unknown key.
 
+What a file *is* refused for names that file, as a warning does. A load reads up to two of them
+-- the global config, and the repo config or a `--config` file -- and the fault is described in
+words that fit either one, so the file comes first:
+
+```text
+error: ci/outrig.toml: TOML parse error at line 2, column 14
+  |
+2 | [images.named
+  |              ^
+unclosed table, expected `]`
+```
+
+The same holds for a rule only the repo side is held to, such as `ci/outrig.toml: repo config
+may set [network].mode only; [network].default belongs in global config`. A rule of the merged
+config -- a model naming a provider neither file declares -- names no file: both halves are
+equally answerable for it.
+
 ## Validation rules
 
 `outrig run` and `outrig mcp` use the full validation path. `outrig build` validates every

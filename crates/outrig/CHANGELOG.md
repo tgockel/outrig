@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`OutrigError::ConfigFile`**: a fault a config file is refused for, wrapped in the path of the
+  file it was read from. It carries the error it names the file on -- the parse's
+  `OutrigError::Config` or `ConfigDottedKey`, or an `OutrigError::ConfigValidation` from the
+  repo-only rules -- so a caller that matched on those matches `source` now. A failed read is
+  still `OutrigError::Path`, and a rule of the merged config is still a bare
+  `OutrigError::ConfigValidation`: neither belongs to one file. See the fix below. (#413)
+
 - **`ConfigValidationError::SidecarViewCapDrop` / `SidecarViewNoNewPrivsOff`**: a `view = "primary"`
   sidecar whose `cap-drop` names a capability the `outrig-enter` launcher needs (`SYS_ADMIN`,
   `SYS_PTRACE`, `SYS_CHROOT`, `SETUID`, `SETGID`, or `ALL`), and one that sets
@@ -66,6 +73,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that contains `:`. See the fix below for why it is now refused. (#365)
 
 ### Fixed
+
+- **A config file that does not load names itself.** A TOML parse error was reported with a line,
+  a column, and an excerpt but no file, so with the global config and a repo (or `--config`) file
+  both in play the reader had to work out which one was being quoted; the repo-only rules were
+  worse, saying "repo config" of a file that may be the repo's own or one `--config` named. Every
+  error a file's own content raises is now prefixed with that file's path, as each warning from a
+  load already was. What a load sets aside, and what it refuses, are unchanged. (#413)
 
 - **A container interception cannot put a resolver in is refused by what it owes, not by an
   errno.** Attach creates `/etc/resolv.conf` for a container that has none, and a create that

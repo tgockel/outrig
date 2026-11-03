@@ -55,6 +55,27 @@ pub enum OutrigError {
         source: toml::de::Error,
     },
 
+    /// A config file's own content is what an error is about, named by the
+    /// file it came from. A load reads up to two of them -- the global
+    /// config, and the repo config or a `--config` file -- and a diagnostic
+    /// that quotes a line and a column says nothing about which one it read
+    /// (#413).
+    ///
+    /// Only what the file *says* is wrapped: a TOML syntax error, a value the
+    /// types refuse, and the repo-only rules
+    /// ([`Config::validate_as_repo`](crate::config::Config::validate_as_repo)),
+    /// whose wording says "repo config" without saying which file that is.
+    /// A failed read is an [`OutrigError::Path`], which names the path
+    /// already, and a rule of the *merged* config belongs to no one file.
+    #[error("{}: {source}", path.display())]
+    #[non_exhaustive]
+    ConfigFile {
+        /// The file the error is about, as the load resolved it.
+        path: PathBuf,
+        #[source]
+        source: Box<OutrigError>,
+    },
+
     #[error("{0}")]
     ApiKey(#[from] ApiKeyError),
 

@@ -1033,6 +1033,9 @@ pub outrig::error::OutrigError::Canceled::program: &'static str
 pub outrig::error::OutrigError::Config(toml::de::error::Error)
 #[non_exhaustive] pub outrig::error::OutrigError::ConfigDottedKey
 pub outrig::error::OutrigError::ConfigDottedKey::source: toml::de::error::Error
+#[non_exhaustive] pub outrig::error::OutrigError::ConfigFile
+pub outrig::error::OutrigError::ConfigFile::path: std::path::PathBuf
+pub outrig::error::OutrigError::ConfigFile::source: alloc::boxed::Box<outrig::error::OutrigError>
 pub outrig::error::OutrigError::ConfigValidation(outrig::config::ConfigValidationError)
 pub outrig::error::OutrigError::Configuration(alloc::string::String)
 #[non_exhaustive] pub outrig::error::OutrigError::ContainerPidNotLocal

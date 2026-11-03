@@ -45,19 +45,44 @@ fn expect_validation_err(cfg: &Config, repo_root: Option<&Path>) -> ConfigValida
     }
 }
 
-/// Unwrap the validation error out of a failed `Config::load`.
+/// Unwrap the validation error out of a failed `Config::load`. A repo-only
+/// rule is broken by one file and says so, so its error arrives wrapped in the
+/// file's name; a rule of the merged config belongs to no single file and
+/// arrives bare.
 fn expect_load_validation_err(err: OutrigError) -> ConfigValidationError {
-    match err {
+    match in_file_source(err) {
         OutrigError::ConfigValidation(e) => e,
         other => panic!("expected ConfigValidation, got: {other:?}"),
     }
 }
 
-/// Write `body` to `<root>/.agents/outrig/config.toml`, creating the tree.
-fn write_repo_cfg(root: &Path, body: &str) {
+/// The error an `OutrigError::ConfigFile` names a file on, or `err` as it is
+/// when no file was named.
+fn in_file_source(err: OutrigError) -> OutrigError {
+    match err {
+        OutrigError::ConfigFile { source, .. } => *source,
+        other => other,
+    }
+}
+
+/// The file an error names, which a test that cares which of the files in
+/// play failed asserts on. Panics when the error names none.
+fn named_file(err: &OutrigError) -> &Path {
+    match err {
+        OutrigError::ConfigFile { path, .. } => path,
+        other => panic!("expected the error to name its config file, got: {other:?}"),
+    }
+}
+
+/// Write `body` to `<root>/.agents/outrig/config.toml`, creating the tree,
+/// and return the path written, for a test that asserts on where an error
+/// came from.
+fn write_repo_cfg(root: &Path, body: &str) -> std::path::PathBuf {
     let agents = root.join(".agents/outrig");
     fs::create_dir_all(&agents).unwrap();
-    fs::write(agents.join("config.toml"), body).unwrap();
+    let path = agents.join("config.toml");
+    fs::write(&path, body).unwrap();
+    path
 }
 
 /// Write `body` to `<dir>/config.toml` and return the path, for use as a
@@ -6875,14 +6900,22 @@ provider   = "openai"
 identifier = "gpt-4o-mini"
 max-tokens = "plenty"
 "#;
-        write_repo_cfg(tmp.path(), bad);
+        let repo = write_repo_cfg(tmp.path(), bad);
         let err = Config::load_for_build(tmp.path(), Some(&global)).unwrap_err();
-        assert!(matches!(err, OutrigError::Config(_)), "got: {err:?}");
+        assert_eq!(named_file(&err), repo);
+        assert!(
+            matches!(in_file_source(err), OutrigError::Config(_)),
+            "the repo file's bad value fails its load",
+        );
 
         let file = tmp.path().join("ci.toml");
         fs::write(&file, bad).unwrap();
         let err = Config::load_file_for_build(&file, tmp.path(), Some(&global)).unwrap_err();
-        assert!(matches!(err, OutrigError::Config(_)), "got: {err:?}");
+        assert_eq!(named_file(&err), file);
+        assert!(
+            matches!(in_file_source(err), OutrigError::Config(_)),
+            "a --config file's bad value fails its load",
+        );
     }
 
     /// `[network]` and the `security` tables set nothing aside, even from the
@@ -6899,7 +6932,11 @@ max-tokens = "plenty"
         ] {
             let global = write_global_cfg(tmp.path(), body);
             let err = Config::load_global(&global).expect_err(body);
-            assert!(matches!(err, OutrigError::Config(_)), "{body}: {err:?}");
+            assert_eq!(named_file(&err), global, "{body}");
+            assert!(
+                matches!(in_file_source(err), OutrigError::Config(_)),
+                "{body}: a strict table sets nothing aside",
+            );
         }
     }
 
@@ -6911,7 +6948,11 @@ max-tokens = "plenty"
         let tmp = tempdir().unwrap();
         let global = write_global_cfg(tmp.path(), "[providers.openai\nstyle = \"openai\"\n");
         let err = Config::load_global(&global).unwrap_err();
-        assert!(matches!(err, OutrigError::Config(_)), "got: {err:?}");
+        assert_eq!(named_file(&err), global);
+        assert!(
+            matches!(in_file_source(err), OutrigError::Config(_)),
+            "a syntax error leaves nothing to read",
+        );
     }
 
     /// A misquoted name is still the error it was, hint and all, from either
@@ -6924,9 +6965,137 @@ max-tokens = "plenty"
             "[models.opus-4.7]\nprovider = \"openai\"\nidentifier = \"x\"\n",
         );
         let err = Config::load_global(&global).unwrap_err();
+        assert_eq!(named_file(&err), global);
         assert!(
-            matches!(err, OutrigError::ConfigDottedKey { .. }),
-            "got: {err:?}"
+            matches!(in_file_source(err), OutrigError::ConfigDottedKey { .. }),
+            "the hint survives the file's name",
+        );
+    }
+}
+
+/// #413: a load reads up to two files -- the global config, and the repo
+/// config or a `--config` file -- and the faults they are refused for are
+/// described in words that say nothing about which file was read: a TOML
+/// excerpt quotes a line and a column, and the repo-only rules say "repo
+/// config". Every such error names the file it is about.
+mod errors_name_their_file {
+    use super::*;
+
+    /// A table header that never closes: a syntax error wherever the text came
+    /// from, and the one the reader cannot place without the file name.
+    const UNCLOSED_TABLE: &str = "[images.named\nimage-name = \"debian\"\n";
+
+    /// A key only the operator's file may set, which fails the repo-only rules
+    /// rather than the parse.
+    const REPO_FORBIDDEN: &str = "[network]\ndefault = \"deny\"\n";
+
+    #[test]
+    fn a_syntax_error_names_the_global_file() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), UNCLOSED_TABLE);
+
+        let err = Config::load(tmp.path(), Some(&global)).unwrap_err();
+        assert_eq!(named_file(&err), global);
+        let message = err.to_string();
+        assert!(
+            message.starts_with(&format!("{}: TOML parse error", global.display())),
+            "the excerpt follows the file it was read from, got: {message}",
+        );
+    }
+
+    #[test]
+    fn a_syntax_error_names_the_repo_file() {
+        let tmp = tempdir().unwrap();
+        let repo = write_repo_cfg(tmp.path(), UNCLOSED_TABLE);
+
+        let err = Config::load(tmp.path(), None).unwrap_err();
+        assert_eq!(named_file(&err), repo);
+        assert!(err.to_string().contains("TOML parse error"), "got: {err}");
+    }
+
+    #[test]
+    fn a_syntax_error_names_the_config_file() {
+        let tmp = tempdir().unwrap();
+        let named = tmp.path().join("ci/outrig.toml");
+        fs::create_dir_all(named.parent().unwrap()).unwrap();
+        fs::write(&named, UNCLOSED_TABLE).unwrap();
+
+        let err = Config::load_file(&named, tmp.path(), None).unwrap_err();
+        assert_eq!(named_file(&err), named);
+        assert!(err.to_string().contains("TOML parse error"), "got: {err}");
+    }
+
+    /// The point of naming the file: with a broken file on each side in turn,
+    /// the name moves with the fault instead of the reader guessing.
+    #[test]
+    fn the_file_named_is_the_one_at_fault() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), UNCLOSED_TABLE);
+        let repo = write_repo_cfg(tmp.path(), "[images.named]\nimage-name = \"debian\"\n");
+
+        let err = Config::load(tmp.path(), Some(&global)).unwrap_err();
+        assert_eq!(named_file(&err), global);
+
+        let global = write_global_cfg(tmp.path(), PROVIDER_AND_FAST_MODEL);
+        write_repo_cfg(tmp.path(), UNCLOSED_TABLE);
+
+        let err = Config::load(tmp.path(), Some(&global)).unwrap_err();
+        assert_eq!(named_file(&err), repo);
+    }
+
+    /// The repo-only rules speak of "the repo config", which is the repo's own
+    /// file or the one `--config` named; the error says which.
+    #[test]
+    fn a_repo_only_rule_names_the_file_that_broke_it() {
+        let tmp = tempdir().unwrap();
+        let repo = write_repo_cfg(tmp.path(), REPO_FORBIDDEN);
+
+        let err = Config::load(tmp.path(), None).unwrap_err();
+        assert_eq!(named_file(&err), repo);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{}: repo config may set [network].mode only; [network].default belongs in \
+                 global config",
+                repo.display()
+            ),
+        );
+
+        let tmp = tempdir().unwrap();
+        let named = tmp.path().join("ci.toml");
+        fs::write(&named, REPO_FORBIDDEN).unwrap();
+
+        let err = Config::load_file(&named, tmp.path(), None).unwrap_err();
+        assert_eq!(named_file(&err), named);
+        assert!(
+            matches!(
+                in_file_source(err),
+                OutrigError::ConfigValidation(ConfigValidationError::RepoNetworkPolicy {
+                    key: "default"
+                })
+            ),
+            "the rule is the one the repo file broke",
+        );
+    }
+
+    /// A rule of the *merged* config is nobody's file: the two halves are
+    /// equally answerable for a model whose provider the other was to declare,
+    /// so no file is named rather than one being blamed.
+    #[test]
+    fn a_merged_rule_names_no_file() {
+        let tmp = tempdir().unwrap();
+        write_repo_cfg(
+            tmp.path(),
+            "[models.fast]\nprovider = \"absent\"\nidentifier = \"gpt-4o-mini\"\n",
+        );
+
+        let err = Config::load(tmp.path(), None).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OutrigError::ConfigValidation(ConfigValidationError::UnknownModelProvider { .. })
+            ),
+            "got: {err:?}",
         );
     }
 }

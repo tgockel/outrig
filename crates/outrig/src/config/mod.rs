@@ -214,6 +214,24 @@ fn source_base_dir<'a>(source: Option<&'a ConfigSource>, repo_root: &'a Path) ->
     source.map_or(repo_root, ConfigSource::base_dir)
 }
 
+/// Name `path` on an error that config file raised, as
+/// [`OutrigError::ConfigFile`]. A load reads up to two files -- the global
+/// config, and the repo config or a `--config` file -- and reports their
+/// faults in the same words: a TOML excerpt with a line and a column, a rule
+/// that says "repo config". Without the file, the reader is left to work out
+/// which of the two is being quoted (#413).
+///
+/// Takes anything an [`OutrigError`] converts from, so the parse's own error
+/// and the repo-only rules' [`ConfigValidationError`] are named the same way.
+/// A failed *read* is not named here: [`OutrigError::Path`] carries its path
+/// already.
+fn in_file(path: &Path, source: impl Into<OutrigError>) -> OutrigError {
+    OutrigError::ConfigFile {
+        path: path.to_path_buf(),
+        source: Box::new(source.into()),
+    }
+}
+
 /// A config file named by path, made absolute, and the outcome of reading it.
 /// Resolve before reading, and read through the resolved path: a
 /// `--global-config` or `--config` path may be relative, and would otherwise
@@ -468,20 +486,26 @@ impl Config {
     }
 
     /// Parse a repo-side file, hold it to the repo-only rules, and stamp it.
+    /// The repo-only rules speak of "the repo config", which is this file:
+    /// naming it is what tells a `--config` file from the repo's own.
     fn repo_side(text: &str, src: &ConfigSource) -> Result<Self> {
         let repo_cfg = Self::parse_stamped(text, src)?;
-        repo_cfg.validate_as_repo()?;
+        repo_cfg
+            .validate_as_repo()
+            .map_err(|e| in_file(&src.config_path(), e))?;
         Ok(repo_cfg)
     }
 
     /// Parse the file `src` names, setting aside what [`load_from_str`]
     /// does -- and, for the global config, a value that does not deserialize
-    /// -- with each warning naming the file, then stamp it.
+    /// -- with each warning naming the file, then stamp it. What is not set
+    /// aside fails the load naming the file too.
     ///
     /// [`load_from_str`]: Self::load_from_str
     fn parse_stamped(text: &str, src: &ConfigSource) -> Result<Self> {
         let global = matches!(src, ConfigSource::Global { .. });
-        let mut cfg = lenient::parse(text, Some(&src.config_path()), global)?;
+        let path = src.config_path();
+        let mut cfg = lenient::parse(text, Some(&path), global).map_err(|e| in_file(&path, e))?;
         cfg.stamp_source(src);
         Ok(cfg)
     }

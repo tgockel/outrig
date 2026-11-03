@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A config file outrig refuses is named in the error.** `error: TOML parse error at line 2,
+  column 14` left the reader to work out which file the excerpt came from, with the global
+  config and a repo (or `--config`) file both in play; it now reads `error: ci/outrig.toml:
+  TOML parse error ...`, as each load warning already named its file. The repo-only rules,
+  which say "repo config", name the file that broke them too. The config reference says so.
+  (#413)
+
 - **A subcommand that does not read `--config` now refuses it instead of ignoring it.** The
   flag is global, so `init`, `config init`, `image add`, `image init`, `image build`,
   `image inspect`, `design prompt`, `mcp self`, `ls`, `logs`, `discard`, and `clean` all
