@@ -245,6 +245,9 @@ either direction, anywhere.
 The config follows from that. With bindings, an unset `container-path` takes the host path, and a
 configured one that differs is a config error rather than a remapping (`0003-20`).
 
+A host program's session goes further: it mounts each of its directories at its host path, bindings
+or none, since a live object can be injected at any time (`embedding.md`, "Inputs"; `0003-36`).
+
 **Mount access limits the container and nothing else.** A directory mounted read-only cannot be
 written by agent code and can be written by a hosted object, which runs on the host as the user and
 never sees the mount. What limits a binding is the host user's authority and what was bound, not the

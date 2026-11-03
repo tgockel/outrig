@@ -39,9 +39,6 @@ use crate::harness::{Closed, ClosedBy};
 /// How long any one reply may take. A 64 MiB result crosses in a few seconds on a loaded runner.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The binding program's source, for the test that reads its handler table.
-pub(crate) const BINDING_SOURCE: &str = include_str!("binding.py");
-
 /// The vendored RPyC's directory, unpacked once for the whole test binary from the embedded
 /// wheel, as a session's first start would.
 pub(crate) fn rpyc_dir() -> &'static Path {

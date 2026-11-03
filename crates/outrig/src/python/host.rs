@@ -443,8 +443,9 @@ struct Table {
     /// its cause is known, and no other close comes first: an owner who closes
     /// on seeing the user's channel end, which ends here, would otherwise.
     exiting: Option<ClosedBy>,
-    /// What carries hosted calls to the session's bindings, when it has any.
-    relay: Option<Relay>,
+    /// What carries hosted calls to the session's bindings, a relay for each endpoint serving
+    /// some: the bindings process, the host program.
+    relays: Vec<Relay>,
     /// Who waits for each kernel being opened: its `ready`, with the instance
     /// id a root child's kernel says, or why it was not built.
     opening: HashMap<String, oneshot::Sender<Result<Option<u64>, String>>>,
@@ -543,6 +544,8 @@ enum Query {
     Tasks(oneshot::Sender<Tasks>),
     /// A file read: what the interpreter made of it, or why it could not.
     File(oneshot::Sender<Result<Option<FileText>, String>>),
+    /// Bindings declared: every kernel has a stub of each.
+    Bound(oneshot::Sender<()>),
 }
 
 /// One protocol line from the interpreter, which names the agent it concerns.
@@ -632,6 +635,10 @@ enum Reply {
     Rpc(Rpc),
     /// A hosted call the interpreter never sent: the relay records it.
     Hosted(Notice),
+    /// Every kernel has a stub of each binding the host told of under `id`.
+    Bound {
+        id: ExecId,
+    },
     /// A kernel the host asked to end has ended: its loop has stopped and its
     /// thread is done.
     Ended {},
@@ -687,6 +694,7 @@ impl Interpreter {
         container: &Container,
         events: Events,
         rpyc: Option<&str>,
+        workdir: Option<&Path>,
     ) -> Result<Self, InterpreterError> {
         let python = format!("{PAYLOAD_MOUNT}/bin/python3");
         let argv: Vec<String> = [python.as_str()]
@@ -696,9 +704,11 @@ impl Interpreter {
             .chain(rpyc)
             .map(String::from)
             .collect();
-        let child = container
-            .exec_stdio_in_own_group(&argv, &ExecOptions::new())
-            .await?;
+        let mut options = ExecOptions::new();
+        if let Some(dir) = workdir {
+            options = options.with_workdir(dir);
+        }
+        let child = container.exec_stdio_in_own_group(&argv, &options).await?;
         Self::from_child(child, events).await
     }
 
@@ -868,7 +878,7 @@ impl Interpreter {
                 .kernels
                 .entry(agent.into())
                 .or_insert_with(|| KernelState::new(events));
-            if let Some(relay) = &table.relay {
+            for relay in &table.relays {
                 relay.opened(agent);
             }
             self.send(open)?;
@@ -1199,10 +1209,24 @@ impl Interpreter {
     }
 
     /// Carry hosted calls through `relay`, built over [`Interpreter::relay_line`]: from now on
-    /// the interpreter's `rpc` lines and its notices go to it, for each kernel opened from now
-    /// on, and the session's close reaches it with admission's.
+    /// the interpreter's `rpc` lines and its notices for a binding it holds go to it, for each
+    /// kernel opened from now on, and the session's close reaches it with admission's.
     pub(crate) fn attach_relay(&self, relay: Relay) {
-        lock(&self.table).relay = Some(relay);
+        lock(&self.table).relays.push(relay);
+    }
+
+    /// Tell the interpreter more bindings -- `message` is [`bindings_message`]'s -- and wait for
+    /// it to say that every kernel has a stub of each, at most [`READY_TIMEOUT`].
+    pub(crate) async fn bind(&self, message: Value) -> Result<(), String> {
+        let receiver = self
+            .request(message, Query::Bound, |_, _| {})
+            .map_err(|e| e.to_string())?;
+        match tokio::time::timeout(READY_TIMEOUT, answer(&self.table, receiver)).await {
+            Ok(bound) => bound.map_err(|e| e.to_string()),
+            Err(_) => Err(format!(
+                "the interpreter did not bind it within {READY_TIMEOUT:?}"
+            )),
+        }
     }
 
     /// Queue `line` as it is, for a test that speaks the protocol itself.
@@ -1781,15 +1805,16 @@ impl Table {
         live.sort_by_key(|(id, _)| id.0);
         let drained = watch::channel(live.is_empty()).0;
         // Under this lock, so a hosted request and an execution are ordered against the one
-        // close alike. The relay tells the interpreter; without one, this does, so the work its
+        // close alike. Each relay tells the interpreter; without one, this does, so the work its
         // agents gave each other ends with the close too.
         let closing = Closed::from(by.clone()).to_string();
-        match (&self.relay, &self.lines) {
-            (Some(relay), _) => relay.close(&closing),
-            (None, Some(lines)) => {
-                lines.send(format!("{}\n", json!({"t": "close", "reason": closing})));
-            }
-            (None, None) => {}
+        for relay in &self.relays {
+            relay.close(&closing);
+        }
+        if self.relays.is_empty()
+            && let Some(lines) = &self.lines
+        {
+            lines.send(format!("{}\n", json!({"t": "close", "reason": closing})));
         }
         self.closing = Some(Closing { by, live, drained });
         true
@@ -2136,9 +2161,13 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
             return;
         }
     };
-    // Any agent the host opened may use a binding; the relay knows which those are.
-    if let Reply::Rpc(_) | Reply::Hosted(_) = &reply {
-        let Some(relay) = lock(table).relay.clone() else {
+    // Any agent the host opened may use a binding; the relays know which those are, and the
+    // first answers for one none holds.
+    if let Reply::Rpc(super::hosted::Rpc { binding, .. })
+    | Reply::Hosted(super::hosted::Notice { binding, .. }) = &reply
+    {
+        let relays = lock(table).relays.clone();
+        let Some(relay) = relays.iter().find(|r| r.holds(binding)).or(relays.first()) else {
             tracing::warn!(
                 "ignored a hosted-call line from agent {agent:?}: the session has no bindings"
             );
@@ -2172,7 +2201,7 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
         let children = {
             let mut table = lock(table);
             table.forget(&agent);
-            if let Some(relay) = &table.relay {
+            for relay in &table.relays {
                 relay.forget(&agent);
             }
             table.children.clone()
@@ -2196,6 +2225,12 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
                 let _ = waiter.send(seconds);
             }
             _ => tracing::warn!("ignored CPU reading {id}, which nothing asked for"),
+        },
+        Reply::Bound { id } => match lock(table).queries.remove(&id) {
+            Some(Query::Bound(waiter)) => {
+                let _ = waiter.send(());
+            }
+            _ => tracing::warn!("ignored bindings bound under {id}, which nothing asked for"),
         },
         Reply::Msg { id, pending, error } => {
             let mut table = lock(table);

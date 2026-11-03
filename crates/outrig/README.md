@@ -16,9 +16,11 @@ library crate. It does two things:
   operator approves it. `outrig run-new` is built on it and nothing else of the loop. A Python
   program on the host, run by [`harness::HostProgram`], owns sessions with no agent of their own
   through `outrig.Session`, drives the agent classes it constructs in them, whose replies it
-  decodes into its own classes, and whatever sessions it leaves open the engine stops and
-  reports. A session serves skills -- a `SKILL.md` of instructions and, optionally, Python --
-  from the [`harness::SkillSource`]s it is given, each skill's files fetched from the host as the
+  decodes into its own classes, and serves their agents objects it holds with
+  `session.inject` -- live objects, each operation on one run in the program and recorded as a
+  binding's is -- and whatever sessions it leaves open the engine stops and reports. A session
+  serves skills -- a `SKILL.md` of instructions and, optionally, Python -- from the
+  [`harness::SkillSource`]s it is given, each skill's files fetched from the host as the
   agent's code imports or reads them, with nothing mounted for them; a user's `/name`, sent with
   [`harness::UserChannel::send_directive`], asks the agent to run one, which its code does with
   `outrig.skills.invoke`.
@@ -37,7 +39,8 @@ bindings process; `OUTRIG_RPYC_WHEEL` names a local copy of it for a build with 
 OutRig reserves `/outrig` inside the container, so neither the workspace nor a mount may be
 placed there. OutRig's own Python package, `outrig`, is part of the build too, and every session
 mounts it read-only at `/outrig/lib`; a session's bindings mount their packages read-only under
-`/outrig/bindings`, and RPyC at `/outrig/rpyc`.
+`/outrig/bindings`, and a session with bindings, or a host program's, mounts RPyC at
+`/outrig/rpyc`.
 
 ## Example
 

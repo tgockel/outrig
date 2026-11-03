@@ -184,10 +184,19 @@ pub(crate) fn host_home() -> PathBuf {
 /// the host, with `arguments` after the program: where OutRig's package is,
 /// and the vendored RPyC's directory for a session with bindings.
 pub(super) async fn spawn(arguments: &[&Path]) -> Child {
+    spawn_in(arguments, None).await
+}
+
+/// [`spawn`], in `dir` when given.
+async fn spawn_in(arguments: &[&Path], dir: Option<&Path>) -> Child {
     let python = payload::host_python()
         .await
         .expect("the payload this build embedded");
-    tokio::process::Command::new(python)
+    let mut command = tokio::process::Command::new(python);
+    if let Some(dir) = dir {
+        command.current_dir(dir);
+    }
+    command
         .args(ARGS)
         .args(arguments)
         .env("HOME", host_home())
@@ -218,13 +227,25 @@ pub(crate) async fn start_on_host_with(events: Events) -> Interpreter {
 /// importing RPyC from `rpyc` when given: one that can reach a session's
 /// bindings.
 pub(crate) async fn start_on_host_rpyc(events: Events, rpyc: Option<&Path>) -> Interpreter {
+    start_on_host_in(events, rpyc, None).await
+}
+
+/// [`start_on_host_rpyc`], in `dir` when given rather than the test's working directory.
+pub(crate) async fn start_on_host_in(
+    events: Events,
+    rpyc: Option<&Path>,
+    dir: Option<&Path>,
+) -> Interpreter {
     let package = payload::package_dir()
         .await
         .expect("the package this build carries");
     let arguments: Vec<&Path> = [package.as_path()].into_iter().chain(rpyc).collect();
-    within(Interpreter::from_child(spawn(&arguments).await, events))
-        .await
-        .unwrap_or_else(|e| panic!("{e}"))
+    within(Interpreter::from_child(
+        spawn_in(&arguments, dir).await,
+        events,
+    ))
+    .await
+    .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// How a test starts the interpreter on the host. By default: in the test's

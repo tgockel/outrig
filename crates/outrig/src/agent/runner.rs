@@ -227,6 +227,8 @@ pub(crate) async fn run(
         }
         match ended {
             Ok(_) => {
+                // What it was told of in results, such as a binding added, it read.
+                agent.announcer().keep();
                 // An orienting round's baseline stays empty, so what is open as
                 // it ends opens the next round.
                 match orienting.take() {

@@ -278,6 +278,14 @@ fn each_event_has_exactly_its_data_fields() {
             &["bindings", "cause"],
         ),
         (
+            Payload::BindingInjected {
+                binding: text("notes"),
+                type_name: text("__main__.Notes"),
+            },
+            "binding.injected",
+            &["binding", "type"],
+        ),
+        (
             Payload::HostedReceived {
                 request: RequestId::new(4),
                 agent: text("primary"),

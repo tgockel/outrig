@@ -741,14 +741,18 @@ alias = ["either", "fast"]
 [workspace]
 host-path = "work/../ws"
 
+[[workspace.mounts]]
+host-path = "data"
+access    = "read-write"
+
 [events]
 mode = "record"
 "#;
 
 /// `outrig.config()` shows each model with the style it is called with -- its own, else its
 /// provider's -- and its effective identifier and window, each alias with its candidates in order,
-/// each provider's style and base URL, the defaults, the resolved workspace and the events mode --
-/// frozen -- and holds no key nor the variable naming it.
+/// each provider's style and base URL, the defaults, the resolved workspace and mounts and the
+/// events mode -- frozen -- and holds no key nor the variable naming it.
 #[tokio::test]
 async fn the_view_holds_the_configuration_and_no_secret() {
     let case = Case::new();
@@ -765,6 +769,7 @@ async fn the_view_holds_the_configuration_and_no_secret() {
         print(view.aliases["chain"])
         print(view.providers["local"])
         print(view.default_model, view.workspace, view.events)
+        print(view.mounts)
         try:
             view.models["new"] = None
         except TypeError:
@@ -786,7 +791,7 @@ async fn the_view_holds_the_configuration_and_no_secret() {
     let workspace = case.path().join("work/../ws");
     let lines: Vec<&str> = ran.stdout.lines().collect();
     assert_eq!(
-        lines[..8],
+        lines[..9],
         [
             "['fast', 'slow'] ['chain', 'either'] ['local']",
             "Model(name='fast', provider='local', style='chat-completions', \
@@ -796,6 +801,10 @@ async fn the_view_holds_the_configuration_and_no_secret() {
             "Alias(name='chain', candidates=('fast', 'slow'))",
             "Provider(name='local', style='chat-completions', base_url='http://127.0.0.1:1/v1')",
             &format!("fast {} Events(mode='record')", workspace.display()),
+            &format!(
+                "(Mount(host_path='{}', access='read-write'),)",
+                case.path().join("data").display()
+            ),
             "read-only",
             "frozen",
         ]
@@ -832,6 +841,7 @@ fn the_view_falls_back_to_the_rows_name_and_no_workspace() {
             "providers": {"local": {"style": "messages", "base_url": "http://127.0.0.1:1"}},
             "default_model": null,
             "workspace": null,
+            "mounts": [],
             "events": {"mode": "off"},
         })
     );

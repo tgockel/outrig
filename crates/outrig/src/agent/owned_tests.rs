@@ -1736,3 +1736,115 @@ asyncio.run(main())
         ran.stderr
     );
 }
+
+/// The requirements' live object against a mock model: `inject("notes", notes)` after the first
+/// `Reader` exists returns `None` before the first request is sent; both `Reader`s read the one
+/// `Notes` through `outrig.bindings["notes"].read()`, as its counter says, and the second's kernel
+/// has the global `notes` too. The second is oriented with the binding -- its type's qualified
+/// name and its docstring's first line, its `repr` never run -- and the first, made before, is
+/// told of it in its next result instead.
+#[tokio::test]
+async fn the_requirements_program_injects_a_live_object() {
+    let script = r#"
+        import asyncio, json, os
+        import outrig
+
+        class Notes:
+            """The program's notes, read by its agents.
+
+            Not this line."""
+
+            def __init__(self):
+                self.reads = 0
+
+            def read(self):
+                self.reads += 1
+                return f"note {self.reads}"
+
+            def __repr__(self):
+                open("repr-ran", "w").close()
+                return "Notes()"
+
+        class Reader(outrig.Agent):
+            """You read the program's notes."""
+
+            @outrig.agent
+            async def read(self, question: str) -> str:
+                """Answer `question` from the notes."""
+                ...
+
+        async def main():
+            notes = Notes()
+            async with outrig.Session() as session:
+                first = Reader(who="ROLE first")
+                await first.ready()
+                returned = session.inject("notes", notes)
+                second = Reader(who="ROLE second")
+                await second.ready()
+                answers = [await first.read("first"), await second.read("second")]
+            print(json.dumps([returned, answers, notes.reads, os.path.exists("repr-ran")]))
+
+        asyncio.run(main())
+        "#;
+    let reads = |id: &str, tail: &str| {
+        super::mock_http::scripted(vec![
+            text_reply("ready"),
+            submit(
+                id,
+                &format!(
+                    "import outrig\n\
+                     d = await runtime.channels['read'].receive()\n\
+                     await d.reply(outrig.bindings['notes'].read(){tail})"
+                ),
+            ),
+            text_reply("answered"),
+        ])
+    };
+    let run = owned(
+        "OUTRIG_TEST_OWNED_NOTES",
+        "",
+        script,
+        vec![
+            ("ROLE first", reads("n1", "")),
+            ("ROLE second", reads("n2", " + ' ' + type(notes).__name__")),
+        ],
+    )
+    .await;
+    let (ran, _, requests) = run.finish().await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    assert_eq!(
+        ran.json(),
+        [json!([null, ["note 1", "note 2 HostedRoot"], 2, false])],
+        "{}",
+        ran.stderr
+    );
+    let of = |marker: &str| -> Vec<&RecordedRequest> {
+        requests
+            .iter()
+            .filter(|request| super::mock_http::system_text(&request.body).contains(marker))
+            .collect()
+    };
+    let oriented = "- `notes`: a `__main__.Notes` the host program holds: The program's notes, \
+                    read by its agents.";
+    // The path agent code reaches it by, whatever its own globals hold, as JSON carries it.
+    let told = |requests: &[&RecordedRequest]| {
+        requests.iter().any(|request| {
+            let body = request.body.to_string();
+            body.contains(r#"[`outrig.bindings[\"notes\"]` is now bound: a `__main__.Notes`"#)
+        })
+    };
+    let (first, second) = (of("ROLE first"), of("ROLE second"));
+    assert!(
+        first.len() >= 2 && second.len() >= 2,
+        "{first:?} {second:?}"
+    );
+    assert!(
+        !super::mock_http::system_text(&first[0].body).contains(oriented),
+        "the first was made before the injection"
+    );
+    assert!(told(&first), "the first is told in its next result");
+    let system = super::mock_http::system_text(&second[0].body);
+    assert!(system.contains(oriented), "{system}");
+    assert!(!system.contains("Not this line"), "{system}");
+    assert!(!told(&second), "the second is oriented instead");
+}

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use super::bindings::Bindings;
+use super::bindings::{Bindings, Brief};
 use super::builder::{self, SessionBuilder};
 use super::event::{Payload, SessionState};
 use super::lifecycle::Lifecycle;
@@ -21,7 +21,8 @@ use crate::agent::orientation::Holdings;
 use crate::agent::window::Windows;
 use crate::agent::{Agent, AgentError, ResolvedAgent};
 use crate::config::{Config, Secrets};
-use crate::python::host::{Interpreter, PRIMARY};
+use crate::python::host::{Interpreter, PRIMARY, bindings_message};
+use crate::python::hosted::Relay;
 use crate::python::supervisor::STOP_GRACE;
 
 /// How long an execution an interrupt reached has to end of its own accord --
@@ -311,6 +312,34 @@ impl Session {
         Closer(Arc::clone(&self.lifecycle))
     }
 
+    /// Bind the live object `brief` describes, which the program on the host
+    /// that owns the session holds and serves, in every kernel: in each one's
+    /// `outrig.bindings`, and as a global where its name is free. Returns once
+    /// every kernel has it; a child made later is oriented with it, and each
+    /// made before is told of it in its next result. Refused once admission
+    /// has closed, and in a session that takes no live object.
+    pub(crate) async fn inject(&self, brief: Brief) -> Result<(), String> {
+        if let Some(by) = self.lifecycle.closed() {
+            return Err(Closed::from(by).to_string());
+        }
+        let Some(live) = self.bindings.live() else {
+            return Err("this session takes no live object: this build carries no RPyC".into());
+        };
+        live.add(&brief.name);
+        self.lifecycle.events().emit(Payload::BindingInjected {
+            binding: brief.name.clone(),
+            type_name: brief.type_name.clone(),
+        });
+        self.children.inject(brief.clone());
+        self.interpreter.bind(bindings_message(&[brief], [])).await
+    }
+
+    /// What carries hosted calls to the live objects of the program on the
+    /// host that owns the session, when it may inject any.
+    pub(crate) fn live(&self) -> Option<Relay> {
+        self.bindings.live().cloned()
+    }
+
     /// The session's child agents, for a program on the host that owns it,
     /// whose agent class instances are root children: held through its
     /// shutdown, which a request may meet.
@@ -432,9 +461,7 @@ impl Session {
             let (gate, hosted) = (&gate, &bindings);
             let drained = move || async move {
                 gate.drained().await;
-                if let Some(hosted) = hosted.drained() {
-                    hosted.await;
-                }
+                hosted.drained().await;
             };
             if tokio::time::timeout_at(until, drained()).await.is_err() {
                 // Interrupted first, which agent code can answer: a `finally`
@@ -459,6 +486,8 @@ impl Session {
                 )
             })
             .collect();
+        // Nothing the engine owns runs these, so nothing it does can end them.
+        failed.extend(bindings.seal_live());
         let gone = interpreter.gone();
         interpreter.expect_exit();
         match container {

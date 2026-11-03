@@ -336,9 +336,21 @@ fn hosted(bindings: &[Brief]) -> String {
          is a request to the host, and it blocks your event loop until the host answers: no \
          message arrives and no timer fires meanwhile. For a long call, `await \
          asyncio.to_thread(lambda: {example}.f(x))` runs the whole expression on a worker thread \
-         and keeps the loop turning. `runtime.bindings` lists them."
+         and keeps the loop turning. `runtime.bindings` lists them, and `outrig.bindings[name]` \
+         reaches each wherever its name holds something else: a binding never replaces a name \
+         your code bound before it came, nor a builtin."
     );
     text
+}
+
+/// What an agent made before a host program injected `brief`'s object is told of it.
+pub(crate) fn injected(brief: &Brief) -> String {
+    let name = &brief.name;
+    format!(
+        "`outrig.bindings[{name:?}]` is now bound: {} The global `{name}` is it too, unless your \
+         code had bound that name, or it is a builtin's",
+        brief.description.trim()
+    )
 }
 
 /// The most skills the preamble lists.

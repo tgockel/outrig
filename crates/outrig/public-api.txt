@@ -1169,6 +1169,7 @@ pub outrig::harness::event::HostedReason::Interception
 pub outrig::harness::event::HostedReason::Interrupted
 pub outrig::harness::event::HostedReason::Killed
 pub outrig::harness::event::HostedReason::QueueFull
+pub outrig::harness::event::HostedReason::StillRunning
 #[non_exhaustive] pub enum outrig::harness::event::InstanceRelease
 pub outrig::harness::event::InstanceRelease::AsyncWith
 pub outrig::harness::event::InstanceRelease::Closing
@@ -1296,6 +1297,9 @@ pub outrig::harness::event::Payload::AgentStarted::tool_result_max: u64
 #[non_exhaustive] pub outrig::harness::event::Payload::BindingExited
 pub outrig::harness::event::Payload::BindingExited::bindings: alloc::vec::Vec<alloc::string::String>
 pub outrig::harness::event::Payload::BindingExited::cause: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::BindingInjected
+pub outrig::harness::event::Payload::BindingInjected::binding: alloc::string::String
+pub outrig::harness::event::Payload::BindingInjected::type_name: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::BindingRefused
 pub outrig::harness::event::Payload::BindingRefused::binding: alloc::string::String
 pub outrig::harness::event::Payload::BindingRefused::declared_in: core::option::Option<std::path::PathBuf>

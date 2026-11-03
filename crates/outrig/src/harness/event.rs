@@ -648,6 +648,15 @@ pub enum Payload {
         from: String,
         to: String,
     },
+    /// The host program injected a live object it holds, which every kernel
+    /// reaches as `outrig.bindings[binding]`: `type` is the qualified name of
+    /// its type.
+    #[non_exhaustive]
+    BindingInjected {
+        binding: String,
+        #[serde(rename = "type")]
+        type_name: String,
+    },
     /// A request agent code made of a hosted object, as it arrived: published
     /// before anything is decided about it. `by` says who saw it -- the
     /// bindings process, which received it, or, for one it never received,
@@ -730,6 +739,7 @@ impl Payload {
             Payload::InterpreterDiagnostic { .. } => "interpreter.diagnostic",
             Payload::InterpreterExited { .. } => "interpreter.exited",
             Payload::BindingRefused { .. } => "binding.refused",
+            Payload::BindingInjected { .. } => "binding.injected",
             Payload::ModelRoundCompleted { .. } => "model.round.completed",
             Payload::ModelRoundFailed { .. } => "model.round.failed",
             Payload::ModelRoundDropped { .. } => "model.round.dropped",
@@ -786,6 +796,7 @@ impl Payload {
             | Self::InterpreterDiagnostic { .. }
             | Self::InterpreterExited { .. }
             | Self::BindingRefused { .. }
+            | Self::BindingInjected { .. }
             | Self::BindingExited { .. }
             | Self::SkillDiscovered { .. } => None,
             // An import is the agent's whose code made it, which may be none.
@@ -926,10 +937,13 @@ pub enum HostedReason {
     Interrupted,
     /// The session closed while it waited.
     Closed,
-    /// The bindings process was killed at shutdown.
+    /// The bindings process was killed at shutdown, or the host program serving it was gone.
     Killed,
     /// Its connection closed before the bindings process read it.
     Disconnected,
+    /// The host program serving it was still running it when the session terminated, and
+    /// nothing the engine owns could end it.
+    StillRunning,
 }
 
 /// A tool a model call carries, as the provider is told of it.

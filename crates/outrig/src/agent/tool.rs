@@ -148,19 +148,24 @@ impl SubmitPython {
         self.interrupts.clone()
     }
 
-    /// A line saying what waits on the agent's channels, if anything arrived
-    /// since the model was last told, or nothing. Never an error: the result
-    /// matters more, and an announcement missed here is made by a later call
-    /// or the next round.
+    /// A line for each live object a host program injected since the model
+    /// was last told, then one saying what waits on the agent's channels, if
+    /// anything arrived since the model was last told, or nothing. Never an
+    /// error: the result matters more, and an announcement missed here is made
+    /// by a later call or the next round.
     async fn announcement(&self) -> String {
+        let mut text: String = self
+            .announcer
+            .injections()
+            .iter()
+            .map(|line| format!("[{line}]\n"))
+            .collect();
         match self.announcer.arrived().await {
-            Ok(Some(text)) => format!("[{text}]\n"),
-            Ok(None) => String::new(),
-            Err(e) => {
-                tracing::debug!("not announcing what waits: {e}");
-                String::new()
-            }
+            Ok(Some(waiting)) => text.push_str(&format!("[{waiting}]\n")),
+            Ok(None) => {}
+            Err(e) => tracing::debug!("not announcing what waits: {e}"),
         }
+        text
     }
 
     /// As if an earlier result had had no room for `late`.

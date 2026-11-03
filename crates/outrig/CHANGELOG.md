@@ -326,7 +326,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Agent code calls its bindings, and every call is recorded.** Each binding is bound under its
   name in every kernel -- the primary and every one opened later -- as RPyC's proxy of its root,
-  fetched at the first use, and agent code uses it as the library documents: each read, call or
+  fetched at the first use, where the name is free: an input, or a builtin such as `print`, keeps
+  what it is, and `outrig.bindings[name]` reaches the binding there. Agent code uses it as the
+  library documents: each read, call or
   iteration step is a request that holds the calling thread, and with it the kernel's event loop,
   until the host answers; `asyncio.to_thread` keeps the loop turning. A read the binding refuses is
   an `AttributeError`, a missing or refused read is one request, and a coroutine function is refused
@@ -407,16 +409,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signal that ended it. The program reaches the engine over two inherited pipes that nothing it
   starts inherits: `outrig.config()` there is a frozen view of the `Config` -- each model's
   provider, effective identifier and declared window, each alias's candidates in order, each
-  provider's style and base URL, `default-model`, the resolved workspace and the events mode --
-  holding no key and no `${VAR}`. In a kernel, `outrig.config` is absent.
+  provider's style and base URL, `default-model`, the resolved workspace, the configured mounts
+  and the events mode -- holding no key and no `${VAR}`. In a kernel, `outrig.config` is
+  absent.
 - **A host program owns sessions, and the engine stops what it leaves open.** In a program
-  `HostProgram` runs, `async with outrig.Session(workspace=..., mounts=..., grace=...)` has the
+  `HostProgram` runs, `async with outrig.Session(mounts=..., cwd=..., grace=...)` has the
   engine start a session with no primary agent from the program's `Config`: the image
   `default-image` names, ensured as `outrig run-new` ensures one, the configured factory bindings
   (a repository's refused, for want of an approver), and `events.jsonl` in
   `<session-root>/<id>/logs` under `[events] mode = "record"`. Making one starts nothing, and
-  checks its `grace`, an hour at most. Its paths are checked before anything starts, a binding's
-  rule that each directory appear at its host path included. Entering it sets
+  checks its `grace`, an hour at most. Each of its `mounts`, an `outrig.Mount(host_path,
+  access="read-only")` or a path, appears in the container at its host path, so a path names the
+  same file in the program and in agent code; `cwd`, a directory inside one, is where agent code
+  runs. The configuration's `[workspace]` and `[[workspace.mounts]]` are the interactive
+  session's and are not mounted; `outrig.config()` shows both. Its paths are checked before
+  anything starts. Entering it sets
   `outrig.current_session()`; `session.events()` yields `outrig.Event` records and
   `outrig.Missed` counts, losing the oldest rather than slowing the session; `await
   session.close_admission()` returns once the gate is closed; and the exit shuts the session down,
@@ -579,6 +586,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still alive, and `ShutdownReport.requests` in the Python mirror, new, lists the requests open at
   the close. Every request the program sends is answered, and each it made ends, however the
   interpreter ends. The owner protocol is version 2, with lines of up to 1 MiB.
+- **A host program serves its own objects to a session's agents: `session.inject(name, obj,
+  serialize=False)`.** Synchronous, before the session's entry or after, it returns `None` once
+  every agent can reach the object -- `outrig.bindings[name]` in every kernel, and the global `name`
+  where the name is free -- in the kernels that exist and in every one built later. The object stays
+  in the program, which serves each operation agent code makes of its proxy on a thread per
+  connection, never on its event loop, through the serving module `binding.py` now wraps, with the
+  checks, admission, drain and `hosted.*` events a configured binding's requests have;
+  `serialize=True` runs one call at a time. A name that is not an identifier, a keyword, `runtime`,
+  `asyncio`, `outrig`, a dunder, one already injected or one the configuration declares a binding of
+  raises `ValueError` -- or, injected before entry, fails the entry -- and an injection while the
+  session starts, or once it is closed to new work, `RuntimeError`. An agent's orientation lists a
+  live object by its type's qualified name and its docstring's first line, read from the class with
+  nothing of the object run, and an agent already running is told of one in its next tool result.
+  `Payload::BindingInjected`, `binding.injected`, records each. A live call still running when the
+  session ends runs on in the program: it ends `unknown` with `HostedReason::StillRunning`, the stop
+  is not proven, and the program's exit raises `outrig.ShutdownException`; a program that dies takes
+  its calls with it, `unknown`, `killed`, and agent code waiting on one is told at once. A program's
+  session mounts RPyC whenever the build carries it, and the program serves with that copy whatever
+  `rpyc` it imports itself. The owner protocol is version 3: `inject` registers a live object, and
+  `rpc`, `event`, `published` and `control` lines, each naming its session, carry the serving of its
+  live objects both ways.
 - **Skills: `SkillSource`, `DirectorySource` and `SessionBuilder::skill_source`.** A skill is a
   directory holding a `SKILL.md` -- Agent Skills frontmatter, then instructions -- and, optionally,
   a `skill.py`. A session serves the skills of the sources it is given, in order: the first that

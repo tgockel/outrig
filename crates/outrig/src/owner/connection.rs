@@ -20,13 +20,13 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::LeftOpen;
-use super::session::{self, Command, Context, MountRequest, Request};
+use super::session::{self, Command, Context, Live, MountRequest, Request};
 use crate::harness::DEFAULT_DRAIN;
 use crate::python::host::next_line;
 use crate::python::supervisor::quoted;
 
 /// The version of the owner protocol this engine speaks.
-pub(crate) const PROTOCOL: u64 = 2;
+pub(crate) const PROTOCOL: u64 = 3;
 /// How long a program has to greet once it is started: its interpreter's start and `outrig`'s
 /// import, which take well under a second.
 const GREETING: Duration = Duration::from_secs(30);
@@ -131,9 +131,11 @@ impl Out {
 #[derive(Deserialize)]
 struct Start {
     session: u64,
-    workspace: Option<PathBuf>,
     #[serde(default)]
     mounts: Vec<MountRequest>,
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    live: Vec<Live>,
 }
 
 /// Read the program's requests until it is gone, then wait for every session it asked for to
@@ -197,8 +199,9 @@ pub(crate) async fn serve(
                         let request = Request {
                             handle: start.session,
                             reply: id,
-                            workspace: start.workspace,
                             mounts: start.mounts,
+                            cwd: start.cwd,
+                            live: start.live,
                         };
                         started.spawn(session::run(
                             request,
@@ -221,6 +224,26 @@ pub(crate) async fn serve(
                 if let Err(why) = routed {
                     out.refuse(id, why).await;
                 }
+            }
+            Some("inject") => {
+                let routed = serde_json::from_value(Value::Object(request.clone()))
+                    .map_err(|e| format!("an inject the engine cannot read: {e}"))
+                    .and_then(|live| {
+                        let reply = id.clone();
+                        route(&sessions, &request, Command::Inject { reply, live })
+                    });
+                if let Err(why) = routed {
+                    out.refuse(id, why).await;
+                }
+            }
+            // What the program's serving module says of its live objects, which carries an id of
+            // its own and is answered by nothing.
+            Some("rpc" | "event") => {
+                let _ = route(
+                    &sessions,
+                    &request,
+                    Command::Live(Value::Object(request.clone())),
+                );
             }
             Some(kind)
                 if kind.starts_with("agent.") || matches!(kind, "ask" | "withdraw" | "verdict") =>

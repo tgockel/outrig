@@ -220,7 +220,9 @@ pub(crate) struct Process {
 /// bindings and carries the last of its stderr. Either way nothing of its group is left running.
 pub(crate) async fn start(spec: Spec<'_>) -> Result<Process> {
     let mut cmd = Command::new(spec.python);
-    cmd.args(["-I", "-c", PROGRAM]).arg(spec.rpyc_dir);
+    cmd.args(["-I", "-c", PROGRAM])
+        .arg(super::payload::package_dir().await?)
+        .arg(spec.rpyc_dir);
     if let Some(cwd) = spec.cwd {
         cmd.current_dir(cwd);
     }

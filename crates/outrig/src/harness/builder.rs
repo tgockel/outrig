@@ -114,6 +114,11 @@ pub struct SessionBuilder {
     /// Whether the session has a primary agent: until
     /// [`SessionBuilder::no_primary`], it does.
     primary: bool,
+    /// Whether a host program owns the session, and may inject live objects.
+    program: bool,
+    /// The interpreter's working directory in the container, in place of the
+    /// image's or the workspace's.
+    workdir: Option<PathBuf>,
 }
 
 impl SessionBuilder {
@@ -154,7 +159,17 @@ impl SessionBuilder {
             #[cfg(test)]
             fail_stop: None,
             primary: true,
+            program: false,
+            workdir: None,
         }
+    }
+
+    /// The session of a host program, which may inject live objects into it,
+    /// its interpreter working in `cwd` when given.
+    pub(crate) fn program(mut self, cwd: Option<PathBuf>) -> Self {
+        self.program = true;
+        self.workdir = cwd;
+        self
     }
 
     /// Start the session with no primary agent: it resolves no model, and asks
@@ -396,15 +411,20 @@ impl SessionBuilder {
         )
         .await;
 
-        let cwd = spec
-            .workspace
-            .as_ref()
-            .map_or_else(|| repo_root.clone(), |workspace| lexical(&workspace.host));
+        // A program's session works in its `cwd`, at the same path on both sides.
+        let cwd = self.workdir.clone().unwrap_or_else(|| {
+            spec.workspace
+                .as_ref()
+                .map_or_else(|| repo_root.clone(), |workspace| lexical(&workspace.host))
+        });
         let mut bindings = self
             .start_bindings(declared, &repo_root, &cwd, &events)
             .await
             .map_err(start_error)?;
-        if !bindings.is_empty()
+        if self.program {
+            bindings.allow_live().await;
+        }
+        if bindings.rpyc_dir().is_some()
             && let Err(e) = same_paths(&self.config, &mut spec, &bindings)
         {
             bindings.stop_after_failed_start().await;
@@ -422,8 +442,10 @@ impl SessionBuilder {
         self.report(Progress::Finished(Step::Container));
 
         self.report(Progress::Started(Step::Python));
-        let rpyc = (!bindings.is_empty()).then_some(RPYC_MOUNT);
-        let interpreter = match Interpreter::start(outrig.primary(), events.clone(), rpyc).await {
+        let rpyc = bindings.rpyc_dir().map(|_| RPYC_MOUNT);
+        let workdir = self.workdir.as_deref();
+        let started = Interpreter::start(outrig.primary(), events.clone(), rpyc, workdir).await;
+        let interpreter = match started {
             Ok(interpreter) => interpreter,
             Err(e) => {
                 stop(Some(outrig), &mut bindings).await;
@@ -437,9 +459,11 @@ impl SessionBuilder {
 
         let primary = outrig.primary();
         // A container launched without a workspace holds an empty path.
-        let workspace = Some(primary.container_workspace())
-            .filter(|workspace| !workspace.as_os_str().is_empty())
-            .map(Path::to_path_buf);
+        let workspace = self.workdir.clone().or_else(|| {
+            Some(primary.container_workspace())
+                .filter(|workspace| !workspace.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+        });
         let name = primary.name().to_string();
         let setup = self.child_setup(workspace.clone());
         let session = Session::new(
@@ -602,18 +626,26 @@ impl SessionBuilder {
             skills::SOURCE_TIMEOUT,
         )
         .await;
+        let cwd = self.workdir.clone().unwrap_or_else(|| repo_root.clone());
         let mut bindings = self
-            .start_bindings(declared, &repo_root, &repo_root, &events)
+            .start_bindings(declared, &repo_root, &cwd, &events)
             .await
             .map_err(start_error)?;
+        if self.program {
+            bindings.allow_live().await;
+        }
         self.report(Progress::Started(Step::Python));
-        let interpreter =
-            crate::python::testing::start_on_host_rpyc(events.clone(), bindings.rpyc_dir()).await;
+        let interpreter = crate::python::testing::start_on_host_in(
+            events.clone(),
+            bindings.rpyc_dir(),
+            self.workdir.as_deref(),
+        )
+        .await;
         bindings.connect(&interpreter, &events);
         bindings.declare(&interpreter, Path::to_path_buf);
         skills::serve(&catalog, &interpreter, &events);
         self.report(Progress::Finished(Step::Python));
-        let workspace = self.host_workspace.take();
+        let workspace = self.host_workspace.take().or(self.workdir.clone());
         let setup = self.child_setup(workspace.clone());
         let session = Session::new(
             id,

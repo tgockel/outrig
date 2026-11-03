@@ -108,12 +108,6 @@ phase.
 | --------- | ------------------------------------------------------------------ |
 | `0003-37` | A request is worked on or cancelled, and its sender is told        |
 
-**Live objects**
-
-| Task      | What it settles                                                    |
-| --------- | ------------------------------------------------------------------ |
-| `0003-36` | A host program injects a live object                               |
-
 **Documentation of the first 37**
 
 | Task      | What it settles                                                    |

@@ -946,7 +946,7 @@ mod e2e {
     #[tokio::test]
     async fn the_interpreter_starts_in_a_session_container_and_answers() {
         let container = session(ALPINE, true).await;
-        let interpreter = within(Interpreter::start(&container, Events::off(), None))
+        let interpreter = within(Interpreter::start(&container, Events::off(), None, None))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         within(interpreter.open(PRIMARY))
@@ -974,7 +974,7 @@ mod e2e {
     #[tokio::test]
     async fn a_plain_pip_install_imports_at_once_in_a_session_container() {
         let container = session(ALPINE, true).await;
-        let interpreter = within(Interpreter::start(&container, Events::off(), None))
+        let interpreter = within(Interpreter::start(&container, Events::off(), None, None))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         within(interpreter.open(PRIMARY))
@@ -1000,7 +1000,7 @@ mod e2e {
     #[tokio::test]
     async fn the_agents_pip_and_the_images_python_do_not_share_a_site() {
         let container = session(PYTHON_ALPINE, true).await;
-        let interpreter = within(Interpreter::start(&container, Events::off(), None))
+        let interpreter = within(Interpreter::start(&container, Events::off(), None, None))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         within(interpreter.open(PRIMARY))
@@ -1035,7 +1035,7 @@ mod e2e {
     #[tokio::test]
     async fn the_compiled_parts_note_is_the_payloads_pip_and_not_the_images() {
         let container = session(PYTHON_ALPINE, true).await;
-        let interpreter = within(Interpreter::start(&container, Events::off(), None))
+        let interpreter = within(Interpreter::start(&container, Events::off(), None, None))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         within(interpreter.open(PRIMARY))
@@ -1071,7 +1071,7 @@ mod e2e {
     async fn an_image_without_the_payload_is_a_startup_error_naming_the_cause() {
         let container = session(ALPINE, false).await;
         let message =
-            startup_error(within(Interpreter::start(&container, Events::off(), None)).await);
+            startup_error(within(Interpreter::start(&container, Events::off(), None, None)).await);
         assert!(
             message.contains(&format!("{}/bin/python3", payload::PAYLOAD_MOUNT))
                 && !message.contains("did not report ready"),

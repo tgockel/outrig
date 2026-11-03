@@ -753,7 +753,7 @@ async fn a_session_asks_the_runtime_for_nothing_until_it_is_entered() {
     );
 }
 
-/// A host directory mounted twice fails the entry before anything is asked of the runtime.
+/// A host directory mounted twice fails the session's making, so nothing is asked of the runtime.
 #[tokio::test]
 async fn a_repeated_mount_fails_entry_before_the_runtime_is_asked() {
     let case = Case::new();
@@ -763,9 +763,9 @@ async fn a_repeated_mount_fails_entry_before_the_runtime_is_asked() {
         "import asyncio, outrig\n\
          async def main():\n\
          \x20   try:\n\
-         \x20       async with outrig.Session(mounts=[outrig.Mount('data', '/a'), outrig.Mount('data', '/b')]):\n\
+         \x20       async with outrig.Session(mounts=['data', outrig.Mount('data', 'read-write')]):\n\
          \x20           print('entered')\n\
-         \x20   except RuntimeError as e:\n\
+         \x20   except ValueError as e:\n\
          \x20       print(e)\n\
          asyncio.run(main())\n",
     );
@@ -774,12 +774,9 @@ async fn a_repeated_mount_fails_entry_before_the_runtime_is_asked() {
     let data = case.path().join("data");
     assert!(
         text(&ran.stdout).starts_with(&format!(
-            "workspace mount host-path \"{}\" is mounted more than once",
+            "{} is mounted twice",
             data.canonicalize().unwrap_or(data.clone()).display()
-        )) || text(&ran.stdout).starts_with(&format!(
-            "workspace mount host-path \"{}\" is mounted more than once",
-            data.display()
-        )),
+        )) || text(&ran.stdout).starts_with(&format!("{} is mounted twice", data.display())),
         "{}",
         text(&ran.stdout)
     );

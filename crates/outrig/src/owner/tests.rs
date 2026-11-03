@@ -442,13 +442,20 @@ async fn run_in(bed: &Bed, interpreter: &Interpreter, agent: &str, source: &str,
     crate::python::testing::within(interpreter.open(agent))
         .await
         .unwrap_or_else(|e| panic!("{e}"));
+    exec_in(bed, interpreter, agent, 1, source, done);
+    bed.raised(done).await;
+}
+
+/// Run `source` as execution `id` in `agent`'s open kernel, raising the flag `done` in the bed
+/// once it has run; returns at once.
+fn exec_in(bed: &Bed, interpreter: &Interpreter, agent: &str, id: u64, source: &str, done: &str) {
     let source = format!(
         "{}\nopen({:?}, 'w').close()",
         crate::python::testing::py(source),
         bed.flag(done).to_str().expect("a UTF-8 path")
     );
-    interpreter.send_line(serde_json::json!({"t": "exec", "agent": agent, "id": 1, "src": source}));
-    bed.raised(done).await;
+    interpreter
+        .send_line(serde_json::json!({"t": "exec", "agent": agent, "id": id, "src": source}));
 }
 
 /// A session a program enters is one with no primary agent: construction asks for nothing, entry
@@ -1056,67 +1063,74 @@ async fn a_session_records_its_events_only_when_the_configuration_asks() {
     }
 }
 
-/// What a program asks to mount is checked at entry, before anything starts: a host directory
-/// mounted twice -- among its own mounts, or as the workspace and a mount -- a container path
-/// taken twice, a configured mount's included, and a workspace that is not a directory each fail
-/// the entry with `RuntimeError` naming the path, and leave no session behind.
+/// What a program asks to mount is checked before anything starts. Making the session raises
+/// `ValueError` for a host directory given twice, however spelled, and for a working directory in
+/// none of its mounts. Entering it raises `RuntimeError`, naming the path, for a mount that does
+/// not exist, is not a directory, or is `/`, for a working directory that is not a directory, and
+/// for a live object injected before entry under a name the configuration declares a binding of;
+/// and leaves no session behind.
 #[tokio::test]
 async fn paths_a_program_cannot_mount_fail_its_entry() {
     let bed = Bed::new();
     let shared = bed.dir.join("shared");
-    let other = bed.dir.join("other");
-    for dir in [&shared, &other] {
-        std::fs::create_dir(dir).unwrap();
-    }
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::write(shared.join("file"), "").unwrap();
     bed.write(
         "mounts.py",
         r#"
         import asyncio, json, outrig
 
-        async def refused(**inputs):
+        def made(**inputs):
             try:
-                async with outrig.Session(**inputs):
+                outrig.Session(**inputs)
+                return "made"
+            except ValueError as e:
+                return str(e)
+
+        async def entered(session):
+            try:
+                async with session:
                     return "entered"
             except RuntimeError as e:
                 return str(e)
 
         async def main():
+            configured = outrig.Session()
+            configured.inject("fx", object())
             print(json.dumps([
-                await refused(mounts=["shared", "shared"]),
-                await refused(mounts=[outrig.Mount("shared", "/a"), outrig.Mount("shared", "/b")]),
-                await refused(workspace="shared", mounts=["shared"]),
-                await refused(mounts=[outrig.Mount("other", "/data")]),
-                await refused(workspace="missing"),
+                made(mounts=["shared", "shared"]),
+                made(mounts=["shared", outrig.Mount("shared/../shared", "read-write")]),
+                made(mounts=["shared"], cwd="."),
+                made(cwd="shared"),
+                await entered(outrig.Session(mounts=["missing"])),
+                await entered(outrig.Session(mounts=["shared/file"])),
+                await entered(outrig.Session(mounts=["/"])),
+                await entered(outrig.Session(mounts=["shared"], cwd="shared/file")),
+                await entered(configured),
+                await entered(outrig.Session(mounts=["shared"], cwd="shared")),
             ]))
 
         asyncio.run(main())
         "#,
     );
-    let configured = format!(
-        "[[workspace.mounts]]\nhost-path = {:?}\ncontainer-path = \"/data\"\n",
-        shared.to_str().unwrap()
-    );
     let program = bed
-        .start(
-            "mounts.py",
-            bed.config(&configured, false),
-            bed.sessions(),
-            |p| p,
-        )
+        .start("mounts.py", bed.config("", true), bed.sessions(), |p| p)
         .await;
     let ran = bed.finish(program).await;
     assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
     let said = &ran.json()[0];
-    let shared = shared.to_str().unwrap();
+    let (dir, shared) = (bed.dir.to_str().unwrap(), shared.to_str().unwrap());
     let expect = [
-        format!("workspace mount container-path \"{shared}\" is declared more than once"),
-        format!("workspace mount host-path \"{shared}\" is mounted more than once"),
-        format!("workspace mount host-path \"{shared}\" is mounted more than once"),
-        "workspace mount container-path \"/data\" is declared more than once".to_string(),
-        format!(
-            "workspace host-path \"{}\" does not exist",
-            bed.dir.join("missing").display()
-        ),
+        format!("{shared} is mounted twice"),
+        format!("{shared} is mounted twice"),
+        format!("cwd {dir} is in none of the session's mounts"),
+        format!("cwd {shared} is in none of the session's mounts"),
+        format!("workspace mount host-path \"{dir}/missing\" does not exist"),
+        format!("workspace mount host-path \"{shared}/file\" is not a directory"),
+        "workspace mount container-path must not be /".to_string(),
+        format!("the working directory {shared}/file is not a directory"),
+        "the live object `fx` is named as a binding the configuration declares".to_string(),
+        "entered".to_string(),
     ];
     assert_eq!(said.as_array().unwrap().len(), expect.len(), "{said}");
     for (said, expect) in said.as_array().unwrap().iter().zip(&expect) {
@@ -1126,77 +1140,6 @@ async fn paths_a_program_cannot_mount_fail_its_entry() {
         );
     }
     assert!(ran.exit.left_open().is_empty());
-}
-
-/// With a binding configured, every directory a program's session mounts appears in the
-/// container at its host path, as a configuration's must: a mount at another container path, or
-/// a workspace the program gives in place of one the configuration mounts at its own host path,
-/// fails the entry before anything starts -- no package installed, no factory run.
-#[tokio::test]
-async fn a_program_with_bindings_mounts_each_directory_at_its_host_path() {
-    let bed = Bed::new();
-    let (data, configured) = (bed.dir.join("data"), bed.dir.join("configured"));
-    for dir in [&data, &configured] {
-        std::fs::create_dir(dir).unwrap();
-    }
-    bed.write(
-        "binding_paths.py",
-        r#"
-        import asyncio, json, outrig
-
-        async def refused(**inputs):
-            try:
-                async with outrig.Session(**inputs):
-                    return "entered"
-            except RuntimeError as e:
-                return str(e)
-
-        async def main():
-            print(json.dumps([
-                await refused(mounts=[outrig.Mount("data", "/elsewhere")]),
-                await refused(workspace="data"),
-            ]))
-
-        asyncio.run(main())
-        "#,
-    );
-    let started = bed.flag("started");
-    let sessions = Sessions {
-        progress: Some(Arc::new(move |_, _| {
-            std::fs::write(&started, b"").expect("raise the flag");
-        })),
-        ..bed.sessions()
-    };
-    let workspace = format!(
-        "[workspace]\nhost-path = {0:?}\ncontainer-path = {0:?}\n",
-        configured.to_str().unwrap()
-    );
-    let program = bed
-        .start(
-            "binding_paths.py",
-            bed.config(&workspace, true),
-            sessions,
-            |p| p,
-        )
-        .await;
-    let ran = bed.finish(program).await;
-    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
-    let said = &ran.json()[0];
-    let (data, configured) = (data.to_str().unwrap(), configured.to_str().unwrap());
-    let expect = [
-        format!(
-            "workspace.mounts[0].container-path \"/elsewhere\" is not its host path \"{data}\""
-        ),
-        format!("workspace.container-path \"{configured}\" is not its host path \"{data}\""),
-    ];
-    assert_eq!(said.as_array().unwrap().len(), expect.len(), "{said}");
-    for (said, expect) in said.as_array().unwrap().iter().zip(&expect) {
-        assert!(
-            said.as_str().unwrap().starts_with(expect.as_str()),
-            "{said} does not start {expect:?}"
-        );
-    }
-    assert!(!bed.flag("started").exists(), "a start began");
 }
 
 /// A program whose `outrig` package speaks another version of the owner protocol is refused at
@@ -1215,7 +1158,7 @@ async fn a_program_speaking_another_protocol_is_refused_before_its_script_runs()
             continue;
         }
         let text = std::fs::read_to_string(entry.path()).unwrap();
-        let text = text.replace("\nPROTOCOL = 2\n", "\nPROTOCOL = 3\n");
+        let text = text.replace("\nPROTOCOL = 3\n", "\nPROTOCOL = 4\n");
         std::fs::write(package.join("outrig").join(entry.file_name()), text).unwrap();
     }
     bed.write("runs.py", "open('ran', 'w').close()");
@@ -1232,7 +1175,7 @@ async fn a_program_speaking_another_protocol_is_refused_before_its_script_runs()
         .expect_err("refused at the greeting");
     assert!(
         refused.to_string().contains(
-            "it speaks version 3 of the owner protocol, and this engine speaks version 2"
+            "it speaks version 4 of the owner protocol, and this engine speaks version 3"
         ),
         "{refused}"
     );
@@ -1633,8 +1576,8 @@ async fn a_second_signal_ends_the_grace_at_once() {
 }
 
 /// `outrig.Session` checks its inputs when it is made, which asks the engine for nothing: paths
-/// are strings or path-likes, made absolute against the working directory with `..` kept; a
-/// container path is absolute; access is one of two; a grace is a number of seconds from 0 to an
+/// are strings or path-likes, made absolute against the working directory with `..` kept, and
+/// so is a working directory; access is one of two; a grace is a number of seconds from 0 to an
 /// hour, the most the engine takes. A session is entered once, a failed entry counting. An entry
 /// whose request is longer than the engine reads fails with `ValueError` before it is sent,
 /// rather than wait for an answer that would never come, and ends the session's events, so a
@@ -1659,10 +1602,10 @@ async fn a_sessions_inputs_are_checked_when_it_is_made() {
 
         async def main():
             out = {name: refused(make) for name, make in {
-                "workspace": lambda: outrig.Session(workspace=3),
-                "bytes": lambda: outrig.Session(workspace=b"/x"),
+                "cwd": lambda: outrig.Session(cwd=3),
+                "bytes": lambda: outrig.Session(cwd=b"/x"),
                 "one_path": lambda: outrig.Session(mounts="/x"),
-                "relative_container": lambda: outrig.Mount("x", "rel"),
+                "no_container_path": lambda: outrig.Mount("x", "/x"),
                 "access": lambda: outrig.Mount("x", access="rw"),
                 "grace_bool": lambda: outrig.Session(grace=True),
                 "grace_negative": lambda: outrig.Session(grace=-1),
@@ -1670,12 +1613,12 @@ async fn a_sessions_inputs_are_checked_when_it_is_made() {
                 "grace_an_hour": lambda: outrig.Session(grace=3600),
                 "grace_past_an_hour": lambda: outrig.Session(grace=3600.5),
             }.items()}
-            mount = outrig.Mount("../up/m", "/m", "read-write")
-            out["mount"] = [str(mount.host_path), str(mount.container_path), mount.access]
+            mount = outrig.Mount("../up/m", "read-write")
+            out["mount"] = [str(mount.host_path), mount.access]
             entered = outrig.Session()
             async with entered:
                 pass
-            failed = outrig.Session(workspace="missing")
+            failed = outrig.Session(mounts=["missing"])
             try:
                 async with failed:
                     pass
@@ -1710,17 +1653,17 @@ async fn a_sessions_inputs_are_checked_when_it_is_made() {
     assert_eq!(
         ran.json()[0],
         serde_json::json!({
-            "workspace": "TypeError",
+            "cwd": "TypeError",
             "bytes": "TypeError",
             "one_path": "TypeError",
-            "relative_container": "ValueError",
+            "no_container_path": "ValueError",
             "access": "ValueError",
             "grace_bool": "TypeError",
             "grace_negative": "ValueError",
             "grace_nan": "ValueError",
             "grace_an_hour": null,
             "grace_past_an_hour": "ValueError",
-            "mount": [format!("{}/../up/m", bed.dir.display()), "/m", "read-write"],
+            "mount": [format!("{}/../up/m", bed.dir.display()), "read-write"],
             "failed": null,
             "again": once,
             "failed_again": once,
@@ -1728,6 +1671,703 @@ async fn a_sessions_inputs_are_checked_when_it_is_made() {
             "too_long_events": [],
         })
     );
+}
+
+/// The JSON a kernel wrote to `name` in the bed.
+fn written(bed: &Bed, name: &str) -> serde_json::Value {
+    let text = std::fs::read_to_string(bed.flag(name)).expect("what the kernel wrote");
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"))
+}
+
+/// A live object a program injects is reached from every kernel, through `outrig.bindings`
+/// always and as a global where the name is free: a kernel whose code had bound `notes` keeps
+/// its value, one opened later has the global, a parameter shadows it, a module reaches it only
+/// through `outrig.bindings`, and rebinding or deleting the global leaves the binding. A builtin's
+/// name is bound and installed as no global. One injected before entry is installed at the start.
+/// Each call runs on the program's one instance, evented with the binding's name, and the factory
+/// binding beside them gets its own calls and stops as before. A name a binding cannot have, or
+/// the session already binds, raises `ValueError`; a name that is not a str, or a `serialize`
+/// that is not a bool, `TypeError`; and once admission closed, or the session ended,
+/// `RuntimeError`. Describing the object runs none of its code.
+#[tokio::test]
+async fn a_live_object_reaches_every_kernel_where_its_name_is_free() {
+    let bed = Bed::new();
+    bed.write(
+        "live.py",
+        r#"
+        import asyncio, json, os, outrig, wait
+
+        class Notes:
+            """Keeps the program's notes.
+
+            The rest of this docstring is not what agents are told."""
+
+            def __init__(self):
+                self.reads = 0
+
+            def read(self):
+                self.reads += 1
+                return f"read {self.reads}"
+
+            def __repr__(self):
+                open("repr-ran", "w").close()
+                return "Notes()"
+
+        class Quiet:
+            pass
+
+        def refused(call):
+            try:
+                call()
+            except Exception as e:
+                return [type(e).__name__, str(e)]
+
+        async def main():
+            notes, early = Notes(), Notes()
+            session = outrig.Session()
+            session.inject("early", early)
+            records = session.events()
+            async with session:
+                wait.raise_flag("entered")
+                await wait.flag("bound")
+                out = {"returned": session.inject("notes", notes)}
+                session.inject("print", Quiet())
+                out["refused"] = {
+                    "duplicate": refused(lambda: session.inject("notes", Notes())),
+                    "configured": refused(lambda: session.inject("fx", Notes())),
+                    "identifier": refused(lambda: session.inject("not-a-name", Notes())),
+                    "keyword": refused(lambda: session.inject("class", Notes())),
+                    "taken": refused(lambda: session.inject("runtime", Notes())),
+                    "dunder": refused(lambda: session.inject("__notes__", Notes())),
+                    "non_str": refused(lambda: session.inject(b"notes", Notes())),
+                    "serialize": refused(lambda: session.inject("other", Notes(), serialize=1)),
+                }
+                wait.raise_flag("injected")
+                await wait.flag("used")
+                await session.close_admission()
+                out["closed"] = refused(lambda: session.inject("late", Notes()))[0]
+            out["ended"] = refused(lambda: session.inject("later", Notes()))[0]
+            out["reads"] = [notes.reads, early.reads]
+            seen = [r for r in [r async for r in records] if isinstance(r, outrig.Event)]
+            out["injected"] = [r.data for r in seen if r.type == "binding.injected"]
+            out["hosted"] = sorted({(r.type, r.data["binding"], r.data["agent"])
+                                    for r in seen if r.type.startswith("hosted.")})
+            report = session.shutdown_report
+            out["bindings"] = [list(report.bindings.names), report.bindings.group_empty]
+            out["repr_ran"] = os.path.exists("repr-ran")
+            print(json.dumps(out))
+
+        asyncio.run(main())
+        "#,
+    );
+    let program = bed
+        .start("live.py", bed.config("", true), bed.sessions(), |p| p)
+        .await;
+    bed.raised("entered").await;
+    let interpreter = interpreter(&program, 1);
+    run_in(&bed, &interpreter, "a", "notes = 1", "a-bound").await;
+    bed.raise("bound");
+    bed.raised("injected").await;
+    let out = |name: &str| bed.flag(name).to_str().unwrap().to_string();
+    exec_in(
+        &bed,
+        &interpreter,
+        "a",
+        2,
+        &format!(
+            r#"
+            import builtins, json, outrig
+            with open({:?}, "w") as f:
+                json.dump({{
+                    "global": notes,
+                    "via": outrig.bindings["notes"].read(),
+                    "early": outrig.bindings["early"].read(),
+                    "print": print is builtins.print,
+                    "listed": [[b.name, b.type] for b in runtime.bindings.values()],
+                }}, f)
+            "#,
+            out("a.json")
+        ),
+        "a-used",
+    );
+    bed.raised("a-used").await;
+    run_in(
+        &bed,
+        &interpreter,
+        "b",
+        &format!(
+            r#"
+            import builtins, json, outrig, types
+
+            def shadow(notes):
+                return notes
+
+            helper = types.ModuleType("helper")
+            exec("import outrig\ndef reach():\n    return ['notes' in globals(), "
+                 "outrig.bindings['notes'].read()]", helper.__dict__)
+            seen = {{
+                "global": type(notes).__name__,
+                "read": notes.read(),
+                "param": shadow(5),
+                "module": helper.reach(),
+                "print": print is builtins.print,
+                "print_binding": type(outrig.bindings["print"]).__name__,
+                "factory": type(fx.thread_name()).__name__,
+            }}
+            del notes
+            seen["after_del"] = outrig.bindings["notes"].read()
+            notes = None
+            seen["after_none"] = [outrig.bindings["notes"].read(), "notes" in runtime.bindings,
+                                  sorted(outrig.bindings)]
+            with open({:?}, "w") as f:
+                json.dump(seen, f)
+            "#,
+            out("b.json")
+        ),
+        "b-used",
+    )
+    .await;
+    bed.raise("used");
+    let ran = bed.finish(program).await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    let notes = "__main__.Notes";
+    assert_eq!(
+        written(&bed, "a.json"),
+        serde_json::json!({
+            "global": 1,
+            "via": "read 1",
+            "early": "read 1",
+            "print": true,
+            "listed": [
+                ["fx", "outrig_fixture.Root"],
+                ["early", notes],
+                ["notes", notes],
+                ["print", "__main__.Quiet"],
+            ],
+        })
+    );
+    assert_eq!(
+        written(&bed, "b.json"),
+        serde_json::json!({
+            "global": "HostedRoot",
+            "read": "read 2",
+            "param": 5,
+            "module": [false, "read 3"],
+            "print": true,
+            "print_binding": "HostedRoot",
+            "factory": "str",
+            "after_del": "read 4",
+            "after_none": ["read 5", true, ["early", "fx", "notes", "print"]],
+        })
+    );
+    let out = &ran.json()[0];
+    assert_eq!(out["returned"], serde_json::Value::Null);
+    let refused = |case: &str| out["refused"][case][0].as_str().unwrap().to_string();
+    for case in [
+        "duplicate",
+        "configured",
+        "identifier",
+        "keyword",
+        "taken",
+        "dunder",
+    ] {
+        assert_eq!(refused(case), "ValueError", "{case}: {out}");
+    }
+    for case in ["non_str", "serialize"] {
+        assert_eq!(refused(case), "TypeError", "{case}: {out}");
+    }
+    assert_eq!(
+        (&out["closed"], &out["ended"]),
+        (
+            &serde_json::json!("RuntimeError"),
+            &serde_json::json!("RuntimeError")
+        )
+    );
+    assert_eq!(
+        out["reads"],
+        serde_json::json!([5, 1]),
+        "one instance: {out}"
+    );
+    assert_eq!(
+        out["injected"],
+        serde_json::json!([
+            {"binding": "early", "type": notes},
+            {"binding": "notes", "type": notes},
+            {"binding": "print", "type": "__main__.Quiet"},
+        ])
+    );
+    let hosted = out["hosted"].as_array().unwrap();
+    for agent in ["a", "b"] {
+        for kind in ["hosted.received", "hosted.dispatched", "hosted.ended"] {
+            assert!(
+                hosted.contains(&serde_json::json!([kind, "notes", agent])),
+                "{kind} of notes by {agent}: {hosted:?}"
+            );
+        }
+    }
+    assert!(hosted.contains(&serde_json::json!(["hosted.ended", "fx", "b"])));
+    assert_eq!(out["bindings"], serde_json::json!([["fx"], true]));
+    assert_eq!(out["repr_ran"], false, "describing the object ran its repr");
+}
+
+/// An injection replaces nothing the program or agent code bound. A program that imported an
+/// `rpyc` of its own, of another version, before its session serves its live objects with the
+/// copy the build carries and keeps its own: the same module, and the same `sys.path`, after. A
+/// kernel whose code binds the object's name while the injection binds it keeps its own value,
+/// and `outrig.bindings` reaches the object: here the binding happens in a `builtins.__getattr__`
+/// that the injection's check of the builtins calls, between that check and the binding, as
+/// agent code on the kernel's own thread could.
+#[tokio::test]
+async fn an_injection_replaces_nothing_the_program_or_agent_code_bound() {
+    let bed = Bed::new();
+    bed.write(
+        "rpyc.py",
+        r#"
+        """The program's own RPyC: another version, which the serving code was not written for."""
+        __version__ = (5, 3, 1)
+        "#,
+    );
+    bed.write(
+        "own.py",
+        r#"
+        import asyncio, json, os, sys, outrig, wait
+
+        sys.path.insert(0, os.path.dirname(__file__))
+        import rpyc
+
+        class Notes:
+            def read(self):
+                return "read"
+
+        async def main():
+            path = list(sys.path)
+            async with outrig.Session() as session:
+                wait.raise_flag("entered")
+                await wait.flag("hooked")
+                session.inject("notes", Notes())
+                wait.raise_flag("injected")
+                await wait.flag("used")
+            import rpyc as again
+            print(json.dumps({
+                "theirs": again is rpyc and sys.modules["rpyc"] is rpyc,
+                "version": list(rpyc.__version__),
+                "loaded": sorted(name for name in sys.modules if name.startswith("rpyc.")),
+                "path": sys.path == path,
+            }))
+
+        asyncio.run(main())
+        "#,
+    );
+    let program = bed
+        .start("own.py", bed.config("", false), bed.sessions(), |p| p)
+        .await;
+    bed.raised("entered").await;
+    let interpreter = interpreter(&program, 1);
+    run_in(
+        &bed,
+        &interpreter,
+        "a",
+        r#"
+        import builtins
+
+        def taking(name, kernel=globals()):
+            if name == "notes":
+                del builtins.__getattr__
+                kernel["notes"] = "mine"
+            raise AttributeError(name)
+
+        builtins.__getattr__ = taking
+        "#,
+        "a-hooked",
+    )
+    .await;
+    bed.raise("hooked");
+    bed.raised("injected").await;
+    let out = bed.flag("a.json");
+    exec_in(
+        &bed,
+        &interpreter,
+        "a",
+        2,
+        &format!(
+            r#"
+            import json, outrig
+            with open({:?}, "w") as f:
+                json.dump({{
+                    "global": notes if type(notes) is str else type(notes).__name__,
+                    "via": outrig.bindings["notes"].read(),
+                }}, f)
+            "#,
+            out.to_str().unwrap()
+        ),
+        "a-used",
+    );
+    bed.raised("a-used").await;
+    bed.raise("used");
+    let ran = bed.finish(program).await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    assert_eq!(
+        written(&bed, "a.json"),
+        serde_json::json!({"global": "mine", "via": "read"})
+    );
+    assert_eq!(
+        ran.json()[0],
+        serde_json::json!({"theirs": true, "version": [5, 3, 1], "loaded": [], "path": true})
+    );
+}
+
+/// A session entered while another thread of the program is importing an `rpyc` of its own leaves
+/// that import alone: it finishes, with the program's module in `sys.modules`, and the copy the
+/// build carries is imported beside it. Here the import waits inside its module's body until the
+/// session has entered, or for ten seconds.
+#[tokio::test]
+async fn a_session_entered_while_the_program_imports_rpyc_leaves_that_import_alone() {
+    let bed = Bed::new();
+    bed.write(
+        "gate.py",
+        r#"
+        import threading
+
+        inside = threading.Event()
+        go = threading.Event()
+        "#,
+    );
+    bed.write(
+        "rpyc.py",
+        r#"
+        """The program's own RPyC, whose import waits inside its body for the program."""
+        import gate
+
+        gate.inside.set()
+        gate.go.wait(10)
+        __version__ = (5, 3, 1)
+        "#,
+    );
+    bed.write(
+        "own.py",
+        r#"
+        import asyncio, json, os, sys, threading, outrig
+
+        sys.path.insert(0, os.path.dirname(__file__))
+        import gate
+
+        imported = []
+
+        def importing():
+            try:
+                import rpyc
+                imported.append(rpyc)
+            except Exception as e:
+                imported.append(repr(e))
+
+        async def main():
+            thread = threading.Thread(target=importing)
+            thread.start()
+            gate.inside.wait(30)
+            async with outrig.Session():
+                copy = "_outrig_rpyc" in sys.modules
+                gate.go.set()
+                thread.join(30)
+            rpyc, = imported
+            print(json.dumps({
+                "imported": rpyc if type(rpyc) is str else list(rpyc.__version__),
+                "kept": sys.modules.get("rpyc") is rpyc,
+                "copy": copy,
+            }))
+
+        asyncio.run(main())
+        "#,
+    );
+    let program = bed
+        .start("own.py", bed.config("", false), bed.sessions(), |p| p)
+        .await;
+    let ran = bed.finish(program).await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    assert_eq!(
+        ran.json()[0],
+        serde_json::json!({"imported": [5, 3, 1], "kept": true, "copy": true})
+    );
+}
+
+/// A live object's calls run in the program, on threads that serve the kernels' connections and
+/// never on its event loop: two kernels' calls overlap, unless it was injected with `serialize`;
+/// and a call that runs a coroutine on the program's loop with `run_coroutine_threadsafe` returns
+/// to its caller while a renewal task on that loop keeps ticking.
+#[tokio::test]
+async fn a_live_objects_calls_run_off_the_programs_loop() {
+    let bed = Bed::new();
+    bed.write(
+        "loop.py",
+        r#"
+        import asyncio, json, threading, time, outrig, wait
+
+        class Spans:
+            """Records when each call ran."""
+
+            def __init__(self):
+                self.spans = []
+
+            def hold(self):
+                start = time.monotonic()
+                time.sleep(0.5)
+                self.spans.append((start, time.monotonic()))
+
+        def overlapped(spans):
+            (_, first_end), (second_start, _) = sorted(spans)
+            return second_start < first_end
+
+        class Lease:
+            """Reads the program's loop."""
+
+            def __init__(self, loop):
+                self.loop, self.ticks = loop, 0
+
+            def fetch(self):
+                async def later():
+                    await asyncio.sleep(0.3)
+                    return self.ticks
+                before = self.ticks
+                after = asyncio.run_coroutine_threadsafe(later(), self.loop).result()
+                return [before, after, threading.current_thread() is threading.main_thread()]
+
+        async def main():
+            lease = Lease(asyncio.get_running_loop())
+
+            async def renew():
+                while True:
+                    lease.ticks += 1
+                    await asyncio.sleep(0.02)
+
+            renewing = asyncio.create_task(renew())
+            free, turns = Spans(), Spans()
+            async with outrig.Session() as session:
+                session.inject("free", free)
+                session.inject("turns", turns, serialize=True)
+                session.inject("lease", lease)
+                wait.raise_flag("injected")
+                await wait.flag("held")
+            renewing.cancel()
+            print(json.dumps({"free": overlapped(free.spans), "turns": overlapped(turns.spans)}))
+
+        asyncio.run(main())
+        "#,
+    );
+    let program = bed
+        .start("loop.py", bed.config("", false), bed.sessions(), |p| p)
+        .await;
+    bed.raised("injected").await;
+    let interpreter = interpreter(&program, 1);
+    run_in(&bed, &interpreter, "a", "pass", "a-open").await;
+    run_in(&bed, &interpreter, "b", "pass", "b-open").await;
+    for (id, binding) in [(2, "free"), (3, "turns")] {
+        for agent in ["a", "b"] {
+            let done = format!("{agent}-{binding}");
+            exec_in(
+                &bed,
+                &interpreter,
+                agent,
+                id,
+                &format!("{binding}.hold()"),
+                &done,
+            );
+        }
+        bed.raised(&format!("a-{binding}")).await;
+        bed.raised(&format!("b-{binding}")).await;
+    }
+    let fetched = bed.flag("fetched.json");
+    let fetch = format!(
+        "import json\nwith open({:?}, 'w') as f:\n    json.dump(list(lease.fetch()), f)",
+        fetched.to_str().unwrap()
+    );
+    exec_in(&bed, &interpreter, "a", 4, &fetch, "a-fetched");
+    bed.raised("a-fetched").await;
+    bed.raise("held");
+    let ran = bed.finish(program).await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    assert_eq!(
+        ran.json()[0],
+        serde_json::json!({"free": true, "turns": false})
+    );
+    let fetched = written(&bed, "fetched.json");
+    let (before, after) = (fetched[0].as_u64().unwrap(), fetched[1].as_u64().unwrap());
+    assert!(after > before, "the loop stood still: {fetched}");
+    assert_eq!(fetched[2], false, "served on the program's main thread");
+}
+
+/// A live call still running when the session terminates cannot be ended by anything the engine
+/// owns: its `hosted.ended` and its row in the report read `unknown`, still running; the report
+/// names the call and reads not proven stopped, so the exit raises `ShutdownException`; the
+/// program survives to read it, and the call finishing later records nothing further.
+#[tokio::test]
+async fn a_live_call_still_running_at_shutdown_is_not_proven_stopped() {
+    let bed = Bed::new();
+    bed.write(
+        "slow.py",
+        r#"
+        import asyncio, json, time, outrig, wait
+
+        class Slow:
+            """Takes its time."""
+
+            def nap(self, seconds):
+                open("napping", "w").close()
+                time.sleep(seconds)
+                open("woke", "w").close()
+                return "rested"
+
+        async def main():
+            session = outrig.Session(grace=0.2)
+            try:
+                async with session:
+                    session.inject("slow", Slow())
+                    wait.raise_flag("injected")
+                    await wait.flag("napping")
+            except outrig.ShutdownException as e:
+                print(json.dumps({
+                    "verdict": e.report.verdict,
+                    "reason": e.report.stopped.reason,
+                    "hosted": [[c.binding, c.outcome, c.reason] for c in e.report.hosted],
+                    "id": session.id,
+                }), flush=True)
+            await wait.flag("woke")
+            time.sleep(0.5)
+            print(json.dumps("survived"))
+
+        asyncio.run(main())
+        "#,
+    );
+    let config = bed.config("[events]\nmode = \"record\"\n", false);
+    let program = bed.start("slow.py", config, bed.sessions(), |p| p).await;
+    bed.raised("injected").await;
+    let interpreter = interpreter(&program, 1);
+    run_in(&bed, &interpreter, "a", "pass", "a-open").await;
+    exec_in(&bed, &interpreter, "a", 2, "slow.nap(4)", "a-napped");
+    let ran = bed.finish(program).await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    let lines = ran.json();
+    let report = &lines[0];
+    assert_eq!(report["verdict"], "not_proven_stopped", "{report}");
+    let reason = report["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("to the binding `slow` is still running in the host program"),
+        "{reason}"
+    );
+    assert_eq!(
+        report["hosted"],
+        serde_json::json!([["slow", "unknown", "still_running"]])
+    );
+    assert_eq!(lines[1], "survived");
+    let logs = bed
+        .sessions
+        .join(report["id"].as_str().unwrap())
+        .join("logs");
+    let records = crate::events::recorded(&logs);
+    let ended = crate::events::of_kind(&records, "hosted.ended");
+    let call = ended.last().expect("the call's end");
+    assert_eq!(
+        (&call["outcome"], &call["reason"]),
+        (
+            &serde_json::json!("unknown"),
+            &serde_json::json!("still_running")
+        )
+    );
+    let of_call = ended.iter().filter(|end| end["request"] == call["request"]);
+    assert_eq!(of_call.count(), 1, "the call ended twice: {ended:?}");
+    assert!(ran.exit.left_open().is_empty());
+}
+
+/// A program killed while a live call runs takes the call with it, at once: the engine shuts its
+/// session down, the call is `unknown`, killed, and the execution waiting on it is told why
+/// rather than left to the drain -- whether the program is killed inside its block, or in its
+/// exit's wait for what still runs, under a grace of ten minutes.
+#[tokio::test]
+async fn a_program_killed_during_a_live_call_takes_the_call_with_it() {
+    for how in ["call", "drain"] {
+        let bed = Bed::new();
+        bed.write(
+            "killed.py",
+            r#"
+            import asyncio, json, os, outrig, sys, time, wait
+
+            class Slow:
+                """Holds a call past the test."""
+
+                def hold(self):
+                    wait.raise_flag("held")
+                    time.sleep(120)
+
+            async def closing(session):
+                async for event in session.events():
+                    if getattr(event, "type", None) == "session.state" and \
+                            event.data["state"] == "closing":
+                        wait.raise_flag("kill")
+
+            async def main():
+                session = outrig.Session(grace=600)
+                watching = asyncio.create_task(closing(session))
+                async with session:
+                    session.inject("slow", Slow())
+                    print(json.dumps({"pid": os.getpid()}), flush=True)
+                    wait.raise_flag("injected")
+                    await wait.flag("held")
+                    if sys.argv[1] == "call":
+                        wait.raise_flag("kill")
+                        await wait.flag("never", timeout=120)
+
+            asyncio.run(main())
+            "#,
+        );
+        let program = bed
+            .start("killed.py", bed.config("", false), bed.sessions(), |p| {
+                p.args([how])
+            })
+            .await;
+        bed.raised("injected").await;
+        let interpreter = interpreter(&program, 1);
+        crate::python::testing::within(interpreter.open("a"))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut execution = interpreter
+            .for_agent("a")
+            .submit("slow.hold()")
+            .unwrap_or_else(|e| panic!("{e}"));
+        bed.raised("kill").await;
+        nix::sys::signal::kill(printed_pid(&bed), nix::sys::signal::Signal::SIGKILL)
+            .expect("kill the program");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(4), execution.outcome())
+            .await
+            .unwrap_or_else(|_| panic!("{how}: the execution was left waiting on the call"));
+        let crate::python::host::Outcome::Error { traceback, .. } = &outcome else {
+            panic!("{how}: {outcome:?}");
+        };
+        assert!(
+            traceback.contains("the host program serving it has ended"),
+            "{how}: {traceback}"
+        );
+        let ran = bed.finish(program).await;
+        assert_eq!(ran.exit.code(), 137, "{how}: {}", ran.stderr);
+        let [left] = ran.exit.left_open() else {
+            panic!("{how}: {:?}", left_open(&ran.exit));
+        };
+        let crate::harness::SessionEnd::ShutDown(report) = &left.end else {
+            panic!("{how}: {:?}", left_open(&ran.exit));
+        };
+        assert_eq!(report.stopped, crate::harness::Stopped::Proven, "{how}");
+        let hosted: Vec<_> = report
+            .hosted
+            .iter()
+            .map(|call| (call.binding.as_str(), call.outcome, call.reason))
+            .collect();
+        assert_eq!(
+            hosted,
+            [(
+                "slow",
+                crate::harness::event::HostedOutcome::Unknown,
+                Some(crate::harness::event::HostedReason::Killed)
+            )],
+            "{how}"
+        );
+    }
 }
 
 /// Sessions a program enters in real containers, with a live podman.
@@ -1917,11 +2557,11 @@ mod e2e {
         std::fs::read_to_string(out).expect("what the kernel wrote")
     }
 
-    /// The workspace a session mounts: the configured `[workspace] host-path` when the program
-    /// names none; none at all when neither does, the kernel's working directory then the
-    /// image's; and the program's own, mounted at its host path, beside a factory binding.
+    /// What a session mounts, and where its kernels work, are the program's: the configured
+    /// `[workspace]` is not mounted, and with no `cwd` a kernel works in the image's directory;
+    /// with one, beside a factory binding, it works there, at its host path in a mount.
     #[tokio::test]
-    async fn the_workspace_is_the_programs_the_configured_one_or_none() {
+    async fn the_mounts_and_the_working_directory_are_the_programs() {
         pull(ALPINE).await;
         let bed = Bed::new();
         let workspace = bed.dir.join("ws");
@@ -1934,8 +2574,8 @@ mod e2e {
 
             async def main():
                 scratch = outrig.Mount(os.getcwd(), access="read-write")
-                workspace = sys.argv[1] if len(sys.argv) > 1 else None
-                async with outrig.Session(workspace=workspace, mounts=[scratch]):
+                cwd = sys.argv[1] if len(sys.argv) > 1 else None
+                async with outrig.Session(mounts=[scratch], cwd=cwd):
                     wait.raise_flag("entered")
                     await wait.flag("looked")
 
@@ -1946,13 +2586,12 @@ mod e2e {
             "[workspace]\nhost-path = {:?}\n",
             workspace.to_str().unwrap()
         );
-        let cases: [(&str, crate::config::Config, Vec<String>); 3] = [
+        let cases: [(&str, crate::config::Config, Vec<String>); 2] = [
             (
                 "configured",
                 in_alpine(&bed, "", &configured, false),
                 vec![],
             ),
-            ("none", in_alpine(&bed, "", "", false), vec![]),
             (
                 "the program's, beside a binding",
                 in_alpine(&bed, "", "", true),
@@ -1992,13 +2631,6 @@ mod e2e {
             assert_eq!(ran.exit.code(), 0, "{case}: {}", ran.stderr);
             match case {
                 "configured" => {
-                    assert_eq!(cwd, "/workspace", "{case}");
-                    assert_eq!(
-                        found, "['/workspace/marker', '/workspace/marker']",
-                        "{case}"
-                    );
-                }
-                "none" => {
                     assert_eq!(cwd, "/", "{case}: the image's own working directory");
                     assert_eq!(found, "[]", "{case}");
                 }
@@ -2058,6 +2690,99 @@ mod e2e {
         for session in ran.json()[0].as_array().unwrap() {
             assert_eq!(session[1], "clean");
             assert_eq!(containers_of(session[0].as_str().unwrap()), "");
+        }
+    }
+
+    /// A live call still running at a container session's end: shut down while it runs, the
+    /// session is not proven stopped -- the call runs on in the program -- yet its container is
+    /// gone; the program killed while it runs, the call is `unknown`, `killed`, and no container
+    /// is left either.
+    #[tokio::test]
+    async fn a_live_call_at_the_end_leaves_no_container() {
+        pull(ALPINE).await;
+        for how in ["shutdown", "kill"] {
+            let bed = Bed::new();
+            bed.write(
+                "held.py",
+                r#"
+                import asyncio, json, os, outrig, sys, time, wait
+
+                class Slow:
+                    """Holds a call until the program lets it go."""
+
+                    def hold(self):
+                        wait.raise_flag("held")
+                        deadline = time.monotonic() + 60
+                        while not os.path.exists("release") and time.monotonic() < deadline:
+                            time.sleep(0.01)
+
+                async def main():
+                    raised = None
+                    scratch = outrig.Mount(os.getcwd(), access="read-write")
+                    session = outrig.Session(mounts=[scratch], grace=0)
+                    try:
+                        async with session:
+                            session.inject("slow", Slow())
+                            print(json.dumps({"pid": os.getpid(), "id": session.id}), flush=True)
+                            wait.raise_flag("injected")
+                            await wait.flag("held")
+                            if sys.argv[1] == "kill":
+                                wait.raise_flag("kill")
+                                await wait.flag("never", timeout=120)
+                    except outrig.ShutdownException:
+                        raised = True
+                    report = session.shutdown_report
+                    hosted = [[c.agent, c.binding, c.outcome, c.reason] for c in report.hosted]
+                    wait.raise_flag("release")
+                    print(json.dumps([raised, report.verdict, hosted]), flush=True)
+
+                asyncio.run(main())
+                "#,
+            );
+            let program = bed
+                .start(
+                    "held.py",
+                    in_alpine(&bed, "", "", false),
+                    bed.in_containers(),
+                    |p| p.args([how]),
+                )
+                .await;
+            bed.raised("injected").await;
+            let interpreter = interpreter(&program, 1);
+            run_in(&bed, &interpreter, "a", "pass", "a-open").await;
+            exec_in(&bed, &interpreter, "a", 2, "slow.hold()", "a-done");
+            if how == "kill" {
+                bed.raised("kill").await;
+                nix::sys::signal::kill(printed_pid(&bed), nix::sys::signal::Signal::SIGKILL)
+                    .expect("kill the program");
+            }
+            let ran = bed.finish(program).await;
+            let lines = ran.json();
+            let id = lines[0]["id"].as_str().expect("the session's id");
+            assert_eq!(containers_of(id), "", "{how}");
+            if how == "kill" {
+                assert_eq!(ran.exit.code(), 137, "{how}: {}", ran.stderr);
+                let [left] = ran.exit.left_open() else {
+                    panic!("{how}: {:?}", left_open(&ran.exit));
+                };
+                let crate::harness::SessionEnd::ShutDown(report) = &left.end else {
+                    panic!("{how}: {:?}", left_open(&ran.exit));
+                };
+                let hosted = serde_json::to_value(&report.hosted).expect("JSON");
+                assert_eq!(hosted[0]["outcome"], "unknown", "{how}: {hosted}");
+                assert_eq!(hosted[0]["reason"], "killed", "{how}: {hosted}");
+            } else {
+                assert_eq!(ran.exit.code(), 0, "{how}: {}", ran.stderr);
+                assert_eq!(
+                    lines[1],
+                    serde_json::json!([
+                        true,
+                        "not_proven_stopped",
+                        [["a", "slow", "unknown", "still_running"]]
+                    ]),
+                    "{how}"
+                );
+            }
         }
     }
 }

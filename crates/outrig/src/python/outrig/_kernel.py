@@ -56,8 +56,10 @@ class _Bindings(collections.abc.Mapping):
     """The session's bindings, by name, each as the calling kernel's own proxy of it. Read-only.
 
     The authoritative lookup: `outrig.bindings["repo"]` is the binding whatever this kernel's
-    global `repo` now holds, and from a module's code, which has no such global, the way to reach
-    one at all. A name the session has not bound raises `KeyError`. `runtime.bindings` says what
+    global `repo` now holds -- a global is bound only where its name was free, so an input or a
+    builtin of the same name keeps it -- and from a module's code, which has no such global, the
+    way to reach one at all. A live object a program on the host injects joins it as it is
+    injected. A name the session has not bound raises `KeyError`. `runtime.bindings` says what
     each is without asking it.
     """
 

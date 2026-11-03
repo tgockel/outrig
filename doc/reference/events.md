@@ -69,8 +69,8 @@ session's own: the one `session.json` and `outrig ls` show, which its containers
 
 The interpreter belongs to the session rather than to one agent, so events about it --
 `output.unattributed`, `interpreter.diagnostic`, and `interpreter.exited` -- carry no `subject`,
-and neither do the session's own, `session.state` and `session.report`, those of the process
-holding its bindings, `binding.refused` and `binding.exited`, or what its skill sources hold,
+and neither do the session's own, `session.state` and `session.report`, those of its bindings,
+`binding.refused`, `binding.injected` and `binding.exited`, or what its skill sources hold,
 `skill.discovered`. A request to a binding is the agent's that made it, and so is the import of a
 skill, which code outside every execution makes for no agent.
 
@@ -229,15 +229,18 @@ results it was refused for is assembled again, and recorded right after its `mod
     `{"state": "not_proven", "reason": ...}` when something could not be confirmed stopped.
   - `executions`: each execution running at the close, as `{execid, status}`; `status` is `ok`
     or `error` if its result arrived, and `unknown` if it was cut off.
-  - `hosted`: each request to a binding that ended after the close, in the order they ended, as
-    `{request, agent, binding, outcome, reason}`, from its `hosted.ended`. One `unknown` makes
-    the verdict `stopped_with_unknown`, as an execution's does.
+  - `hosted`: each request to a binding that ended after the close, in the order they ended --
+    those of a host program's live objects after the bindings process's -- as `{request, agent,
+    binding, outcome, reason}`, from its `hosted.ended`. One `unknown` makes the verdict
+    `stopped_with_unknown`, as an execution's does; one `still_running` makes `stopped`
+    `not_proven`, its reason naming the call.
   - `bindings`: how the process holding the session's bindings stopped, as `{names,
     group_empty, killed, survivors, exited}`, or `null` when the session had none: the bindings
     it held, whether no process is left in its process group, whether `SIGKILL` was needed after
     the grace, what was still in the group when it could not be proven empty, each as
     `<pid> <command> <state>`, and how the process ended when it ended before the stop, as its
-    `binding.exited` says, or `null`. A group not proven empty makes `stopped` `not_proven`.
+    `binding.exited` says, or `null`. A group not proven empty makes `stopped` `not_proven`. A
+    host program's live objects are served by the program, not this process, and are not in it.
   - `requests`: each request made of a child agent that was open at the close, as `{request,
     child, channel, outcome}`: `channel` is `null` for a submission, and `outcome` is how it
     ended -- `closed` by the close, or `terminated` when the interpreter died first.
@@ -246,6 +249,10 @@ results it was refused for is assembled again, and recorded right after its `mod
   runs without it: `binding`, its name; `declared_in`, the config file, or `null`; and
   `reason`, which says whether the operator did not approve the declaration, nobody could be
   asked, or the session had no approver, and how to approve it.
+- `binding.injected` -- a host program served a live object to the session's agents
+  (`session.inject`): `binding`, its name, and `type`, the qualified name of the object's type. It
+  is published as the engine takes the object, before any agent can reach it; the object stays in
+  the program, which serves each request made of it.
 - `binding.exited` -- the process holding the session's bindings ended while the session ran:
   `bindings`, the names it held, and `cause`, such as `it was killed by SIGKILL`. The session goes
   on without them: each request the process was running ends `unknown`, and a later one raises an
@@ -506,9 +513,10 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
   asks of its target; `member`, the attribute it names, or `null`; `target`, the qualified name of
   its target's type on the host, or `null`; `arguments`, a preview of each positional argument,
   and `keywords`, one per keyword argument, by name; `parent`, the request a callback made it
-  under, or `null`; and `by`: `binding` when the bindings process received it, or, for one it
-  never received, `relay` -- refused, or lost with the process or its connection, on its way
-  there -- or `interpreter`, never sent. `operation` is `getattr`, `setattr`, `delattr`, `call`,
+  under, or `null`; and `by`: `binding` when what serves the binding received it -- the bindings
+  process, or for a live object the host program -- or, for one it never received, `relay` --
+  refused, or lost with that process or its connection, on its way there -- or `interpreter`,
+  never sent. `operation` is `getattr`, `setattr`, `delattr`, `call`,
   `callattr`, `repr`, `str`, `cmp`, `hash`, `dir`, `instancecheck`, `buffiter`, `oldslicing` or
   `ctxexit`, each recorded every time; `ping`, `close`, `getroot`, `inspect`, `pickle` or `del`,
   bookkeeping, recorded only when refused; or `unknown`, a request type outside the protocol. A
@@ -525,12 +533,16 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
   - `refused` -- the target never ran: `interception`, the bindings process's checks refused it;
     `admission_closed`, the session was closed to new work; `queue_full`, the bindings process
     was not taking calls and the queue to it had no room, or the agent already had 1,024 requests
-    in flight; or `exited`, the process had ended.
+    in flight; or `exited`, the process, or the host program serving a live object, had ended.
   - `cancelled` -- the target never ran: `interrupted`, its caller was interrupted first;
-    `closed`, the session closed while it waited for its binding's turn or a free connection; or
-    `disconnected`, its connection closed before the bindings process read it.
-  - `unknown` -- no reply came: `killed`, the bindings process was killed at shutdown, or
-    `exited`, it ended on its own. Whether the target ran is open.
+    `closed`, the session closed while it waited for its binding's turn or a free connection, or
+    ended before the host program started a live object's call; or `disconnected`, its
+    connection closed before the bindings process read it.
+  - `unknown` -- no reply came: `killed`, the bindings process was killed at shutdown, or the
+    host program serving a live object ended; `exited`, the bindings process ended on its own; or
+    `still_running`, a live object's call was still running in the host program when the session
+    ended, and runs on there, which leaves the session not proven stopped. Whether the target ran
+    is open.
 
   That a target never ran is read from `refused` or `cancelled` alone: a missing
   `hosted.dispatched` may be one a gap lost.

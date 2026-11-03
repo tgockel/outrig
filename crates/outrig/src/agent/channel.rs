@@ -18,16 +18,23 @@
 //! itself, so a child's announcer counts from that ([`Announcer::of_requests`])
 //! and says "requests". When a child's round opens is the runner's to decide;
 //! its announcer only says what arrives while one runs.
+//!
+//! A live object a host program injects is announced the same way, to each
+//! child made before it, in the next result: a line of its own, which opens
+//! no round, and is made again if the round that made it failed
+//! ([`Injected`]).
 
 use std::error::Error;
 use std::future::Future;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
 
 use super::AgentError;
+use super::orientation;
+use crate::harness::bindings::Brief;
 use crate::harness::skills::Catalog;
 use crate::python::host::{Channels, Interpreter, Sent, USER};
 
@@ -42,6 +49,26 @@ const PENDING_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) struct Announcer {
     source: Source,
     told: Arc<Told>,
+    injected: Injected,
+}
+
+/// The briefs of the live objects a host program injected into a session, in order: what an
+/// agent made later is oriented with, and an agent made earlier is told of.
+#[derive(Clone, Default)]
+pub(crate) struct Injected(Arc<std::sync::Mutex<Vec<Brief>>>);
+
+impl Injected {
+    pub(crate) fn push(&self, brief: Brief) {
+        self.lock().push(brief);
+    }
+
+    pub(crate) fn briefs(&self) -> Vec<Brief> {
+        self.lock().clone()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Brief>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// Where an announcer's counts come from.
@@ -54,13 +81,18 @@ enum Source {
 }
 
 /// How many deliveries, summed over the agent's channels, the model has been
-/// told of.
+/// told of; and how many of the live objects injected, counting those it was
+/// made knowing.
 #[derive(Default)]
 struct Told {
     /// By the round in flight, or the last one.
     announced: AtomicU64,
     /// By the last round that ended well.
     kept: AtomicU64,
+    /// Live objects, by the round in flight, or the last one.
+    injections: AtomicUsize,
+    /// Live objects, by the last round that ended well.
+    injections_kept: AtomicUsize,
 }
 
 impl Announcer {
@@ -68,21 +100,43 @@ impl Announcer {
         Self {
             source: Source::Interpreter(interpreter),
             told: Arc::default(),
+            injected: Injected::default(),
         }
     }
 
     /// A child's announcer, counting its requests by channel as `counts`
-    /// gives them.
-    pub(crate) fn of_requests(counts: Arc<dyn Fn() -> Channels + Send + Sync>) -> Self {
+    /// gives them, and telling of each live object `injected` holds from now on.
+    pub(crate) fn of_requests(
+        counts: Arc<dyn Fn() -> Channels + Send + Sync>,
+        injected: Injected,
+    ) -> Self {
+        let known = injected.lock().len();
+        let told = Told {
+            injections: known.into(),
+            injections_kept: known.into(),
+            ..Told::default()
+        };
         Self {
             source: Source::Requests(counts),
-            told: Arc::default(),
+            told: Arc::new(told),
+            injected,
         }
     }
 
+    /// The line for each live object injected since the round in flight last
+    /// told of one, counted as announced.
+    pub(crate) fn injections(&self) -> Vec<String> {
+        let injected = self.injected.lock();
+        let from = self.told.injections.swap(injected.len(), Ordering::SeqCst);
+        injected[from..].iter().map(orientation::injected).collect()
+    }
+
     /// A child's round opens, telling the model what waits: only what arrives
-    /// from here on is news within it.
+    /// from here on is news within it. A live object a failed round told of is
+    /// told of again.
     pub(crate) fn opened(&self) {
+        let kept = self.told.injections_kept.load(Ordering::SeqCst);
+        self.told.injections.store(kept, Ordering::SeqCst);
         if let Source::Requests(counts) = &self.source {
             let delivered = counts().values().map(|counts| counts.delivered).sum();
             self.told.announced.store(delivered, Ordering::SeqCst);
@@ -109,6 +163,10 @@ impl Announcer {
     pub(crate) fn keep(&self) {
         let announced = self.told.announced.load(Ordering::SeqCst);
         self.told.kept.fetch_max(announced, Ordering::SeqCst);
+        let injections = self.told.injections.load(Ordering::SeqCst);
+        self.told
+            .injections_kept
+            .fetch_max(injections, Ordering::SeqCst);
     }
 
     /// What waits unread, if anything was delivered past `seen`, counted as

@@ -65,6 +65,7 @@ const PACKAGE: &[(&str, &str)] = &[
     ("outrig/_agents.py", include_str!("outrig/_agents.py")),
     ("outrig/_host.py", include_str!("outrig/_host.py")),
     ("outrig/_kernel.py", include_str!("outrig/_kernel.py")),
+    ("outrig/_serve.py", include_str!("outrig/_serve.py")),
     ("outrig/schema.py", include_str!("outrig/schema.py")),
     ("outrig/skills.py", include_str!("outrig/skills.py")),
 ];

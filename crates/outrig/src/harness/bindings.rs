@@ -309,6 +309,10 @@ pub(crate) struct Bindings {
     process: Option<supervisor::Process>,
     /// What carries the interpreter's hosted calls to the process, once connected.
     relay: Option<Relay>,
+    /// Whether a host program may inject live objects into the session.
+    injectable: bool,
+    /// What carries the interpreter's hosted calls to the live objects, once connected.
+    live: Option<Relay>,
 }
 
 /// What the agent is told of one binding.
@@ -355,35 +359,71 @@ impl Bindings {
         dirs
     }
 
-    /// The vendored RPyC's directory on the host, when there are bindings.
+    /// The vendored RPyC's directory on the host, when there are bindings, or there may be.
     pub(crate) fn rpyc_dir(&self) -> Option<&Path> {
         self.rpyc_dir.as_deref()
+    }
+
+    /// Let a host program inject live objects into the session, which the interpreter reaches
+    /// through RPyC: none can be, in a build that carries no RPyC.
+    pub(crate) async fn allow_live(&mut self) {
+        if self.rpyc_dir.is_none() {
+            self.rpyc_dir = payload::rpyc_dir().await.ok();
+        }
+        self.injectable = self.rpyc_dir.is_some();
+    }
+
+    /// What carries hosted calls to a host program's live objects, when it may inject any.
+    pub(crate) fn live(&self) -> Option<&Relay> {
+        self.live.as_ref()
     }
 
     /// Carry `interpreter`'s hosted calls to the process from now on, recording them to `events`.
     /// Before [`Bindings::declare`], so the relay is in place before agent code can know a
     /// binding to call.
     pub(crate) fn connect(&mut self, interpreter: &Interpreter, events: &Events) {
-        let Some(process) = &mut self.process else {
-            return;
-        };
-        let names = self.declared.iter().map(|d| d.name.clone()).collect();
-        let relay = Relay::new(interpreter.relay_line(), events.clone(), names);
-        relay.attach(process);
-        interpreter.attach_relay(relay.clone());
-        self.relay = Some(relay);
+        if let Some(process) = &mut self.process {
+            let names = self.declared.iter().map(|d| d.name.clone()).collect();
+            let relay = Relay::new(interpreter.relay_line(), events.clone(), names);
+            relay.attach(process);
+            interpreter.attach_relay(relay.clone());
+            self.relay = Some(relay);
+        }
+        if self.injectable {
+            let live = match &self.relay {
+                Some(relay) => relay.beside(),
+                None => Relay::new(interpreter.relay_line(), events.clone(), Vec::new()),
+            };
+            interpreter.attach_relay(live.clone());
+            self.live = Some(live);
+        }
     }
 
-    /// Resolves once no hosted request the process was sent is still to end; `None` when there
-    /// is no relay.
-    pub(crate) fn drained(&self) -> Option<impl Future<Output = ()> + Send + 'static> {
-        self.relay.as_ref().map(Relay::drained)
+    /// Resolves once no hosted request an endpoint was sent is still to end.
+    pub(crate) fn drained(&self) -> impl Future<Output = ()> + Send + 'static {
+        let drained: Vec<_> = self.relays().map(Relay::drained).collect();
+        async move {
+            futures_util::future::join_all(drained).await;
+        }
     }
 
     /// Each hosted request whose outcome came after admission closed, and that outcome. Read
     /// last: nothing hosted is published after.
     pub(crate) fn report(&self) -> Vec<HostedCall> {
-        self.relay.as_ref().map(Relay::report).unwrap_or_default()
+        self.relays().flat_map(Relay::report).collect()
+    }
+
+    /// Each call the host program is still running, which the session's terminating leaves it:
+    /// sealed `unknown`, and named.
+    pub(crate) fn seal_live(&self) -> Vec<String> {
+        self.live
+            .as_ref()
+            .map(Relay::seal_running)
+            .unwrap_or_default()
+    }
+
+    fn relays(&self) -> impl Iterator<Item = &Relay> {
+        self.relay.iter().chain(&self.live)
     }
 
     /// Tell `interpreter` the bindings, with each package directory as `path` names it where the

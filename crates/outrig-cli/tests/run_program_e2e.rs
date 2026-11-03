@@ -54,10 +54,15 @@ impl Case {
     /// `outrig --session-root <case> run-new <args>`, in the repository, in a process group of its
     /// own, its stdout and stderr piped.
     fn spawn(&self, args: &[&str]) -> Child {
+        // An empty global config, which exists, as `--global-config` must.
+        self.spawn_with(Path::new("/dev/null"), args)
+    }
+
+    /// [`Case::spawn`], with `global` as the global configuration.
+    fn spawn_with(&self, global: &Path, args: &[&str]) -> Child {
         Command::new(env!("CARGO_BIN_EXE_outrig"))
-            // An empty global config, which exists, as `--global-config` must.
             .arg("--global-config")
-            .arg("/dev/null")
+            .arg(global)
             .arg("--session-root")
             .arg(self.sessions())
             .arg("run-new")
@@ -276,6 +281,23 @@ async fn outrig_stops_the_session_a_program_left_open() {
 /// How long a program whose agent runs on a real model has to finish: a few of its rounds.
 const REAL_MODEL_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// The global configuration a real-model test runs on, `OUTRIG_E2E_GLOBAL_CONFIG`, when
+/// `OUTRIG_E2E_REAL_API=1` opts into them; otherwise `None`, saying that `test` is skipped.
+fn real_model(test: &str) -> Option<PathBuf> {
+    if std::env::var("OUTRIG_E2E_REAL_API").ok().as_deref() != Some("1") {
+        eprintln!(
+            "[outrig-e2e] skipping {test} (set OUTRIG_E2E_REAL_API=1 and \
+             OUTRIG_E2E_GLOBAL_CONFIG to enable)"
+        );
+        return None;
+    }
+    let global = std::env::var("OUTRIG_E2E_GLOBAL_CONFIG").expect(
+        "OUTRIG_E2E_REAL_API=1 set without OUTRIG_E2E_GLOBAL_CONFIG -- name the global \
+         configuration that declares the model",
+    );
+    Some(global.into())
+}
+
 /// The requirements' program, given the directory of a project to read as its argument: a
 /// `ProjectReader` in a session where that directory is mounted read-only, at its own path,
 /// answers what the project does, and the program prints the answer on one line and then the
@@ -310,17 +332,9 @@ asyncio.run(main())
 /// the model cannot change it, its agent answers, and the program exits 0 with a clean report.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_requirements_reader_answers_about_this_repository() {
-    if std::env::var("OUTRIG_E2E_REAL_API").ok().as_deref() != Some("1") {
-        eprintln!(
-            "[outrig-e2e] skipping the_requirements_reader_answers_about_this_repository (set \
-             OUTRIG_E2E_REAL_API=1 and OUTRIG_E2E_GLOBAL_CONFIG to enable)"
-        );
+    let Some(global) = real_model("the_requirements_reader_answers_about_this_repository") else {
         return;
-    }
-    let global = std::env::var("OUTRIG_E2E_GLOBAL_CONFIG").expect(
-        "OUTRIG_E2E_REAL_API=1 set without OUTRIG_E2E_GLOBAL_CONFIG -- name the global \
-         configuration that declares the model",
-    );
+    };
     pull();
     let case = Case::new("");
     case.write("reader.py", READER);
@@ -328,23 +342,10 @@ async fn the_requirements_reader_answers_about_this_repository() {
         .join("../..")
         .canonicalize()
         .expect("this repository");
-    let child = Command::new(env!("CARGO_BIN_EXE_outrig"))
-        .arg("--global-config")
-        .arg(&global)
-        .arg("--session-root")
-        .arg(case.sessions())
-        .arg("run-new")
-        .arg("reader.py")
-        .arg(&repository)
-        .current_dir(case.repo())
-        .env_remove("RUST_LOG")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-        .expect("outrig starts");
+    let child = case.spawn_with(
+        &global,
+        &["reader.py", repository.to_str().expect("a UTF-8 path")],
+    );
     let out = timeout(REAL_MODEL_TIMEOUT, child.wait_with_output())
         .await
         .expect("the program ended in time")
@@ -362,4 +363,137 @@ async fn the_requirements_reader_answers_about_this_repository() {
     );
     assert!(!lines[0].trim().is_empty(), "an answer: {stdout}");
     assert_eq!(lines[1], "clean", "{stdout}\n{stderr}");
+}
+
+/// The host-program exit criterion's program: a `Task` the program holds, injected as `task`,
+/// whose numbers an `Adder` fetches and adds, reporting its progress there, and answers with a
+/// `Total` the program declares. It prints the session's id, then the answer and the progress,
+/// then waits for `SIGTERM`, which cancels it, and prints the verdict of the report it read.
+const TASKED: &str = r#"
+import asyncio, dataclasses, json, signal
+import outrig
+
+class Task:
+    """The work this program hands its agent: its inputs, and where progress is reported."""
+
+    def __init__(self):
+        self.progress = []
+
+    def report_progress(self, summary: str) -> None:
+        """Record `summary`, a line saying what has been done so far."""
+        self.progress.append(summary)
+
+    def fetch_input(self, name: str) -> str:
+        """The input `name`, as text: `numbers` is the numbers to add, comma-separated."""
+        if name != "numbers":
+            raise KeyError(f"no input {name!r}: the one input is 'numbers'")
+        return "17, 25, 58"
+
+@dataclasses.dataclass
+class Total:
+    numbers: list[int]
+    total: int
+
+class Adder(outrig.Agent):
+    """You add numbers for the program that made you. Its `task` object, a binding in your
+    Python, holds the work: `task.fetch_input("numbers")` returns the numbers, and
+    `task.report_progress(summary)` records a line of progress -- call it once you have read
+    them."""
+
+    @outrig.agent
+    async def add(self, request: str) -> Total:
+        """Do `request`, and return the numbers you added and their sum."""
+        ...
+
+async def main():
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
+    task, session = Task(), outrig.Session()
+    try:
+        async with session:
+            session.inject("task", task)
+            print(json.dumps({"session": session.id}), flush=True)
+            async with Adder() as agent:
+                total = await agent.add("Add the task's numbers, reporting your progress.")
+            print(json.dumps({"total": total.total, "numbers": total.numbers,
+                              "progress": task.progress}), flush=True)
+            await asyncio.sleep(600)
+    except asyncio.CancelledError:
+        pass
+    print(json.dumps({"verdict": session.shutdown_report.verdict}), flush=True)
+
+asyncio.run(main())
+"#;
+
+/// The host-program exit criterion against a real model, opted into as the reader's test is:
+/// the `task` the program injects is used by its agent as plain code -- `fetch_input` and
+/// `report_progress` each called, evented under the binding -- the agent answers with the
+/// program's own `Total`, and `SIGTERM` then ends the program, which reads its session's report,
+/// with no container left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tasked_agent_uses_the_object_its_program_injected() {
+    let Some(global) = real_model("a_tasked_agent_uses_the_object_its_program_injected") else {
+        return;
+    };
+    pull();
+    let case = Case::new("[events]\nmode = \"record\"\n");
+    case.write("tasked.py", TASKED);
+    let mut child = case.spawn_with(&global, &["tasked.py"]);
+    let mut lines = BufReader::new(child.stdout.take().expect("piped")).lines();
+    let mut read = Vec::new();
+    timeout(REAL_MODEL_TIMEOUT, async {
+        while read.len() < 2 {
+            match lines.next_line().await.expect("read stdout") {
+                Some(line) => read.push(line),
+                None => break,
+            }
+        }
+    })
+    .await
+    .expect("the answer in time");
+    if read.len() < 2 {
+        let (status, stderr, _) = finish(child).await;
+        panic!("{status}: {read:?}\n{stderr}");
+    }
+    kill(Pid::from_raw(child.id().unwrap() as i32), Signal::SIGTERM).unwrap();
+    while let Some(line) = timeout(TEST_TIMEOUT, lines.next_line())
+        .await
+        .expect("the program ended in time")
+        .expect("read stdout")
+    {
+        read.push(line);
+    }
+    let (status, stderr, _) = finish(child).await;
+    assert_eq!(status.code(), Some(0), "{read:?}\n{stderr}");
+    let json: Vec<serde_json::Value> = read
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}")))
+        .collect();
+    let id = json[0]["session"].as_str().expect("the session's id");
+    assert_eq!(json[1]["total"], 100, "{read:?}");
+    assert_eq!(
+        json[1]["numbers"],
+        serde_json::json!([17, 25, 58]),
+        "{read:?}"
+    );
+    assert!(
+        json[1]["progress"]
+            .as_array()
+            .is_some_and(|lines| !lines.is_empty()),
+        "progress reported: {read:?}"
+    );
+    assert_eq!(json[2], serde_json::json!({"verdict": "clean"}), "{read:?}");
+    assert_eq!(containers_of(id), "");
+    let log = case.sessions().join(id).join("logs/events.jsonl");
+    let members: std::collections::BTreeSet<String> = std::fs::read_to_string(log)
+        .expect("the log")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a record"))
+        .filter(|record| record["type"] == "org.outrig.hosted.received")
+        .filter(|record| record["data"]["binding"] == "task")
+        .filter_map(|record| record["data"]["member"].as_str().map(String::from))
+        .collect();
+    assert!(
+        members.contains("fetch_input") && members.contains("report_progress"),
+        "{members:?}"
+    );
 }

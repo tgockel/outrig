@@ -1,7 +1,8 @@
-//! The relay between agent code's hosted calls and the process holding the session's bindings: it
-//! carries `interpreter.py`'s RPyC frames to `binding.py` and back, decides at the session's close
-//! which requests never reach the process, and records each request -- its receipt, its dispatch
-//! and its outcome -- under a [`RequestId`] it gives out.
+//! The relay between agent code's hosted calls and a process serving the session's bindings -- the
+//! bindings process, or a host program serving the live objects it injected, each with a relay of
+//! its own: it carries `interpreter.py`'s RPyC frames to `outrig._serve` and back, decides at the
+//! session's close which requests never reach the process, and records each request -- its
+//! receipt, its dispatch and its outcome -- under a [`RequestId`] the session's relays give out.
 //!
 //! Lines toward the process wait in one queue, bounded in bytes, which a writer task hands to the
 //! supervisor's one-line stdin queue; a request is *forwarded* when the writer takes it. A labeled
@@ -29,6 +30,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
@@ -82,7 +84,7 @@ const EXIT_LOOK: Duration = Duration::from_secs(1);
 /// label; a connection's close; or a cancel of requests in flight.
 #[derive(Deserialize)]
 pub(crate) struct Rpc {
-    binding: String,
+    pub(crate) binding: String,
     id: u64,
     #[serde(default)]
     data: String,
@@ -104,7 +106,7 @@ pub(crate) struct Rpc {
 /// there once the close reached it.
 #[derive(Deserialize)]
 pub(crate) struct Notice {
-    binding: String,
+    pub(crate) binding: String,
     exec: Option<u64>,
     invocation: Option<u64>,
     operation: String,
@@ -164,6 +166,8 @@ struct Call {
     sent: bool,
     /// Its receipt published by the process.
     received: bool,
+    /// Its dispatch published, so the process may be running it.
+    dispatched: bool,
 }
 
 /// Lines for the process: a whole frame, or one line of the relay's own.
@@ -188,6 +192,8 @@ enum Frame {
 
 #[derive(Default)]
 struct State {
+    /// The bindings the endpoint serves.
+    bindings: Vec<String>,
     /// The agents the host opened, whose lines are carried.
     agents: HashSet<String>,
     queue: VecDeque<Item>,
@@ -210,8 +216,6 @@ struct State {
     sealed: bool,
     hung_up: bool,
     forwarded: u64,
-    /// The last request id given out.
-    last_request: u64,
     after_close: Vec<HostedCall>,
     /// Event lines of kinds the relay does not know, for a test that writes its own.
     #[cfg(test)]
@@ -252,11 +256,6 @@ impl State {
             .then(|| format!("agent {agent:?} already has {CALLS_MAX} requests in flight"))
     }
 
-    fn next_id(&mut self) -> RequestId {
-        self.last_request += 1;
-        RequestId::new(self.last_request)
-    }
-
     /// Let go of a frame never forwarded, and of the request it carried.
     fn discard(&mut self, item: Item) {
         self.queued -= item.cost;
@@ -284,7 +283,8 @@ impl State {
     }
 }
 
-/// The session's relay to its bindings process. Cheap to clone.
+/// The session's relay to one endpoint serving its bindings: the bindings process, or the host
+/// program serving its live objects. Cheap to clone.
 #[derive(Clone)]
 pub(crate) struct Relay(Arc<Shared>);
 
@@ -292,13 +292,14 @@ struct Shared {
     state: watch::Sender<State>,
     to_interpreter: ToInterpreter,
     events: Events,
-    bindings: Vec<String>,
+    /// The last request id given out, shared by the session's relays.
+    ids: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for Relay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Relay")
-            .field("bindings", &self.0.bindings)
+            .field("bindings", &self.0.state.borrow().bindings)
             .finish_non_exhaustive()
     }
 }
@@ -310,11 +311,103 @@ impl Relay {
         bindings: Vec<String>,
     ) -> Self {
         Self(Arc::new(Shared {
-            state: watch::Sender::new(State::default()),
+            state: watch::Sender::new(State {
+                bindings,
+                ..State::default()
+            }),
             to_interpreter,
             events,
-            bindings,
+            ids: Arc::default(),
         }))
+    }
+
+    /// A relay to another endpoint of the same session, which serves no binding yet: its
+    /// requests are numbered with this one's.
+    pub(crate) fn beside(&self) -> Self {
+        Self(Arc::new(Shared {
+            state: watch::Sender::new(State::default()),
+            to_interpreter: Arc::clone(&self.0.to_interpreter),
+            events: self.0.events.clone(),
+            ids: Arc::clone(&self.0.ids),
+        }))
+    }
+
+    /// Whether the endpoint serves `binding`.
+    pub(crate) fn holds(&self, binding: &str) -> bool {
+        self.0.state.borrow().bindings.iter().any(|b| b == binding)
+    }
+
+    /// The endpoint serves `binding` too, from now on.
+    pub(crate) fn add(&self, binding: &str) {
+        self.with(|s| s.bindings.push(binding.to_string()));
+    }
+
+    /// Write to the host program, the endpoint, through what this returns, on the current
+    /// runtime; what it writes comes back through [`Relay::program_line`].
+    pub(crate) fn attach_program(&self) -> mpsc::Receiver<Value> {
+        let (lines, to_program) = mpsc::channel(1);
+        tokio::spawn(write(self.clone(), lines));
+        to_program
+    }
+
+    /// A line the host program's serving module wrote: a part of a frame, or a close, for the
+    /// interpreter, or an event line.
+    pub(crate) fn program_line(&self, line: Value) {
+        match line["t"].as_str() {
+            Some("event") => self.event(line),
+            _ => self.forward(line),
+        }
+    }
+
+    /// Each call the host program was sent and has not answered, now that the session is
+    /// terminating: one whose dispatch was published may be running, which nothing the engine
+    /// owns can end -- `unknown`, still running, and named in what this returns; any other never
+    /// runs, the program refusing a dispatch it is not told was published -- `cancelled`, closed.
+    /// The program is taken as gone, so what it writes later counts for nothing.
+    pub(crate) fn seal_running(&self) -> Vec<String> {
+        self.with(|s| {
+            let mut running = Vec::new();
+            for (_, call) in std::mem::take(&mut s.calls) {
+                if !call.received {
+                    self.receipt(&call, ReceivedBy::Relay);
+                }
+                let (outcome, reason) = match call.dispatched {
+                    true => (HostedOutcome::Unknown, HostedReason::StillRunning),
+                    false => (HostedOutcome::Cancelled, HostedReason::Closed),
+                };
+                self.end(s, &call, outcome, Some(reason), None);
+                if call.dispatched {
+                    running.push(format!(
+                        "request {} of agent {:?} to the binding `{}` is still running in the \
+                         host program",
+                        call.id, call.agent, call.binding
+                    ));
+                }
+            }
+            self.gone(s, None);
+            running.sort();
+            running
+        })
+    }
+
+    /// The host program serving this relay's objects is gone, and its calls with it: each it was
+    /// sent and never answered is `unknown`, `killed`, and the interpreter closes every kernel's
+    /// connections to its objects, so agent code waiting on one is told at once. Nothing, once
+    /// the relay is gone.
+    pub(crate) fn program_gone(&self) {
+        self.with(|s| {
+            if s.gone.is_some() {
+                return;
+            }
+            self.gone(s, None);
+            let reason = "the host program serving it has ended";
+            let unbind = json!({"t": "unbind", "reason": reason, "bindings": s.bindings});
+            (self.0.to_interpreter)(unbind);
+        });
+    }
+
+    fn next_id(&self) -> RequestId {
+        RequestId::new(self.0.ids.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
     /// Start writing to `process` and reading from it, on the current runtime.
@@ -352,7 +445,7 @@ impl Relay {
                 return;
             }
             let conn = (agent.to_string(), rpc.binding.clone(), rpc.id);
-            if !self.0.bindings.contains(&rpc.binding) {
+            if !s.bindings.contains(&rpc.binding) {
                 let reason = format!("this session holds no binding {:?}", rpc.binding);
                 (self.0.to_interpreter)(json!({
                     "t": "rpc", "agent": agent, "binding": rpc.binding, "id": rpc.id,
@@ -447,7 +540,7 @@ impl Relay {
                 return;
             }
             let call = Call {
-                id: s.next_id(),
+                id: self.next_id(),
                 agent: agent.to_string(),
                 binding: notice.binding,
                 exec: notice.exec.map(ExecId::new),
@@ -458,6 +551,7 @@ impl Relay {
                 since: Instant::now(),
                 sent: false,
                 received: false,
+                dispatched: false,
             };
             self.receipt(&call, ReceivedBy::Interpreter);
             let outcome = outcome(&notice.outcome);
@@ -627,7 +721,7 @@ impl Relay {
             };
             if refusal.is_some() || !op.bookkeeping() {
                 let call = Call {
-                    id: s.next_id(),
+                    id: self.next_id(),
                     agent: conn.0.clone(),
                     binding: conn.1.clone(),
                     exec: rpc.exec.map(ExecId::new),
@@ -638,6 +732,7 @@ impl Relay {
                     since: Instant::now(),
                     sent: false,
                     received: false,
+                    dispatched: false,
                 };
                 if let Some((reason, error)) = refusal {
                     self.refuse(s, &key, &call, reason, &error);
@@ -804,7 +899,7 @@ impl Relay {
                     // process refuses it at once.
                     if !s.calls.contains_key(&key) {
                         let call = Call {
-                            id: s.next_id(),
+                            id: self.next_id(),
                             agent: r.agent.clone(),
                             binding: r.binding.clone(),
                             exec: None,
@@ -815,6 +910,7 @@ impl Relay {
                             since: Instant::now(),
                             sent: true,
                             received: false,
+                            dispatched: false,
                         };
                         s.calls.insert(key.clone(), call);
                     }
@@ -840,7 +936,10 @@ impl Relay {
                     self.0.events.emit(received);
                 }
                 "dispatched" => {
-                    let request = s.calls.get(&key).map(|call| call.id);
+                    let request = s.calls.get_mut(&key).map(|call| {
+                        call.dispatched = true;
+                        call.id
+                    });
                     if let Some(request) = request {
                         self.0.events.emit(Payload::HostedDispatched {
                             request,
@@ -921,7 +1020,7 @@ impl Relay {
         let text = match &cause {
             Some(cause) => format!(
                 "the process holding the bindings {} has ended: {cause}",
-                self.0.bindings.join(", ")
+                s.bindings.join(", ")
             ),
             None => STOPPED.to_string(),
         };
@@ -945,11 +1044,12 @@ impl Relay {
         s.queued = 0;
         if let Some(cause) = &cause {
             let exited = Payload::BindingExited {
-                bindings: self.0.bindings.clone(),
+                bindings: s.bindings.clone(),
                 cause: cause.clone(),
             };
             self.0.events.emit(exited);
-            (self.0.to_interpreter)(json!({"t": "unbind", "reason": text}));
+            let unbind = json!({"t": "unbind", "reason": text, "bindings": s.bindings});
+            (self.0.to_interpreter)(unbind);
         }
         s.exited = cause;
         s.gone = Some(text);

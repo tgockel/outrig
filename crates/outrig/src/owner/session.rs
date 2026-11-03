@@ -33,8 +33,11 @@ use tokio::task::JoinHandle;
 use super::connection::Out;
 use super::{LeftOpen, SessionEnd};
 use crate::agent::children::Children;
-use crate::config::{Config, EventsMode, MountAccess, MountConfig, validate_session_paths};
+use crate::config::{
+    Config, EventsMode, MountAccess, MountConfig, Workspace, validate_session_paths,
+};
 use crate::events::Record;
+use crate::harness::bindings::Brief;
 use crate::harness::event::{Received, Subscription};
 use crate::harness::{
     Closer, ContainerSpec, DEFAULT_DRAIN, Session, SessionBuilder, ShutdownReport, Stopped,
@@ -68,18 +71,48 @@ pub(crate) struct Request {
     pub(crate) handle: u64,
     /// The request's id, which its answer carries.
     pub(crate) reply: Value,
-    pub(crate) workspace: Option<PathBuf>,
     pub(crate) mounts: Vec<MountRequest>,
+    /// The interpreter's working directory, in one of the mounts; the image's when `None`.
+    pub(crate) cwd: Option<PathBuf>,
+    /// The live objects the program injected before entry, installed at the start.
+    pub(crate) live: Vec<Live>,
 }
 
-/// One mount a program asks for, as a `[[workspace.mounts]]` entry says it: the container path
-/// its host path when not given, and read-only unless it says otherwise.
+/// One mount a program asks for, which the container sees at its host path, read-only unless it
+/// says otherwise.
 #[derive(Debug, Deserialize)]
 pub(crate) struct MountRequest {
     host_path: PathBuf,
-    container_path: Option<PathBuf>,
     #[serde(default)]
     access: MountAccess,
+}
+
+/// A live object the program injects, which its own process serves: its binding's name, the
+/// qualified name of its type, its class docstring's first line, and whether its calls take
+/// turns.
+#[derive(Debug, Deserialize)]
+pub(crate) struct Live {
+    name: String,
+    #[serde(rename = "type")]
+    type_name: String,
+    doc: String,
+    serialize: bool,
+}
+
+impl Live {
+    /// What agents are told of it.
+    fn brief(self) -> Brief {
+        let doc = match self.doc.trim() {
+            "" => ".".to_string(),
+            doc => format!(": {doc}"),
+        };
+        Brief {
+            description: format!("a `{}` the host program holds{doc}", self.type_name),
+            name: self.name,
+            type_name: self.type_name,
+            serialize: self.serialize,
+        }
+    }
 }
 
 /// A program's request about a session it asked for.
@@ -94,6 +127,14 @@ pub(crate) enum Command {
     /// A line about its agent class instances, the session's root children: see
     /// [`Children::owner_line`].
     Agent(Value),
+    /// A live object to bind in every kernel.
+    Inject {
+        reply: Value,
+        live: Live,
+    },
+    /// A line its serving module wrote about its live objects: see
+    /// [`Relay::program_line`](crate::python::hosted::Relay::program_line).
+    Live(Value),
 }
 
 /// Start the session `request` asks for and serve its commands until it has ended. What the
@@ -107,15 +148,15 @@ pub(crate) async fn run(
     let Request {
         handle,
         reply,
-        workspace,
         mounts,
+        cwd,
+        live: injected,
     } = request;
-    let prepared =
-        prepare(&context, workspace.as_deref(), &mounts).and_then(|(config, mounted)| {
-            let (id, logs) = session_dir(&config)?;
-            Ok((config, mounted, id, logs))
-        });
-    let (config, mounted, id, logs) = match prepared {
+    let prepared = prepare(&context, &mounts, cwd.as_deref(), &injected).and_then(|config| {
+        let (id, logs) = session_dir(&config)?;
+        Ok((config, id, logs))
+    });
+    let (config, id, logs) = match prepared {
         Ok(prepared) => prepared,
         Err(why) => {
             out.send(json!({"t": "events.end", "session": handle}))
@@ -126,10 +167,12 @@ pub(crate) async fn run(
         }
     };
     let requests_max = config.limits(None).requests_max;
+    let configured: Vec<String> = config.bindings.keys().cloned().collect();
 
     let mut builder = SessionBuilder::new(config.clone(), None, None)
         .no_primary()
-        .repo_root(&context.repo_root);
+        .repo_root(&context.repo_root)
+        .program(cwd);
     if config.events.mode() == EventsMode::Record {
         builder = builder.record_events();
     }
@@ -141,9 +184,9 @@ pub(crate) async fn run(
         Arc::clone(&context),
         builder,
         config,
-        mounted,
         id.clone(),
         logs,
+        injected,
     ));
     // How the start ended: with the session, or without it -- failed, saying why, or interrupted
     // by the program's shutdown, answered with its `reply`, or by the program's end.
@@ -153,10 +196,10 @@ pub(crate) async fn run(
             started = &mut start => break started.map_err(|why| (why, None)),
             command = commands.recv() => match command {
                 Some(Command::Close { reply }) => closes.push(reply),
-                Some(Command::Agent(line)) => refuse_agent(line, &out).await,
                 Some(Command::Shutdown { reply, .. }) => {
                     break Err((INTERRUPTED.to_string(), Some(reply)));
                 }
+                Some(other) => refuse(other, &out).await,
                 None => break Err((INTERRUPTED.to_string(), None)),
             },
             () = out.gone().cancelled() => break Err((INTERRUPTED.to_string(), None)),
@@ -183,11 +226,11 @@ pub(crate) async fn run(
                     stopped = &mut settling => break stopped,
                     Some(command) = commands.recv() => match command {
                         Command::Close { reply } => closes.push(reply),
-                        Command::Agent(line) => refuse_agent(line, &out).await,
                         Command::Shutdown { reply, .. } => {
                             held.get_or_insert_with(|| Asked::new(&context.shutdowns));
                             asked.push(reply);
                         }
+                        other => refuse(other, &out).await,
                     },
                 }
             };
@@ -216,7 +259,15 @@ pub(crate) async fn run(
         }
     };
 
-    let session_line = json!({"id": id, "requests_max": requests_max});
+    let live = session.live();
+    if let Some(relay) = &live {
+        tokio::spawn(to_program(handle, relay.attach_program(), out.clone()));
+    }
+    // Where the program imports RPyC from to serve its live objects, and what it may not name one.
+    let rpyc = crate::python::payload::rpyc_dir().await.ok();
+    let session_line = json!({
+        "id": id, "requests_max": requests_max, "bindings": configured, "rpyc": rpyc,
+    });
     out.send(json!({"t": "session.start", "id": reply, "session": session_line}))
         .await;
     // Its events, from `starting` on, once the program knows the session.
@@ -235,6 +286,18 @@ pub(crate) async fn run(
             command = commands.recv() => match command {
                 Some(Command::Close { reply }) => close(&closer, reply, &out).await,
                 Some(Command::Agent(line)) => children.owner_line(line),
+                Some(Command::Inject { reply, live }) => {
+                    let line = match session.inject(live.brief()).await {
+                        Ok(()) => json!({"t": "inject", "id": reply}),
+                        Err(why) => json!({"t": "error", "id": reply, "error": why}),
+                    };
+                    out.send(line).await;
+                }
+                Some(Command::Live(line)) => {
+                    if let Some(relay) = &live {
+                        relay.program_line(line);
+                    }
+                }
                 Some(Command::Shutdown { reply, grace }) => {
                     let shutdowns = &context.shutdowns;
                     let pumps = (pump, children, told);
@@ -247,8 +310,11 @@ pub(crate) async fn run(
             () = out.gone().cancelled() => break,
         }
     }
-    // The program is gone, and left the session open.
+    // The program is gone, and left the session open: its live objects went with it.
     session.close_admission();
+    if let Some(relay) = &live {
+        relay.program_gone();
+    }
     let report = session.shutdown(DEFAULT_DRAIN).await;
     children.detach_owner().await;
     let _ = pump.await;
@@ -278,7 +344,8 @@ impl Drop for Asked<'_> {
 /// `admission.close` that arrives meanwhile, and then every shutdown asked for with the report;
 /// the program's grace is held while the shutdown runs, counted in `shutdowns`. The report, when
 /// the program was gone before it could be answered. `pumps` push its events, and what its
-/// `children` tell the program, which goes on hearing them until the shutdown is done.
+/// `children` tell the program, which goes on hearing them until the shutdown is done; and its
+/// live objects' calls end as the program says, until it is gone.
 async fn shut_down(
     session: Session,
     grace: Duration,
@@ -290,6 +357,8 @@ async fn shut_down(
 ) -> Option<ShutdownReport> {
     let mut replies = vec![reply];
     let closer = session.closer();
+    let live = session.live();
+    let mut abandoned = false;
     let report = {
         let _asked = Asked::new(shutdowns);
         let stopping = session.shutdown(grace);
@@ -301,7 +370,20 @@ async fn shut_down(
                     Command::Close { reply } => close(&closer, reply, out).await,
                     Command::Agent(line) => children.owner_line(line),
                     Command::Shutdown { reply, .. } => replies.push(reply),
+                    Command::Live(line) => {
+                        if let Some(relay) = &live {
+                            relay.program_line(line);
+                        }
+                    }
+                    other => refuse(other, out).await,
                 },
+                // A program gone takes its calls with it.
+                () = out.gone().cancelled(), if !abandoned => {
+                    abandoned = true;
+                    if let Some(relay) = &live {
+                        relay.program_gone();
+                    }
+                }
             }
         }
     };
@@ -323,11 +405,11 @@ async fn shut_down(
             Command::Close { reply } => {
                 out.send(json!({"t": "admission.close", "id": reply})).await;
             }
-            Command::Agent(line) => refuse_agent(line, out).await,
             Command::Shutdown { reply, .. } => {
                 let line = json!({"t": "session.shutdown", "id": reply, "report": answer});
                 out.send(line).await;
             }
+            other => refuse(other, out).await,
         }
     }
     (!delivered).then_some(report)
@@ -350,21 +432,34 @@ async fn refuse_all(replies: Vec<Value>, out: &Out, why: &str) {
 async fn refuse_the_rest(mut commands: mpsc::UnboundedReceiver<Command>, out: &Out) {
     commands.close();
     while let Some(command) = commands.recv().await {
-        match command {
-            Command::Close { reply } | Command::Shutdown { reply, .. } => {
-                out.refuse(reply, "the session is not running").await;
-            }
-            Command::Agent(line) => refuse_agent(line, out).await,
-        }
+        refuse(command, out).await;
     }
 }
 
-/// Answer a line about the program's agent class instances that the session is not running: a
-/// request, which carries an id. A notice is not answered.
-async fn refuse_agent(line: Value, out: &Out) {
-    if !line["id"].is_null() {
-        out.refuse(line["id"].clone(), "the session is not running")
-            .await;
+/// Answer `command`, which the session is not running for, when it is a request: a line about
+/// the program's agent class instances that carries an id, or any other but its serving
+/// module's. A notice is not answered.
+async fn refuse(command: Command, out: &Out) {
+    let id = match command {
+        Command::Agent(line) => line["id"].clone(),
+        Command::Close { reply }
+        | Command::Shutdown { reply, .. }
+        | Command::Inject { reply, .. } => reply,
+        Command::Live(_) => Value::Null,
+    };
+    if !id.is_null() {
+        out.refuse(id, "the session is not running").await;
+    }
+}
+
+/// Write to the program, naming the session, what `lines` brings it for its live objects. Stops
+/// once the program is gone.
+async fn to_program(handle: u64, mut lines: mpsc::Receiver<Value>, out: Out) {
+    while let Some(mut line) = lines.recv().await {
+        line["session"] = json!(handle);
+        if !out.send(line).await {
+            return;
+        }
     }
 }
 
@@ -389,35 +484,42 @@ async fn settled(owed: Owed) -> Stopped {
     }
 }
 
-/// The configuration a session starts from: the engine's, with the program's workspace in place
-/// of the configured one and its mounts added -- and whether a workspace is mounted. Checked, so
-/// nothing starts on paths that cannot be mounted.
+/// The configuration a session starts from: the engine's, with the program's mounts, each at its
+/// host path, in place of the configured workspace and its mounts, which are the interactive
+/// session's. Checked, so nothing starts on paths that cannot be mounted, in a working directory
+/// that is none, or with a live object named as a configured binding.
 fn prepare(
     context: &Context,
-    workspace: Option<&Path>,
     mounts: &[MountRequest],
-) -> Result<(Config, bool), String> {
-    let absolute = |path: &Path, what: &str| match path.is_absolute() {
-        true => Ok(()),
-        false => Err(format!("{what} {} is not an absolute path", path.display())),
-    };
+    cwd: Option<&Path>,
+    live: &[Live],
+) -> Result<Config, String> {
     let mut config = context.config.clone();
-    if let Some(workspace) = workspace {
-        absolute(workspace, "the workspace")?;
-        config.workspace.set_host_path(workspace);
-    }
-    let mounted = config.workspace.declared_host_path().is_some();
+    config.workspace = Workspace::default();
     for mount in mounts {
-        absolute(&mount.host_path, "the mount")?;
-        let container = mount.container_path.as_deref().unwrap_or(&mount.host_path);
-        absolute(container, "the mount's container path")?;
+        let host = &mount.host_path;
         config
             .workspace
             .mounts
-            .push(MountConfig::new(&mount.host_path, container, mount.access));
+            .push(MountConfig::new(host, host, mount.access));
     }
-    validate_session_paths(&config, &context.repo_root, mounted).map_err(|e| e.to_string())?;
-    Ok((config, mounted))
+    validate_session_paths(&config, &context.repo_root, false).map_err(|e| e.to_string())?;
+    if let Some(cwd) = cwd.filter(|cwd| !cwd.is_dir()) {
+        return Err(format!(
+            "the working directory {} is not a directory",
+            cwd.display()
+        ));
+    }
+    if let Some(live) = live
+        .iter()
+        .find(|live| config.bindings.contains_key(&live.name))
+    {
+        return Err(format!(
+            "the live object `{}` is named as a binding the configuration declares",
+            live.name
+        ));
+    }
+    Ok(config)
 }
 
 /// A new session's id and its `logs` directory, `<session-root>/<id>/logs`, the session's
@@ -449,13 +551,37 @@ fn session_dir(config: &Config) -> Result<(String, PathBuf), String> {
     ))
 }
 
-/// The session's start: its image ensured as `outrig run-new` ensures one, then the session
-/// started in a container of it.
+/// Start the session `builder` describes, with each live object the program injected before entry
+/// bound: one that cannot be fails the start, what it made stopped.
 async fn start(
     context: Arc<Context>,
     builder: SessionBuilder,
     config: Config,
-    mounted: bool,
+    id: String,
+    logs: PathBuf,
+    injected: Vec<Live>,
+) -> Result<Session, String> {
+    let session = begin(context, builder, config, id, logs).await?;
+    for live in injected {
+        if let Err(why) = session.inject(live.brief()).await {
+            let why = format!("a live object injected before entry is not bound: {why}");
+            return Err(match session.shutdown(DEFAULT_DRAIN).await.stopped {
+                Stopped::Proven => why,
+                Stopped::NotProven { reason } => {
+                    format!("{why}; and the session is not proven stopped: {reason}")
+                }
+            });
+        }
+    }
+    Ok(session)
+}
+
+/// The session's start: its image ensured as `outrig run-new` ensures one, then the session
+/// started in a container of it.
+async fn begin(
+    context: Arc<Context>,
+    builder: SessionBuilder,
+    config: Config,
     id: String,
     logs: PathBuf,
 ) -> Result<Session, String> {
@@ -482,12 +608,8 @@ async fn start(
         container_spec(&config, image, Some(&ensured.tag), repo_root, logs)
             .await
             .map_err(|e| e.to_string())?;
-    let spec = match mounted {
-        true => spec,
-        false => spec.without_workspace(),
-    };
     builder
-        .container(spec.with_session_id(id))
+        .container(spec.without_workspace().with_session_id(id))
         .start()
         .await
         .map_err(|e| e.to_string())

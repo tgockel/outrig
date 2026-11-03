@@ -17,10 +17,12 @@ which the engine left blocked until the handler below is in place, and the end o
 which the reading thread sees.
 
 An `outrig.Agent` subclass constructed here is a root child of a session the program owns
-("agent classes", below).
+("agent classes", below), and an object the program injects into one is served from here, by the
+serving module the bindings process uses ("live objects", below).
 """
 
 import asyncio
+import builtins
 import collections
 import concurrent.futures
 import contextlib
@@ -28,14 +30,19 @@ import contextvars
 import copy
 import dataclasses
 import datetime
+import importlib.machinery
+import importlib.util
 import inspect
 import itertools
 import json
 import keyword
 import os
 import pathlib
+import queue
+import re
 import select
 import signal
+import sys
 import threading
 import time
 import types
@@ -44,7 +51,7 @@ from collections.abc import Mapping
 
 import outrig
 
-from . import _agents, schema
+from . import _agents, _serve, schema
 
 # The signal the engine's death delivers: `PR_SET_PDEATHSIG`, set between fork and exec and
 # blocked until `install` has put the handler in place, so a death in between is pending rather
@@ -55,7 +62,7 @@ DEATH_SIGNAL = signal.SIGHUP
 DEATH_GRACE = 1.0
 # The version of the protocol over the connection, which the greeting names; the engine refuses
 # any other.
-PROTOCOL = 2
+PROTOCOL = 3
 # How many pushes of a session's events this program holds for a reader that falls behind before
 # it drops the oldest. The engine holds as many for this program, and drops past it too, counted.
 EVENT_CAPACITY = 4096
@@ -171,9 +178,16 @@ class _Connection:
                 f"a {kind} request of {len(line)} bytes is longer than the {LINE_MAX} the engine "
                 "reads"
             )
+        self.write(line + b"\n")
+
+    def write(self, data):
+        """Write `data`, whole lines already encoded. Raises `RuntimeError` once the connection
+        is broken."""
+        if self._broken is not None:
+            raise RuntimeError(self._broken)
         try:
             with self._send:
-                _write_all(self.fds[1], line + b"\n")
+                _write_all(self.fds[1], data)
         except OSError as e:
             raise RuntimeError(f"the connection to the engine is broken: {e}") from None
 
@@ -203,6 +217,11 @@ class _Connection:
     def _deliver(self, line):
         try:
             message = json.loads(line)
+            if message["t"] in ("rpc", "published", "control"):
+                # A live object's serving, whose `id` is no request's: handed to a thread of its
+                # own, since handling it may write, and this one must never wait on a write.
+                _served.put(message)
+                return
             if "id" not in message:
                 # A push, for one session: an event, `events.end` their last, or what became of
                 # one of its agent class instances or their requests.
@@ -338,6 +357,7 @@ class Config:
     providers: Mapping[str, Provider]
     default_model: str | None
     workspace: pathlib.Path | None
+    mounts: tuple["Mount", ...]
     events: Events
 
 
@@ -360,6 +380,9 @@ def config():
     - `default_model`: the model or alias `default-model` names, or `None`.
     - `workspace`: the configured `[workspace] host-path`, resolved to an absolute path on this
       host, or `None` where the configuration names none.
+    - `mounts`: each configured `[[workspace.mounts]]` entry, a `Mount` of its host path. The
+      workspace and these are the interactive session's: a session this program starts mounts
+      them only where the program passes them to it.
     - `events`: the `[events]` table, whose `mode` is `"off"` or `"record"`.
 
     A declared window is a number the configuration states, not the model's capacity: OutRig
@@ -390,6 +413,7 @@ def config():
         ),
         default_model=view["default_model"],
         workspace=None if workspace is None else pathlib.Path(workspace),
+        mounts=tuple(Mount(**row) for row in view["mounts"]),
         events=Events(**view["events"]),
     )
 
@@ -404,26 +428,18 @@ _current = contextvars.ContextVar("outrig.current_session", default=None)
 
 @dataclasses.dataclass(frozen=True)
 class Mount:
-    """One more directory a session's container sees, as a `[[workspace.mounts]]` entry
-    declares one.
+    """A directory a session's container sees, at its path on this host, so a path means the
+    same file on both sides: one a live object returns names the file agent code opens.
 
-    `host_path` is the directory on this host, a str or path made absolute against the working
-    directory when the `Mount` is made. `container_path` is where the container sees it, an
-    absolute path, or `None` for the same path as on the host, which a session with bindings
-    requires of every mount. `access` is `"read-only"`, the default, or `"read-write"`.
+    `host_path` is the directory, a str or path made absolute against the working directory when
+    the `Mount` is made. `access` is `"read-only"`, the default, or `"read-write"`.
     """
 
     host_path: str
-    container_path: str | None = None
     access: str = "read-only"
 
     def __post_init__(self):
         object.__setattr__(self, "host_path", str(pathlib.Path(self.host_path).absolute()))
-        if self.container_path is not None:
-            container = pathlib.PurePosixPath(self.container_path)
-            if not container.is_absolute():
-                raise ValueError(f"container_path {str(container)!r} is not absolute")
-            object.__setattr__(self, "container_path", str(container))
         if self.access not in ("read-only", "read-write"):
             raise ValueError(f"access is 'read-only' or 'read-write', not {self.access!r}")
 
@@ -706,21 +722,25 @@ class Session:
     """A session this program owns, with no primary agent: a container, the interpreter in it,
     and the configuration's bindings, which the engine that runs this program starts and stops.
 
-        async with outrig.Session(workspace="./repo") as session:
+        async with outrig.Session(mounts=["./repo"], cwd="./repo") as session:
             ...
         print(session.shutdown_report.verdict)
 
     Making one checks its inputs and starts nothing:
 
-    - `workspace`: the directory to mount as the session's workspace, a str or path made
-      absolute against the working directory now. `None` takes the configuration's `[workspace]
-      host-path` where it declares one; with neither, no workspace is mounted.
-    - `mounts`: more directories, each a `Mount` or a path, which is `Mount(path)`, added to the
-      configuration's `[[workspace.mounts]]`. A host or container path given twice fails entry.
+    - `mounts`: the directories its container sees, each at its path on this host: a `Mount`, or
+      a path, which is `Mount(path)`, read-only. The configuration's `[workspace]` and
+      `[[workspace.mounts]]` are not mounted: `outrig.config()` shows them, for a program that
+      passes them here. A directory given twice raises `ValueError`.
+    - `cwd`: the interpreter's working directory, where agent code runs and what its imports
+      find: a directory in one of `mounts`, or `ValueError`. `None` leaves the image's.
     - `grace`: how many seconds the exit lets what is still running -- hosted calls, executions --
       finish before it stops what is left, at most an hour, or `None` for the engine's default,
       five. It bounds that wait only: interrupting kernels and stopping the bindings and the
       container after it take bounded times of their own.
+
+    Relative paths are made absolute against the working directory now. A mount that does not
+    exist, is not a directory, or is `/`, and a `cwd` that is not a directory, fail entry.
 
     `async with` starts it in the image `default-image` names, with the configured factory
     bindings -- a repository's own are refused, there being nobody to approve them -- and records
@@ -744,11 +764,13 @@ class Session:
     session is shut down and `shutdown_report` set. One while the exit waits is raised once the
     shutdown is done.
 
+    `inject` gives its agents an object this program holds.
+
     `id` is the engine's id for the session once entered, which names its container and its
     directory under the session root, and `None` before.
     """
 
-    def __init__(self, *, workspace=None, mounts=(), grace=None):
+    def __init__(self, *, mounts=(), cwd=None, grace=None):
         if isinstance(mounts, str):
             raise TypeError("mounts takes Mount entries or paths, not one path")
         if grace is not None:
@@ -756,9 +778,25 @@ class Session:
                 raise TypeError(f"grace takes None or a number of seconds, not {grace!r}")
             if not 0 <= grace <= GRACE_MAX:
                 raise ValueError(f"grace takes from 0 to {GRACE_MAX} seconds, not {grace!r}")
-        self._workspace = None if workspace is None else str(pathlib.Path(workspace).absolute())
         self._mounts = [dataclasses.asdict(m if isinstance(m, Mount) else Mount(m)) for m in mounts]
+        hosts = [os.path.normpath(mount["host_path"]) for mount in self._mounts]
+        for host in hosts:
+            if hosts.count(host) > 1:
+                raise ValueError(f"{host} is mounted twice")
+        self._cwd = None if cwd is None else str(pathlib.Path(cwd).absolute())
+        if self._cwd is not None and not any(
+            os.path.commonpath([os.path.normpath(self._cwd), host]) == host for host in hosts
+        ):
+            raise ValueError(f"cwd {self._cwd} is in none of the session's mounts")
         self._grace = grace
+        # Each live object injected, by name: what it is, and whether its calls take turns. Under
+        # `_lock`, with entry, so an injection from another thread is never lost or doubled.
+        self._live = {}
+        self._lock = threading.Lock()
+        # The configuration's bindings, which no live object may be named as; said at entry.
+        self._configured = frozenset()
+        # What serves this session's live objects from entry on, when RPyC is there to.
+        self._server = None
         self._handle = next(_handles)
         self._events = _Events()
         self._entered = False
@@ -769,9 +807,13 @@ class Session:
         self.shutdown_report = None
 
     async def __aenter__(self):
-        if self._entered:
-            raise RuntimeError("an outrig.Session is entered once; make another to enter again")
-        self._entered = True
+        with self._lock:
+            if self._entered:
+                raise RuntimeError(
+                    "an outrig.Session is entered once; make another to enter again"
+                )
+            self._entered = True
+            live = [_described(name, *live) for name, live in self._live.items()]
         try:
             if _connection is None:
                 raise RuntimeError(
@@ -781,8 +823,9 @@ class Session:
             start = _connection.post(
                 "session.start",
                 session=self._handle,
-                workspace=self._workspace,
                 mounts=self._mounts,
+                cwd=self._cwd,
+                live=live,
             )
         except BaseException:
             # Nothing was sent, so nothing but this ends the session's events.
@@ -799,8 +842,15 @@ class Session:
             if stop.exception() is None and "report" in stop.result():
                 self.shutdown_report = _report(stop.result()["report"], self._events.lost)
             raise
-        self.id = answer["session"]["id"]
         self._requests_max = answer["session"]["requests_max"]
+        with self._lock:
+            self._configured = frozenset(answer["session"]["bindings"])
+            if answer["session"]["rpyc"] is not None:
+                # Before anything can call what was injected before entry: no agent exists yet.
+                self._server = _server(self._handle, answer["session"]["rpyc"])
+                for name, (obj, serialize) in self._live.items():
+                    self._server.hosted[name] = _serve.Hosted(obj, serialize)
+            self.id = answer["session"]["id"]
         self._token = _current.set(self)
         return self
 
@@ -809,8 +859,14 @@ class Session:
         with contextlib.suppress(ValueError):
             _current.reset(self._token)
         stop = _connection.post("session.shutdown", session=self._handle, grace=self._grace)
-        cancelled = await _settled(stop)
-        self.shutdown_report = _report(stop.result()["report"], self._events.lost)
+        try:
+            cancelled = await _settled(stop)
+            self.shutdown_report = _report(stop.result()["report"], self._events.lost)
+        finally:
+            # A live call still running finishes, and its reply goes nowhere.
+            server = _servers.pop(self._handle, None)
+            if server is not None:
+                server.end("the session has ended")
         # Whatever of its agent class instances nothing ended, nothing will now.
         _closed([root for root in list(_roots.values()) if root.session is self], terminated=True)
         if self.shutdown_report.verdict == "not_proven_stopped":
@@ -825,6 +881,58 @@ class Session:
         returns at once."""
         if self.shutdown_report is None:
             await asyncio.wrap_future(_connection.post("admission.close", session=self._handle))
+
+    def inject(self, name, obj, *, serialize=False):
+        """Give every agent of the session `obj`, an object this program holds, as the binding
+        `name`: in every kernel, now and made later, `outrig.bindings[name]` is a proxy of it,
+        and so is the global `name` wherever that name is free -- one agent code bound, or a
+        builtin's, is left as it is. Agents use it as its library documents; each operation on it
+        runs here, on a thread serving that agent's connection, never on this program's event
+        loop, and is evented as a factory binding's is. A method that needs the loop uses
+        `asyncio.run_coroutine_threadsafe` itself: an `async def` method is not awaited for it.
+        With `serialize`, its calls run one at a time, as a library that is not thread-safe
+        needs.
+
+        Before entry, it is installed as the session starts; after, this returns once every agent
+        can reach it. Agents are told its type's qualified name and the first line of its class's
+        docstring; nothing of `obj` itself is run to describe it. The object stays this
+        program's, and so does a call on it: one still running when the session ends is left to
+        finish here, its reply going nowhere, and the exit raises `ShutdownException`, the report
+        reading not proven stopped.
+
+        Raises `TypeError` for a `name` that is not a str or a `serialize` that is not a bool;
+        `ValueError` for a name a binding cannot have -- not an identifier, a keyword, `runtime`,
+        `asyncio`, `outrig` or a dunder -- or one the session already binds; and `RuntimeError`
+        while the session starts, and once it takes no more: its admission closed, or it ended. A
+        name injected before entry that the configuration declares a binding of fails the
+        entry."""
+        if not isinstance(name, str):
+            raise TypeError(f"a binding is named by a str, not {type(name).__qualname__}")
+        if not isinstance(serialize, bool):
+            raise TypeError(f"serialize takes a bool, not {type(serialize).__qualname__}")
+        if (not _BINDING_NAME.fullmatch(name) or keyword.iskeyword(name)
+                or name in ("runtime", "asyncio", "outrig")
+                or len(name) > 4 and name.startswith("__") and name.endswith("__")):
+            raise ValueError(f"{name!r} cannot name a binding: it is a global in every kernel")
+        with self._lock:
+            if name in self._live or name in self._configured:
+                raise ValueError(f"the session already binds {name!r}")
+            if self.shutdown_report is not None or self._entered and self.id is None:
+                raise RuntimeError("the session takes no live object: it has ended, or is starting")
+            if self._entered and self._server is None:
+                raise RuntimeError("the session takes no live object: this build carries no RPyC")
+            self._live[name] = (obj, serialize)
+            if not self._entered:
+                return
+            server = self._server
+            server.hosted[name] = _serve.Hosted(obj, serialize)
+        try:
+            _connection.request("inject", session=self._handle,
+                                **_described(name, obj, serialize))
+        except BaseException:
+            with self._lock:
+                del self._live[name], server.hosted[name]
+            raise
 
     def events(self):
         """The session's events, as an async iterator, in the order the session published them.
@@ -846,6 +954,112 @@ class Session:
             raise RuntimeError("a session's events are read through one iterator, already made")
         self._reading = True
         return self._events
+
+
+# ------------------------------------------------------------------------------------ live objects
+#
+# A live object is served from here, by the serving module the bindings process is built from,
+# over the engine's connection: a `Server` per session, which the engine's lines about it reach
+# through one thread, and whose connections each have a thread of their own.
+
+# An ASCII identifier, as the configuration's rule for a binding's name asks; `inject` refuses
+# the keywords, the kernel's own names and the dunders beside it.
+_BINDING_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# The longest docstring line an object is described with.
+DOC_MAX = 300
+# A class's own namespace, read from `type` itself, so a metaclass's descriptor never runs.
+_CLASS_DICT = type.__dict__["__dict__"].__get__
+# Each session's server of its live objects, by its handle, from its entry until its exit.
+_servers = {}
+# The engine's lines about live objects, for `_serve_lines`.
+_served = queue.SimpleQueue()
+# RPyC's connection class, every request intercepted, once a session has served.
+_Binding = None
+# Held while `_Binding` is made, so two sessions entered at once on two threads make it once.
+_binding_lock = threading.Lock()
+# The name RPyC's copy is imported under: `rpyc` is the program's own.
+_RPYC = "_outrig_rpyc"
+
+
+def _described(name, obj, serialize):
+    """What the engine is told of `obj`, injected as `name`: the qualified name of its type and
+    the first line of that class's own docstring, read from the class's slots, so nothing of
+    `obj`'s own runs."""
+    cls = type(obj)
+    doc = _CLASS_DICT(cls).get("__doc__")
+    lines = [line.strip() for line in doc.splitlines()] if isinstance(doc, str) else []
+    first = next((line for line in lines if line), "")
+    return {"name": name, "type": _serve.type_name(cls), "doc": first[:DOC_MAX],
+            "serialize": serialize}
+
+
+def _server(handle, rpyc_dir):
+    """The server of session `handle`'s live objects, built over RPyC's copy in `rpyc_dir`."""
+    global _Binding
+    with _binding_lock:
+        if _Binding is None:
+            _Binding = _serve.connection_class(_rpyc(rpyc_dir))
+            threading.Thread(target=_serve_lines, name="outrig-serve", daemon=True).start()
+    server = _servers[handle] = _serve.Server(_Binding, _connection.write, _diag, session=handle)
+    return server
+
+
+def _rpyc(directory):
+    """RPyC's copy in `directory`, the one the interception was written against, imported as
+    `_RPYC` whatever the program imports as `rpyc`. No module leaves `sys.modules`, one another
+    thread is importing included, and `sys.path` stays as it was; `sys.meta_path` gains a finder
+    of `_RPYC`'s modules alone.
+
+    The copy's modules import each other as `rpyc.*`, as they load and later in their functions.
+    Each runs with a builtins namespace of its own, whose `__import__` imports those names as
+    `_RPYC`'s and any other as usual."""
+    names = dict(vars(builtins))
+
+    def import_(name, globals=None, locals=None, fromlist=(), level=0):
+        if not level and name.split(".")[0] == "rpyc":
+            name = _RPYC + name[len("rpyc") :]
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+    names["__import__"] = import_
+
+    class Loader(importlib.machinery.SourceFileLoader):
+        def exec_module(self, module):
+            module.__builtins__ = names
+            super().exec_module(module)
+
+    class Finder:
+        """Finds `_RPYC` and the modules below it in `directory`. First on `sys.meta_path`, since
+        the path's finder would also find a submodule, through its package's `__path__`, and run
+        it with the interpreter's own builtins."""
+
+        @staticmethod
+        def find_spec(name, path=None, target=None):
+            parts = name.split(".")
+            if parts[0] != _RPYC:
+                return None
+            base = os.path.join(directory, "rpyc", *parts[1:])
+            for location in (os.path.join(base, "__init__.py"), base + ".py"):
+                if os.path.isfile(location):
+                    return importlib.util.spec_from_file_location(
+                        name, location, loader=Loader(name, location)
+                    )
+            return None
+
+    sys.meta_path.insert(0, Finder)
+    return importlib.import_module(_RPYC)
+
+
+def _serve_lines():
+    """Hand each of the engine's lines about live objects to its session's server, in order."""
+    while True:
+        message = _served.get()
+        server = _servers.get(message.get("session"))
+        if server is None:
+            continue
+        try:
+            _serve.handle(server, message)
+        except Exception as e:
+            _diag(f"ignored a line about live objects ({e!r})")
 
 
 def current_session():

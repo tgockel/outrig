@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::interpreter_tests::Interpreter;
-use super::relay::{BINDING_SOURCE, Bind, Relay, Service, TIMEOUT, fixture_dir, rpyc_dir};
+use super::relay::{Bind, Relay, Service, TIMEOUT, fixture_dir, rpyc_dir};
 use super::testing::{Flag, Start, eventually, py, python};
 
 // The programs' bounds, restated so that changing one changes a test.
@@ -203,16 +203,14 @@ const INVENTORY: [&str; 20] = [
 
 #[test]
 fn every_request_type_is_in_the_table_and_the_inventory() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let source = dir.path().join("binding.py");
-    std::fs::write(&source, BINDING_SOURCE).expect("write the binding program");
+    let source = super::testing::package();
     let driver = py(r#"
         import json, sys
-        rpyc_dir, source = sys.argv[1], sys.argv[2]
-        sys.path.insert(0, rpyc_dir)
+        rpyc_dir, package = sys.argv[1], sys.argv[2]
+        sys.path[:0] = [rpyc_dir, package]
         import rpyc
-        ns = {"__name__": "outrig_binding"}
-        exec(compile(open(source).read(), source, "exec"), ns)
+        from outrig import _serve
+        ns = vars(_serve)
         Binding = ns["connection_class"](rpyc)
         handles = {n: v for n, v in vars(rpyc.core.consts).items() if n.startswith("HANDLE_")}
         stock = sorted(rpyc.core.protocol.Connection._request_handlers())
@@ -223,7 +221,7 @@ fn every_request_type_is_in_the_table_and_the_inventory() {
     let output = Command::new(python())
         .args(["-I", "-c", &driver])
         .arg(rpyc_dir())
-        .arg(&source)
+        .arg(source)
         .output()
         .expect("the payload's Python runs");
     assert!(
@@ -1914,18 +1912,53 @@ fn a_blocked_call_delays_neither_another_kernel_nor_a_worker() {
     }
 }
 
+/// A server's end, at its session's: a dispatch still waiting for its publication is answered
+/// unpublished, so its request is refused rather than run; one that starts to wait afterward is
+/// answered so at once; and nothing more is written.
+#[test]
+fn a_servers_end_answers_every_waiting_dispatch_unpublished() {
+    let source = super::testing::package();
+    let driver = py(r#"
+        import json, sys
+        sys.path.insert(0, sys.argv[1])
+        from outrig import _serve
+        written = []
+        server = _serve.Server(None, written.append, print, session=1)
+        _, waiting = server.awaiting()
+        server.send({"t": "event"})
+        server.end("the session has ended")
+        _, late = server.awaiting()
+        server.send({"t": "event"})
+        print(json.dumps({"waiting": waiting.get(timeout=5), "late": late.get(timeout=5),
+                          "written": len(written), "held": len(server.acks)}))
+    "#);
+    let output = Command::new(python())
+        .args(["-I", "-c", &driver])
+        .arg(source)
+        .output()
+        .expect("the payload's Python runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("a JSON report");
+    assert_eq!(
+        report,
+        json!({"waiting": false, "late": false, "written": 1, "held": 0})
+    );
+}
+
 // ---------------------------------------------------------------------------- serialize
 
 #[test]
 fn the_serialize_lock_is_reentrant_and_fifo() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let source = dir.path().join("binding.py");
-    std::fs::write(&source, BINDING_SOURCE).expect("write the binding program");
+    let source = super::testing::package();
     let driver = py(r#"
         import json, sys, threading, time
-        source = sys.argv[1]
-        ns = {"__name__": "outrig_binding"}
-        exec(compile(open(source).read(), source, "exec"), ns)
+        sys.path.insert(0, sys.argv[1])
+        from outrig import _serve
+        ns = vars(_serve)
         turn = ns["Turn"]()
         order = []
         outer, inner = turn.taking(), turn.taking()
@@ -1954,7 +1987,7 @@ fn the_serialize_lock_is_reentrant_and_fifo() {
     "#);
     let output = Command::new(python())
         .args(["-I", "-c", &driver])
-        .arg(&source)
+        .arg(source)
         .output()
         .expect("the payload's Python runs");
     assert!(
@@ -1974,14 +2007,12 @@ fn the_serialize_lock_is_reentrant_and_fifo() {
 /// joining that thread. One whose parent holds nothing, or that names none, waits like any other.
 #[test]
 fn a_request_nested_in_the_holder_is_refused_on_any_other_thread() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let source = dir.path().join("binding.py");
-    std::fs::write(&source, BINDING_SOURCE).expect("write the binding program");
+    let source = super::testing::package();
     let driver = py(r#"
         import json, sys, threading, time
-        source = sys.argv[1]
-        ns = {"__name__": "outrig_binding"}
-        exec(compile(open(source).read(), source, "exec"), ns)
+        sys.path.insert(0, sys.argv[1])
+        from outrig import _serve
+        ns = vars(_serve)
         turn, Refused = ns["Turn"](), ns["Refused"]
         def request():
             return ns["Request"](0, False, turn)
@@ -2029,7 +2060,7 @@ fn a_request_nested_in_the_holder_is_refused_on_any_other_thread() {
     "#);
     let output = Command::new(python())
         .args(["-I", "-c", &driver])
-        .arg(&source)
+        .arg(source)
         .output()
         .expect("the payload's Python runs");
     assert!(

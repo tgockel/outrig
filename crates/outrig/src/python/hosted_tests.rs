@@ -2037,3 +2037,108 @@ fn an_agent_holds_at_most_1024_requests_in_flight() {
     bare.rpc(1, read(1025, "public"));
     assert!(bare.told().is_empty());
 }
+
+/// The ends of each request a relay recorded, by request.
+fn ends(recorded: &[Payload]) -> BTreeMap<RequestId, (HostedOutcome, Option<HostedReason>)> {
+    recorded
+        .iter()
+        .filter_map(|payload| match payload {
+            Payload::HostedEnded {
+                request,
+                outcome,
+                reason,
+                ..
+            } => Some((*request, (*outcome, *reason))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// At the session's terminating, a host program's call whose dispatch was published may be
+/// running, which nothing the engine owns can end: it is `unknown`, still running, and named; one
+/// the program received and never dispatched never runs, and is `cancelled`, closed, unnamed. The
+/// report holds both, and nothing the program writes later is recorded.
+#[test]
+fn the_seal_ends_a_live_call_by_whether_its_dispatch_was_published() {
+    let mut bare = Bare::new();
+    bare.wrote("received", json!(4), json!({"operation": "call"}));
+    bare.wrote("dispatched", json!(4), json!({"ack": 1}));
+    bare.wrote("received", json!(5), json!({"operation": "call"}));
+    bare.relay.close("the session closed");
+    let running = bare.relay.seal_running();
+    bare.wrote("ended", json!(4), json!({"outcome": "returned"}));
+    let recorded = bare.recorded();
+    let received: Vec<RequestId> = recorded
+        .iter()
+        .filter_map(|payload| match payload {
+            Payload::HostedReceived { request, .. } => Some(*request),
+            _ => None,
+        })
+        .collect();
+    let [dispatched, held] = received[..] else {
+        panic!("{recorded:?}");
+    };
+    assert_eq!(
+        ends(&recorded),
+        BTreeMap::from([
+            (
+                dispatched,
+                (HostedOutcome::Unknown, Some(HostedReason::StillRunning))
+            ),
+            (held, (HostedOutcome::Cancelled, Some(HostedReason::Closed))),
+        ])
+    );
+    assert_eq!(
+        running,
+        [format!(
+            "request {dispatched} of agent {PRIMARY:?} to the binding `fx` is still running in \
+             the host program"
+        )]
+    );
+    assert_eq!(bare.relay.report().len(), 2);
+}
+
+/// A host program's end takes the calls it was serving with it, and only those: each is
+/// `unknown`, `killed`, the interpreter is told to close its connections to the program's
+/// objects alone, and no `binding.exited` is published, since the bindings process lives on. Its
+/// requests are numbered with the bindings process's, and a second end does nothing.
+#[test]
+fn a_programs_end_ends_its_own_calls_and_unbinds_its_own_objects() {
+    let mut bare = Bare::new();
+    let live = bare.relay.beside();
+    live.add("notes");
+    bare.wrote("received", json!(4), json!({"operation": "call"}));
+    live.wrote(
+        json!({"t": "event", "kind": "received", "binding": "notes", "agent": PRIMARY,
+        "conn": 1, "seq": 7, "operation": "call"}),
+    );
+    live.program_gone();
+    live.program_gone();
+    let recorded = bare.recorded();
+    let [
+        Payload::HostedReceived { request: fx, .. },
+        Payload::HostedReceived { request: notes, .. },
+        Payload::HostedEnded {
+            request: ended,
+            outcome: HostedOutcome::Unknown,
+            reason: Some(HostedReason::Killed),
+            ..
+        },
+    ] = recorded.as_slice()
+    else {
+        panic!("{recorded:?}");
+    };
+    assert_eq!(ended, notes);
+    assert_ne!(fx, notes, "one numbering for both");
+    assert_eq!(
+        bare.told(),
+        [
+            json!({"t": "unbind", "reason": "the host program serving it has ended",
+            "bindings": ["notes"]})
+        ]
+    );
+    assert!(
+        bare.relay.drained().now_or_never().is_none(),
+        "the process's call goes on"
+    );
+}

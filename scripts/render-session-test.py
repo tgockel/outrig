@@ -869,6 +869,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             },
             a,
         ),
+        ("binding.injected", {"binding": "notes", "type": "__main__.Notes"}, None),
         ("binding.exited", {"bindings": ["repo"], "cause": "it was killed by SIGKILL"}, None),
         ("session.state", {"state": "closing"}, None),
         ("interpreter.exited", {"cause": "c", "expected": False}, None),

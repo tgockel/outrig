@@ -5415,12 +5415,22 @@ class Kernel:
         _send({"t": "ready", "agent": self.agent, "version": _VERSION, "instance": instance})
 
     def bind_stubs(self):
-        """Bind each of the session's bindings under its name, as its stub, among the names bound
-        at boot, which the inventory leaves out. Nothing, without RPyC."""
+        """Give each of the session's bindings this kernel has no stub of one, which
+        `outrig.bindings` reaches, and bind it under its name too, among the names bound at boot,
+        which the inventory leaves out -- where neither this kernel's globals nor the builtins
+        hold that name already: a binding never replaces a name agent code bound, nor `print`.
+        Nothing, without RPyC."""
         if _Hosted is None:
             return
         for name in _BINDINGS:
-            self.stubs[name] = self.globals[name] = self._boot[name] = self.stub(name)
+            if name in self.stubs:
+                continue
+            stub = self.stub(name)
+            # Checked and bound in one step, as agent code may bind the name on another thread;
+            # the stub joins `stubs` after, so a global that holds it was bound here.
+            if not hasattr(builtins, name) and self.globals.setdefault(name, stub) is stub:
+                self._boot[name] = stub
+            self.stubs[name] = stub
 
     def stub(self, binding):
         """The root of `binding` -- an object in a process on the host -- as the `HostedRoot`
@@ -6152,13 +6162,15 @@ _BINDINGS = types.MappingProxyType({})
 
 
 def _bindings(message):
-    """Take the session's bindings, which the host sends once, before anything runs.
+    """Take bindings the host declares: the session's own, before anything runs, and each live
+    object a program on the host injects later, answered once every kernel has its stub.
 
-    Each binding's record goes in `runtime.bindings` for every kernel, and its package directory on
-    `sys.path`: after the workspace and before the agent's own pip installs, so that the container
-    imports the version of a library its binding runs rather than one the agent installed, in the
-    order the host gave them, which decides between two bindings that hold different versions of
-    one package. Each kernel open then binds a stub for each, as one opened later does.
+    Each binding's record joins `runtime.bindings` for every kernel, and its package directory goes
+    on `sys.path`: after the workspace and before the agent's own pip installs, so that the
+    container imports the version of a library its binding runs rather than one the agent
+    installed, in the order the host gave them, which decides between two bindings that hold
+    different versions of one package. Each kernel open then binds a stub for each, as one opened
+    later does.
     """
     global _BINDINGS
     entries, paths = message.get("bindings"), message.get("paths")
@@ -6172,14 +6184,20 @@ def _bindings(message):
         records[record.name] = record
     if not all(isinstance(path, str) for path in paths):
         raise ValueError("a binding package path that is not a string")
-    _BINDINGS = types.MappingProxyType(records)
+    _BINDINGS = types.MappingProxyType({**_BINDINGS, **records})
     at = sys.path.index(_SITE) if _SITE in sys.path else len(sys.path)
     for path in paths:
         if path not in sys.path:
             sys.path.insert(at, path)
             at += 1
-    for kernel in list(_kernels.values()):
-        kernel.bind_stubs()
+    try:
+        for kernel in list(_kernels.values()):
+            if not kernel.ended:  # a released one needs none, and could make none
+                kernel.bind_stubs()
+    finally:
+        # Answered however it went, so the host never waits on it for good.
+        if "id" in message:
+            _send({"t": "bound", "agent": message.get("agent"), "id": message["id"]})
 
 
 def _close(message):
@@ -6189,6 +6207,8 @@ def _close(message):
     the closing error, and no request or submission is sent from now on. Each agent class
     instance not yet ready never is, and each is released, as `closing`."""
     global _closing
+    if _closing is not None:
+        return  # each endpoint's relay says so
     _closing = text = message["reason"]
     for kernel in list(_kernels.values()):
         for pool in list(kernel._hosted.values()):
@@ -6219,10 +6239,11 @@ def _close(message):
 
 
 def _unbind(message):
-    """The process holding the bindings has ended: every kernel's connections to them close, a
-    call in flight told its outcome on the host is unknown, and a later use raises with why."""
+    """What served `bindings` has ended: every kernel's connections to them close, a call in
+    flight told its outcome on the host is unknown, and a later use raises with why."""
     for kernel in list(_kernels.values()):
-        kernel.close_hosted(reason=message["reason"])
+        for binding in message["bindings"]:
+            kernel.close_hosted(binding, reason=message["reason"])
 
 
 # ---------------------------------------------------------------------------- routing

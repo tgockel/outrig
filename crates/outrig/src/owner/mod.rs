@@ -9,19 +9,26 @@
 //! for in [`ProgramExit`]; and a program that does not end after a forwarded signal is ended
 //! (`program.rs`).
 //!
-//! # The owner protocol, version 2
+//! # The owner protocol, version 3
 //!
 //! NDJSON over the two pipes `python::program` sets up, one object per line, both ways.
 //!
-//! - **The greeting.** The program's first line is `{"t": "hello", "id": 0, "protocol": 2}`. The
+//! - **The greeting.** The program's first line is `{"t": "hello", "id": 0, "protocol": 3}`. The
 //!   engine answers the same at the same version, before the program's script runs; a program
 //!   speaking another version is answered with an `error` and ended, and its start fails.
 //! - **Requests**, answered by `id` with a line of the same `t`, or an `error`: `config`;
-//!   `session.start` (`session`, `workspace`, `mounts`), answered with the session's `id` and
-//!   its `requests_max` once it has started; `admission.close` (`session`), answered once the
-//!   gate is closed; and `session.shutdown` (`session`, `grace`), answered with the report once
-//!   the session stopped. `session` is a number the program chooses for each session, so what
-//!   the engine pushes about one can be routed before its start is answered.
+//!   `session.start` (`session`, `mounts`, `cwd`, and `live`, the objects injected before
+//!   entry), answered with the session's `id`, its `requests_max`, the `bindings` its
+//!   configuration declares and the `rpyc` the program serves live objects with, once it has
+//!   started; `inject` (`session`, `name`, `type`, `doc`, `serialize`), answered once every kernel
+//!   has the binding; `admission.close` (`session`), answered once the gate is closed; and
+//!   `session.shutdown` (`session`, `grace`), answered with the report once the session stopped.
+//!   `session` is a number the program chooses for each session, so what the engine pushes about
+//!   one can be routed before its start is answered.
+//! - **Its live objects' serving**, both ways, each line naming its `session` and answered by
+//!   nothing: `rpc` and `event` lines from the program, and `rpc`, `published` and `control`
+//!   lines to it, as the bindings process's stdio carries them -- their `id` is a connection's,
+//!   or a publication's, and no request's.
 //! - **Its agent class instances**, root children of the session (`agent::children`): `agent.*`
 //!   lines, as a kernel sends them -- `agent.spawn`, answered with the `instance` id the child's
 //!   kernel gave it; `agent.release`, with `how`, which the engine records as it releases, and
@@ -408,12 +415,22 @@ pub(crate) fn view(config: &Config, repo_root: &Path) -> Result<Value, OutrigErr
             })
         })
         .transpose()?;
+    let mounts = config
+        .workspace
+        .mounts
+        .iter()
+        .map(|mount| {
+            let path = mount.resolved_host_path(repo_root);
+            json!({"host_path": path.to_string_lossy(), "access": mount.access()})
+        })
+        .collect::<Vec<_>>();
     Ok(json!({
         "models": models,
         "aliases": aliases,
         "providers": providers,
         "default_model": config.default_model,
         "workspace": workspace,
+        "mounts": mounts,
         "events": { "mode": config.events.mode() },
     }))
 }

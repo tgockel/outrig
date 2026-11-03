@@ -685,8 +685,8 @@ no model; a [session](#sessions) the program enters does.
   never again: not from the script's directory. `outrig.config()` is a read-only view of it: each
   model with its provider, the style OutRig calls it with -- its own, else its provider's -- the
   identifier OutRig sends and its declared window, each alias with its candidates in order, each
-  provider's style and base URL, `default-model`, the resolved `[workspace] host-path`, and
-  `[events] mode`. No API key and no `${VAR}` value is in it.
+  provider's style and base URL, `default-model`, the resolved `[workspace] host-path`, each
+  `[[workspace.mounts]]` entry, and `[events] mode`. No API key and no `${VAR}` value is in it.
 - **Flags.** `--config`, `--global-config`, `--session-root` and `-v` go before the script, and
   so does `--grace`, which is the program's alone (see [Signals and the
   grace](#signals-and-the-grace)). The interactive session's flags -- `--agent`, `--model` and
@@ -710,23 +710,30 @@ Python interpreter in it, and the bindings the configuration declares, with no a
 OutRig owns each of those and stops them; the program owns its own control flow.
 
 ```python
-async with outrig.Session(workspace="./repo") as session:
+repo = outrig.Mount("./repo", access="read-write")
+async with outrig.Session(mounts=[repo], cwd="./repo") as session:
     ...                         # outrig.current_session() is session here
 
 print(session.shutdown_report)
 ```
 
-- **Making one starts nothing.** `outrig.Session(workspace=None, mounts=(), grace=None)` checks
-  its inputs and returns. `workspace` replaces the configured `[workspace] host-path`; when it is
-  `None` the configured one is mounted if one is declared, and otherwise no workspace is.
-  `mounts`, each an `outrig.Mount` or a path, are added to `[[workspace.mounts]]`; a host or
-  container path mounted twice fails the entry, and so, with a binding configured, does a
-  directory mounted anywhere but at its host path, as in a configuration. Relative paths are taken
-  from the program's working directory when the session is made.
+- **Making one starts nothing.** `outrig.Session(mounts=(), cwd=None, grace=None)` checks its
+  inputs and returns. `mounts` are the directories of this host the container sees, each an
+  `outrig.Mount(host_path, access="read-only")` or a path, which is mounted read-only. Each
+  appears in the container at its own path, so a path names the same file in the program and in
+  agent code; nothing else of the host is there. `cwd`, a directory inside one of them, is where
+  agent code runs and what its imports find; without it, the image's working directory is. Relative
+  paths are taken from the program's working directory when the session is made, and a directory
+  given twice, or a `cwd` outside every mount, raises `ValueError`.
+- **The configuration's workspace is not mounted.** `[workspace]` and `[[workspace.mounts]]` are
+  the interactive session's; `outrig.config().workspace` and `outrig.config().mounts` show them
+  to a program that mounts them itself.
 - **Entering it starts it.** It runs in the image `default-image` names -- or OutRig's built-in
   default, as for `outrig run-new` -- with the configured bindings; one a repository's config
-  declares is refused, since no one is there to approve it. An entry that fails raises
-  `RuntimeError` saying why, once what the start had made is stopped, and the body does not run.
+  declares is refused, since no one is there to approve it. A mount that is not an existing
+  directory, or is `/`, fails the entry, and so does a `cwd` that is not a directory. An entry
+  that fails raises `RuntimeError` saying why, once what the start had made is stopped, and the
+  body does not run.
 - **Its events.** `session.events()` is the session's event stream, read with `async for`: each
   `outrig.Event` has the `type`, `subject`, `time` and `data` that [the event
   log](../reference/events.md) records, and an `outrig.Missed` says how many a slow reader lost.
@@ -761,7 +768,7 @@ class Summary:
     languages: list[str]
 
 class ProjectReader(outrig.Agent):
-    """You read the project in /workspace, and answer questions about it."""
+    """You read the project in your working directory, and answer questions about it."""
 
     @outrig.agent
     async def explain(self, question: str) -> Summary:
@@ -769,7 +776,7 @@ class ProjectReader(outrig.Agent):
         ...
 
 async def main():
-    async with outrig.Session(workspace="./repo"):
+    async with outrig.Session(mounts=["./repo"], cwd="./repo"):
         async with ProjectReader() as agent:
             summary = await agent.explain("What does this project do?")
     print(summary.purpose)
@@ -809,6 +816,60 @@ The session's events record such an agent under a subject of its own, `agent/c1`
 parent `owner`, the program (see [the event log](../reference/events.md)). The calls an agent's
 own Python makes to launch children and give them work by hand -- `runtime.spawn`, `submit` --
 have no counterpart in a program: it constructs agent classes.
+
+### Live objects
+
+A program can hand its agents an object it holds: `session.inject("notes", notes)` serves `notes`
+to every agent of the session, those made later too. The object stays in the program; the agents'
+Python holds a proxy of it, and each attribute read, call or other operation on it runs in the
+program and is recorded in the session's events, as a configured binding's is. Injecting needs
+no approval, the program being the session's owner.
+
+```python
+class Notes:
+    """Notes the program keeps for its agents."""
+
+    def __init__(self):
+        self.lines = []
+
+    def add(self, line: str) -> None:
+        self.lines.append(line)
+
+async def main():
+    notes = Notes()
+    async with outrig.Session() as session:
+        session.inject("notes", notes)
+        async with ProjectReader() as agent:
+            await agent.explain("Note what each module does.")
+    print(notes.lines)
+```
+
+- **Where agents find it.** As `outrig.bindings["notes"]` in every kernel, and as the global
+  `notes` where that name is free: a variable the agent's code bound, an input of that name, and
+  a builtin such as `print` keep what they are. `runtime.bindings` lists it. An agent's
+  instructions name it with its type's qualified name and the first line of the type's
+  docstring, and an agent already running is told of it in its next tool result. Nothing of the
+  object itself is read to describe it: no `repr`, no property.
+- **`inject` is synchronous**, and returns `None` once every agent can reach the object; before
+  entry, the object is served from the session's start. The name must be a Python identifier,
+  not a keyword, `runtime`, `asyncio`, `outrig` or a dunder, and neither one already injected
+  nor one the configuration declares a binding of: otherwise `ValueError`, or, for an object
+  injected before entry under a configured binding's name, a failed entry. While the session
+  starts, and once it has closed to new work, `RuntimeError`. Nothing replaces or withdraws an
+  injected object.
+- **Threads, not the loop.** Each agent's operations run on a thread of their own, never on the
+  program's event loop, which goes on running meanwhile. A method that needs the loop hands it
+  work with `asyncio.run_coroutine_threadsafe(coroutine, loop).result()`; an `async def` method
+  is called and its coroutine returned, never awaited. An object that is not safe to call from
+  several threads at once is injected with `serialize=True`, which runs one call at a time.
+- **Paths.** Injecting mounts nothing. A path the object returns names the same file in agent
+  code only inside one of the session's `mounts`.
+- **When the session ends.** Calls still running drain with the rest for `grace` seconds. One
+  still running after that runs on in its thread, since nothing can end a thread: its record ends
+  `unknown`, `still_running`, the report is `not_proven_stopped` and names the call, and leaving
+  the `async with` raises `outrig.ShutdownException`. What the call returns later goes nowhere.
+  A program that is killed takes its calls with it, each ending `unknown`, `killed`, and the
+  agent code waiting on one is told at once.
 
 ### Signals and the grace
 

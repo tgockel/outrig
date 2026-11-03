@@ -38,7 +38,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
 
-use super::channel::Announcer;
+use super::channel::{Announcer, Injected};
 use super::history::Window;
 use super::ledger::{CallSlot, Ledger};
 use super::orientation::{self, ChannelText, ChildBrief};
@@ -111,6 +111,9 @@ pub(crate) struct Inner {
     /// Held from reading a child's life to telling its parent, so the last
     /// told is the latest; never with the state's lock.
     telling: Mutex<()>,
+    /// The live objects the program on the host injected, which a child
+    /// made later is oriented with, and one made earlier is told of.
+    injected: Injected,
 }
 
 #[derive(Default)]
@@ -287,6 +290,7 @@ impl Children {
             owner: Mutex::default(),
             owner_tasks: Mutex::default(),
             telling: Mutex::default(),
+            injected: Injected::default(),
         });
         let weak = Arc::downgrade(&inner);
         let lines: ChildLines = Arc::new(move |agent: &str, line: Value| {
@@ -307,6 +311,13 @@ impl Children {
             }
         }));
         Self(inner)
+    }
+
+    /// The program on the host injected the live object `brief` describes:
+    /// a child made from now on is oriented with it, and each made before is
+    /// told of it in its next result.
+    pub(crate) fn inject(&self, brief: Brief) {
+        self.0.injected.push(brief);
     }
 
     /// `agent` is a root of the tree, at `depth`, running on `model` as named
@@ -826,22 +837,29 @@ impl Inner {
             ChildKind::Request => ChildBrief::Request(&channels),
             _ => ChildBrief::Work,
         };
+        // Made first, so an object injected meanwhile is announced, if also in the orientation.
+        let announcer = Announcer::of_requests(
+            {
+                let weak = Arc::downgrade(self);
+                let child = id.to_string();
+                Arc::new(move || {
+                    weak.upgrade()
+                        .map(|inner| inner.counts(&child))
+                        .unwrap_or_default()
+                })
+            },
+            self.injected.clone(),
+        );
+        let bindings = [settings.bindings.clone(), self.injected.briefs()].concat();
         let preamble = orientation::child_preamble(
             settings.workspace.as_deref(),
-            &settings.bindings,
+            &bindings,
             Window::DEFAULT,
             line["prompt"].as_str().unwrap_or_default(),
             &inputs,
             &brief,
         );
         let slot = CallSlot::new(self.ledger.clone(), events, Some(lineage));
-        let weak = Arc::downgrade(self);
-        let child = id.to_string();
-        let announcer = Announcer::of_requests(Arc::new(move || {
-            weak.upgrade()
-                .map(|inner| inner.counts(&child))
-                .unwrap_or_default()
-        }));
         let weak = Arc::downgrade(self);
         let child = id.to_string();
         let quiet: Quiet =

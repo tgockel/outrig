@@ -200,7 +200,7 @@ it runs. Starting the program starts no container and calls no model. The progra
 enter a session (`0003-29`):
 
 ```python
-async with outrig.Session(workspace=workspace) as session:
+async with outrig.Session(mounts=[outrig.Mount(repo)], cwd=repo) as session:
     async with ProjectReader() as agent:
         result = await agent.explain("What does this project do?")
 
@@ -213,9 +213,13 @@ print(session.shutdown_report)
 - **The current session.** Entry sets a `ContextVar`; exit restores it. An agent class
   constructed without `session=` uses it, an explicit `session=` overrides it, and neither is an
   error.
-- **Inputs.** `workspace` overrides the configured one; omitted, it falls back to `[workspace]`;
-  with neither, nothing is mounted. `mounts` add to the configured ones. Factory bindings come from
-  the configuration, repo-declared ones refused for want of an approver. Live objects come through
+- **Inputs.** `mounts` are the host directories the container sees, each at its host path, so a
+  path means the same file in the program, in a binding and in agent code ("Same paths",
+  `hosted-objects.md`); `cwd`, a directory inside one, is where agent code runs. The
+  configuration's `[workspace]` and `[[workspace.mounts]]` are the interactive session's and are
+  not mounted; `outrig.config()` shows them to a program that mounts them itself (`0003-36`, which
+  replaced `workspace=` and a mount's container path). Factory bindings come from the
+  configuration, repo-declared ones refused for want of an approver. Live objects come through
   `session.inject(name, obj)`, synchronous, returning once every agent can reach the object
   (`0003-36`).
 - **Events.** `session.events()` is one subscription, registered when the session is built and read
