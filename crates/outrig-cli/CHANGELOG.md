@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--config` reports a file it cannot examine as what it is.** A `--config` path whose
+  `stat` failed for any reason -- a directory without search permission, say -- was called
+  "not an existing file", which sends the user looking for a file that is there. That message
+  now stays for a path that is absent or not a regular file; any other failure reads
+  `--config <path> cannot be read: <cause>`. (#496)
+
 - **A config file outrig refuses is named in the error.** `error: TOML parse error at line 2,
   column 14` left the reader to work out which file the excerpt came from, with the global
   config and a repo (or `--config`) file both in play; it now reads `error: ci/outrig.toml:

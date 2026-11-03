@@ -1,7 +1,7 @@
 //! CLI-owned repo, config, and cache path policy.
 
-use std::io::Write as _;
-use std::fs::{File, Permissions};
+use std::fs::{self, File, Permissions};
+use std::io::{ErrorKind, Write as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
@@ -339,11 +339,20 @@ pub(crate) fn resolve_repo_config_optional(
 /// empty model directory as a Hugging Face repo ID.
 fn explicit_repo_config(path: &Path, cwd: &Path) -> Result<RepoConfig> {
     let file: PathBuf = cwd.join(path).components().collect();
-    if !file.is_file() {
-        return Err(OutrigError::Configuration(format!(
-            "--config {} is not an existing file",
-            path.display()
-        )));
+    match fs::metadata(&file) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Err(not_an_existing_file(path)),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            return Err(not_an_existing_file(path));
+        }
+        // A `stat` that failed for another reason (a directory it may not
+        // search, say) says nothing about whether the file is there.
+        Err(e) => {
+            return Err(OutrigError::Configuration(format!(
+                "--config {} cannot be read: {e}",
+                path.display()
+            )));
+        }
     }
     if file.ends_with(REPO_CONFIG_REL) {
         let root = file.ancestors().nth(3).expect("an absolute path ending in \
@@ -354,6 +363,13 @@ fn explicit_repo_config(path: &Path, cwd: &Path) -> Result<RepoConfig> {
         root: repo_root_or_cwd(cwd)?,
         file: Some(file),
     })
+}
+
+fn not_an_existing_file(path: &Path) -> OutrigError {
+    OutrigError::Configuration(format!(
+        "--config {} is not an existing file",
+        path.display()
+    ))
 }
 
 /// The repo found from `cwd`, else `cwd` when there is none. A config the walk
@@ -1207,6 +1223,40 @@ mod tests {
                     ),
                 );
             }
+        }
+    }
+
+    /// A `--config` whose `stat` fails for a reason other than absence is not
+    /// "not an existing file": that sends the user looking for a file that is
+    /// there. The error names the path and the cause instead.
+    #[test]
+    fn explicit_config_that_cannot_be_examined_reports_why() {
+        let repo = tempdir().unwrap();
+        write_repo_config(repo.path());
+        let locked = repo.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        let file = locked.join("outrig.toml");
+        fs::write(&file, b"# fixture\n").unwrap();
+        fs::set_permissions(&locked, Permissions::from_mode(0o000)).unwrap();
+        // A superuser searches any directory, so there is nothing to see.
+        let searchable = fs::metadata(&file).is_ok();
+
+        let errs: Vec<_> = [resolve_repo_config, resolve_repo_config_optional]
+            .map(|resolve| resolve(Some(&file), repo.path()))
+            .into();
+        fs::set_permissions(&locked, Permissions::from_mode(0o755)).unwrap();
+        if searchable {
+            return;
+        }
+        for err in errs {
+            let msg = err.unwrap_err().to_string();
+            assert!(
+                msg.starts_with(&format!(
+                    "configuration: --config {} cannot be read: ",
+                    file.display()
+                )) && msg.contains("Permission denied"),
+                "{msg}"
+            );
         }
     }
 
