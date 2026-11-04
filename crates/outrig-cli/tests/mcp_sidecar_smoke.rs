@@ -116,6 +116,8 @@ struct McpChild {
     stdout: Option<tokio::process::ChildStdout>,
     stderr_buf: Arc<Mutex<String>>,
     stderr_task: tokio::task::JoinHandle<()>,
+    /// Holds the empty `--global-config` file, removed with the child.
+    _global_config_dir: tempfile::TempDir,
 }
 
 /// A host variable every spawned `outrig mcp` has, for a config to reference
@@ -123,13 +125,27 @@ struct McpChild {
 const TOKEN_VAR: &str = "OUTRIG_E2E_SIDECAR_TOKEN";
 const TOKEN_VALUE: &str = "sidecar-token-value-324";
 
+/// Spawns `outrig mcp` against `repo` with an empty `--global-config`, so the developer's own
+/// `~/.outrig/config.toml` is never read (#479). A test that passes its own `--global-config`
+/// keeps it. The environment is left alone: `XDG_CONFIG_HOME` also moves Podman's
+/// `storage.conf`, which would put outrig's containers in a different store than the one the
+/// harness's own `podman` calls query.
 fn spawn_mcp(repo: &Path, session_root: &Path, extra_args: &[&str]) -> McpChild {
+    let global_config_dir = tempfile::tempdir().expect("tempdir global config");
+    let empty_global = global_config_dir.path().join("config.toml");
+    std::fs::write(&empty_global, "").expect("write empty global config");
+    let own_global = extra_args.contains(&"--global-config");
     let bin = env!("CARGO_BIN_EXE_outrig");
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .arg("--session-root")
         .arg(session_root)
         .arg("mcp")
-        .args(extra_args)
+        .args(extra_args);
+    if !own_global {
+        command.arg("--global-config").arg(&empty_global);
+    }
+    let mut child = command
         .current_dir(repo)
         .env("OUTRIG_LOG", "info")
         .env(TOKEN_VAR, TOKEN_VALUE)
@@ -151,6 +167,7 @@ fn spawn_mcp(repo: &Path, session_root: &Path, extra_args: &[&str]) -> McpChild 
         stdout,
         stderr_buf,
         stderr_task,
+        _global_config_dir: global_config_dir,
     }
 }
 
