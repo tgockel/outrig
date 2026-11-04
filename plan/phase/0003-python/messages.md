@@ -56,8 +56,9 @@ channel (`agent-classes.md`). It is said in two places that do different things.
 opens on queue state opens with it, and the state that round opened on is the baseline: when a
 round ends, the host compares the live state with the state at the last such round, and any change
 since -- an arrival, a receive, a reply, a cancellation -- opens the next round when the live state
-is not empty, while an unchanged state opens nothing, and so does an empty one, nothing unread and
-nothing unanswered. An announcement during a round, a prefix on the next result for what arrived
+is not empty; an unchanged state that holds requests earns one warning round and then the cancel of
+each, its sender told (`0003-37`), and an empty one, nothing unread and nothing unanswered, opens
+nothing. An announcement during a round, a prefix on the next result for what arrived
 since the round opened or last announced, reports the counts and moves that baseline nowhere
 (`execution-and-rounds.md`, "A round").
 

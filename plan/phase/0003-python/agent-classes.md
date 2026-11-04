@@ -248,16 +248,18 @@ for a request the child cannot answer -- a file that is not there, an instructio
 -- so that the parent learns why instead of holding an open request until it cancels it. A
 reply to a request that
 has settled -- answered already, cancelled, released -- is refused and evented, and after
-`h.cancel()` it raises `RequestCancelled`. `reply` and `fail` are methods of request deliveries,
+`h.cancel()`, or the host's cancel ("The child's rounds"), it raises `RequestCancelled`. `reply`
+and `fail` are methods of request deliveries,
 `0003-30`'s `RequestDelivery` subclass of `Delivery`; `id` is on every delivery, the user channel's
 included, since the interpreter already posts each message under an id (`_deliver`,
 `interpreter.py:1725`).
 
 **A request child has no `runtime.complete`**, and the parent has no `submit` on it. The two child
-kinds never mix: a work child has inputs bound as variables, one active submission, and
-`complete`; a request child receives each request and answers by its delivery. Letting `complete`
-answer "the one outstanding request" was rejected ("Rejected alternatives"), so a request child's
-`help(runtime)` does not list `complete`, and calling it raises with a message naming `reply`.
+kinds never mix: a work child has inputs bound as variables, one active submission, `complete`,
+and `fail` for a submission it cannot complete (`0003-37`); a request child receives each request
+and answers by its delivery. Letting `complete` answer "the one outstanding request" was rejected
+("Rejected alternatives"), so a request child's `help(runtime)` lists neither `complete` nor
+`fail`, and calling either raises with a message naming `reply` and `d.fail`.
 
 ## The child's rounds
 
@@ -302,8 +304,9 @@ the end of every round, the host computes the same summary from the child's live
 compares it with the baseline. Any difference -- an arrival, a receive, a reply, a cancellation
 -- opens the next round, and the opening is rendered from the live summary: the unread counts in
 the announcer's words, and each received request by id and channel with how long it has waited.
-An unchanged summary opens nothing, and so does one with nothing in it, nothing unread and
-nothing unanswered. An announcement made during a round, in a result's prefix, moves the baseline
+One with nothing in it, nothing unread and nothing unanswered, opens nothing, and the child is
+idle; an unchanged one that holds something earns the warning and then the cancel (below). An
+announcement made during a round, in a result's prefix, moves the baseline
 nowhere: it tells the model what has arrived, and the comparison is still with the summary the
 round opened on. The baseline moves only when the nudge's round ends well; a round that ended in
 an error leaves it where it was, as `Announcer::keep` does today, so its opening is made again.
@@ -313,33 +316,75 @@ host knows because it delivers and settles each one, and compares ids where `Tol
 counts (`execution-and-rounds.md`, "A round", for what else changes). Such a round counts no
 attempt against any request (below).
 
-`0003-37`, decided on 2026-10-26, changes what an unchanged summary does. Where this rule leaves a
-child idle with requests open, or ends a work child's submission `CompletionRejected`, `0003-37`
-asks the child once more with a warning, and when that round changes nothing either, cancels every
-request the summary holds and tells each sender, so that no child is idle holding a request it has
-not answered.
+**A round that changes nothing is followed by a warning, and a warning round that changes nothing
+ends in a cancel.** Decided on 2026-10-26 (`0003-37`), replacing an idle child that kept its
+requests open with the sender told nothing, and a work child's submission ended
+`CompletionRejected`. The maintainer's goal for messages is that they are reliable in how they are
+processed: a request is either being worked on -- the model responsible for it acting on it -- or
+cancelled, and its sender is told which. No child is idle while it holds a request it owes an
+answer to. Beside the baseline the host keeps whether the warning round has been given since the
+summary last changed, and when a round ends it compares the live summary with the one the round
+opened on:
+
+- *Nothing in it:* the child is idle. This is the only way a child becomes idle.
+- *Different* -- a reply, a `fail`, a receive, an arrival, the caller's cancel, a release: an
+  ordinary round on the live summary, as above, and the warning is available again.
+- *The same, and holding something* -- the child changed nothing: the first time, a warning round;
+  the second time, the host cancels every request the summary holds, by id.
+
+The first nudge is unchanged: it names each request taken by id, channel and wait, and counts what
+waits unread; a work child's asks for the result by the submission's id. The warning names what is
+outstanding; says that a round's end is not a wait, since nothing opens a round when what the
+child waited on finishes; gives each way out -- `await d.reply(value)`, `await d.fail(message)`,
+`runtime.wait`, and for an unread request `receive()` first, since `runtime.wait` raises
+`MessageAvailable` while one waits unread; for a work child `runtime.complete`, `runtime.fail` and
+`runtime.wait` -- and says that if this round ends with them open they are cancelled and each
+sender gets an exception. The preambles state the rule, and a request child's says that what it
+writes itself is not delivered to the sender -- only `d.reply` and `d.fail` answer -- and that code
+it leaves running when it stops writing keeps no request open.
+
+A request the host cancels ends `cancelled`, as after `h.cancel()`: the sender's `await` raises
+`RequestCancelled`, whose message names the request and says the child ended its rounds without
+answering it, or without reading it, and `agent.request.cancelled` carries the host's `reason`,
+which a sender's cancel leaves `None`. An unread request is taken out of the child's queue first,
+so the child never takes what was cancelled before it did; a received one stays with the child, and
+a `reply` or `fail` on it afterwards raises `RequestCancelled`, whether from a later round or from a
+task the child left running. The host then waits to hear each end before it computes the summary
+again: empty, the child is idle; anything left -- a submission queued behind a work child's, an
+arrival that came in as the host decided -- differs from the baseline, and its round opens at once,
+with no idle state between. An end not heard within a second is asked for again: out of memory, the
+interpreter can lose the host's settle, or its notice of the end, and it keeps a request it ended
+until the host has been told, telling the end again when settled again. The child's release, or the
+session's close, after which nothing settles it again, tells it once more, and the interpreter then
+keeps the request no longer, heard or not.
+
+A round that ends in an error is not a round that changed nothing: it neither gives nor uses the
+warning, and the decision after the wait is against the baseline from before it, as above. A round
+stopped early, at the tool-call cap, has ended like any other. A host-opened round counts no
+attempt against any request. So a request child that takes a request and never answers is asked
+three times -- the round its arrival opened, the round that names it, and the warning -- one that
+never takes a request twice, and a work child three times.
 
 A round the host opens for a purpose other than the request summary -- the assessment and
 designation rounds of `0003-60` and `0003-61` (`continuation.md`, "Assessment", "Designation") --
 neither gives nor uses `0003-37`'s warning, moves no baseline, and counts no attempt, as a round
 that ended in an error does; `0003-60` builds the exemption.
 
-Five consequences, which `0003-30` tests:
+Five consequences, which `0003-30` and `0003-37` test:
 
 - **A child that answered anything in a round gets the next round, whatever arrived meanwhile.**
   Every reply removes a request's id from the summary, so a round that answers one of several
   ends with a summary that differs from the baseline, and an arrival during the round, announced
   or not, cannot make the two equal again, since the baseline holds ids and not a count.
-- **A request the child received and left unanswered earns exactly one further round**, its
-  nudge: receiving it moved it from unread to received, a change since the baseline. If the nudge
-  round ends with it still unanswered, the summary is the one that round opened on, and no round
-  opens.
-- **A request never received earns one round at most.** One that arrives while the child is idle
-  opens that round itself; one that arrives during a round, announced in a result, is a change
-  since the baseline when the round ends, and opens the round after it. Either way it is then
-  unread in the baseline, and it earns nothing more while it stays so.
-- **A child that ends a round with nothing changed gets no further round** until an arrival, a
-  cancel or a release changes the summary.
+- **A request the child received and left unanswered earns its nudge**: receiving it moved it
+  from unread to received, a change since the baseline. If the nudge round ends with it still
+  unanswered, the summary is the one that round opened on, and the warning round follows.
+- **A request never received earns one round, then the warning.** One that arrives while the child
+  is idle opens that round itself; one that arrives during a round, announced in a result, is a
+  change since the baseline when the round ends, and opens the round after it. Either way it is
+  then unread in the baseline, and the next round that leaves it so is the warning.
+- **A child that ends a round with nothing changed gets the warning, and after a second such round
+  the cancel:** it is never idle holding a request.
 - **A new arrival opens a round that names the old requests too**, since the opening is rendered
   from the whole summary and not from the arrival.
 
@@ -357,9 +402,9 @@ is idle, and the child serves one per round:
    by id, and each later reply changes the summary again until none is left.
 4. Had the child received #1 and ended the round without answering it, the summary is #1 received
    and four unread, against five unread: one round opens naming #1 and counting four, and that is
-   the new baseline. If that round ends the same way, the summary is unchanged, and the child is
-   idle with #1 open and four unread; nothing further is spent until an arrival, a cancel or a
-   release changes it.
+   the new baseline. If that round ends the same way, the summary is unchanged, and the warning
+   round opens on it; if that one ends the same way too, the host cancels #1 and the four unread,
+   each sender told, and the child is idle, holding nothing (`0003-37`).
 
 The trace the baseline was fixed on, the follow-up review's interleaving. The same five arrive
 while the child is idle, and a sixth arrives during the first round:
@@ -376,27 +421,50 @@ while the child is idle, and a sixth arrives during the first round:
 4. The child goes on serving one per round, and each round's reply opens the next, until the
    summary is empty.
 
-A work child has one more step. Its summary is its one submission, and where this rule would
-leave the submission unanswered and the child idle, the submission settles with
-`CompletionRejected` instead; a decorated call's child is then released, while an explicit work
-child stays idle and a submission queued behind the failed one opens its own round next
-(`work.md`, "A request settles once").
+The trace `0003-37` was decided on. Request #7 arrives on `fizz` while the child is idle:
 
-**What an idle child's open requests wait for.** A request the rule leaves open stays open -- its
-handle unsettled, its status saying the child is idle -- until the caller cancels it with
-`h.cancel()`, the child answers it in a round a later arrival opened, or the instance is released.
-A `runtime.wait(timeout=...)` that expires ends the caller's wait and nothing else: the request is
-still open, and it still holds its instance ("Release"). A caller that wants to be rid of it
-inspects what is pending -- `h.done()`, `h.status` -- and cancels or releases, and neither undoes
-an effect the child has already dispatched. `requests-max` ("Limits and placement") bounds how
-many such requests one child can accumulate, abandoned ones included.
+1. The round its arrival opens: the child receives #7 and ends the round with text, the answer
+   written as its closing text, which reaches no one. The summary is #7 received, against #7
+   unread: a change.
+2. The nudge: `you took request 7 from runtime.channels["fizz"] 12s ago and have not answered it`.
+   The child ends this round with text too. The summary is unchanged, and the warning has not been
+   given.
+3. The warning: what is outstanding, that a round's end is not a wait, the ways out, and that
+   ending this round with #7 open cancels it. The child ends it the same way. The summary is
+   unchanged, and the warning was given: the host cancels #7.
+4. The sender's `await` raises `RequestCancelled` -- `request 7 was cancelled: the child ended its
+   rounds without answering it` -- and the child is idle, holding nothing. Had the child replied
+   in the warning round, or waited there with `runtime.wait` on the build it needed, that round
+   would not have ended with #7 open.
+
+A work child's summary is its one submission, so the cancel ends that submission `cancelled`. When
+a model call failed and ended one of its rounds after the round's code ran, the child did not stop
+of its own accord, and the exception's `__cause__` is an `AgentRequestFailed` saying how the call
+failed, as `raise ... from` would set it. A decorated call's child is then released, as on any end
+of its call; an explicit work child is idle, or, with a submission queued behind the cancelled one,
+opens that one's round at once (`work.md`, "A request settles once"). A work child that cannot
+complete a submission ends it with `await runtime.fail(message)`, which its sender gets as
+`AgentRequestFailed`.
+
+**An idle child holds nothing.** The runner marks a child idle only after computing an empty
+summary, which is also the case after a cancel, and the registry decides it under the lock a request
+is recorded under: one that arrives as the runner decides opens the round instead. A
+`runtime.wait(timeout=...)` that expires ends the caller's wait and nothing else: the request goes
+on, and it still holds its instance ("Release"). A caller that wants to be rid of it sooner cancels
+it or releases the instance, and neither undoes an effect the child has already dispatched.
+
+**Known limit.** An arrival is a change, so requests that keep arriving at the pace of the child's
+rounds keep restarting the count for the older ones. The child is not idle while they do, and
+`requests-max` ("Limits and placement") bounds what accumulates. A count per request would end the
+oldest regardless of arrivals; it is not built.
 
 **Only an invalid reply counts toward the attempt limit, 3 by default.** A reply that fails the
 reply type's check is raised in the child's code with its problems and counts one attempt; past
 the limit the request settles with `CompletionRejected`, carrying the last value replied and its
 problems, and a reply to it afterward is refused. The child goes on serving its other requests:
-the limit ends one request, not the instance. A host-initiated round counts nothing, and no count
-of rounds ends a request child's request. Decided on 2026-10-02, replacing a rule under which each
+the limit ends one request, not the instance. A host-initiated round counts no attempt: a request
+its child leaves as it was is ended by the cancel above, never by the attempt limit. Decided on
+2026-10-02, replacing a rule under which each
 trailing round counted an attempt against every request it listed, so that a child serving a
 batch in order across rounds spent the later requests' allowance while answering the earlier ones
 correctly, and rejecting a separate budget of rounds in its place. The maintainer's reasons:
@@ -411,7 +479,8 @@ unread and received-and-unanswered alike, and a call past it raises `AgentLimitR
 call with nothing sent ("Limits and placement"). Nothing waits outside the child's queue.
 
 **`h.cancel()` before receipt removes the request**, so the child never sees it; after receipt the
-child's `reply` or `fail` raises `RequestCancelled`, and the handle settles cancelled. Cancelling a
+child's `reply` or `fail` raises `RequestCancelled`, and the handle settles cancelled. The host's
+cancel does the same. Cancelling a
 request never interrupts the child's execution: it is cancelling work, not interrupting
 (`execution-and-rounds.md`'s four cancellations), and the child learns of it at its reply.
 

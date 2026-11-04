@@ -12,9 +12,9 @@
 //! The host decides what the interpreter cannot: whether an agent may launch a
 //! child at all -- the session's admission, `subagent-depth-max`,
 //! `children-max` -- what model it runs on, when it gets a round, when a request
-//! it leaves open ends -- a work child's second round without completing, a
-//! spent token budget -- when a round has nothing left to do, and how a release
-//! ends a child and everything below it. A release does not drop the round in
+//! it holds ends without its answer -- cancelled once its rounds leave it as it
+//! was after a warning, or a spent token budget -- when a round has nothing
+//! left to do, and how a release ends a child and everything below it. A release does not drop the round in
 //! flight: it ends the child's kernel, which returns the call the round waits
 //! on, and the round stops before its next model call; only one still in a
 //! model call after [`RELEASE_WAIT`] is dropped.
@@ -929,7 +929,6 @@ impl Inner {
                     kind,
                     agent,
                     Arc::clone(&child.wake),
-                    self.ledger.budget_watch(),
                     instance,
                 ));
                 child.abort = Some(runner.abort_handle());
@@ -1242,6 +1241,10 @@ impl Inner {
             let Some(record) = state.requests.get_mut(&id) else {
                 return;
             };
+            // Told again, for a settle sent again: it ended once.
+            if matches!(record.state, Req::Ended(_)) {
+                return;
+            }
             record.state = Req::Ended(outcome);
             let ended = (record.child.clone(), record.attempts, record.rounds.clone());
             if let Some(node) = state.child(&ended.0) {
@@ -1252,9 +1255,11 @@ impl Inner {
         let events = self.events_of(&child);
         let request = AgentRequestId::new(id);
         match outcome {
+            // Only the host's own cancel says why.
             RequestEnd::Cancelled => events.emit(Payload::AgentRequestCancelled {
                 request,
                 received: line["received"].as_bool().unwrap_or_default(),
+                reason: line["message"].as_str().map(str::to_string),
             }),
             RequestEnd::Failed => events.emit(Payload::AgentRequestFailed {
                 request,
@@ -1393,6 +1398,15 @@ impl Inner {
             .unwrap_or_default()
     }
 
+    /// Each of `child`'s channels with a request waiting unread.
+    pub(crate) fn unread_on(&self, child: &str) -> Vec<String> {
+        self.counts(child)
+            .into_iter()
+            .filter(|(_, counts)| counts.pending > 0)
+            .map(|(channel, _)| channel)
+            .collect()
+    }
+
     /// The submission request `id` is.
     pub(crate) fn submission(&self, id: u64) -> Option<Submission> {
         self.state().requests.get(&id)?.submission.clone()
@@ -1446,9 +1460,26 @@ impl Inner {
         }
     }
 
-    /// `child`'s runner waits for a change: it is idle.
+    /// `child`'s runner found it holding nothing, and waits for a change: it is
+    /// idle. Decided under the lock a request is recorded under: one recorded
+    /// since the runner looked keeps the child as it is, its arrival having
+    /// woken the runner to open its round.
     pub(crate) fn idle(&self, child: &str) {
         let mut state = self.state();
+        let open: Vec<&Record> = state
+            .requests
+            .values()
+            .filter(|record| record.child == child && !matches!(record.state, Req::Ended(_)))
+            .collect();
+        // What arrived since the runner looked spans none of the child's rounds. One a round
+        // spanned is a request the runner nudged or warned about, and left open.
+        debug_assert!(
+            open.iter().all(|record| record.rounds.is_empty()),
+            "child {child} was to be idle holding a request its rounds spanned"
+        );
+        if !open.is_empty() {
+            return;
+        }
         let Some(node) = state.child_mut(child) else {
             return;
         };
@@ -1492,11 +1523,12 @@ impl Inner {
         self.interpreter.tell(line);
     }
 
-    /// End request `id`, open on `child`, `outcome` -- `rejected`, `budget`
+    /// End request `id`, open on `child`, `outcome` -- `cancelled`, `budget`
     /// or `failed` -- for `message`. `cause`, when there is one, is how a
     /// model call of the child's failed and ended a round: the parent's
     /// exception carries it as its `__cause__`, and the event the end is
-    /// recorded in.
+    /// recorded in. The end is the interpreter's to make, so the child holds
+    /// the request until [`Inner::ended`] hears of it.
     pub(crate) fn settle(
         &self,
         child: &str,

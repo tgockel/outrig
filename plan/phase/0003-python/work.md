@@ -139,7 +139,9 @@ What a handle has to expose, and why each one is on the list rather than inferre
   whose child exists for that one item, it releases the child as well. For a channel request,
   what it does depends on whether the child has received it: before, the request is removed from
   the queue and the child never sees it; after, the delivery stays with the child, and its `reply`
-  or `fail` raises `RequestCancelled`. Either way the handle settles as cancelled.
+  or `fail` raises `RequestCancelled`. Either way the handle settles as cancelled. The host cancels
+  a request the same way once the child's rounds leave it unanswered after a warning ("A request
+  settles once").
 - **A wait that times out ends the wait, not the request.** `runtime.wait(timeout=...)` returning
   with a handle in its pending set has settled nothing: the request is still open, and its child
   or its instance is still held by it. The caller inspects what is pending -- `h.done()`,
@@ -207,30 +209,34 @@ and the host keeps the summary the nudge opened on -- the unread requests per ch
 each request received and neither replied to nor failed -- as the baseline; at the end of every
 round it computes the same summary from the child's live queue state, and any difference since
 the baseline -- an arrival, a receive, a reply, a cancellation -- opens a round rendered from the
-live summary when that summary is not empty, while an unchanged summary opens nothing, and so does
-an empty one, nothing unread and nothing unanswered. An announcement during a round, in a result,
-reports what has arrived and moves the baseline nowhere. So a child that answered anything in a
-round, and still has a request unread or unanswered, gets the next round, whatever arrived
-meanwhile; a request the child received and left unanswered earns exactly one more round, naming
-its id; one never received earns none beyond the first round that opens with it counted; and a
-new arrival opens a round that names the old requests too. A request child the rule leaves idle
-keeps its requests open until the caller cancels one with `h.cancel()`, a later round answers it,
-the child is released, or the session closes; a `runtime.wait` timeout in the caller ends that
-wait only ("The handle").
+live summary when that summary is not empty; an empty one, nothing unread and nothing unanswered,
+opens nothing, and the child is idle. An announcement during a round, in a result, reports what
+has arrived and moves the baseline nowhere. So a child that answered anything in a round, and
+still has a request unread or unanswered, gets the next round, whatever arrived meanwhile; a
+request the child received and left unanswered earns a round naming its id; and a new arrival
+opens a round that names the old requests too.
 
-For a **work child** the summary is its one submission, and the rule has one more step. A round that
-ends without a completion that passed earns one more round asking for the result by the submission's
-id, and if that round ends without one too, the submission settles with `CompletionRejected` whose
-message says the child ended without completing. When a model call failed and ended one of those
-rounds after its code ran, the child did not stop of its own accord, and the exception's
-`__cause__` is an `AgentRequestFailed` saying how the call failed, as `raise ... from` would set
-it. What happens to the child follows from what it is:
-a decorated call's child is released, as it is whenever its one call settles; an explicit work child
-stays, idle, and a submission queued behind the failed one opens its own round next, since a new
-submission is a change in the summary. The skill parser (`skills.md`) is a decorated call and
-inherits the release. `0003-37`, decided on 2026-10-26, changes this ending and the idle one for a
-request child above: after a warning round, a child that still changes nothing has every request
-it holds cancelled, and each sender is told.
+**A request is worked on or cancelled** (`0003-37`, decided on 2026-10-26): a round that ends with
+the summary unchanged, holding something, is followed by a warning round, and when that one changes
+nothing either, the host cancels every request the summary holds and tells each sender, as
+`agent-classes.md` ("The child's rounds") states with its traces. No child is idle while it holds a
+request: a request child that takes a request and never answers is asked three times, one that
+never takes it twice, and then the request ends `cancelled`, its sender's `await` raising
+`RequestCancelled` with why. A round that ends in an error neither gives nor uses the warning. A
+`runtime.wait` timeout in the caller ends that wait only ("The handle").
+
+For a **work child** the summary is its one submission, asked for three times: by the round that
+gives it, by a round asking for the result by the submission's id, and by the warning; when the
+warning round ends without a completion that passed too, the submission is cancelled the same way.
+When a model call failed and ended one of those rounds
+after its code ran, the child did not stop of its own accord, and the exception's `__cause__` is an
+`AgentRequestFailed` saying how the call failed, as `raise ... from` would set it. A work child that
+cannot complete its submission says so with `await runtime.fail(message)`, which its sender gets as
+`AgentRequestFailed`. What happens to the child follows from what it is: a decorated call's child
+is released, as it is whenever its one call settles; an explicit work child is idle, or, with a
+submission queued behind the cancelled one, opens that one's round at once, since a new submission
+is a change in the summary. The skill parser (`skills.md`) is a decorated call and inherits the
+release.
 
 Only an invalid answer -- a completion or reply that failed a check -- counts toward the
 per-request attempt limit, 3 by default; past it the request settles with `CompletionRejected`,
@@ -242,11 +248,11 @@ budget bounds spend; a long wait may be legitimate, because a request can wait o
 test run; and the child's own long waits happen inside an execution, where no round ends, so a
 round ending with a request open says nothing about whether the child is still working on it.
 That answers what an earlier draft of this page left open, whether an idle child is a terminal
-outcome for the work it was given: for a request child it is not, and for a work child the second
-round that ends without completing is. A request ends when an answer is accepted, when the third
-invalid answer rejects it, when a work child's prompted round ends without completing, or when its
-caller ends it. `await d.fail(message)` is the child's own way to end a request without a value,
-and settles it with `AgentRequestFailed`.
+outcome for the work it was given: no child is idle holding work, since rounds that leave it as it
+was after a warning cancel it. A request ends when an answer is accepted, when the third invalid
+answer rejects it, when the child's rounds leave it unanswered after the warning, or when its
+caller ends it. `await d.fail(message)`, and a work child's `await runtime.fail(message)`, are the
+child's own way to end a request without a value, and settle it with `AgentRequestFailed`.
 
 The existing system's lesson still applies, in a different place. `outrig__set_result` takes a
 required `status` enum and a required `body` because an earlier design with two optional fields

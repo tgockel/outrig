@@ -750,7 +750,14 @@ class Builder:
     def on_agent_request_cancelled(self, d: dict) -> None:
         req = self.request(d.get("request"))
         taken = " (already taken)" if d.get("received") else " (not yet taken)"
-        self.add(f"request {req.id}: cancelled by its sender{taken}", href=link(req.anchor))
+        # Only the host's cancel says why: the child's rounds left the request unanswered.
+        reason = d.get("reason")
+        said = (
+            f"cancelled by its sender{taken}"
+            if reason is None
+            else f"cancelled by the host{taken}: {first_line(text(reason))}"
+        )
+        self.add(f"request {req.id}: {said}", href=link(req.anchor))
 
     def on_agent_request_settled(self, d: dict) -> None:
         req = self.request(d.get("request"))

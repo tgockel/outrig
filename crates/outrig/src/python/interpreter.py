@@ -3792,7 +3792,8 @@ _USER_CHANNELS = """`runtime.channels` maps a name to the endpoint of a channel.
 `runtime.channels["user"]` is how the user reaches you and you reach them: see
 `help(type(runtime.channels["user"]))`."""
 _WORK_CHANNELS = """`await runtime.complete(value)` answers the submission your parent gave you,
-and is the only way to answer it: see `help(runtime.complete)`.
+and is the only way to answer it: see `help(runtime.complete)`. `await runtime.fail(message)`
+ends it unanswered.
 
 `runtime.channels` maps a name to the endpoint of a channel, and yours is
 `runtime.channels["progress"]`, which says how far you have got. No user reaches you."""
@@ -3846,23 +3847,28 @@ class Runtime:
 
     MessageAvailable = MessageAvailable
 
-    def __init__(self, channels, held, history, context, kernel):
-        self._channels = types.MappingProxyType(channels)
-        self._held = held
-        self._history = history
-        self._context = context
-        self._kernel = kernel
+    @classmethod
+    def _made(cls, channels, held, history, context, kernel):
+        """The runtime a kernel binds. Made here rather than in `__init__`, which `help(runtime)`
+        would list, signature and all, though no agent makes a runtime."""
+        runtime = object.__new__(cls)
+        runtime._channels = types.MappingProxyType(channels)
+        runtime._held = held
+        runtime._history = history
+        runtime._context = context
+        runtime._kernel = kernel
+        return runtime
 
     def __getattr__(self, name):
-        if name == "complete":
+        if name in ("complete", "fail"):
             child = self._kernel.child
             if child is None:
                 raise AttributeError(
-                    "runtime.complete is a work child's, which completes the submission its parent "
-                    "gave it; this agent is no child"
+                    f"runtime.{name} is a work child's, which ends the submission its parent gave "
+                    "it; this agent is no child"
                 )
             raise AttributeError(
-                "this child answers requests, and has no runtime.complete: take one with "
+                f"this child answers requests, and has no runtime.{name}: take one with "
                 "`d = await runtime.channels[name].receive()`, then answer it with "
                 "`await d.reply(value)`, or end it with `await d.fail(message)`"
             )
@@ -4157,6 +4163,14 @@ class WorkRuntime(Runtime):
                                "complete")
         await work.answer(value)
 
+    async def fail(self, message):
+        """End your submission unanswered; its sender gets `outrig.AgentRequestFailed(message)`."""
+        work = self._kernel.child.last
+        if work is None:
+            raise RuntimeError("no submission has been given to you yet, so there is nothing to "
+                               "fail")
+        await work.fail(message)
+
 
 class RequestRuntime(Runtime):
     __doc__ = _runtime_doc(_REQUEST_CHANNELS)
@@ -4179,7 +4193,7 @@ class RequestRuntime(Runtime):
 # gets a round, are made of -- and never carries the objects.
 
 _ids = itertools.count(1)  # every id the interpreter gives: a request, an ask, a message
-_works = {}  # each request not yet ended, by id
+_works = {}  # each request open, or ended and the host not yet told so (`_Work.tell`), by id
 _launching = {}  # each typed call (`outrig.agent`) not yet ended, by its id, the submission's
 _works_lock = threading.Lock()
 # What a typed call's status reads when its launch -- its spawn, or its submission -- was refused.
@@ -4203,15 +4217,23 @@ OWNER_TEXT_MAX = 64 << 10  # bytes of why a request ended that the program is to
 
 
 def _notify(message):
-    """Tell the host one step of an agent's work with a child. Nothing here raises: the step has
-    happened, and a record that lacks it is the cost of a host that could not be told."""
+    """Tell the host one step of an agent's work with a child, and return whether it was told:
+    `False` if its line was never made, and `None` if that is not known, the line failing as it
+    was written -- memory can run out even once all of it has gone. Nothing here raises: the step
+    has happened, and a record that lacks it is the cost of a host that could not be told -- save a
+    request's end, which `_Work.tell` tells again."""
+    told = False
     try:
-        _write_line(_encode(message))
+        line = _with_room(_encode, message)
+        told = None
+        _write_line(line)
     except BaseException as e:
         try:
             _diag(f"telling the host of {message.get('t')!r} failed: {e!r}")
         except BaseException:
             pass
+        return told
+    return True
 
 
 # How long a request about a skill waits for the host's answer. The host gives up on a source
@@ -4492,6 +4514,8 @@ class _Work:
         # verdict on the reply being checked; and how many replies were sent it, each numbered.
         self.ask = self.verdict = None
         self.replies = 0
+        self.notice = None  # the host's notice of its end, once it has ended
+        self.recorded = False  # whether the host may hold a record of it to settle, told of it
 
     def __str__(self):
         if self.channel is None:
@@ -4508,30 +4532,39 @@ class _Work:
         """End the request: accepted with `value` when `reason` is `None` -- for a root child's
         request, the reply numbered `reply` -- failed with `error` for `reason` otherwise. Whether
         this ended it: one that had ended is left as it was. Any thread."""
+        # Made before anything changes: memory running out here leaves the request as it was,
+        # rather than ended with no notice to tell the host.
+        state = "accepted" if reason is None else "failed"
+        final = _agents.Status(state, reason, self.child.state)
+        # A request held for a child that never came to exist was never told of.
+        notice = None
+        if self.child.id is not None:
+            if self.sender is _OWNER:
+                # What the program's handle ends with: why, or the reply the program accepted.
+                said.update(error=None if error is None else str(error)[:OWNER_TEXT_MAX],
+                            reply=reply)
+            notice = {"t": "agent.ended", "agent": self.child.id, "request": self.id,
+                      "outcome": reason or "accepted", "ask": self.ask, **said}
         with self.lock:
             if self.state in _ENDED:
                 return False
             unread = self.state in ("queued", "waiting")
-            self.state = "accepted" if reason is None else "failed"
+            self.state = state
             self.reason = reason
             self.value, self.error = value, error
-            self.final = _agents.Status(self.state, reason, self.child.state)
-        with _works_lock:
-            _works.pop(self.id, None)
+            self.final = final
+            self.notice = notice
         # A request the child never read -- one the host ended because the child will not -- is not
         # kept for it, copy and all. The state already says it ended, so a `RequestEndpoint._put`
         # the host's word got ahead of finds that and queues nothing.
         if unread:
             self.child.withdraw(self)
         self.child.settled(self)
-        # A request held for a child that never came to exist was never told of.
-        if self.child.id is not None:
-            if self.sender is _OWNER:
-                # What the program's handle ends with: why, or the reply the program accepted.
-                said.update(error=None if error is None else str(error)[:OWNER_TEXT_MAX],
-                            reply=reply)
-            _notify({"t": "agent.ended", "agent": self.child.id, "request": self.id,
-                     "outcome": reason or "accepted", "ask": self.ask, **said})
+        if notice is None:
+            with _works_lock:
+                _works.pop(self.id, None)
+        else:
+            self.tell()
         try:
             self.sender.loop.call_soon_threadsafe(self._settle)
         except RuntimeError:
@@ -4544,6 +4577,29 @@ class _Work:
         # whose release is then said after it.
         self.instance = None
         return True
+
+    def tell(self):
+        """Tell the host this request has ended. Until it has been told, the request stays in
+        `_works`: memory can run out as it is told, and the host, not hearing, settles it again,
+        which tells it again. It stays when its line failed as it was written, too, heard or not:
+        the host's runner waits for good on an end it never hears. Nothing settles it again if the
+        host was never told of it, or once its child's kernel has ended, as the child is released:
+        then it goes told or not. One still waiting as the kernel ends, or the session closes, is
+        told once more (`forget`)."""
+        told = _notify(self.notice)
+        kernel = self.child.kernel
+        if told or not (self.recorded and kernel is not None and not kernel.ended):
+            with _works_lock:
+                _works.pop(self.id, None)
+
+    def forget(self):
+        """Take this request, ended, out of `_works`: its child was released, or the session
+        closed, and nothing settles it again. If the host was not told it ended, it is told once
+        more first, and the request goes whether or not the host hears."""
+        with _works_lock:
+            untold = self.notice is not None and _works.pop(self.id, None) is self
+        if untold:
+            _notify(self.notice)
 
     def _settle(self):
         if self.future.done():
@@ -4562,7 +4618,8 @@ class _Work:
         _notify({"t": "agent.refused", "agent": self.child.id, "request": self.id,
                  "ended": reason or "accepted"})
         if reason == "cancelled":
-            return _agents.RequestCancelled(f"{self} was cancelled by its sender; it takes no answer")
+            # Its error says who cancelled it, and the host's why.
+            return _agents.RequestCancelled(f"{self.error}; it takes no answer")
         return _agents.RequestSettled(
             f"{self} has already ended ({reason or 'answered'}), so it takes no further answer",
             reason or "accepted",
@@ -4684,7 +4741,8 @@ class _Work:
                 return False
         # Out of the child's reach first, so it never takes what was cancelled before it did.
         received = not self.child.withdraw(self)
-        return self.end("cancelled", error=_agents.RequestCancelled(f"{self} was cancelled"),
+        return self.end("cancelled",
+                        error=_agents.RequestCancelled(f"{self} was cancelled by its sender"),
                         received=received)
 
 
@@ -4754,11 +4812,15 @@ def _sent(work):
     endpoint = None if child.kernel is None else child.kernel.channels.get(work.channel)
     if type(endpoint) is not RequestEndpoint:
         return False
-    _notify({"t": "agent.request", "agent": work.sender.agent, "request": work.id,
-             "ask": work.ask, "child": child.id, "channel": work.channel,
-             "attempts": work.attempts_max,
-             "body": _agents.preview(child.channels[work.channel].request.encode(work.body))
-             if _observing else None})
+    notice = {"t": "agent.request", "agent": work.sender.agent, "request": work.id,
+              "ask": work.ask, "child": child.id, "channel": work.channel,
+              "attempts": work.attempts_max,
+              "body": _agents.preview(child.channels[work.channel].request.encode(work.body))
+              if _observing else None}
+    # Recorded before the line goes, as the host may end the request as soon as it reads it; not,
+    # if the line was never made. One that failed as it was written may have reached the host.
+    work.recorded = True
+    work.recorded = _notify(notice) is not False
     return endpoint._put(work)
 
 
@@ -4852,12 +4914,13 @@ def _submit(child, kernel, inputs, result, attempts, call=None):
         _works[work.id] = work
     # Queued and told of in one step against the assign that gives the child its next
     # submission: the host hears of it once it is queued, and the child takes it only once the
-    # host has heard, so what the child says of it names a request the host knows.
+    # host has heard, so what the child says of it names a request the host knows. A settle takes
+    # this lock before it ends the request, so `recorded` is set by then.
     with child.lock:
         queued = not child.released
         if queued:
             child.queue.append(work)
-        _notify(notice)
+        work.recorded = _notify(notice) is not False
     if not queued:
         work.end("released", error=_agents.AgentReleased(f"{child} was released"))
     return work
@@ -5375,7 +5438,7 @@ class Kernel:
         self.history = History()
         # Also `outrig.runtime`, from any code an execution of this kernel runs, whatever the
         # global comes to hold.
-        self.runtime = self.globals["runtime"] = runtime(
+        self.runtime = self.globals["runtime"] = runtime._made(
             self.channels, self.held, self.history, Context(agent, self.history), self
         )
         sys.modules[self.module.__name__] = self.module
@@ -5539,8 +5602,9 @@ class Kernel:
 
     def end(self):
         """End this child's kernel, on the reader thread: every request it holds ends
-        `AgentReleased`, its connections to the bindings close, and its loop cancels every task
-        and stops once they finish, or after a second, after which its thread says so and is gone.
+        `AgentReleased` -- one that had ended, the host not yet told so, is told again -- its
+        connections to the bindings close, and its loop cancels every task and stops once they
+        finish, or after a second, after which its thread says so and is gone.
         A loop that never turns -- code that never yields -- never stops, and its thread runs on.
         """
         if self.ended:
@@ -5556,6 +5620,7 @@ class Kernel:
                 held = [work for work in _works.values() if work.child is child]
             for work in held:
                 work.end("released", error=_agents.AgentReleased(f"{child} was released"))
+                work.forget()
         self.close_hosted(reason="its agent was released")
         try:
             self.loop.call_soon_threadsafe(self._stop)
@@ -6204,8 +6269,9 @@ def _close(message):
     """The session has closed to new work. A boundary call is refused here from now on, and each
     one still waiting for a free connection, so never sent, raises the closing error now; what was
     sent is the binding's to finish. Every request made of a child and not yet answered ends with
-    the closing error, and no request or submission is sent from now on. Each agent class
-    instance not yet ready never is, and each is released, as `closing`."""
+    the closing error -- one that had ended, the host not yet told so, is told again -- and no
+    request or submission is sent from now on. Each agent class instance not yet ready never is,
+    and each is released, as `closing`."""
     global _closing
     if _closing is not None:
         return  # each endpoint's relay says so
@@ -6226,6 +6292,8 @@ def _close(message):
     for work in open_works + launching:
         work.end("closed", error=_agents.SessionClosing(
             f"the session closed before {work} was answered: {text}"))
+    for work in open_works:
+        work.forget()
     for call in launching:
         call.settle()
     for instance in list(_instances.values()):
@@ -6454,21 +6522,25 @@ def _assign(kernel, assign_id, _message):
              "request": None if work is None else work.id})
 
 
-# What a request the host ends ends with: a work child's rounds ended without completing it, the
+# What a request the host ends ends with: the child's rounds left it as it was after a warning, the
 # token budget was spent first, or the child's model failed for good.
 _HOST_ENDS = {
-    "rejected": "CompletionRejected",
+    "cancelled": "RequestCancelled",
     "budget": "BudgetExhausted",
     "failed": "AgentRequestFailed",
 }
 
 
 def _settle_work(kernel, work_id, message):
-    """End request `work_id` as the host decided."""
+    """End request `work_id` as the host decided; or, if it has ended and the host was not told
+    so, tell it again: the host settles it again when it does not hear."""
     with _works_lock:
         work = _works.get(work_id)
     outcome = message.get("outcome")
     if work is None or outcome not in _HOST_ENDS:
+        return
+    if work.notice is not None:
+        work.tell()
         return
     text = message.get("message") or f"{work} ended {outcome}"
     error = getattr(_agents, _HOST_ENDS[outcome])(text)
@@ -6477,7 +6549,10 @@ def _settle_work(kernel, work_id, message):
         # What `raise error from _agents.AgentRequestFailed(cause)` sets: a model call of the
         # child's failed and ended a round, which is not the child giving up.
         error.__cause__ = _agents.AgentRequestFailed(cause)
-    work.end(outcome, error=error, message=text, cause=cause)
+    # Out of the child's reach first, as a sender's cancel takes it, so the child never takes what
+    # the host ended before it did.
+    received = not work.child.withdraw(work)
+    work.end(outcome, error=error, message=text, cause=cause, received=received)
 
 
 def _oriented(kernel, instance_id, message):

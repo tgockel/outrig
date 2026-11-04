@@ -478,15 +478,17 @@ async fn the_attempt_limit_rejects_a_work_childs_third_wrong_answer() {
     assert_eq!(kind(&events, "agent.request.invalid", None).len(), 3);
 }
 
-/// A work child whose round and the one more round asking for its result
-/// both end without completing fails the submission, saying so, with no
-/// third call and no invalid answer recorded; a submission queued behind it
-/// then gets its own round and completes.
+/// A work child whose submission's round, the round asking for its result and the warning round
+/// all end without completing it has the submission cancelled, saying so, with no fourth call for
+/// it and no invalid answer recorded. The nudge says nothing of what follows it; the warning names
+/// each way out and that ending the round cancels. The child is never idle between the cancel and
+/// the round of the submission queued behind it, which completes, and is idle after that.
 #[tokio::test]
-async fn a_work_child_that_ends_two_rounds_without_completing_fails() {
+async fn a_work_child_that_never_completes_is_cancelled_after_three_rounds() {
     let child = vec![
         text_reply("I will not complete it"),
         text_reply("Still not"),
+        text_reply("Not even now"),
         submit("c1", &py("await runtime.complete(Total(total=sum(xs)))")),
         text_reply("ended"),
     ];
@@ -497,16 +499,32 @@ async fn a_work_child_that_ends_two_rounds_without_completing_fails() {
             ("ROLE stubborn", scripted(child)),
             (
                 "",
-                primary_runs(&format!(
-                    "{TOTAL}\nimport outrig\n\
-                     child = await runtime.spawn('s', prompt='ROLE stubborn')\n\
-                     first = child.submit({{'xs': [1]}}, result=Total)\n\
-                     second = child.submit({{'xs': [2, 3]}}, result=Total)\n\
-                     print(second.status.state)\n\
-                     try:\n    await first\n\
-                     except outrig.CompletionRejected as e:\n    print(e, e.__cause__)\n\
-                     print((await second).total)"
-                )),
+                primary_waits(
+                    r#"
+                    child = await runtime.spawn('s', prompt='ROLE stubborn')
+                    first = child.submit({'xs': [1]}, result=Total)
+                    second = child.submit({'xs': [2, 3]}, result=Total)
+                    print(second.status.state)
+                    seen = []
+                    async def watch():
+                        while True:
+                            state = child.status
+                            if second.done():
+                                return
+                            if first.done():
+                                seen.append(state)
+                            await asyncio.sleep(0.001)
+                    watching = asyncio.create_task(watch())
+                    try:
+                        await first
+                    except outrig.RequestCancelled as e:
+                        print(e, e.__cause__)
+                    print((await second).total)
+                    await watching
+                    print(len(seen) > 0, 'idle' in seen)
+                    await until(lambda: child.status == 'idle')
+                    "#,
+                ),
             ),
         ],
     )
@@ -514,34 +532,60 @@ async fn a_work_child_that_ends_two_rounds_without_completing_fails() {
     round(&mut tree.session, "go").await;
     let (_, events, requests) = tree.end().await;
     let said = printed(&requests, "p1");
-    assert!(
-        said.starts_with("queued\n")
-            && said.contains("ended without completing")
-            && said.ends_with("5\n"),
-        "{said}"
-    );
-    assert!(
-        said.contains("so it ended without completing None\n"),
-        "no round failed on a model call, so nothing is chained: {said}"
+    let id = said
+        .lines()
+        .nth(1)
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("the cancelled submission's id")
+        .to_string();
+    assert_eq!(
+        said,
+        format!(
+            "queued\nsubmission {id} was cancelled: the child ended its rounds without completing \
+             it None\n5\nTrue False\n"
+        ),
+        "no round failed on a model call, so nothing is chained"
     );
     let child = of_agent(&requests, "ROLE stubborn");
     assert_eq!(
         child.len(),
-        3,
-        "two rounds for the first, one for the second, which ends on its completion"
+        4,
+        "three rounds for the first, and one call for the second, whose round ends on its \
+         completion"
     );
-    let nudge = child[1].body["messages"].to_string();
-    assert!(nudge.contains("is still open"), "{nudge}");
-    assert!(kind(&events, "agent.request.invalid", None).is_empty());
-    let outcomes: Vec<Value> = kind(&events, "agent.request.settled", None)
-        .into_iter()
-        .map(|event| data(event)["outcome"].clone())
-        .collect();
-    assert_eq!(outcomes, ["rejected", "accepted"]);
+    let nudge = opening(child[1]);
     assert!(
-        kind(&events, "agent.request.settled", None)
-            .into_iter()
-            .all(|event| data(event)["cause"].is_null())
+        nudge.contains(&format!("submission {id} is still open"))
+            && !nudge.contains("fail")
+            && !nudge.contains("cancel"),
+        "{nudge}"
+    );
+    let warning = opening(child[2]);
+    assert!(
+        warning.contains("your last two rounds ended without completing it")
+            && warning.contains("`await runtime.fail(message)`")
+            && warning.contains("it is cancelled, and its caller gets an exception"),
+        "{warning}"
+    );
+    assert!(kind(&events, "agent.request.invalid", None).is_empty());
+    let settled: Vec<(Value, Value)> = kind(&events, "agent.request.settled", None)
+        .into_iter()
+        .map(|event| (data(event)["outcome"].clone(), data(event)["cause"].clone()))
+        .collect();
+    assert_eq!(
+        settled,
+        [
+            (Value::from("cancelled"), Value::Null),
+            (Value::from("accepted"), Value::Null)
+        ]
+    );
+    let cancelled = data(kind(&events, "agent.request.cancelled", None)[0]);
+    assert_eq!(cancelled["received"], true, "it was given to the child");
+    assert!(
+        cancelled["reason"]
+            .as_str()
+            .is_some_and(|why| why.contains("without completing it")),
+        "{cancelled}"
     );
 }
 
@@ -550,11 +594,11 @@ async fn a_work_child_that_ends_two_rounds_without_completing_fails() {
 const FILTERED_CALLS: usize = 2;
 
 /// A work child whose round runs code and then meets only replies the provider filtered fails
-/// that round, and the next ends on a plain stop without completing: the request is rejected,
-/// and the parent's exception chains the failed round as its `__cause__`, an `AgentRequestFailed`
-/// naming the finish reason, which the settled event carries too.
+/// that round; the next two end on plain stops without completing, and the submission is
+/// cancelled. The parent's exception chains the failed round as its `__cause__`, an
+/// `AgentRequestFailed` naming the finish reason, which the settled event carries too.
 #[tokio::test]
-async fn a_rejection_chains_the_round_a_filtered_reply_failed() {
+async fn a_cancel_chains_the_round_a_filtered_reply_failed() {
     let mut child = vec![submit("c1", &py("print('ran')"))];
     child.extend(std::iter::repeat_n(
         mock_http::Style::Messages.empty("refusal"),
@@ -573,7 +617,7 @@ async fn a_rejection_chains_the_round_a_filtered_reply_failed() {
                      child = await runtime.spawn('s', prompt='ROLE filtered')\n\
                      first = child.submit({{'xs': [1]}}, result=Total)\n\
                      try:\n    await first\n\
-                     except outrig.CompletionRejected as e:\n    \
+                     except outrig.RequestCancelled as e:\n    \
                          print(type(e.__cause__).__name__, e.__cause__)"
                 )),
             ),
@@ -587,8 +631,13 @@ async fn a_rejection_chains_the_round_a_filtered_reply_failed() {
         said.starts_with("AgentRequestFailed ") && said.contains("finish reason refusal"),
         "{said}"
     );
+    assert_eq!(
+        of_agent(&requests, "ROLE filtered").len(),
+        1 + FILTERED_CALLS + 2,
+        "the failed round's calls, then the nudge and the warning"
+    );
     let settled = data(kind(&events, "agent.request.settled", None)[0]);
-    assert_eq!(settled["outcome"], "rejected");
+    assert_eq!(settled["outcome"], "cancelled");
     assert!(
         settled["cause"]
             .as_str()
@@ -728,20 +777,57 @@ pub(super) fn primary_waits(source: &str) -> Responder {
     primary_runs(&format!("{THING}{TOTAL}{UNTIL}\n{}", py(source)))
 }
 
+/// Python that watches children for the one state none may be in: idle while it holds a request
+/// it took. `watch(child, handles)` starts a task that reads the child's status, then its handles,
+/// every millisecond, and adds the child's name to `idle_holding` whenever it reads `idle` while
+/// one it took -- `received`, or a submission `running` -- has not ended. A request not yet taken
+/// on an idle child is the moment before its round opens, and is not noted.
+const WATCH: &str = r#"
+idle_holding = []
+def watch(child, handles):
+    async def run():
+        while True:
+            state = child.status
+            taken = [h for h in handles if not h.done() and h.status.state in ('received', 'running')]
+            if state == 'idle' and taken:
+                idle_holding.append(child.name)
+            await asyncio.sleep(0.001)
+    return asyncio.get_running_loop().create_task(run())
+"#;
+
 /// The text of the message `request` ended on: for a round's first call, its
 /// opening.
 pub(super) fn opening(request: &RecordedRequest) -> String {
     text_of(&messages(request).last().expect("a message")["content"])
 }
 
-/// A request the child received and left unanswered earns one more round,
-/// whose opening names it by id with how long it has waited; when that round
-/// ends with nothing changed, nothing follows, and the request stays open with
-/// its status saying the child is idle, until a cancel ends it.
+/// A request the child took and never answers is asked for three times: in the round its arrival
+/// opened, in the round whose opening names it by id with how long it has waited, and in the
+/// warning round, which says ending it so cancels the request. Then the host cancels it, saying
+/// why: the handle ends cancelled and the child idle, the record names the host and that the child
+/// had taken it, no answer was counted, and a reply from a task the child left running is refused.
 #[tokio::test]
-async fn an_unchanged_state_opens_nothing_and_a_cancel_ends_the_request() {
+async fn a_request_taken_and_never_answered_is_cancelled_after_three_rounds() {
+    let (go, out) = (Flag::new(), Flag::new());
+    let taking = format!(
+        r#"
+        import os, outrig
+        d = await runtime.channels['fizz'].receive()
+        async def late():
+            while not os.path.exists({go}):
+                await asyncio.sleep(0.01)
+            try:
+                await d.reply(Thing(n=1))
+            except outrig.RequestCancelled as e:
+                with open({out}, 'w') as f:
+                    f.write(f'{{type(e).__name__}}: {{e}}')
+        left = asyncio.get_running_loop().create_task(late())
+        "#,
+        go = go.py(),
+        out = out.py()
+    );
     let child = vec![
-        submit("c1", "d = await runtime.channels['fizz'].receive()"),
+        submit("c1", &py(&taking)),
         text_reply("taken"),
         text_reply("still not answering"),
     ];
@@ -752,15 +838,24 @@ async fn an_unchanged_state_opens_nothing_and_a_cancel_ends_the_request() {
             ("ROLE silent", scripted(child)),
             (
                 "",
-                primary_waits(
+                primary_waits(&format!(
                     r#"
-                    child = await runtime.spawn('s', prompt='ROLE silent', requests={'fizz': (str, Thing)})
+                    child = await runtime.spawn('s', prompt='ROLE silent', requests={{'fizz': (str, Thing)}})
                     h = child.channels['fizz'].request('a')
-                    await until(lambda: h.status.state == 'received' and child.status == 'idle')
-                    print(h.id, h.done(), h.status)
-                    print(h.cancel(), h.status)
+                    try:
+                        await h
+                    except outrig.RequestCancelled as e:
+                        print(h.id, e)
+                    print(h.status.state, h.status.reason)
+                    await until(lambda: child.status == 'idle')
+                    print(child.status, h.done())
+                    open({go}, 'w').close()
+                    await until(lambda: os.path.exists({out}))
+                    print(open({out}).read())
                     "#,
-                ),
+                    go = go.py(),
+                    out = out.py()
+                )),
             ),
         ],
     )
@@ -769,36 +864,71 @@ async fn an_unchanged_state_opens_nothing_and_a_cancel_ends_the_request() {
     let (_, events, requests) = tree.end().await;
     let said = printed(&requests, "p1");
     let id = said.split_whitespace().next().expect("an id").to_string();
+    let why =
+        format!("request {id} was cancelled: the child ended its rounds without answering it");
     assert_eq!(
         said,
-        format!("{id} False received (child idle)\nTrue failed: cancelled (child idle)\n")
+        format!(
+            "{id} {why}\nfailed cancelled\nidle True\nRequestCancelled: {why}; it takes no answer\n"
+        )
     );
     let child = of_agent(&requests, "ROLE silent");
-    assert_eq!(child.len(), 3, "the round, its nudge, and nothing after");
+    assert_eq!(
+        child.len(),
+        4,
+        "the round its arrival opened, its nudge, the warning, and nothing after"
+    );
     let nudge = opening(child[2]);
     assert!(
         nudge.contains(&format!(
             "you took request {id} from runtime.channels[\"fizz\"] "
-        )) && nudge.contains("s ago and have not answered it"),
+        )) && nudge.contains("s ago and have not answered it")
+            && !nudge.contains("cancel"),
         "{nudge}"
     );
+    let warning = opening(child[3]);
+    assert!(
+        warning.contains(&format!(
+            "your last round ended with requests unanswered: you took request {id} from"
+        )) && warning.contains("they are cancelled, and each sender gets an exception")
+            && !warning.contains("receive()"),
+        "{warning}"
+    );
     assert!(kind(&events, "agent.request.invalid", None).is_empty());
-    let cancelled = kind(&events, "agent.request.cancelled", None);
-    assert_eq!(data(cancelled[0])["received"], true);
+    let cancelled = data(kind(&events, "agent.request.cancelled", None)[0]);
+    assert_eq!(cancelled["received"], true);
+    assert_eq!(cancelled["reason"], why.as_str());
+    assert_eq!(
+        data(kind(&events, "agent.request.settled", None)[0])["outcome"],
+        "cancelled"
+    );
+    assert_eq!(
+        data(kind(&events, "agent.request.refused", None)[0])["ended"],
+        "cancelled"
+    );
 }
 
-/// With the child idle on one request received and unanswered and one
-/// unread, a third request opens a round whose opening names the received one
-/// by id and counts two unread; a reply to each then settles its handle, the
-/// old one's with its value.
+/// A request that arrives while the child holds others -- one taken, one unread -- opens a round
+/// once the round it came in ends, whose opening names the taken one by id and counts the two
+/// unread; a reply to each then settles its handle, the old one's with its value.
 #[tokio::test]
 async fn a_new_arrival_opens_a_round_naming_the_old_requests_too() {
+    let flag = Flag::new();
     let child = vec![
         submit("c1", "d1 = await runtime.channels['fizz'].receive()"),
         text_reply("took one"),
-        text_reply("idle now"),
+        // The round naming d1 says it runs, then waits for the third request to arrive.
         submit(
             "c2",
+            &format!(
+                "open({flag}, 'w').close()\n\
+                 while runtime.channels['fizz'].pending() < 2:\n    await asyncio.sleep(0.01)",
+                flag = flag.py()
+            ),
+        ),
+        text_reply("waited"),
+        submit(
+            "c3",
             &py(r#"
                 await d1.reply(Thing(n=d1.id))
                 for _ in range(2):
@@ -815,17 +945,18 @@ async fn a_new_arrival_opens_a_round_naming_the_old_requests_too() {
             ("ROLE late", scripted(child)),
             (
                 "",
-                primary_waits(
+                primary_waits(&format!(
                     r#"
-                    child = await runtime.spawn('l', prompt='ROLE late', requests={'fizz': (str, Thing)})
+                    child = await runtime.spawn('l', prompt='ROLE late', requests={{'fizz': (str, Thing)}})
                     h1 = child.channels['fizz'].request('a')
                     h2 = child.channels['fizz'].request('b')
-                    await until(lambda: h1.status.state == 'received' and child.status == 'idle')
+                    await until(lambda: os.path.exists({flag}))
                     h3 = child.channels['fizz'].request('c')
                     for h in (h1, h2, h3):
                         print(h.id, (await h).n)
                     "#,
-                ),
+                    flag = flag.py()
+                )),
             ),
         ],
     )
@@ -840,56 +971,78 @@ async fn a_new_arrival_opens_a_round_naming_the_old_requests_too() {
     assert_eq!(answered.len(), 3);
     assert!(answered.iter().all(|(id, n)| id == n), "{said}");
     let child = of_agent(&requests, "ROLE late");
-    assert_eq!(child.len(), 5);
-    let named = opening(child[3]);
+    assert_eq!(child.len(), 6);
+    let named = opening(child[4]);
     assert!(
         named.contains("2 requests are waiting on runtime.channels[\"fizz\"]")
-            && named.contains(&format!("you took request {} from", answered[0].0)),
+            && named.contains(&format!("you took request {} from", answered[0].0))
+            && !named.contains("your last round ended"),
         "{named}"
     );
 }
 
-/// A request that arrives while the child is idle and is never received earns
-/// the round its arrival opened and no more; one that arrives during a round,
-/// announced there, earns the round after it, whose opening counts it, and no
-/// more. Neither counts an attempt.
+/// A request the child never takes is asked for twice: in the round its arrival opened, and in
+/// the warning round, which says to take it with `receive()` first. Then the host takes it out of
+/// the child's queue and cancels it: `pending()` is 0, and its body never reached the model. One
+/// that arrives during a round, announced there, gets the round after it, whose opening counts it,
+/// then the warning, then the cancel. Neither counts an attempt.
 #[tokio::test]
-async fn an_unread_request_earns_no_round_past_the_first_that_counts_it() {
-    let flag = Flag::new();
+async fn a_request_never_taken_is_cancelled_after_two_rounds() {
     let mut idle = tree(
         "OUTRIG_TEST_CHILD_UNREAD_IDLE",
         "",
         vec![
-            (
-                "ROLE ignoring",
-                scripted(vec![
-                    submit("c1", &format!("open({}, 'w').close()", flag.py())),
-                    text_reply("not now"),
-                ]),
-            ),
+            ("ROLE ignoring", scripted(vec![text_reply("not now")])),
             (
                 "",
-                primary_waits(&format!(
+                primary_waits(
                     r#"
-                    child = await runtime.spawn('i', prompt='ROLE ignoring', requests={{'fizz': (str, Thing)}})
-                    h = child.channels['fizz'].request('a')
-                    await until(lambda: os.path.exists({flag}))
+                    child = await runtime.spawn('i', prompt='ROLE ignoring', requests={'fizz': (str, Thing)})
+                    h = child.channels['fizz'].request('a secret body')
+                    try:
+                        await h
+                    except outrig.RequestCancelled as e:
+                        print(e)
                     await until(lambda: child.status == 'idle')
-                    print(h.status)
+                    print(child.channels['fizz'].pending(), h.status.state, h.status.reason)
                     "#,
-                    flag = flag.py()
-                )),
+                ),
             ),
         ],
     )
     .await;
     round(&mut idle.session, "go").await;
     let (_, events, requests) = idle.end().await;
-    assert_eq!(printed(&requests, "p1"), "waiting (child idle)\n");
+    let said = printed(&requests, "p1");
+    assert!(
+        said.ends_with(
+            " was cancelled: the child ended its rounds without reading it\n0 failed cancelled\n"
+        ),
+        "{said}"
+    );
+    let child = of_agent(&requests, "ROLE ignoring");
     assert_eq!(
-        of_agent(&requests, "ROLE ignoring").len(),
+        child.len(),
         2,
-        "the round its arrival opened, and no more"
+        "the round its arrival opened, and the warning"
+    );
+    let warning = opening(child[1]);
+    assert!(
+        warning.contains("your last round ended with requests unanswered: 1 request is waiting")
+            && warning.contains(
+                "Take an unread one first, with `await runtime.channels[\"fizz\"].receive()`"
+            ),
+        "{warning}"
+    );
+    assert!(
+        child
+            .iter()
+            .all(|request| !request.body.to_string().contains("a secret body")),
+        "the body never reached the child's model"
+    );
+    assert_eq!(
+        data(kind(&events, "agent.request.cancelled", None)[0])["received"],
+        false
     );
     assert!(kind(&events, "agent.request.invalid", None).is_empty());
 
@@ -922,8 +1075,10 @@ async fn an_unread_request_earns_no_round_past_the_first_that_counts_it() {
                     await until(lambda: first.status.state != 'waiting')
                     second = child.channels['fizz'].request('b')
                     await first
-                    await until(lambda: child.status == 'idle')
-                    print(second.status)
+                    try:
+                        await second
+                    except outrig.RequestCancelled as e:
+                        print('cancelled', 'without reading it' in str(e))
                     "#,
                 ),
             ),
@@ -932,12 +1087,12 @@ async fn an_unread_request_earns_no_round_past_the_first_that_counts_it() {
     .await;
     round(&mut announced.session, "go").await;
     let (_, events, requests) = announced.end().await;
-    assert_eq!(printed(&requests, "p1"), "waiting (child idle)\n");
+    assert_eq!(printed(&requests, "p1"), "cancelled True\n");
     let child = of_agent(&requests, "ROLE ignoring");
     assert_eq!(
         child.len(),
-        3,
-        "the first round's two calls and the one round after it"
+        4,
+        "the first round's two calls, the round after it, and the warning"
     );
     let result = tool_result(child[1], "c1");
     assert!(
@@ -946,10 +1101,730 @@ async fn an_unread_request_earns_no_round_past_the_first_that_counts_it() {
     );
     let after = opening(child[2]);
     assert!(
-        after.contains("1 request is waiting on runtime.channels[\"fizz\"]"),
+        after.contains("1 request is waiting on runtime.channels[\"fizz\"]")
+            && !after.contains("your last round ended"),
         "{after}"
     );
+    assert!(
+        opening(child[3]).contains("your last round ended with requests unanswered"),
+        "{}",
+        opening(child[3])
+    );
     assert!(kind(&events, "agent.request.invalid", None).is_empty());
+}
+
+/// The rounds of a request child that takes its request, ends that round and the one naming it,
+/// and then runs `source` in the warning round.
+fn warned_then(source: &str) -> Vec<CannedResponse> {
+    vec![
+        submit("c1", "d = await runtime.channels['fizz'].receive()"),
+        text_reply("taken"),
+        text_reply("not yet"),
+        submit("c2", &py(source)),
+        text_reply("answered"),
+    ]
+}
+
+/// A child that replies in its warning round has its request answered with the value; one that
+/// waits there with `runtime.wait` on a task, and replies once it ends, has its request answered
+/// too, since its round has not ended while it waits. Neither is cancelled.
+#[tokio::test]
+async fn a_reply_or_a_wait_in_the_warning_round_is_not_cancelled() {
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_WARNED_REPLY",
+        "",
+        vec![
+            (
+                "ROLE replier",
+                scripted(warned_then("await d.reply(Thing(n=7))")),
+            ),
+            (
+                "ROLE waiter",
+                scripted(warned_then(
+                    r#"
+                    slow = asyncio.create_task(asyncio.sleep(0.3))
+                    await runtime.wait({slow})
+                    await d.reply(Thing(n=8))
+                    "#,
+                )),
+            ),
+            (
+                "",
+                primary_waits(
+                    r#"
+                    r = await runtime.spawn('r', prompt='ROLE replier', requests={'fizz': (str, Thing)})
+                    w = await runtime.spawn('w', prompt='ROLE waiter', requests={'fizz': (str, Thing)})
+                    print((await r.channels['fizz'].request('a')).n, (await w.channels['fizz'].request('b')).n)
+                    "#,
+                ),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(printed(&requests, "p1"), "7 8\n");
+    for role in ["ROLE replier", "ROLE waiter"] {
+        let child = of_agent(&requests, role);
+        assert_eq!(child.len(), 5, "{role}");
+        assert!(
+            opening(child[3]).contains("your last round ended with requests unanswered"),
+            "{role}: {}",
+            opening(child[3])
+        );
+    }
+    assert!(kind(&events, "agent.request.cancelled", None).is_empty());
+}
+
+/// Anything the child changes begins the count again. With two requests taken and both left, a
+/// warning round that answers one is followed by an ordinary round; when that one and the warning
+/// after it change nothing, the other is cancelled, and the first stays answered.
+#[tokio::test]
+async fn anything_the_child_changes_begins_the_count_again() {
+    let child = vec![
+        submit(
+            "c1",
+            "d1 = await runtime.channels['fizz'].receive()\n\
+             d2 = await runtime.channels['fizz'].receive()",
+        ),
+        text_reply("took both"),
+        text_reply("nudged"),
+        submit("c2", "await d1.reply(Thing(n=1))"),
+        text_reply("answered one"),
+        text_reply("leaving the other"),
+    ];
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_COUNT_AGAIN",
+        "",
+        vec![
+            ("ROLE twice", scripted(child)),
+            (
+                "",
+                primary_waits(
+                    r#"
+                    child = await runtime.spawn('t', prompt='ROLE twice', requests={'fizz': (str, Thing)})
+                    h1 = child.channels['fizz'].request('a')
+                    h2 = child.channels['fizz'].request('b')
+                    print((await h1).n)
+                    try:
+                        await h2
+                    except outrig.RequestCancelled as e:
+                        print('cancelled', 'without answering it' in str(e))
+                    print(h1.status.state)
+                    "#,
+                ),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, _, requests) = tree.end().await;
+    assert_eq!(printed(&requests, "p1"), "1\ncancelled True\naccepted\n");
+    let child = of_agent(&requests, "ROLE twice");
+    assert_eq!(
+        child.len(),
+        7,
+        "the first round's two calls, the nudge, the warning's two, an ordinary round, a warning"
+    );
+    let warned = |n: usize| opening(child[n]).contains("your last round ended with requests");
+    assert_eq!(
+        [2, 3, 5, 6].map(warned),
+        [false, true, false, true],
+        "nudge, warning, ordinary, warning"
+    );
+}
+
+/// A warning round whose model call fails before its code ran is opened again with the same
+/// opening, and nothing is cancelled until that round ends. One whose code ran before a call
+/// failed neither gives the warning nor counts as the round after it: the next round is the
+/// warning again, and only once it ends is the request cancelled.
+#[tokio::test]
+async fn a_round_ending_in_an_error_is_no_unchanged_round() {
+    let taken = || {
+        vec![
+            submit("c1", "d = await runtime.channels['fizz'].receive()"),
+            text_reply("taken"),
+            text_reply("nudged"),
+        ]
+    };
+    let mut before = taken();
+    before.extend([mock_http::failure(500), text_reply("warned")]);
+    let mut after = taken();
+    after.extend([
+        submit("c2", "print('looked')"),
+        mock_http::failure(500),
+        text_reply("warned again"),
+    ]);
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_ERROR_ROUND",
+        "",
+        vec![
+            ("ROLE before", scripted(before)),
+            ("ROLE after", scripted(after)),
+            (
+                "",
+                primary_waits(
+                    r#"
+                    b = await runtime.spawn('b', prompt='ROLE before', requests={'fizz': (str, Thing)})
+                    a = await runtime.spawn('a', prompt='ROLE after', requests={'fizz': (str, Thing)})
+                    for h in (b.channels['fizz'].request('x'), a.channels['fizz'].request('y')):
+                        try:
+                            await h
+                        except outrig.RequestCancelled:
+                            print('cancelled')
+                    "#,
+                ),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(printed(&requests, "p1"), "cancelled\ncancelled\n");
+    let warning = "your last round ended with requests unanswered";
+
+    let before = of_agent(&requests, "ROLE before");
+    assert_eq!(
+        before.len(),
+        5,
+        "the warning round opened again once, and nothing after"
+    );
+    assert!(
+        opening(before[3]).contains(warning),
+        "{}",
+        opening(before[3])
+    );
+    assert_eq!(opening(before[3]), opening(before[4]), "the same opening");
+
+    let after = of_agent(&requests, "ROLE after");
+    assert_eq!(
+        after.len(),
+        6,
+        "the failed warning round's two calls, then the warning again"
+    );
+    for n in [3, 5] {
+        assert!(opening(after[n]).contains(warning), "{}", opening(after[n]));
+    }
+    assert_eq!(
+        kind(&events, "model.round.failed", Some("agent/c2")).len(),
+        1
+    );
+    assert_eq!(kind(&events, "agent.request.cancelled", None).len(), 2);
+}
+
+/// A round stopped at the tool-call cap has ended as any other: the nudge round it cut short is
+/// followed by the warning round, in which the child fails the request on purpose, and the handle
+/// ends failed with that message, not cancelled.
+#[tokio::test]
+async fn a_round_stopped_at_the_cap_counts_as_ended() {
+    let child = vec![
+        submit("c1", "d = await runtime.channels['fizz'].receive()"),
+        text_reply("taken"),
+        submit("c2", "print('one')"),
+        submit("c3", "print('two, never run')"),
+        submit("c4", "await d.fail('the file is not there')"),
+        text_reply("failed it"),
+    ];
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_CAPPED",
+        "tool-call-max = 1",
+        vec![
+            ("ROLE capped", scripted(child)),
+            (
+                "",
+                primary_waits(
+                    r#"
+                    child = await runtime.spawn('c', prompt='ROLE capped', requests={'fizz': (str, Thing)})
+                    h = child.channels['fizz'].request('x')
+                    try:
+                        await h
+                    except outrig.AgentRequestFailed as e:
+                        print(e.message, h.status.state, h.status.reason)
+                    "#,
+                ),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(
+        printed(&requests, "p1"),
+        "the file is not there failed failed\n"
+    );
+    let child = of_agent(&requests, "ROLE capped");
+    assert_eq!(child.len(), 6);
+    assert!(
+        opening(child[4]).contains("your last round ended with requests unanswered"),
+        "{}",
+        opening(child[4])
+    );
+    assert!(kind(&events, "agent.request.cancelled", None).is_empty());
+}
+
+/// No child is idle while it holds a request. Each way a child's rounds end is driven under the
+/// watcher [`WATCH`] starts: a request taken and never answered, one never taken, a model that
+/// fails for good, and a release. It never finds a child idle with a request it took open, and
+/// wherever a child is idle, every handle sent to it has ended. The spent budget and the close
+/// are watched in their own tests.
+#[tokio::test]
+async fn no_child_is_idle_holding_a_request() {
+    let held = Flag::new();
+    let holding = format!(
+        r#"
+        d = await runtime.channels['fizz'].receive()
+        open({held}, 'w').close()
+        while True:
+            await asyncio.sleep(0.05)
+        "#,
+        held = held.py()
+    );
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_NEVER_IDLE_HOLDING",
+        "",
+        vec![
+            (
+                "ROLE taker",
+                scripted(child_runs(
+                    "t1",
+                    "d = await runtime.channels['fizz'].receive()",
+                )),
+            ),
+            ("ROLE ignorer", scripted(vec![text_reply("not now")])),
+            ("ROLE broken", scripted(vec![mock_http::failure(401)])),
+            ("ROLE holder", scripted(vec![submit("h1", &py(&holding))])),
+            (
+                "",
+                primary_waits(&format!(
+                    "{WATCH}{}",
+                    py(&format!(
+                        r#"
+                        spec = {{'fizz': (str, Thing)}}
+                        for role in ('taker', 'ignorer', 'broken', 'holder'):
+                            child = await runtime.spawn(role, prompt=f'ROLE {{role}}', requests=spec)
+                            handles = [child.channels['fizz'].request(body) for body in ('a', 'b')]
+                            watching = watch(child, handles)
+                            if role == 'holder':
+                                await until(lambda: os.path.exists({held}))
+                                await runtime.release([child])
+                            ended = []
+                            for h in handles:
+                                try:
+                                    await h
+                                except outrig.AgentError as e:
+                                    ended.append(type(e).__name__)
+                            await until(lambda: child.status in ('idle', 'released'))
+                            print(role, child.status, all(h.done() for h in handles), ended)
+                            watching.cancel()
+                        print(idle_holding)
+                        "#,
+                        held = held.py()
+                    ))
+                )),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, _, requests) = tree.end().await;
+    assert_eq!(
+        printed(&requests, "p1"),
+        "taker idle True ['RequestCancelled', 'RequestCancelled']\n\
+         ignorer idle True ['RequestCancelled', 'RequestCancelled']\n\
+         broken idle True ['AgentRequestFailed', 'AgentRequestFailed']\n\
+         holder released True ['AgentReleased', 'AgentReleased']\n\
+         []\n"
+    );
+}
+
+/// What a child runs as it takes its request: the notice of that request's end then fails to
+/// encode, as out of memory, until `freed` is raised.
+fn muted(freed: &Flag) -> String {
+    format!(
+        r#"
+        import __main__, os
+        d = await runtime.channels['fizz'].receive()
+        encode = __main__._encode
+        def short(message):
+            if message.get('t') == 'agent.ended' and message.get('request') == d.id \
+                    and not os.path.exists({freed}):
+                raise MemoryError
+            return encode(message)
+        __main__._encode = short
+        "#,
+        freed = freed.py()
+    )
+}
+
+/// The rounds of a request child that runs `taking` as it takes its request, ends that round, the
+/// one naming the request and the warning, and then answers the next request.
+fn taking_then_answering(taking: &str) -> Responder {
+    scripted(vec![
+        submit("c1", &py(taking)),
+        text_reply("taken"),
+        text_reply("not yet"),
+        text_reply("still not"),
+        submit(
+            "c2",
+            "e = await runtime.channels['fizz'].receive()\nawait e.reply(Thing(n=2))",
+        ),
+        text_reply("answered"),
+    ])
+}
+
+/// The rounds of a request child that replies to its request as it takes it, the reply's notice
+/// failing as [`muted`] has it, and holds that round open until `finish` is raised: until then,
+/// only its release, or the close, can tell the host the request ended.
+fn replying_then_holding(freed: &Flag, finish: &Flag) -> Responder {
+    let source = format!(
+        r#"{muted}
+        import asyncio
+        await d.reply(Thing(n=1))
+        while not os.path.exists({finish}):
+            await asyncio.sleep(0.05)
+        "#,
+        muted = muted(freed),
+        finish = finish.py()
+    );
+    scripted(vec![submit("c1", &py(&source)), text_reply("held")])
+}
+
+/// An end the host does not hear is asked for again. Out of memory, the interpreter can lose its
+/// notice of an end it made, or a settle the host sent: here `mute`'s notice of its request's cancel
+/// fails to encode until memory frees, after the request has ended, and the first settle `deaf` is
+/// sent is lost as the reader loses a line it had no memory to handle. Each request ends cancelled,
+/// and is recorded so once; each child goes idle, and takes the next request it is sent.
+#[tokio::test]
+async fn an_end_the_host_does_not_hear_is_asked_for_again() {
+    let freed = Flag::new();
+    let deaf = r#"
+        import __main__
+        d = await runtime.channels['fizz'].receive()
+        settle, lost = __main__._ROUTES['settle'], []
+        def deaf(kernel, request, message):
+            if request == d.id and not lost:
+                lost.append(request)
+                return
+            settle(kernel, request, message)
+        __main__._ROUTES['settle'] = deaf
+        "#;
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_UNHEARD_END",
+        "",
+        vec![
+            ("ROLE mute", taking_then_answering(&muted(&freed))),
+            ("ROLE deaf", taking_then_answering(deaf)),
+            (
+                "",
+                primary_waits(&format!(
+                    r#"
+                    for role in ('mute', 'deaf'):
+                        child = await runtime.spawn(role, prompt=f'ROLE {{role}}', requests={{'fizz': (str, Thing)}})
+                        h = child.channels['fizz'].request('a')
+                        try:
+                            await h
+                        except outrig.RequestCancelled:
+                            pass
+                        open({freed}, 'w').close()
+                        await until(lambda: child.status == 'idle')
+                        print(role, h.status.reason, (await child.channels['fizz'].request('b')).n)
+                    "#,
+                    freed = freed.py()
+                )),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(
+        printed(&requests, "p1"),
+        "mute cancelled 2\ndeaf cancelled 2\n"
+    );
+    assert_eq!(kind(&events, "agent.request.cancelled", None).len(), 2);
+    let outcomes: Vec<Value> = kind(&events, "agent.request.settled", None)
+        .into_iter()
+        .map(|event| data(event)["outcome"].clone())
+        .collect();
+    assert_eq!(
+        outcomes,
+        ["cancelled", "accepted", "cancelled", "accepted"],
+        "each end recorded once"
+    );
+}
+
+/// Requests that keep arriving while an end is unheard wake the runner, and do not put off sending
+/// the settle again: with one sent every 0.2 s, more often than the settle is sent again, the end
+/// is heard once memory frees, and an arrival is answered.
+#[tokio::test]
+async fn arrivals_do_not_put_off_asking_for_an_end_again() {
+    let freed = Flag::new();
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_UNHEARD_ARRIVALS",
+        "",
+        vec![
+            ("ROLE mute", taking_then_answering(&muted(&freed))),
+            (
+                "",
+                primary_waits(&format!(
+                    r#"
+                    child = await runtime.spawn('m', prompt='ROLE mute', requests={{'fizz': (str, Thing)}})
+                    try:
+                        await child.channels['fizz'].request('a')
+                    except outrig.RequestCancelled:
+                        pass
+                    open({freed}, 'w').close()
+                    arrivals = []
+                    while not any(h.done() for h in arrivals):
+                        if len(arrivals) == 50:
+                            raise TimeoutError('no arrival was answered in 10 s')
+                        arrivals.append(child.channels['fizz'].request('b'))
+                        await asyncio.sleep(0.2)
+                    print(await next(h for h in arrivals if h.done()))
+                    "#,
+                    freed = freed.py()
+                )),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, _, requests) = tree.end().await;
+    assert_eq!(printed(&requests, "p1"), "Thing(n=2)\n");
+}
+
+/// A child released before the host hears an end it made tells the host that end as it is
+/// released, and its kernel keeps nothing of the request. Each child replies with its notice of the
+/// end failing to encode, and holds its round open, so nothing else tells the host: `told`'s memory
+/// frees before its release, and the host records the request answered; `lost`'s does not, and the
+/// request goes all the same.
+#[tokio::test]
+async fn a_release_tells_an_unheard_end_and_keeps_nothing() {
+    let (freed, never) = (Flag::new(), Flag::new());
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_UNHEARD_RELEASE",
+        "",
+        vec![
+            ("ROLE told", replying_then_holding(&freed, &never)),
+            ("ROLE lost", replying_then_holding(&never, &never)),
+            (
+                "",
+                primary_waits(&format!(
+                    r#"
+                    import __main__
+                    for role in ('told', 'lost'):
+                        child = await runtime.spawn(role, prompt=f'ROLE {{role}}', requests={{'fizz': (str, Thing)}})
+                        h = child.channels['fizz'].request('a')
+                        n = (await h).n
+                        if role == 'told':
+                            open({freed}, 'w').close()
+                        await runtime.release([child])
+                        print(role, n, h.status.state, h.id in __main__._works)
+                    "#,
+                    freed = freed.py()
+                )),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(
+        printed(&requests, "p1"),
+        "told 1 accepted False\nlost 1 accepted False\n"
+    );
+    let outcomes: Vec<Value> = kind(&events, "agent.request.settled", None)
+        .into_iter()
+        .map(|event| data(event)["outcome"].clone())
+        .collect();
+    assert_eq!(
+        outcomes,
+        ["accepted"],
+        "told's end, once; lost's is never heard"
+    );
+}
+
+/// A request whose end the host has not heard when the session closes is told then: the child's
+/// notice of its reply fails to encode until memory frees, which it does before the close, while
+/// the child holds its round open, and the report has the request answered, not terminated.
+#[tokio::test]
+async fn the_close_tells_an_unheard_end() {
+    let (freed, closing, finish) = (Flag::new(), Flag::new(), Flag::new());
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_UNHEARD_CLOSE",
+        "",
+        vec![
+            ("ROLE told", replying_then_holding(&freed, &finish)),
+            (
+                "",
+                primary_waits(&format!(
+                    r#"
+                    child = await runtime.spawn('told', prompt='ROLE told', requests={{'fizz': (str, Thing)}})
+                    print((await child.channels['fizz'].request('a')).n)
+                    open({freed}, 'w').close()
+                    open({closing}, 'w').close()
+                    "#,
+                    freed = freed.py(),
+                    closing = closing.py()
+                )),
+            ),
+        ],
+    )
+    .await;
+    let closer = tree.session.closer();
+    let (end, ()) = tokio::join!(round_end(&mut tree.session, "go"), async {
+        raised(&closing).await;
+        closer.close_admission();
+    });
+    assert_eq!(end.reply, "done");
+    finish.raise();
+    let (report, _, requests) = tree.end().await;
+    assert_eq!(printed(&requests, "p1"), "1\n");
+    let outcomes: Vec<_> = report.requests.iter().map(|row| row.outcome).collect();
+    assert_eq!(outcomes, [crate::harness::event::RequestEnd::Accepted]);
+}
+
+/// A request counted on its child before the child's release, and recorded only once the release
+/// has ended the child's kernel -- and so looked at what it holds -- ends released. Its notice of
+/// that fails to encode, and it is kept no longer all the same: nothing would settle it again.
+#[tokio::test]
+async fn a_request_racing_its_childs_release_is_not_kept() {
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_UNHEARD_RACE",
+        "",
+        vec![
+            ("ROLE racer", scripted(vec![text_reply("idle")])),
+            (
+                "",
+                primary_waits(
+                    r#"
+                    import __main__, asyncio, threading, time
+                    child = await runtime.spawn('r', prompt='ROLE racer', requests={'fizz': (str, Thing)})
+                    encode = __main__._encode
+                    def short(message):
+                        if message.get('t') == 'agent.ended' and message.get('agent') == child.id:
+                            raise MemoryError
+                        return encode(message)
+                    __main__._encode = short
+                    record = child._child
+                    take, taken = record.take, threading.Event()
+                    def late(what):
+                        take(what)
+                        taken.set()
+                        while child.id in __main__._kernels:
+                            time.sleep(0.001)
+                    record.take = late
+                    sending = asyncio.ensure_future(asyncio.to_thread(child.channels['fizz'].request, 'late'))
+                    await asyncio.to_thread(taken.wait)
+                    await runtime.release([child])
+                    h = await sending
+                    print(h.status.state, h.status.reason, h.id in __main__._works)
+                    "#,
+                ),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, _, requests) = tree.end().await;
+    assert_eq!(printed(&requests, "p1"), "failed released False\n");
+}
+
+/// A request whose notice to the host fails to encode, as out of memory, is one the host never
+/// settles: cancelled, its notice of that failing too, it is kept no longer.
+#[tokio::test]
+async fn a_request_the_host_never_heard_of_is_not_kept() {
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_UNHEARD_REQUEST",
+        "",
+        vec![
+            ("ROLE unheard", scripted(vec![text_reply("idle")])),
+            (
+                "",
+                primary_waits(
+                    r#"
+                    import __main__
+                    child = await runtime.spawn('u', prompt='ROLE unheard', requests={'fizz': (str, Thing)})
+                    encode = __main__._encode
+                    def short(message):
+                        if message.get('t') == 'agent.request' and message.get('child') == child.id \
+                                or message.get('t') == 'agent.ended' and message.get('agent') == child.id:
+                            raise MemoryError
+                        return encode(message)
+                    __main__._encode = short
+                    h = child.channels['fizz'].request('a')
+                    print(h.cancel(), h.status.state, h.status.reason, h.id in __main__._works)
+                    "#,
+                ),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(printed(&requests, "p1"), "True failed cancelled False\n");
+    assert!(kind(&events, "agent.request.sent", None).is_empty());
+}
+
+/// A request whose notice to the host fails only as it is written -- memory running out once the
+/// whole line has gone -- may be one the host has, and here is: the host cancels it when the child
+/// leaves it unread, its notice of that end failing to encode until memory frees, and the end is
+/// asked for again and heard, so the child takes the next request.
+#[tokio::test]
+async fn a_request_whose_notice_failed_as_it_was_written_is_settled() {
+    let freed = Flag::new();
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_WRITTEN_REQUEST",
+        "",
+        vec![
+            (
+                "ROLE written",
+                scripted(vec![
+                    text_reply("not taking it"),
+                    text_reply("still not"),
+                    submit(
+                        "c1",
+                        "e = await runtime.channels['fizz'].receive()\nawait e.reply(Thing(n=2))",
+                    ),
+                    text_reply("answered"),
+                ]),
+            ),
+            (
+                "",
+                primary_waits(&format!(
+                    r#"
+                    import __main__, asyncio, os
+                    child = await runtime.spawn('w', prompt='ROLE written', requests={{'fizz': (str, Thing)}})
+                    write, encode, failed = __main__._write_line, __main__._encode, []
+                    def written(line):
+                        write(line)
+                        if b'"agent.request"' in line and not failed:
+                            failed.append(line)
+                            raise MemoryError
+                    __main__._write_line = written
+                    h = child.channels['fizz'].request('a')
+                    def short(message):
+                        if message.get('t') == 'agent.ended' and message.get('request') == h.id \
+                                and not os.path.exists({freed}):
+                            raise MemoryError
+                        return encode(message)
+                    __main__._encode = short
+                    try:
+                        await h
+                    except outrig.RequestCancelled:
+                        pass
+                    open({freed}, 'w').close()
+                    print(len(failed), (await asyncio.wait_for(child.channels['fizz'].request('b'), 10)).n)
+                    "#,
+                    freed = freed.py()
+                )),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, _, requests) = tree.end().await;
+    assert_eq!(printed(&requests, "p1"), "1 2\n");
 }
 
 /// Five requests sent before the child receives any, served one per round:
@@ -2209,25 +3084,17 @@ async fn a_spent_budget_ends_the_childs_work_and_stops_the_main_agent() {
     }
 }
 
-/// The budget spent by one child ends what another, idle, holds open: its
-/// runner hears the budget go, and a request it never took ends
-/// `BudgetExhausted` rather than waiting for a round that cannot open.
+/// An idle child holds nothing, so a budget another child spent ends nothing of its: a request
+/// sent to it afterwards wakes its runner, which ends the request `BudgetExhausted` with no round,
+/// and the child is idle, holding nothing.
 #[tokio::test]
-async fn a_spent_budget_ends_what_an_idle_child_holds() {
-    // Each call reports 19 tokens: the primary's first and the idle child's
-    // two spend 57 of 70, and the spender's first spends the rest.
-    let flag = Flag::new();
+async fn a_request_to_an_idle_child_once_the_budget_is_spent_ends_at_once() {
+    // Each call reports 19 tokens: the primary's first and the spender's first spend 38 of 30.
     let mut tree = tree(
         "OUTRIG_TEST_CHILD_BUDGET_IDLE",
-        "token-budget = 70",
+        "token-budget = 30",
         vec![
-            (
-                "ROLE idle",
-                scripted(vec![
-                    submit("a1", &format!("open({}, 'w').close()", flag.py())),
-                    text_reply("not now"),
-                ]),
-            ),
+            ("ROLE idle", scripted(vec![text_reply("never sent")])),
             (
                 "ROLE spender",
                 scripted(vec![submit("b1", "print('spending')"), text_reply("never sent")]),
@@ -2235,18 +3102,23 @@ async fn a_spent_budget_ends_what_an_idle_child_holds() {
             (
                 "",
                 primary_waits(&format!(
-                    r#"
-                    a = await runtime.spawn('a', prompt='ROLE idle', requests={{'fizz': (str, Thing)}})
-                    h = a.channels['fizz'].request('x')
-                    await until(lambda: os.path.exists({flag}) and a.status == 'idle')
+                    "{WATCH}{}",
+                    py(r#"
+                    a = await runtime.spawn('a', prompt='ROLE idle', requests={'fizz': (str, Thing)})
                     b = await runtime.spawn('b', prompt='ROLE spender')
-                    for handle in (b.submit({{}}, result=Total), h):
-                        try:
-                            await asyncio.wait_for(handle, 10)
-                        except outrig.BudgetExhausted:
-                            print('budget', handle.status.reason)
-                    "#,
-                    flag = flag.py()
+                    try:
+                        await asyncio.wait_for(b.submit({}, result=Total), 10)
+                    except outrig.BudgetExhausted:
+                        print('spender budget')
+                    h = a.channels['fizz'].request('x')
+                    watch(a, [h])
+                    try:
+                        await asyncio.wait_for(h, 10)
+                    except outrig.BudgetExhausted:
+                        print('idle', h.status.reason)
+                    await until(lambda: a.status == 'idle')
+                    print(a.status, h.done(), idle_holding)
+                    "#)
                 )),
             ),
         ],
@@ -2256,12 +3128,11 @@ async fn a_spent_budget_ends_what_an_idle_child_holds() {
     let (_, events, requests) = tree.end().await;
     assert_eq!(
         exec_outputs(&events, "agent/primary"),
-        ["budget budget\nbudget budget\n"]
+        ["spender budget\nidle budget\nidle True []\n"]
     );
-    assert_eq!(
-        of_agent(&requests, "ROLE idle").len(),
-        2,
-        "no call after its round"
+    assert!(
+        of_agent(&requests, "ROLE idle").is_empty(),
+        "no round for a request it could not answer"
     );
     assert_eq!(
         of_agent(&requests, "ROLE spender").len(),
@@ -2627,14 +3498,23 @@ async fn requests_max_refuses_the_257th() {
 /// and an unread one until it is cancelled; `submit` counts the same way.
 #[tokio::test]
 async fn requests_max_counts_received_requests_and_submissions() {
+    let (took, go) = (Flag::new(), Flag::new());
     let child = vec![
-        submit("c1", "d1 = await runtime.channels['fizz'].receive()"),
-        text_reply("took one"),
-        text_reply("holding it"),
-        submit("c2", "await d1.reply(Thing(n=1))"),
+        submit(
+            "c1",
+            &format!(
+                "import os\n\
+                 d1 = await runtime.channels['fizz'].receive()\n\
+                 open({took}, 'w').close()\n\
+                 while not os.path.exists({go}):\n    await asyncio.sleep(0.01)\n\
+                 await d1.reply(Thing(n=1))",
+                took = took.py(),
+                go = go.py()
+            ),
+        ),
         text_reply("answered it"),
         submit(
-            "c3",
+            "c2",
             &py(r#"
                 for _ in range(2):
                     d = await runtime.channels['fizz'].receive()
@@ -2650,23 +3530,26 @@ async fn requests_max_counts_received_requests_and_submissions() {
             ("ROLE slow", scripted(child)),
             (
                 "",
-                primary_waits(
+                primary_waits(&format!(
                     r#"
-                    child = await runtime.spawn('s', prompt='ROLE slow', requests={'fizz': (str, Thing)})
+                    child = await runtime.spawn('s', prompt='ROLE slow', requests={{'fizz': (str, Thing)}})
                     h1 = child.channels['fizz'].request('a')
                     h2 = child.channels['fizz'].request('b')
-                    await until(lambda: h1.status.state == 'received' and child.status == 'idle')
+                    await until(lambda: os.path.exists({took}))
                     try:
                         child.channels['fizz'].request('c')
                     except outrig.AgentLimitReached:
                         print('refused')
                     print(h2.cancel())
                     h3 = child.channels['fizz'].request('c')
+                    open({go}, 'w').close()
                     print((await h1).n)
                     h4 = child.channels['fizz'].request('d')
                     print((await h3).n == h3.id, (await h4).n == h4.id)
                     "#,
-                ),
+                    took = took.py(),
+                    go = go.py()
+                )),
             ),
         ],
     )
@@ -2792,7 +3675,7 @@ async fn a_release_batch_is_all_or_nothing() {
 /// cancelled and its kernel is gone.
 #[tokio::test]
 async fn a_released_childs_subtree_goes_with_it() {
-    let log = Flag::new();
+    let (log, held) = (Flag::new(), Flag::new());
     let middle = format!(
         r#"
         d = await runtime.channels['fizz'].receive()
@@ -2808,22 +3691,19 @@ async fn a_released_childs_subtree_goes_with_it() {
         sleeping = asyncio.create_task(forever())
         while below.status.state != 'running':
             await asyncio.sleep(0.01)
+        open({held}, 'w').close()
+        while True:
+            await asyncio.sleep(0.05)
         "#,
-        log = log.py()
+        log = log.py(),
+        held = held.py()
     );
     let mut tree = tree(
         "OUTRIG_TEST_CHILD_SUBTREE",
         "",
         vec![
             ("ROLE leaf", scripted(child_runs("l1", "await asyncio.sleep(3600)"))),
-            (
-                "ROLE middle",
-                scripted(vec![
-                    submit("m1", &py(&middle)),
-                    text_reply("working on it"),
-                    text_reply("still working on it"),
-                ]),
-            ),
+            ("ROLE middle", scripted(vec![submit("m1", &py(&middle))])),
             (
                 "",
                 primary_waits(&format!(
@@ -2831,7 +3711,7 @@ async fn a_released_childs_subtree_goes_with_it() {
                     import __main__
                     middle = await runtime.spawn('m', prompt='ROLE middle', requests={{'fizz': (str, Thing)}})
                     h = middle.channels['fizz'].request('a')
-                    await until(lambda: h.status.state == 'received' and middle.status == 'idle')
+                    await until(lambda: os.path.exists({held}))
                     await runtime.release([middle])
                     try:
                         await h
@@ -2839,7 +3719,8 @@ async fn a_released_childs_subtree_goes_with_it() {
                         print('released', middle.status)
                     print(open({log}).read(), middle.id in __main__._kernels)
                     "#,
-                    log = log.py()
+                    log = log.py(),
+                    held = held.py()
                 )),
             ),
         ],
@@ -3083,7 +3964,7 @@ async fn at_the_close_every_wait_raises_and_none_hangs() {
         "",
         vec![
             ("ROLE worker", scripted(child_runs("c1", &wait_to_finish))),
-            ("ROLE ignoring", scripted(vec![text_reply("not now")])),
+            ("ROLE ignoring", scripted(child_runs("c1", &wait_to_finish))),
             (
                 "ROLE holder",
                 scripted(child_runs(
@@ -3099,7 +3980,9 @@ async fn at_the_close_every_wait_raises_and_none_hangs() {
             (
                 "",
                 primary_waits(&format!(
-                    r#"
+                    "{WATCH}{}",
+                    py(&format!(
+                        r#"
                     spec = {{'fizz': (str, Thing)}}
                     w = await runtime.spawn('w', prompt='ROLE worker')
                     running = w.submit({{}}, result=Total)
@@ -3108,6 +3991,8 @@ async fn at_the_close_every_wait_raises_and_none_hangs() {
                     k = await runtime.spawn('k', prompt='ROLE holder', requests=spec)
                     answered = k.channels['fizz'].request('first')
                     received = k.channels['fizz'].request('second')
+                    for child, handles in ((w, [running]), (i, [waiting]), (k, [answered, received])):
+                        watch(child, handles)
                     await until(lambda: running.status.state == 'running' and received.status.state == 'received')
                     open({closing}, 'w').close()
                     await until(lambda: running.done() and waiting.done() and received.done())
@@ -3131,8 +4016,10 @@ async fn at_the_close_every_wait_raises_and_none_hangs() {
                         await runtime.spawn('late', prompt='ROLE late')
                     except outrig.SessionClosing:
                         print('no spawn', time.monotonic() - started < 1)
+                    print(idle_holding)
                     "#,
-                    closing = closing.py()
+                        closing = closing.py()
+                    ))
                 )),
             ),
         ],
@@ -3149,7 +4036,7 @@ async fn at_the_close_every_wait_raises_and_none_hangs() {
     let all = "['await', 'asyncio.wait', 'again'] closed";
     assert_eq!(
         printed(&requests, "p1"),
-        format!("running {all}\nwaiting {all}\nreceived {all}\n1\nno spawn True\n")
+        format!("running {all}\nwaiting {all}\nreceived {all}\n1\nno spawn True\n[]\n")
     );
     assert_eq!(report.requests.len(), 3);
     assert!(

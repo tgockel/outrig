@@ -14,7 +14,9 @@ whose instance is one long-lived child answering typed requests. On 2026-10-02, 
 critique, the body check was dropped in favor of ignoring the body, the trailing round stopped
 counting an attempt, and two session-wide limits were added ("Placement and limits"). On
 2026-10-05, after the follow-up review, a call whose child ends two rounds without completing
-settles `CompletionRejected` instead of staying open ("Validation and repair"). This page is the
+settled `CompletionRejected` instead of staying open, and on 2026-10-26 (`0003-37`) one whose child
+ends its rounds without completing after a warning is cancelled instead ("Validation and
+repair"). This page is the
 function form, one fresh child per call; a host program as the declaring side -- types declared
 in a script, replies decoded there -- is "Declared on the host" (`0003-35`).
 
@@ -297,26 +299,29 @@ bounded: each problem's JSON path, what is wrong, and the expected shape. The ch
 value and calls `complete` again. Nothing it ran before is run again -- its earlier executions,
 hosted calls and model turns stand, and only the final answer is redone.
 
-**A child whose round ends without a completion that passed is prompted once more, and a second
-such round ends the call.** The host opens a round only when a child's queue state has changed
-since the last round it opened on that state -- the state at the last nudge is the baseline, and
-an announcement during a round moves it nowhere -- one rule for every child that
+**A child whose round ends without a completion that passed is asked once more, then warned, and
+a third such round cancels the call.** The host opens a round only when a child's queue state has
+changed since the last round it opened on that state -- the state at the last nudge is the
+baseline, and an announcement during a round moves it nowhere -- and a round that leaves the state
+as it was is followed by a warning, and then a cancel: one rule for every child that
 `agent-classes.md` states in full ("The child's rounds"). For a work child that state is its one
 submission: the submission's round opened on new work, and a round that ends without completing
 leaves it unanswered, which differs, so one round opens asking for the result by the submission's
 id. If that round ends without a completion that passed too, nothing has changed since it opened,
-and where a request child would go idle the call settles with `CompletionRejected` whose message
-says the child ended without completing, and its child is released. Decided on 2026-10-05, after
-the follow-up review, replacing a call left open with its child resident until the caller ended
-it. `0003-37`, decided on 2026-10-26, changes this ending: after a warning round, a child that
-still changes nothing is cancelled, not rejected. Only a completion that failed a check counts
-toward the per-request attempt limit, 3 by default (`work.md`); past it the call settles with
-`CompletionRejected` carrying the last value submitted and its problems. The two ends are one
-exception with different contents, and neither re-runs anything. The prompted round counts no
-attempt: a round ending with the submission open is not evidence of a bad answer, and the token
-budget bounds spend (`work.md`, "A request settles once"). A call can still be long, since a
-child's own waits happen inside executions, where no round ends, so a workflow that fans out
-bounds its own waiting as well ("A workflow").
+and the warning round opens: it names the submission, `runtime.complete`, `runtime.fail` and
+`runtime.wait`, and says that ending the round with the submission open cancels it. When that one
+ends so too, the call settles with `RequestCancelled`, whose message says the child ended its rounds
+without completing it, and its child is released. Decided on 2026-10-26 (`0003-37`), replacing a
+`CompletionRejected` after two rounds, which on 2026-10-05 had replaced a call left open with its
+child resident until the caller ended it. A child that cannot complete the call ends it with `await
+runtime.fail(message)`, and the call settles with `AgentRequestFailed` carrying the message. Only a
+completion that failed a check counts toward the per-request attempt limit, 3 by default
+(`work.md`); past it the call settles with `CompletionRejected` carrying the last value submitted
+and its problems. Neither end re-runs anything. The rounds that ask again count no attempt: a round
+ending with the submission open is not evidence of a bad answer, and the token budget bounds spend
+(`work.md`, "A request settles once"). A call can still be long, since a child's own waits happen
+inside executions, where no round ends, so a workflow that fans out bounds its own waiting as well
+("A workflow").
 
 ## Calling
 
@@ -508,11 +513,12 @@ What it guarantees:
   at once. The host's limits are the session's (`work.md`): without the semaphore a diff of 65
   sections would launch 64 children and fail the 65th with `AgentLimitReached`, and however many
   children run, at most `model-concurrency-max` of their model requests are in flight.
-- **A child that stops working does not hold the review open.** A call whose child ends two
-  rounds without completing settles with `CompletionRejected` ("Validation and repair") and is one
-  more failed section. `timeout` bounds the whole gather for a child still working, slowly, inside
-  an execution; it ends the wait and nothing else, so the `finally` cancels every open handle,
-  which releases each child, and `main` raises `TimeoutError`. `None` removes the bound.
+- **A child that stops working does not hold the review open.** A call whose child ends its
+  rounds without completing, after a warning, settles with `RequestCancelled` ("Validation and
+  repair") and is one more failed section. `timeout` bounds the whole gather for a child still
+  working, slowly, inside an execution; it ends the wait and nothing else, so the `finally`
+  cancels every open handle, which releases each child, and `main` raises `TimeoutError`. `None`
+  removes the bound.
 - **An interruption stops the children.** Cancelling `main` cancels the gather's waiters, which
   cancels no child; the `finally` cancels every handle not yet settled, and each cancelled call
   releases its child.

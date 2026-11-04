@@ -154,13 +154,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the notice, so a call still rebuilds from the log. (#722) A reply the agent could use,
   reasoning or the start of an answer, that the provider ended with `content_filter` or `refusal`
   is no turn the model ended, and is treated as the empty one is: retried, sent once more without
-  the results, and left out of the conversation. It had been read as the model finishing, and two
-  such rounds rejected a child's request as ended without completing, though the child never chose
-  to stop. (#755) A work child's request rejected for its rounds ending without completing raises
-  a `CompletionRejected` whose `__cause__` is an `AgentRequestFailed` saying how a model call
-  ended a round, when one did after the round's code ran, so a parent can tell a provider that
-  refused the replies from a child that gave up; `agent.request.settled` records the same text as
-  `cause`. (#756) An alias naming
+  the results, and left out of the conversation. It had been read as the model finishing, and such
+  rounds ended a child's request as though the child had stopped, though it never chose to. (#755)
+  A work child's submission cancelled for its rounds ending without completing it raises a
+  `RequestCancelled` whose `__cause__` is an `AgentRequestFailed` saying how a model call ended a
+  round, when one did after the round's code ran, so a parent can tell a provider that refused the
+  replies from a child that gave up; `agent.request.settled` records the same text as `cause`.
+  (#756) An alias naming
   several models resolves to each this build can reach, in order, and a call that still fails moves
   to the next, starting again at the first on every call. Each model a call goes to is sent a view
   assembled for its own window, and carries its own reply ceiling, so a turn too large for the first
@@ -470,7 +470,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `await runtime.spawn(name, prompt=..., model=None, inputs=None, requests=None)` launches a child
   as a kernel of the session's interpreter, with its own namespace, model and rounds, which the
   engine drives. A work child takes submissions, `child.submit(inputs, result=T, attempts=3)`, one
-  at a time with the rest queued, and answers each with `await runtime.complete(value)`. A request
+  at a time with the rest queued, and answers each with `await runtime.complete(value)`, or ends
+  one it cannot complete with `await runtime.fail(message)`. A request
   child, `requests={"fizz": outrig.Request(str, Thing, doc=...)}`, answers requests sent with
   `child.channels["fizz"].request(body)` by `await delivery.reply(value)` or `await
   delivery.fail(message)`. Each returns a handle at once: `await handle` gives an instance of the
@@ -490,12 +491,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The engine opens a child's round when what it holds -- the requests waiting unread, and those
   it took and has not answered -- has changed since the last round opened on it, and holds
   something: a request to an idle child starts a round, a child that answered anything gets the
-  next, a request it took and left unanswered earns one more, and an unchanged state opens
-  nothing. A work child whose round and the one after both end without completing ends its
-  submission `CompletionRejected`. A child's round whose model call fails is tried again after a
-  wait -- as it was, when its code never ran, and otherwise on what is open then, so work its code
-  finished is not given again -- unless the failure cannot clear, a refused key say, which fails
-  what the child holds. `Config` and `Agent` gain four limits, set at the top level or under
+  next, and a request it took and left unanswered gets a round naming it. A round that leaves
+  that state as it was is followed by a warning round, and when the warning round changes nothing
+  either, every request the child holds is cancelled: its sender's handle raises
+  `RequestCancelled`, saying the child ended its rounds without answering it, and
+  `agent.request.cancelled` carries the engine's `reason`, which a sender's own cancel leaves
+  `None`. A child is idle only when it holds nothing, so a request is either being worked on or
+  cancelled, and `CompletionRejected` means only answers that failed their check past the attempt
+  limit. A child's round whose model call fails is tried again after a wait -- as it was, when its
+  code never ran, and otherwise on what is open then, so work its code finished is not given again
+  -- unless the failure cannot clear, a refused key say, which fails what the child holds.
+  `Config` and `Agent` gain four limits, set at the top level or under
   `[agents.<name>]`: `children_max` (64 by default, 1 to 1024) children resident at once,
   `model_concurrency_max` (8, 1 to 128) model requests in flight across the session, each holding
   its place until what it used is counted, and `requests_max` (256, 1 to 4096) unsettled requests

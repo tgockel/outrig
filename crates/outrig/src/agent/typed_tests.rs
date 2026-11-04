@@ -418,12 +418,11 @@ async fn a_typed_calls_round_ends_when_its_submission_is_accepted() {
     }
 }
 
-/// A child that ends its submission's round and the one more round asking
-/// for the result without completing fails the call `CompletionRejected`,
-/// saying so; the mock gets no third call, no answer was counted, and the
-/// child is released.
+/// A child that ends its submission's round, the round asking for the result and the warning
+/// round without completing has the call cancelled, saying so: the mock gets no fourth call, no
+/// answer was counted, and the child is released.
 #[tokio::test]
-async fn a_child_that_ends_two_rounds_without_completing_fails_the_call() {
+async fn a_child_that_never_completes_has_the_call_cancelled() {
     let mut tree = tree(
         "OUTRIG_TEST_TYPED_ONE_SHOT",
         "",
@@ -446,7 +445,7 @@ async fn a_child_that_ends_two_rounds_without_completing_fails_the_call() {
                     try:
                         await h
                     except outrig.AgentError as e:
-                        print(type(e).__name__, 'ended without completing' in str(e), h.status)
+                        print(type(e).__name__, 'without completing it' in str(e), h.status)
                     "#,
                 ),
             ),
@@ -454,21 +453,76 @@ async fn a_child_that_ends_two_rounds_without_completing_fails_the_call() {
     )
     .await;
     round(&mut tree.session, "go").await;
-    let (events, requests) =
-        one_call(tree, "c1", "outrig_session_primary", "stubborn", "rejected").await;
+    let (events, requests) = one_call(
+        tree,
+        "c1",
+        "outrig_session_primary",
+        "stubborn",
+        "cancelled",
+    )
+    .await;
     assert_eq!(
         printed(&requests, "p1"),
-        "CompletionRejected True failed: rejected (child released)\n"
+        "RequestCancelled True failed: cancelled (child released)\n"
     );
-    assert_eq!(
-        of_agent(&requests, "ROLE stubborn").len(),
-        2,
-        "no third call"
+    let child = of_agent(&requests, "ROLE stubborn");
+    assert_eq!(child.len(), 3, "no fourth call");
+    let warning = opening(child[2]);
+    assert!(
+        warning.contains("your last two rounds ended without completing it")
+            && warning.contains("`await runtime.fail(message)`"),
+        "{warning}"
     );
     assert!(kind(&events, "agent.request.invalid", None).is_empty());
     assert_eq!(
         data(kind(&events, "agent.request.settled", None)[0])["outcome"],
-        "rejected"
+        "cancelled"
+    );
+}
+
+/// A call's child that cannot complete it says so with `runtime.fail`: the call fails with
+/// `AgentRequestFailed` carrying its message, at once, and the child is released.
+#[tokio::test]
+async fn a_child_that_cannot_complete_fails_the_call_saying_why() {
+    let mut tree = tree(
+        "OUTRIG_TEST_TYPED_FAIL",
+        "",
+        vec![
+            (
+                "ROLE unable",
+                scripted(child_runs(
+                    "c1",
+                    "await runtime.fail('there is no such country')",
+                )),
+            ),
+            (
+                "",
+                primary_waits(
+                    r#"
+                    @outrig.agent
+                    async def unable(n: int) -> Total:
+                        "ROLE unable: cannot do it"
+                    h = unable(1)
+                    try:
+                        await h
+                    except outrig.AgentRequestFailed as e:
+                        print(e.message, h.status)
+                    "#,
+                ),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, requests) = one_call(tree, "c1", "outrig_session_primary", "unable", "failed").await;
+    assert_eq!(
+        printed(&requests, "p1"),
+        "there is no such country failed: failed (child released)\n"
+    );
+    let system = system_text(&of_agent(&requests, "ROLE unable")[0].body);
+    assert!(
+        system.contains("A call you cannot complete you end with `await runtime.fail(message)`"),
+        "{system}"
     );
 }
 

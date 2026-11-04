@@ -102,12 +102,6 @@ was built from the phase's exit criteria instead and silently omitted discovery,
 observability -- the exit criteria describe the first milestone, the deliverables describe the
 phase.
 
-**Children**
-
-| Task      | What it settles                                                    |
-| --------- | ------------------------------------------------------------------ |
-| `0003-37` | A request is worked on or cancelled, and its sender is told        |
-
 **Documentation of the first 37**
 
 | Task      | What it settles                                                    |

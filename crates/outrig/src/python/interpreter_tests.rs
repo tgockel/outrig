@@ -4932,6 +4932,7 @@ fn help_on_a_runtime_names_the_channels_that_agent_has() {
     );
     assert!(
         work.contains("await runtime.complete(value)")
+            && work.contains("await runtime.fail(message)")
             && work.contains("runtime.channels[\"progress\"]")
             && !work.contains("the user reaches you and you reach them"),
         "{work}"
@@ -4939,9 +4940,11 @@ fn help_on_a_runtime_names_the_channels_that_agent_has() {
     assert!(
         request.contains("await d.reply(value)")
             && request.contains("no `runtime.complete`")
+            && !request.contains("runtime.fail")
             && !request.contains("runtime.channels[\"progress\"]"),
         "{request}"
     );
+    assert!(!primary.contains("runtime.fail"), "{primary}");
 }
 
 /// A request crosses to the child as a copy of its body; a reply that fails its check raises in
@@ -5230,11 +5233,12 @@ fn a_request_the_host_ended_before_it_was_queued_is_not_queued() {
     assert_eq!(said, "failed 0 0\n");
 }
 
-/// A rejection the host gives a `cause` raises `CompletionRejected` with an `AgentRequestFailed`
-/// as its `__cause__`, as `raise ... from` makes it, so a traceback shows both, and the host hears
-/// the cause in the end; one it gives none has no `__cause__`.
+/// A cancel the host gives a `cause` raises `RequestCancelled` with an `AgentRequestFailed` as its
+/// `__cause__`, as `raise ... from` makes it, so a traceback shows both, and the host hears the
+/// cause in the end; one it gives none has no `__cause__`. A host that sends a rejection, which it
+/// no longer makes, ends nothing.
 #[test]
-fn a_rejection_with_a_cause_raises_it_chained() {
+fn a_host_cancel_with_a_cause_raises_it_chained() {
     let mut k = Interpreter::start();
     k.output(1, "import outrig");
     k.spawn_as(2, "work = await runtime.spawn('w', prompt='p')", "c1");
@@ -5248,6 +5252,10 @@ fn a_rejection_with_a_cause_raises_it_chained() {
         .filter(|n| n["t"] == "agent.request")
         .collect();
     assert_eq!(sent.len(), 2, "{notices:?}");
+    k.send(json!({
+        "t": "settle", "agent": "c1", "id": sent[0]["request"],
+        "outcome": "rejected", "message": "ended without completing", "cause": null,
+    }));
     let mut ended = Vec::new();
     for (request, cause) in sent
         .iter()
@@ -5255,26 +5263,196 @@ fn a_rejection_with_a_cause_raises_it_chained() {
     {
         k.send(json!({
             "t": "settle", "agent": request["child"], "id": request["request"],
-            "outcome": "rejected", "message": "ended without completing", "cause": cause,
+            "outcome": "cancelled", "cause": cause,
+            "message": format!(
+                "submission {} was cancelled: the child ended its rounds without completing it",
+                request["request"]
+            ),
         }));
         ended.push(k.until("agent.ended", Vec::new()).1);
     }
+    assert_eq!(
+        ended[0]["request"], sent[0]["request"],
+        "the rejection ended nothing"
+    );
+    assert_eq!(ended[0]["outcome"], "cancelled");
+    assert_eq!(ended[0]["received"], false, "never given to the child");
     assert_eq!(ended[0]["cause"], "finish reason content_filter");
     assert!(ended[1]["cause"].is_null(), "{}", ended[1]);
+    let said = k.output(
+        4,
+        "import traceback\n\
+         for h in (chained, plain):\n    \
+             try:\n        \
+                 await h\n    \
+             except outrig.RequestCancelled as e:\n        \
+                 shown = ''.join(traceback.format_exception(e))\n        \
+                 print(e, '|', type(e.__cause__).__name__, e.__cause__, '|', \
+                       'direct cause' in shown, '|', h.status)",
+    );
+    let lines: Vec<&str> = said.lines().collect();
+    assert_eq!(lines.len(), 2, "{said}");
+    assert!(
+        lines[0].ends_with(
+            "was cancelled: the child ended its rounds without completing it | \
+             AgentRequestFailed finish reason content_filter | True | failed: cancelled (child \
+             idle)"
+        ),
+        "{said}"
+    );
+    assert!(
+        lines[1].ends_with(
+            "without completing it | NoneType None | False | failed: cancelled (child idle)"
+        ),
+        "{said}"
+    );
+}
+
+/// The host's cancel of a request takes one still unread out of the child's queue before it ends
+/// it, as `h.cancel()` does: `received` is false, `pending()` is 0, and the child never takes it.
+/// One the child took ends `received`, and the child's answer to it after raises
+/// `RequestCancelled` carrying why. Each sender's exception says the host's why, and a sender's
+/// own cancel, as before, says it was its sender's.
+#[test]
+fn a_host_cancel_withdraws_an_unread_request_and_refuses_a_late_answer() {
+    let mut k = Interpreter::start();
+    k.output(1, &format!("{THING}import outrig"));
+    k.spawn_as(
+        2,
+        "child = await runtime.spawn('r', prompt='p', requests={'fizz': (str, Thing)})",
+        "c1",
+    );
+    let (_, notices) = k.noted(
+        PRIMARY,
+        3,
+        "taken = child.channels['fizz'].request('a')\n\
+         unread = child.channels['fizz'].request('b')\n\
+         mine = child.channels['fizz'].request('c')",
+    );
+    let ids: Vec<Value> = notices
+        .iter()
+        .filter(|n| n["t"] == "agent.request")
+        .map(|n| n["request"].clone())
+        .collect();
+    assert_eq!(ids.len(), 3, "{notices:?}");
+    k.noted("c1", 4, "d = await runtime.channels['fizz'].receive()");
+    let mut ended = Vec::new();
+    for (id, without) in ids.iter().zip(["answering", "reading"]) {
+        k.send(json!({
+            "t": "settle", "agent": "c1", "id": id, "outcome": "cancelled", "cause": null,
+            "message": format!(
+                "request {id} was cancelled: the child ended its rounds without {without} it"
+            ),
+        }));
+        ended.push(k.until("agent.ended", Vec::new()).1);
+    }
+    assert_eq!(
+        [&ended[0]["received"], &ended[1]["received"]],
+        [&json!(true), &json!(false)]
+    );
+    assert!(
+        ended
+            .iter()
+            .all(|end| end["outcome"] == "cancelled" && end["message"].is_string()),
+        "{ended:?}"
+    );
+    let (said, _) = k.noted(
+        PRIMARY,
+        5,
+        "mine.cancel()\n\
+         print(child.channels['fizz'].pending())\n\
+         for h in (taken, unread, mine):\n    \
+             try:\n        \
+                 await h\n    \
+             except outrig.RequestCancelled as e:\n        \
+                 print(e, '|', h.status.state, h.status.reason)",
+    );
+    assert_eq!(
+        said,
+        format!(
+            "0\n\
+             request {} was cancelled: the child ended its rounds without answering it | failed \
+             cancelled\n\
+             request {} was cancelled: the child ended its rounds without reading it | failed \
+             cancelled\n\
+             request {} on child 'r' (c1)'s channel 'fizz' was cancelled by its sender | failed \
+             cancelled\n",
+            ids[0], ids[1], ids[2]
+        )
+    );
+    let (late, notices) = k.exec_collecting("c1", 6, "await d.reply(Thing(n=1))");
+    assert!(
+        text(&late["error"]).contains(&format!(
+            "RequestCancelled: request {} was cancelled: the child ended its rounds without \
+             answering it; it takes no answer",
+            ids[0]
+        )),
+        "{late}"
+    );
+    assert_eq!(notice(&notices, "agent.refused")["ended"], "cancelled");
+    let (late, _) = k.exec_collecting("c1", 7, "await d.fail('too late')");
+    assert!(text(&late["error"]).contains("RequestCancelled"), "{late}");
+    let (none, notices) = k.exec_collecting(
+        "c1",
+        8,
+        "await asyncio.wait_for(runtime.channels['fizz'].receive(), 0.2)",
+    );
+    assert!(text(&none["error"]).contains("TimeoutError"), "{none}");
+    assert!(
+        notices.iter().all(|n| n["t"] != "agent.received"),
+        "the cancelled requests were never taken: {notices:?}"
+    );
+}
+
+/// A work child ends a submission it cannot complete with `runtime.fail(message)`: its sender's
+/// handle raises `AgentRequestFailed` carrying the message, and a second end raises. A work child
+/// given nothing yet has nothing to fail; the primary and a request child have no
+/// `runtime.fail`, each told what it has instead.
+#[test]
+fn runtime_fail_ends_a_submission_and_only_a_work_child_has_it() {
+    let mut k = Interpreter::start();
+    k.output(1, "import outrig");
+    k.spawn_as(2, "work = await runtime.spawn('w', prompt='p')", "c1");
+    let (early, _) = k.exec_collecting("c1", 3, "await runtime.fail('nothing yet')");
+    assert!(text(&early["error"]).contains("nothing to fail"), "{early}");
+    let (_, notices) = k.noted(PRIMARY, 4, "h = work.submit({}, result=int)");
+    let request = notice(&notices, "agent.request")["request"].clone();
+    k.send(json!({"t": "assign", "agent": "c1", "id": 60}));
+    let (_, assigned) = k.until("agent.assigned", Vec::new());
+    assert_eq!(assigned["request"], request);
+    let (_, notices) = k.noted("c1", 5, "await runtime.fail('no such file')");
+    let ended = notice(&notices, "agent.ended");
+    assert_eq!(
+        (&ended["outcome"], &ended["message"]),
+        (&json!("failed"), &json!("no such file"))
+    );
     assert_eq!(
         k.output(
-            4,
-            "import traceback\n\
-             for h in (chained, plain):\n    \
-                 try:\n        \
-                     await h\n    \
-                 except outrig.CompletionRejected as e:\n        \
-                     shown = ''.join(traceback.format_exception(e))\n        \
-                     print(e, '|', type(e.__cause__).__name__, e.__cause__, '|', \
-                           'direct cause' in shown)"
+            6,
+            "try:\n    await h\n\
+             except outrig.AgentRequestFailed as e:\n    print(e.message, h.status)"
         ),
-        "ended without completing | AgentRequestFailed finish reason content_filter | True\n\
-         ended without completing | NoneType None | False\n"
+        "no such file failed: failed (child idle)\n"
+    );
+    let (again, _) = k.exec_collecting("c1", 7, "await runtime.fail('again')");
+    assert!(text(&again["error"]).contains("RequestSettled"), "{again}");
+
+    let primary = k.exec(8, "runtime.fail");
+    assert!(
+        text(&primary["error"]).contains("runtime.fail is a work child's")
+            && text(&primary["error"]).contains("this agent is no child"),
+        "{primary}"
+    );
+    k.spawn_as(
+        9,
+        "r = await runtime.spawn('r', prompt='p', requests={'fizz': (str, int)})",
+        "c2",
+    );
+    let (request_child, _) = k.exec_collecting("c2", 10, "runtime.fail");
+    assert!(
+        text(&request_child["error"]).contains("has no runtime.fail")
+            && text(&request_child["error"]).contains("await d.fail(message)"),
+        "{request_child}"
     );
 }
 

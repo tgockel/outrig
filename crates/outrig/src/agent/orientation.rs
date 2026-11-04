@@ -115,6 +115,15 @@ pub(crate) fn preamble(
 const WAIT: &str = "`runtime.wait` is `asyncio.wait`: the same arguments, the same `(done, pending)` \
                     back, and a timeout that cancels nothing.\n\n";
 
+/// What every child is told of ending a round, which no request outlives
+/// for long.
+const NOT_WAITING: &str = "Ending your round is not waiting: nothing opens a round when what you \
+                           waited on finishes, so wait inside the round, with `runtime.wait`.";
+
+/// What the warning before a cancel says of the round that ended.
+const NOT_A_WAIT: &str = "A round's end is not a wait: nothing opens a round when what you waited \
+                          on finishes.";
+
 /// What every agent is told after how it is reached: its conversation, a
 /// round beginning `begins`, its working directory, the interpreter, and the
 /// session's bindings.
@@ -230,24 +239,29 @@ pub(crate) fn child_preamble(
                  with every dataclass it uses -- or its JSON form:\n\n{}\n\n\
                  It returns once the value is accepted, which ends the call; nothing more is \
                  asked of you. One that is not accepted raises what is wrong, each problem with \
-                 its path, so correct it and complete again. A round that ends with the \
-                 submission open is followed by one more, and if that one ends with it open too, \
-                 the call fails. `await runtime.channels[\"progress\"].send(text)` tells your \
-                 caller how far you have got, and settles nothing.\n\n{WAIT}",
+                 its path, so correct it and complete again. A call you cannot complete you end \
+                 with `await runtime.fail(message)`, saying why. {NOT_WAITING} A round that ends \
+                 with the submission open is followed by up to two more, the last warning that \
+                 the call is cancelled if it ends the same way. `await \
+                 runtime.channels[\"progress\"].send(text)` tells your caller how far you have \
+                 got, and settles nothing.\n\n{WAIT}",
                 indented(schema)
             );
-            "on the call's submission, and once more if that round leaves it open"
+            "on the call's submission, and up to twice more while rounds leave it open"
         }
         ChildBrief::Work => {
-            text.push_str(
+            let _ = write!(
+                text,
                 "Your work arrives as submissions. A round opens on each one, naming it, binding \
                  its inputs as variables, and giving the type of the result it asks for, whose \
                  class -- and every dataclass it uses -- is bound under its name. Complete it with \
                  `await runtime.complete(value)`, `value` an instance of that type or its JSON \
                  form. It returns once the value is accepted, which ends the submission; one that \
                  is not accepted raises what is wrong, each problem with its path, so correct it \
-                 and complete again. A round that ends with the submission open is followed by \
-                 one more, and if that one ends with it open too, the submission fails. `await \
+                 and complete again. A submission you cannot complete you end with `await \
+                 runtime.fail(message)`, saying why. {NOT_WAITING} A round that ends with the \
+                 submission open is followed by up to two more, the last warning that it is \
+                 cancelled if it ends the same way. `await \
                  runtime.channels[\"progress\"].send(text)` tells your caller how far you have \
                  got, and settles nothing.\n\n",
             );
@@ -277,11 +291,19 @@ pub(crate) fn child_preamble(
                  uses -- or its JSON form. It returns once the reply is accepted; one that is not \
                  raises what is wrong, each problem with its path, so correct it and reply again. \
                  A request you cannot answer you end with `await d.fail(message)`, saying why. \
-                 You have no `runtime.complete`.\n\n\
+                 Only `d.reply` and `d.fail` answer: what you write yourself is not delivered to \
+                 the request's sender. You have no `runtime.complete`.\n\n\
                  `runtime.wait` is `asyncio.wait` -- the same arguments, the same `(done, pending)` \
                  back, and a timeout that cancels nothing -- except that while a request waits \
                  unread, it raises `runtime.MessageAvailable`, which `except Exception` does not \
                  catch. The request stays queued and the tasks keep running.\n\n",
+            );
+            let _ = write!(
+                text,
+                "{NOT_WAITING} Code you leave running when you stop writing keeps no request \
+                 open. A round that ends with a request unread or unanswered is followed by up to \
+                 two more, the last warning that the requests are cancelled if it ends the same \
+                 way, and each sender then gets an exception.\n\n"
             );
             match brief {
                 ChildBrief::Instance(_) => {
@@ -458,12 +480,57 @@ pub(crate) fn submission(
 }
 
 /// What a work child is told when its submission's round ended without
-/// completing it: the one more round it gets.
+/// completing it: a round that asks for it.
 pub(crate) fn nudge(id: u64, result_type: &str) -> String {
     format!(
         "submission {id} is still open: your last round ended without completing it. Complete \
-         it now with `await runtime.complete(value)`, `value` a `{result_type}`; if this round \
-         ends without that too, the submission fails"
+         it now with `await runtime.complete(value)`, `value` a `{result_type}`"
+    )
+}
+
+/// What a work child is told as a round opens on submission `id`, which its
+/// last two rounds left open: each way to end it, that a round's end is not a
+/// wait, and that ending this round with it open cancels it.
+pub(crate) fn submission_warning(id: u64, result_type: &str) -> (String, String) {
+    (
+        format!("submission {id} is still open: your last two rounds ended without completing it"),
+        format!(
+            "Complete it with `await runtime.complete(value)`, `value` a `{result_type}`; end it \
+             with `await runtime.fail(message)`, saying why, if you cannot; or wait for what you \
+             need with `runtime.wait`. {NOT_A_WAIT} If this round ends with it open, it is \
+             cancelled, and its caller gets an exception."
+        ),
+    )
+}
+
+/// What a request child is told as a round opens on what its last round left
+/// as it was: `outstanding`, in [`requests`]' words; that a round's end is not
+/// a wait; each way out, a receive first on each channel `unread_on` names,
+/// where requests wait unread; and that ending this round so cancels them.
+pub(crate) fn requests_warning(outstanding: &str, unread_on: &[String]) -> (String, String) {
+    let mut detail = format!(
+        "{NOT_A_WAIT} Answer a request with `await d.reply(value)`, or end one you cannot answer \
+         with `await d.fail(message)`. "
+    );
+    if !unread_on.is_empty() {
+        let receives: Vec<String> = unread_on
+            .iter()
+            .map(|channel| format!("`await runtime.channels[{channel:?}].receive()`"))
+            .collect();
+        let _ = write!(
+            detail,
+            "Take an unread one first, with {}: `runtime.wait` raises \
+             `runtime.MessageAvailable` while one waits unread. ",
+            receives.join(" or ")
+        );
+    }
+    detail.push_str(
+        "Wait for what you need with `runtime.wait`. If this round ends with any of them \
+         unanswered, they are cancelled, and each sender gets an exception.",
+    );
+    (
+        format!("your last round ended with requests unanswered: {outstanding}"),
+        detail,
     )
 }
 
@@ -570,5 +637,127 @@ mod tests {
         assert!(!detail.contains("SCHEMA"), "{detail}");
         let (_, detail) = submission(4, &inputs, "Fact", "{SCHEMA}");
         assert!(detail.contains("SCHEMA"), "{detail}");
+    }
+
+    /// The first nudge asks for what is open and says nothing of what follows: a request
+    /// child's names each request it took, by id, channel and wait, and counts the unread; a
+    /// work child's asks for the result by the submission's id.
+    #[test]
+    fn the_first_nudge_asks_and_says_nothing_of_what_follows() {
+        let taken = [(7, "fizz".to_string(), Duration::from_secs(12))];
+        assert_eq!(
+            requests(
+                "2 requests are waiting on runtime.channels[\"fizz\"]",
+                &taken
+            ),
+            "2 requests are waiting on runtime.channels[\"fizz\"]; you took request 7 from \
+             runtime.channels[\"fizz\"] 12s ago and have not answered it"
+        );
+        assert_eq!(
+            nudge(12, "Total"),
+            "submission 12 is still open: your last round ended without completing it. Complete \
+             it now with `await runtime.complete(value)`, `value` a `Total`"
+        );
+    }
+
+    /// Each warning names what is outstanding and every way out, says a round's end is not a
+    /// wait, and that ending this round so cancels. A request child is told to take an unread
+    /// request first, on each channel that holds one.
+    #[test]
+    fn each_warning_names_what_is_open_every_way_out_and_the_cancel() {
+        let (lead, detail) = requests_warning(
+            "1 request is waiting on runtime.channels[\"fizz\"]; you took request 7 from \
+             runtime.channels[\"fizz\"] 12s ago and have not answered it",
+            &["fizz".to_string()],
+        );
+        assert!(
+            lead.starts_with("your last round ended with requests unanswered: 1 request is")
+                && lead.contains("you took request 7 from"),
+            "{lead}"
+        );
+        for said in [
+            "A round's end is not a wait",
+            "`await d.reply(value)`",
+            "`await d.fail(message)`",
+            "`await runtime.channels[\"fizz\"].receive()`",
+            "`runtime.wait` raises `runtime.MessageAvailable`",
+            "with `runtime.wait`",
+            "they are cancelled, and each sender gets an exception",
+        ] {
+            assert!(detail.contains(said), "{said}: {detail}");
+        }
+        let (_, several) = requests_warning("", &["a".to_string(), "b".to_string()]);
+        assert!(
+            several.contains(
+                "`await runtime.channels[\"a\"].receive()` or \
+                 `await runtime.channels[\"b\"].receive()`"
+            ),
+            "{several}"
+        );
+        let (_, taken_only) = requests_warning("", &[]);
+        assert!(!taken_only.contains("receive()"), "{taken_only}");
+
+        let (lead, detail) = submission_warning(12, "Total");
+        assert_eq!(
+            lead,
+            "submission 12 is still open: your last two rounds ended without completing it"
+        );
+        for said in [
+            "`await runtime.complete(value)`, `value` a `Total`",
+            "`await runtime.fail(message)`",
+            "with `runtime.wait`",
+            "A round's end is not a wait",
+            "it is cancelled, and its caller gets an exception",
+        ] {
+            assert!(detail.contains(said), "{said}: {detail}");
+        }
+    }
+
+    /// Every child's preamble states the rule: up to two more rounds, the last a warning, then the
+    /// cancel, and that ending a round is not waiting. A request child is also told that only
+    /// `d.reply` and `d.fail` answer, and that code left running keeps no request open; a work
+    /// child, and a call's, how to fail what it cannot complete.
+    #[test]
+    fn every_preamble_states_the_rule() {
+        let channels = [ChannelText {
+            name: "fizz".into(),
+            doc: None,
+            request_type: "str".into(),
+            reply_type: "Thing".into(),
+            request: "{}".into(),
+            reply: "{}".into(),
+        }];
+        let call = ChildBrief::Call {
+            signature: "f() -> Fact",
+            result_type: "Fact",
+            schema: "{}",
+        };
+        for brief in [
+            ChildBrief::Work,
+            call,
+            ChildBrief::Request(&channels),
+            ChildBrief::Instance(&channels),
+        ] {
+            let text = preamble(&brief, &[]);
+            assert!(
+                text.contains("followed by up to two more, the last warning that")
+                    && text.contains("cancelled if it ends the same way")
+                    && text.contains("Ending your round is not waiting"),
+                "{text}"
+            );
+            let request = matches!(brief, ChildBrief::Request(_) | ChildBrief::Instance(_));
+            assert_eq!(
+                text.contains("what you write yourself is not delivered"),
+                request,
+                "{text}"
+            );
+            assert_eq!(text.contains("keeps no request open"), request, "{text}");
+            assert_eq!(
+                text.contains("`await runtime.fail(message)`"),
+                !request,
+                "{text}"
+            );
+            assert!(!text.contains("fails."), "{text}");
+        }
     }
 }

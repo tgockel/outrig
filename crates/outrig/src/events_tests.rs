@@ -737,9 +737,10 @@ fn each_event_has_exactly_its_data_fields() {
             Payload::AgentRequestCancelled {
                 request: AgentRequestId::new(7),
                 received: true,
+                reason: None,
             },
             "agent.request.cancelled",
-            &["request", "received"],
+            &["request", "received", "reason"],
         ),
         (
             Payload::AgentRequestProgress {

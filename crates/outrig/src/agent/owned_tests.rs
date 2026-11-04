@@ -13,7 +13,10 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::agent_tests::keyed;
 use super::children_tests::{Hold, held};
-use super::mock_http::{self, Gauge, MODEL, RecordedRequest, Responder, submit, text_reply};
+use super::instance_tests::ready_then;
+use super::mock_http::{
+    self, Gauge, MODEL, RecordedRequest, Responder, scripted, submit, text_reply,
+};
 use crate::config::Config;
 use crate::events::of_kind;
 use crate::harness::RunningProgram;
@@ -501,8 +504,26 @@ async fn the_planned_rules_hold_for_types_the_program_declares() {
 /// directory the program raises its flags in.
 fn serving_in(bed: &Bed, source: &str) -> Responder {
     let flags = bed.dir.to_str().expect("a UTF-8 path");
-    super::children_tests::serving(&source.replace("{flags}", flags))
+    super::children_tests::serving(&format!("{SERVE}{}", source.replace("{flags}", flags)))
 }
+
+/// What every child [`serving_in`] runs has first: `await serve(channel, answer)` answers each
+/// request on `channel` with a task of its own running `answer`, receiving those that arrive
+/// meanwhile, and keeps the round open until every task has ended. A request a task still held
+/// as the round ended would be cancelled once the child's rounds left it unanswered.
+const SERVE: &str = r#"
+async def serve(channel, answer):
+    tasks = set()
+    while True:
+        while channel.pending():
+            tasks.add(asyncio.create_task(answer(await channel.receive())))
+        if not tasks:
+            return
+        try:
+            _, tasks = await runtime.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        except runtime.MessageAvailable:
+            pass
+"#;
 
 /// An agent class whose child, `ROLE asker`, answers each request `done <question>` -- one whose
 /// question starts `hold` once a flag of that name is raised -- and says how an answer it could
@@ -525,7 +546,7 @@ async def until(test):
 "#;
 
 /// What the asker's child runs in each round: each request waiting is answered by a task of its
-/// own, so a held one waits for its flag while the rest are answered.
+/// own, so a held one waits for its flag, its round open, while the rest are answered.
 const ASKS: &str = r#"
 import asyncio, os
 async def answer(d):
@@ -537,9 +558,7 @@ async def answer(d):
     except Exception as e:
         with open(os.path.join('{flags}', 'refused-' + d.body), 'w') as f:
             f.write(type(e).__name__)
-channel = runtime.channels['ask']
-while channel.pending():
-    asyncio.create_task(answer(await channel.receive()))
+await serve(runtime.channels['ask'], answer)
 "#;
 
 /// The session an instance runs in is the one `session=` names, else the current one, and with
@@ -889,6 +908,7 @@ async def main():
         gc.collect()
         out.append((await next_of(events, "agent.instance.released")).data["how"])
         kept = Asker()
+        await kept.ready()
         handle = kept.ask("hold-on")
         await until(lambda: handle.status.state == "received")
         request = handle.id
@@ -957,6 +977,65 @@ asyncio.run(main())
         .collect();
     assert_eq!(ready.len(), 2, "{ready:?}");
     assert!(ready.iter().all(|subject| **subject != json!(launching)));
+}
+
+/// A request a root child takes and never answers is cancelled by the host, as a kernel's is, once
+/// the round naming it and the warning round have left it so: the program's `await h.future`
+/// raises `RequestCancelled` saying why, the status reads cancelled, and the program's own
+/// `cancel()` after it says it did not end the request.
+#[tokio::test]
+async fn a_request_the_root_child_never_answers_is_cancelled() {
+    let script = format!(
+        r#"
+import asyncio, json
+import outrig
+{ASKER}
+async def main():
+    out = []
+    async with outrig.Session():
+        async with Asker() as agent:
+            h = agent.ask("anything")
+            try:
+                await h.future
+            except outrig.RequestCancelled as e:
+                out.append(["cancelled", "without answering it" in str(e)])
+            out.append([h.status.state, h.status.reason, h.cancel()])
+    print(json.dumps(out), flush=True)
+
+asyncio.run(main())
+"#
+    );
+    let run = owned(
+        "OUTRIG_TEST_OWNED_HOST_CANCEL",
+        "",
+        &script,
+        vec![(
+            "ROLE asker",
+            ready_then(scripted(vec![
+                submit("c1", "d = await runtime.channels['ask'].receive()"),
+                text_reply("taken"),
+            ])),
+        )],
+    )
+    .await;
+    let (ran, records, _) = run.finish().await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    assert_eq!(
+        ran.json(),
+        [json!([["cancelled", true], ["failed", "cancelled", false]])],
+        "{}",
+        ran.stderr
+    );
+    let cancelled = of_kind(&records, "agent.request.cancelled");
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(cancelled[0]["received"], true);
+    assert!(
+        cancelled[0]["reason"]
+            .as_str()
+            .is_some_and(|why| why.contains("without answering it")),
+        "{:?}",
+        cancelled[0]
+    );
 }
 
 /// A root child counts against the session's limits as any child does: with `children-max = 1`
@@ -1166,9 +1245,7 @@ async def answer(d):
         open(os.path.join('{flags}', 'failed'), 'w').close()
     else:
         await d.reply('done ' + d.body)
-channel = runtime.channels['ask']
-while channel.pending():
-    asyncio.create_task(answer(await channel.receive()))
+await serve(runtime.channels['ask'], answer)
 "#;
 
 /// A request cancelled before the launch answered ends in the program and never reaches the
@@ -1254,9 +1331,7 @@ async def answer(d):
     for value in values:
         with contextlib.suppress(Exception):
             await d.reply(value)
-channel = runtime.channels['ask']
-while channel.pending():
-    asyncio.create_task(answer(await channel.receive()))
+await serve(runtime.channels['ask'], answer)
 "#;
 
 /// A request rejected for a last reply its child's kernel found wrong itself carries that reply's
@@ -1332,9 +1407,7 @@ async def answer(d):
         await inner.ready()
         await inner.release()
     await d.reply('done ' + d.body)
-channel = runtime.channels['ask']
-while channel.pending():
-    asyncio.create_task(answer(await channel.receive()))
+await serve(runtime.channels['ask'], answer)
 "#;
 
 /// Root children's instances and one a root child made each have an id no other has; and each
@@ -1415,9 +1488,7 @@ async def answer(d):
             await d.reply(value)
         except Exception:
             pass
-channel = runtime.channels['pick']
-while channel.pending():
-    asyncio.create_task(answer(await channel.receive()))
+await serve(runtime.channels['pick'], answer)
 "#;
 
 /// A verdict whose problem names text no line can carry -- a lone surrogate the child replied

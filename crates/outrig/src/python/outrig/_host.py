@@ -1363,9 +1363,9 @@ class _Request:
         self.state, self.final = "waiting", None
         self.value = self.error = self.progress = None
         self.decoded = {}  # each reply this program found nothing wrong with, by its number
-        # Whether it was sent, its handle was collected, and a cancel of it was sent; and the lock
-        # that keeps a cancel's line from going before the request's.
-        self.sent = self.dropped = self.withdrawn = False
+        # Whether it was sent, its handle was collected, a cancel of it was sent, and that cancel
+        # ended it; and the lock that keeps a cancel's line from going before the request's.
+        self.sent = self.dropped = self.withdrawn = self.cancelled = False
         self.sending = threading.Lock()
         self.has_ended = threading.Event()
         self.future = root.loop.create_future()
@@ -1398,6 +1398,8 @@ class _Request:
         program's runs in this."""
         outcome = message["outcome"]
         text = message.get("error") or f"{self} ended {outcome}"
+        # This program's cancel, and not the host's, which says why.
+        self.cancelled = outcome == "cancelled" and message.get("message") is None
         if outcome == "accepted":
             with self.lock:
                 value = self.decoded.get(message["reply"])
@@ -1442,9 +1444,8 @@ class _Request:
             if first:
                 self.root.tell("withdraw", agent=self.root.child, ask=self.ask)
         self.has_ended.wait(CANCEL_WAIT)
-        with self.lock:
-            # Only the program cancels its requests, and only its first cancel asked to.
-            return first and self.final is not None and self.final.reason == "cancelled"
+        # Only its first cancel asked to.
+        return first and self.cancelled
 
     def end(self, reason, error=None, value=None, unsent=False):
         """End the request: accepted with `value` when `reason` is `None`, failed with `error`

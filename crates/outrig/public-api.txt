@@ -1244,6 +1244,7 @@ pub outrig::harness::event::Payload::AgentReleased::ended: alloc::vec::Vec<alloc
 pub outrig::harness::event::Payload::AgentReleased::released: alloc::vec::Vec<alloc::string::String>
 pub outrig::harness::event::Payload::AgentReleased::requests: alloc::vec::Vec<outrig::harness::event::AgentRequestId>
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentRequestCancelled
+pub outrig::harness::event::Payload::AgentRequestCancelled::reason: core::option::Option<alloc::string::String>
 pub outrig::harness::event::Payload::AgentRequestCancelled::received: bool
 pub outrig::harness::event::Payload::AgentRequestCancelled::request: outrig::harness::event::AgentRequestId
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentRequestFailed

@@ -29,7 +29,7 @@ fn launching(request: &RecordedRequest) -> bool {
 
 /// `responder`, with each launch round answered at once with text: the child
 /// is ready, having done nothing.
-fn ready_then(responder: Responder) -> Responder {
+pub(super) fn ready_then(responder: Responder) -> Responder {
     Arc::new(move |request: &RecordedRequest| {
         if launching(request) {
             Box::pin(async { text_reply("ready") })
@@ -449,10 +449,10 @@ async fn the_mark_decides_and_the_types_are_derived() {
     );
 }
 
-/// A request the child read and left unanswered earns one more round, which
-/// names it by id, and a reply there settles it; one it never answers earns
-/// that round and no other, the child idle and the request open, until a new
-/// request opens a round naming the old one too.
+/// A request the child read and left unanswered gets a round that names it
+/// by id, and a reply there settles it; one it never answers is named in the
+/// round after, warned of in the next, and then cancelled by the host, and the
+/// instance goes on to answer the next request.
 #[tokio::test]
 async fn re_prompting_follows_the_summary_rule() {
     let mut answered = tree(
@@ -493,9 +493,6 @@ async fn re_prompting_follows_the_summary_rule() {
     );
     assert!(kind(&events, "agent.request.invalid", None).is_empty());
 
-    // The round the second request opens says so through a flag, so the
-    // first is cancelled only after that round has opened on it.
-    let opened = Flag::new();
     let mut silent = tree(
         "OUTRIG_TEST_INSTANCE_SILENT",
         "",
@@ -506,8 +503,9 @@ async fn re_prompting_follows_the_summary_rule() {
                     submit("c1", "d = await runtime.channels['fizz'].receive()"),
                     text_reply("taken"),
                     text_reply("still not answering"),
-                    submit("c2", &format!("open({}, 'w').close()", opened.py())),
                     text_reply("not answering either"),
+                    submit("c2", ANSWER_ONE),
+                    text_reply("answered the next"),
                 ])),
             ),
             (
@@ -518,14 +516,14 @@ async fn re_prompting_follows_the_summary_rule() {
                     s = Silent()
                     await s.ready()
                     h = s.fizz('a')
-                    await until(lambda: h.status.state == 'received' and h.status.child == 'idle')
-                    print(h.id, h.done(), h.status)
-                    h2 = s.fizz('b')
-                    await until(lambda: os.path.exists({opened}))
-                    print(h.cancel(), h.status.state, h.status.reason)
+                    try:
+                        await h
+                    except outrig.RequestCancelled as e:
+                        print(h.id, h.status.state, h.status.reason, 'without answering it' in str(e))
+                    nxt = s.fizz('b')
+                    print((await nxt).n == nxt.id)
                     "#,
                     class = indented(&fizzing("Silent", "silent"), 20),
-                    opened = opened.py(),
                 )),
             ),
         ],
@@ -535,23 +533,23 @@ async fn re_prompting_follows_the_summary_rule() {
     let (_, events, requests) = silent.end().await;
     let said = printed(&requests, "p1");
     let id = said.split_whitespace().next().expect("an id").to_string();
-    assert_eq!(
-        said,
-        format!("{id} False received (child idle)\nTrue failed cancelled\n")
-    );
+    assert_eq!(said, format!("{id} failed cancelled True\nTrue\n"));
     let child = past_launch(&requests, "ROLE silent");
-    // The round that received it, the one that named it, and then only the
-    // round the second request opened, which names the first too.
+    // The round that received it, the one that named it, the warning, and the
+    // round the next request opened.
+    assert_eq!(child.len(), 6);
+    let named = opening(child[2]);
     assert!(
-        opening(child[2]).contains(&format!("you took request {id} from")),
-        "{}",
-        opening(child[2])
+        named.contains(&format!("you took request {id} from"))
+            && !named.contains("your last round ended"),
+        "{named}"
     );
-    let both = opening(child[3]);
+    let warning = opening(child[3]);
     assert!(
-        both.contains(&format!("you took request {id} from"))
-            && both.contains("1 request is waiting on runtime.channels[\"fizz\"]"),
-        "{both}"
+        warning.contains(&format!(
+            "your last round ended with requests unanswered: you took request {id} from"
+        )),
+        "{warning}"
     );
     assert!(kind(&events, "agent.request.invalid", None).is_empty());
 }
@@ -696,19 +694,24 @@ async fn release_settles_and_closes() {
         vec![
             (
                 "ROLE holder",
-                ready_then(scripted(vec![
-                    submit(
-                        "c1",
-                        "g = await runtime.spawn('g', prompt='ROLE grand: never answers', \
-                         requests={'ping': (str, Thing)})\n\
-                         gh = g.channels['ping'].request('x')\n\
-                         d = await runtime.channels['fizz'].receive()",
-                    ),
-                    text_reply("holding"),
-                    text_reply("still holding"),
-                ])),
+                // Holding inside its round, and the grandchild too, so the release
+                // is what ends both requests.
+                ready_then(scripted(vec![submit(
+                    "c1",
+                    "g = await runtime.spawn('g', prompt='ROLE grand: never answers', \
+                     requests={'ping': (str, Thing)})\n\
+                     gh = g.channels['ping'].request('x')\n\
+                     d = await runtime.channels['fizz'].receive()\n\
+                     while True:\n    await asyncio.sleep(0.05)",
+                )])),
             ),
-            ("ROLE grand", scripted(vec![text_reply("not answering")])),
+            (
+                "ROLE grand",
+                scripted(vec![submit(
+                    "g1",
+                    "while True:\n    await asyncio.sleep(0.05)",
+                )]),
+            ),
             (
                 "ROLE ctx",
                 ready_then(scripted(vec![text_reply("nothing")])),
@@ -1015,16 +1018,30 @@ async fn an_instance_from_a_child_at_the_depth_limit_fails_at_ready() {
 /// made before the child exists count the same way.
 #[tokio::test]
 async fn requests_max_counts_an_instances_unsettled_requests() {
+    let (took, go) = (Flag::new(), Flag::new());
     let mut tree = tree(
         "OUTRIG_TEST_INSTANCE_REQUESTS_MAX",
         "requests-max = 2",
         vec![
             (
                 "ROLE capped",
+                // Holds the request it took inside its round until told to answer.
                 ready_then(scripted(vec![
-                    submit("c1", "d = await runtime.channels['fizz'].receive()"),
-                    text_reply("took one"),
-                    text_reply("not now"),
+                    submit(
+                        "c1",
+                        &format!(
+                            "import os\n\
+                             d = await runtime.channels['fizz'].receive()\n\
+                             open({took}, 'w').close()\n\
+                             while not os.path.exists({go}):\n    await asyncio.sleep(0.01)\n\
+                             await d.reply(Thing(n=1))",
+                            took = took.py(),
+                            go = go.py()
+                        ),
+                    ),
+                    text_reply("answered one"),
+                    submit("c2", ANSWER_ONE),
+                    text_reply("answered the next"),
                 ])),
             ),
             (
@@ -1040,7 +1057,7 @@ async fn requests_max_counts_an_instances_unsettled_requests() {
                     c = Capped()
                     await c.ready()
                     h1 = c.fizz('a')
-                    await until(lambda: h1.status.state == 'received' and h1.status.child == 'idle')
+                    await until(lambda: os.path.exists({took}))
                     h2 = c.fizz('b')
                     try:
                         c.fizz('c')
@@ -1049,6 +1066,8 @@ async fn requests_max_counts_an_instances_unsettled_requests() {
                     h2.cancel()
                     h3 = c.fizz('d')
                     print('room', h3.status.state)
+                    open({go}, 'w').close()
+                    print((await h1).n, (await h3).n == h3.id)
                     e = Early()
                     held = [e.fizz('1'), e.fizz('2')]
                     try:
@@ -1058,6 +1077,8 @@ async fn requests_max_counts_an_instances_unsettled_requests() {
                     "#,
                     capped = indented(&fizzing("Capped", "capped"), 20),
                     early = indented(&fizzing("Early", "early"), 20),
+                    took = took.py(),
+                    go = go.py(),
                 )),
             ),
         ],
@@ -1067,7 +1088,7 @@ async fn requests_max_counts_an_instances_unsettled_requests() {
     let (_, events, requests) = tree.end().await;
     assert_eq!(
         printed(&requests, "p1"),
-        "limit True\nroom waiting\nheld limit ['waiting', 'waiting']\n"
+        "limit True\nroom waiting\n1 True\nheld limit ['waiting', 'waiting']\n"
     );
     let bodies: Vec<String> = kind(&events, "agent.request.sent", None)
         .into_iter()
@@ -1163,6 +1184,57 @@ async fn cancellation_before_and_after_receipt() {
             .concat()
             .contains("reply refused"),
         "the child's reply raised"
+    );
+}
+
+/// A request held for an instance's child and cancelled once the child exists, before it is sent
+/// on, was never told of to the host, which so never settles it. Its notice of the cancel fails to
+/// encode, and it is kept no longer all the same.
+#[tokio::test]
+async fn a_held_request_cancelled_before_it_is_sent_is_not_kept() {
+    let mut tree = tree(
+        "OUTRIG_TEST_INSTANCE_UNSENT_CANCEL",
+        "",
+        vec![
+            (
+                "ROLE unsent",
+                ready_then(scripted(vec![text_reply("idle")])),
+            ),
+            (
+                "",
+                primary_waits(&format!(
+                    r#"
+                    {class}
+                    import __main__
+                    s = Unsent()
+                    h = s.fizz('a')
+                    encode = __main__._encode
+                    def short(message):
+                        if message.get('t') == 'agent.ended' and message.get('request') == h.id:
+                            raise MemoryError
+                        return encode(message)
+                    __main__._encode = short
+                    unhold = __main__._Instance.unhold
+                    def late(instance, send):
+                        if send:
+                            print(instance.record.kernel is not None, h.cancel())
+                        unhold(instance, send)
+                    __main__._Instance.unhold = late
+                    await s.ready()
+                    await until(lambda: h.done())
+                    print(h.status.state, h.status.reason, h.id in __main__._works)
+                    "#,
+                    class = indented(&fizzing("Unsent", "unsent"), 20),
+                )),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, _, requests) = tree.end().await;
+    assert_eq!(
+        printed(&requests, "p1"),
+        "True True\nfailed cancelled False\n"
     );
 }
 

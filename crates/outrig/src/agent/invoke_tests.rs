@@ -449,11 +449,12 @@ async fn a_parse_the_child_cannot_complete_calls_nothing() {
     assert_eq!(started["call"], Value::Null);
 }
 
-/// A parser whose round ends without completing, and whose one further round
-/// ends the same way, ends the parse `CompletionRejected`: no third round is
-/// opened, the parser is released and stops, and nothing is called.
+/// A parser whose round ends without completing, and whose round asking for
+/// the result and warning round end the same way, has the parse cancelled:
+/// `invoke` raises `RequestCancelled`, no fourth round is opened, the parser
+/// is released and stops, and nothing is called.
 #[tokio::test]
-async fn a_parser_that_ends_without_completing_is_rejected_after_one_more_round() {
+async fn a_parser_that_never_completes_is_cancelled_after_three_rounds() {
     let dir = skills(&[("review-diff", &[("skill.py", REVIEW_DIFF)])]);
     let parser = scripted(vec![text_reply("I will not"), text_reply("Still not")]);
     let (mut tree, _approvals) = session(
@@ -469,8 +470,8 @@ async fn a_parser_that_ends_without_completing_is_rejected_after_one_more_round(
                     import outrig
                     try:
                         await outrig.skills.invoke("review-diff", "go")
-                    except outrig.CompletionRejected as e:
-                        print("rejected", "without completing" in str(e))
+                    except outrig.RequestCancelled as e:
+                        print("cancelled", "without completing it" in str(e))
                     "#,
                 ),
             ),
@@ -480,11 +481,11 @@ async fn a_parser_that_ends_without_completing_is_rejected_after_one_more_round(
     assert_eq!(round(&mut tree.session, "go").await, "done");
     let (_, events, requests) = tree.end().await;
 
-    assert_eq!(printed(&requests, "p1"), "rejected True\n");
+    assert_eq!(printed(&requests, "p1"), "cancelled True\n");
     assert_eq!(
         of_agent(&requests, "ROLE parser").len(),
-        2,
-        "no third round"
+        3,
+        "no fourth round"
     );
     assert!(kind(&events, "agent.request.invalid", None).is_empty());
     let released = kind(&events, "agent.released", Some("agent/primary"));

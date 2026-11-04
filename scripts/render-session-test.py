@@ -765,7 +765,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             c,
         ),
         ("agent.request.progress", {"request": 8, "body": "p"}, c),
-        ("agent.request.cancelled", {"request": 8, "received": True}, c),
+        ("agent.request.cancelled", {"request": 8, "received": True, "reason": "r"}, c),
         ("agent.released", {"released": ["c1"], "ended": ["c1", "c2"], "requests": [8]}, a),
         (
             "agent.call.settled",
@@ -1169,6 +1169,28 @@ class RenderSession(unittest.TestCase):
         html = self.page(events[:4] + child + events[4:])
         requests = html[html.index('id="requests"') :]
         self.assertIn('<td class="n">0</td>', requests)
+
+    def test_a_cancel_says_whether_its_sender_or_the_host_made_it(self) -> None:
+        """A cancel with no `reason` is its sender's. One with a `reason` is the host's, made when
+        the child's rounds left the request unanswered, and the page says why."""
+        c = "agent/c1"
+        why = "request 10 was cancelled: the child ended its rounds without answering it"
+        child = [
+            ("agent.spawned", {"name": "n", "parent": "agent/primary", "kind": "request", "model": "m"}, c),
+            ("agent.started", {"model": "m", "python": "3.13.15", "container": "x"}, c),
+            *(
+                ("agent.request.sent", {"request": n, "channel": "ch", "sender": "agent/primary",
+                                         "body": "b", "attempts_max": 3}, c)
+                for n in (9, 10)
+            ),
+            ("round.started", {"round": 1}, c),
+            ("agent.request.cancelled", {"request": 9, "received": False, "reason": None}, c),
+            ("agent.request.cancelled", {"request": 10, "received": True, "reason": why}, c),
+        ]
+        events = ordinary()
+        html = self.page(events[:4] + child + events[4:])
+        self.assertIn("request 9: cancelled by its sender (not yet taken)", html)
+        self.assertIn(f"request 10: cancelled by the host (already taken): {why}", html)
 
     def test_a_session_with_no_primary_titles_its_shared_section_session(self) -> None:
         """`no_primary()` means `agent/primary` never names a real agent, so the section a

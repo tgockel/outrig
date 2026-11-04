@@ -90,15 +90,10 @@ class AgentError(Exception):
 
 
 class CompletionRejected(AgentError):
-    """The child's answers failed their check past the request's attempt limit, or a work child's
-    rounds ended without completing.
+    """The child's answers failed their check past the request's attempt limit.
 
     `value` is the last value it answered with and `problems` what was wrong with it, each a
-    `outrig.schema.Problem`; both are empty when it never answered.
-
-    When a model call of the child's failed and ended one of those rounds -- the provider
-    refused a reply, say -- the child did not stop of its own accord, and `__cause__` is an
-    `AgentRequestFailed` whose message says how the call failed. It is `None` otherwise.
+    `outrig.schema.Problem`.
     """
 
     def __init__(self, message, value=None, problems=()):
@@ -112,8 +107,8 @@ class AgentReleased(AgentError):
 
 
 class AgentRequestFailed(AgentError):
-    """The child failed the request on purpose, with `await delivery.fail(message)`; `message` is
-    why."""
+    """The child failed the request on purpose, with `await delivery.fail(message)`, or a work
+    child its submission, with `await runtime.fail(message)`; `message` is why."""
 
     def __init__(self, message):
         super().__init__(message)
@@ -121,8 +116,15 @@ class AgentRequestFailed(AgentError):
 
 
 class RequestCancelled(AgentError):
-    """The request was cancelled with `handle.cancel()`. In the child, an answer to it raises
-    this."""
+    """The request was cancelled: with `handle.cancel()`, or by the host, when the child's rounds
+    left it unanswered after one that warned it would be. The message says which. In the child, an
+    answer to it raises this.
+
+    When the host cancelled a submission and a model call of the child's had failed and ended one
+    of its rounds -- the provider refused a reply, say -- the child did not stop of its own accord,
+    and `__cause__` is an `AgentRequestFailed` whose message says how the call failed. It is `None`
+    otherwise.
+    """
 
 
 class RequestSettled(AgentError):

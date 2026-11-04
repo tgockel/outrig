@@ -243,3 +243,107 @@ Each is a mock-driven test unless it says otherwise.
   `## Decisions` for the rule this task replaces.
 - `crates/outrig/src/agent/runner.rs`, `orientation.rs`, `children.rs` and `children_tests.rs`;
   `crates/outrig/src/python/interpreter.py`, `_HOST_ENDS`.
+
+## Decisions
+
+The deliverables were built as written. What they left to the task is recorded here.
+
+- **Fork 1 was taken as recommended: a work child has `runtime.fail(message)`.** It ends the
+  submission `failed` with `AgentRequestFailed(message)`, an end that already existed, so a
+  decorated call's child is released as on any end and `invoke` raises it for the skill parser.
+  It is on `WorkRuntime`, in `help(runtime)`, in the work and call preambles, and in the work
+  child's warning. The primary and a request child have no `runtime.fail`; asking for it raises
+  `AttributeError` naming what that agent has, as `runtime.complete` already did.
+- **The host's cancel is `reason` on `agent.request.cancelled`**, `None` for a sender's cancel and
+  the host's text for its own: one field that says both who cancelled and why. It comes from the
+  `agent.ended` notice's `message`, which only the host's cancel puts on a cancelled end; the host
+  program's `_Request` reads the same key to tell the host's cancel from its own.
+- **The cancel's text is the host's.** `request 7 was cancelled: the child ended its rounds
+  without answering it`, `... without reading it` for one never taken, and `submission 12 ...
+  without completing it` for a work child. The child's refusal after it is that text and `; it
+  takes no answer`. A sender's cancel now reads `... was cancelled by its sender`, so the refusal
+  after it reads as before; `refused()` builds every cancelled refusal from the request's error.
+- **#756's cause carries over to the cancel.** A work child's cancelled submission carries the
+  failure of a round that failed after its code ran as `RequestCancelled.__cause__` and as
+  `agent.request.settled`'s `cause`, as the rejection did; `CompletionRejected`'s paragraph on
+  it moved to `RequestCancelled`'s docstring. A request child's cancel carries none, as its idle
+  ending never did. `_HOST_ENDS` swaps `rejected` for `cancelled`: the host rejects nothing now.
+- **The runner hears every end it sends before it decides again.** It keeps the requests it ended
+  and has not heard end, and waits on the child's wake until each is heard, for the cancel and
+  equally for the ends of a spent budget or a broken model, which used to mark the child idle
+  while the interpreter was still ending what it held.
+- **An end the host does not hear is asked for again.** Out of memory, the interpreter loses lines
+  both ways: its reader drops a host line it had no memory to handle, and `_notify` dropped a
+  notice it could not encode, a request's end among them, after the request had left `_works`.
+  The runner would then wait for good on an end it never hears, while the child's later requests
+  get no round. So the runner keeps each end it made -- request, outcome, why, cause -- until it
+  hears it, and sends the settle again each `SETTLE_WAIT` (a second) unheard. It times that from
+  the last send, not the last wake: arrivals wake it, and a child sent requests more often than
+  once a second would otherwise never have the end asked for again. The interpreter keeps an
+  ended request in `_works` until the host has been told, and a settle of one it ended tells the
+  end again. Resending alone recovers a lost settle, not a lost notice, whose request was gone
+  from `_works`. Keeping the request where it is allocates nothing when memory has just run out,
+  where filing the notice in a table of unsent ones would, and losing that insert would hang the
+  sender too. `_Work.end` makes the notice before it changes the request's state, so memory
+  running out partway leaves the request as it was rather than ended with nothing to tell. Any
+  request's lost end ends up here: the runner, counting it open still, warns and cancels, and the
+  settle has the true end told. `_notify` sends through `_send`, which retries an encoding that
+  ran out of memory with the reserve given back, so most ends are told the first time; and
+  `Inner::ended` ignores an end told twice, as a settle that crosses the child's own end can have
+  it told. After the child's release, or the session's close, nothing settles a request again:
+  each tells an end the host has not heard once more, and takes the request out of `_works`
+  whether or not that is heard (`_Work.forget`), rather than keep its body, its result and the
+  kernels on both ends for the rest of the session. An end not heard then either is lost, as every
+  lost end was before: the host's record of the request stays open, and the close's report has it
+  `terminated`. A request sent as its child is released can be counted before the release and
+  recorded after the release looked at what the child holds; it ends released then, and nothing
+  would tell that end again, so `_Work.tell` keeps no request whose child's kernel has ended, heard
+  or not. The kernel's end, not the child's `released`: a release while an agent class instance's
+  launch holds its requests leaves `released` unset, and those requests end later, in `unhold`.
+  Nor does it keep a request the host has no record of, which nothing settles either: one whose
+  own notice to the host failed, or one held for an instance's child and cancelled before it was
+  sent on. `_Work.recorded` says which the host may have; it is set before the request's notice
+  goes, since the host may end the request as soon as it reads it, and cleared only if the
+  notice's line was never made. Memory can run out as a line is written even once all of it has
+  gone -- `os.write`'s count, and the slice `_write_all` takes after it, are allocated -- so
+  `_notify` answers `None`, not known, for a line that failed as it was written. A request whose
+  own notice that was counts as recorded, and an end notice that was keeps its request for the
+  host's settle: one the host did hear stays until its child's kernel ends.
+- **`Inner::idle` decides under the registry's lock.** It marks the child idle only when nothing
+  is open on it. A request recorded between the runner's look at the summary and the mark is the
+  legitimate race: idle leaves the child as it is, and the request's arrival has already woken the
+  runner, which opens its round. The `debug_assert!`, run on every call, is on what that race
+  cannot produce: an open request that spanned one of the child's rounds, which only a runner
+  idling a child over a request it nudged or warned about would leave. A bare "nothing open"
+  assertion would fire on the race.
+- **Every end the host makes takes the request out of the child's reach first**, as `cancel()`
+  does, and reports `received`: one path for the cancel, a spent budget and a broken model, where
+  only the cancel's event reads it.
+- **The runner's budget watch is gone.** It woke an idle child so it could end what it held; an
+  idle child holds nothing now, and an arrival after the budget is spent wakes the runner, which
+  ends it `budget`. `Ledger::budget_watch` went with it, and the ledger's spent flag is an
+  `AtomicBool` rather than a `watch` channel nobody subscribes to.
+- **The warnings' texts.** The request child's lead is `your last round ended with requests
+  unanswered: ` and the first nudge's words; its detail names `receive()` on each channel holding
+  unread requests, and says nothing of it when none does. The work child's names
+  `runtime.complete`, `runtime.fail` and `runtime.wait`.
+  The preambles share one sentence: ending a round is not waiting, so wait inside it with
+  `runtime.wait`.
+- **`help(runtime)` had no room for `runtime.fail`.** A work child's was 29 characters under
+  `HELP_MAX`. Runtimes are now made by `Runtime._made`, not `__init__`, which removes the
+  constructor's signature and `object.__init__`'s docstring from every agent's help; `fail`'s
+  docstring is one line.
+- **The tests that synchronized on a child idle with a request open** -- the instance and child
+  `requests-max` tests, a released subtree, the close, the release of an instance -- now hold the
+  request inside a round that waits on a flag, or keep the round open with a sleep loop. The host
+  program's serving children (`ASKS`, `DECIDES`, `JUDGED`, `MAKES`, `PICKS`) keep their round open
+  over their answer tasks with a `runtime.wait` loop that receives on `MessageAvailable`: a request
+  held by a task left running is cancelled now. The test of a collected handle and the close awaits
+  `kept.ready()` before asking, so the request opens a round of its own and the orienting round
+  ends.
+- **The no-idle-holding watcher notes only requests a child took.** A request not yet taken on an
+  idle child is the moment between its arrival and the round it opens, which every child passes
+  through; one taken and open on an idle child is what the rule forbids, and what the watcher
+  reports. At each point a child reads idle, every handle sent to it has ended.
+- **`scripts/render-session.py`** names the host's cancels, `cancelled by the host (...): <reason>`,
+  as the field lets it; a sender's still reads `cancelled by its sender`.

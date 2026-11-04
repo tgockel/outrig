@@ -234,8 +234,8 @@ The other codes, for reference: `unknown-skill`, `metadata-invalid`, `duplicate-
 `requires-python`, `entry-not-found` for a module with no callable entry, `signature-unsupported`
 for an entry whose signature cannot become `<Skill>Params` ("How `invoke` parses"),
 `missing-binding`, `skill-changed`, and `skill-busy` if a reload during an invocation is refused
-("Open questions"). `SkillNeedsClarification` and `CompletionRejected` are not codes of the load
-but outcomes of the parse ("How `invoke` parses").
+("Open questions"). `SkillNeedsClarification`, `CompletionRejected` and `RequestCancelled` are not
+codes of the load but outcomes of the parse ("How `invoke` parses").
 
 ## From `/name` to a call
 
@@ -359,14 +359,16 @@ a fresh child of the agent that called `invoke`, on that agent's model -- the se
 main agent calls it -- and a child like any other: it counts against `children-max`, its usage is
 attributed to it and added to the invocation and the round, and it has no user channel, so it cannot
 ask what the text meant; the agent relays its question. It completes with its reading of the text or
-with a `Clarification`, or the call settles with `CompletionRejected`.
+with a `Clarification`, or the call ends without one.
 
 The call does not stay open on a child that will not complete. A parser whose round ends without
-a completion gets one further round from the host, which asks for the result by the request's id
-(`work.md`, "A request settles once"); if that round ends the same way, the call settles with
-`CompletionRejected`, whose reason is that the child ended without completing, and the child is
-released. Three completions that fail a check settle it the same way, carrying the last value and
-its problems. Either way `invoke` raises it and nothing is called.
+a completion gets a round from the host asking for the result by the request's id, and then the
+warning round (`work.md`, "A request settles once"); if that one ends the same way, the call is
+cancelled -- `RequestCancelled`, whose message says the child ended its rounds without completing
+it -- and the child is released. Three completions that fail a check settle it with
+`CompletionRejected`, carrying the last value and its problems, and a parser that says it cannot
+read the text with `runtime.fail` settles it with `AgentRequestFailed`. Each way `invoke` raises
+it and nothing is called.
 
 **Or it raises the child's question.** When the parser completes with a `Clarification`,
 `invoke` raises `SkillNeedsClarification`, an `outrig.AgentError` spelled in `outrig.skills`,
@@ -452,11 +454,12 @@ and `repo` is not in it.
   tests/test_auth.py`, and the agent calls `invoke("review-diff",
   params=ReviewDiffParams(paths=["src/auth/", "tests/test_auth.py"]))`, which makes no parse
   call; the started event carries that instance and says the caller passed it.
-- A parse the child cannot complete settles with `CompletionRejected`, which `invoke` raises to
-  the agent, and nothing is called. There are two ways there: three completions that fail a
-  check, or a round that ends without a completion followed by the one further round the host
-  opens ending the same way. The parser never idles with the call open. The agent may ask the
-  user, and then call `invoke` again with the text or with `params=`.
+- A parse the child cannot complete ends without a value, which `invoke` raises to the agent, and
+  nothing is called. There are three ways there: three completions that fail a check
+  (`CompletionRejected`), a `runtime.fail` (`AgentRequestFailed`), or a round that ends without a
+  completion followed by the round asking for it and the warning ending the same way
+  (`RequestCancelled`). The parser never idles with the call open. The agent may ask the user, and
+  then call `invoke` again with the text or with `params=`.
 
 **Bound parameters.** A parameter `bind` names is not a field of `<Skill>Params`, so neither the
 user nor the parser can set it, and it is filled from the session's binding of that name: the
@@ -503,8 +506,8 @@ directive, and `invoke` for the rest.
   type, and the model usage of the children the invocation ran, the parser included.
 
 A parse the child could not complete ends the invocation before `skill.invocation.started`: the
-parse call's own events carry the invocation's id and the rejection, and `invoke` raises
-`CompletionRejected`. A parse that completed with a `Clarification` ends it at the same point:
+parse call's own events carry the invocation's id and how the call ended, and `invoke` raises it.
+A parse that completed with a `Clarification` ends it at the same point:
 the parse call's settled event carries the invocation's id and the `Clarification`, and `invoke`
 raises `SkillNeedsClarification`. The call the agent makes after the user's answer is a new
 invocation, with an id of its own.

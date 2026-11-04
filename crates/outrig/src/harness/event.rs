@@ -422,18 +422,20 @@ pub enum Payload {
         request: AgentRequestId,
         message: String,
     },
-    /// Its sender cancelled the request, before or after the child received
-    /// it.
+    /// The request was cancelled, before or after the child received it: by
+    /// its sender, or, when `reason` says why, by the host, the child's rounds
+    /// having ended without answering it after a warning.
     #[non_exhaustive]
     AgentRequestCancelled {
         request: AgentRequestId,
         received: bool,
+        reason: Option<String>,
     },
     /// How the request ended, how many answers it took, and the child's
     /// rounds it spanned. `cause` is how a model call of the child's failed
-    /// and ended a round of them, when one did and the request was rejected
-    /// for the child's rounds ending without completing: the text its
-    /// sender's exception carries as `__cause__`.
+    /// and ended a round of them, when one did and the host cancelled a
+    /// submission for the child's rounds ending without completing it: the
+    /// text its sender's exception carries as `__cause__`.
     #[non_exhaustive]
     AgentRequestSettled {
         request: AgentRequestId,
@@ -1304,12 +1306,12 @@ pub struct ChannelBrief {
 pub enum RequestEnd {
     /// An answer passed its check, and is its result.
     Accepted,
-    /// Its answers failed their checks past the attempt limit, or a work
-    /// child's rounds ended without completing it.
+    /// Its answers failed their checks past the attempt limit.
     Rejected,
     /// The child failed it on purpose.
     Failed,
-    /// Its sender cancelled it.
+    /// Its sender cancelled it, or the host did: the child's rounds ended
+    /// without answering it.
     Cancelled,
     /// The child, or an agent above it, was released.
     Released,

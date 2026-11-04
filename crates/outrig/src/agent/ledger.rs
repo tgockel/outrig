@@ -30,13 +30,13 @@
 //! round's tree.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use bytes::Bytes;
 use rig::completion::CompletionResponse;
 use rig::error::ProviderError;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::budget::Budget;
 use super::history::Adjacent;
@@ -89,8 +89,8 @@ struct Inner {
     /// What the session may spend, when it has a budget.
     budget: Option<u64>,
     /// Whether the budget is spent: set once, as the attempts recorded reach
-    /// it, and heard by whoever waits for it.
-    out: watch::Sender<bool>,
+    /// it.
+    out: AtomicBool,
 }
 
 /// The fold every total is derived from: each attempt once, by its id.
@@ -217,13 +217,7 @@ impl Ledger {
     /// Whether the session has spent its token budget: no model call may be
     /// made from here on.
     pub(crate) fn budget_spent(&self) -> bool {
-        *self.inner.out.borrow()
-    }
-
-    /// Whether the budget is spent, as it changes: `true` from the moment it
-    /// is, for every receiver.
-    pub(crate) fn budget_watch(&self) -> watch::Receiver<bool> {
-        self.inner.out.subscribe()
+        self.inner.out.load(Ordering::SeqCst)
     }
 
     /// Mark the budget spent once what `book`, just changed, totals reaches
@@ -234,9 +228,7 @@ impl Ledger {
                 .is_some_and(|spent| spent.total_tokens >= budget)
         });
         if reached {
-            self.inner
-                .out
-                .send_if_modified(|spent| !std::mem::replace(spent, true));
+            self.inner.out.store(true, Ordering::SeqCst);
         }
     }
 
@@ -1132,12 +1124,10 @@ mod tests {
         let ledger = Ledger::new(Events::off(), None, Some(30));
         let primary = CallSlot::new(ledger.clone(), Events::off(), None);
         let child = CallSlot::new(ledger.clone(), Events::off().for_agent("c1"), None);
-        let out = ledger.budget_watch();
         spend_through(&primary, plain(12, 7));
-        assert!(!ledger.budget_spent() && !*out.borrow());
+        assert!(!ledger.budget_spent());
         spend_through(&child, plain(5, 6));
         assert!(ledger.budget_spent(), "19 + 11 is 30");
-        assert!(*out.borrow(), "whoever waits hears it");
         assert!(!Ledger::default().budget_spent(), "no budget, never spent");
     }
 
