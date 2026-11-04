@@ -74,6 +74,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The network audit writer no longer panics when the runtime is shutting down mid-append.**
+  A failed append is rolled back by truncating the file to where the record began; `tokio::fs::File`
+  cannot be trusted to do that once a blocking spawn it attempted has been refused, which happens
+  while the runtime is shutting down with a record in flight -- its internal state is left with no
+  buffer to resume from, and the rollback's `set_len` panicked unwrapping it (tokio-rs/tokio#8182).
+  The writer now owns a `std::fs::File` and runs a record's append, flush, and rollback inside a
+  single `spawn_blocking` call instead: a spawn the runtime refuses surfaces as a `JoinError` the
+  writer counts as a loss, like any other failed write, rather than as `tokio::fs::File` state that
+  panics on next use. (#453)
+
 - **A config file that does not load names itself.** A TOML parse error was reported with a line,
   a column, and an excerpt but no file, so with the global config and a repo (or `--config`) file
   both in play the reader had to work out which one was being quoted; the repo-only rules were
