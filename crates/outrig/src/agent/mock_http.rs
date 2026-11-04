@@ -738,6 +738,43 @@ fn content_refusal(body: &Value) -> Option<CannedResponse> {
     })
 }
 
+/// The most a conversation [`start_limited`]'s provider takes, in bytes of its
+/// `messages` as sent.
+pub(super) const LIMIT_BYTES: usize = 24_000;
+
+/// [`start`], as a Messages provider whose input limit is below any window a
+/// row would set: a request whose `messages` run past [`LIMIT_BYTES`] is
+/// rejected as Anthropic rejects a prompt over its limit, with the request's
+/// size and the limit in tokens by OutRig's own rule of three bytes to one,
+/// the system prompt counted in both; it does not advance the script.
+pub(super) async fn start_limited(
+    script: Vec<CannedResponse>,
+) -> (
+    std::net::SocketAddr,
+    mpsc::UnboundedReceiver<RecordedRequest>,
+) {
+    start_with(script, size_rejection, None).await
+}
+
+/// How [`start_limited`]'s provider answers `body`: `None` unless its
+/// `messages` run past [`LIMIT_BYTES`].
+fn size_rejection(body: &Value) -> Option<CannedResponse> {
+    let messages = body["messages"].to_string().len();
+    if messages <= LIMIT_BYTES {
+        return None;
+    }
+    let system = system_text(body).len();
+    let mut rejection = failure(400);
+    rejection.body["error"]["type"] = "invalid_request_error".into();
+    rejection.body["error"]["message"] = format!(
+        "prompt is too long: {} tokens > {} maximum",
+        (messages + system).div_ceil(3),
+        (LIMIT_BYTES + system).div_ceil(3)
+    )
+    .into();
+    Some(rejection)
+}
+
 /// [`start`], refusing each request `refuses` answers for, which the script
 /// does not advance past, and answering a lookup of a model's window with
 /// `lookup`, or not at all.

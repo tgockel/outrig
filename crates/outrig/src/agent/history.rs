@@ -507,6 +507,10 @@ impl fmt::Display for TooLarge {
             WindowSource::Assumed => {
                 write!(f, " (assumed: [models.{model}] sets no context-window)")?
             }
+            WindowSource::Rejected => write!(
+                f,
+                " (lowered after {model}'s provider rejected a larger request)"
+            )?,
         }
         write!(
             f,
@@ -525,14 +529,22 @@ impl fmt::Display for TooLarge {
             f,
             ". The turn stays in runtime.history, and later calls leave it out. "
         )?;
-        if *window_source != WindowSource::Configured {
-            write!(
+        match window_source {
+            WindowSource::Provider | WindowSource::Assumed => write!(
                 f,
                 "Set [models.{model}].context-window to the model's own window, or lower \
                  tool-result-max, to send a turn this large."
-            )
-        } else {
-            f.write_str("Lower tool-result-max or max-tokens to send a turn this large.")
+            ),
+            // Not the row's to raise: the provider has rejected more.
+            WindowSource::Rejected => write!(
+                f,
+                "Set [models.{model}].context-window to the limit its provider enforces, so a \
+                 session is held to it from the start, or lower tool-result-max or max-tokens \
+                 to send a turn this large."
+            ),
+            WindowSource::Configured => {
+                f.write_str("Lower tool-result-max or max-tokens to send a turn this large.")
+            }
         }
     }
 }

@@ -66,6 +66,14 @@
 //!   earlier one had. Answered, every later call is sent the notice too, so a
 //!   result the provider will not read cannot refuse the rest of the session;
 //!   refused again, nothing stays withheld, and the call moves on.
+//! * **Nor is a rejection for size.** A provider whose own input limit is
+//!   below the candidate's window -- a gateway that caps what it forwards, or
+//!   a row whose `context-window` is more than the model takes -- says so only
+//!   by rejecting a request as too long. The chain holds that candidate to a
+//!   window below the request rejected from then on, with the candidate's
+//!   calibration, and sends the call again, assembled for the smaller window
+//!   and recorded as a `model.call` of its own, a bounded number of times
+//!   ([`SIZE_RESENDS`]); past that the rejection stands as the failure it is.
 //! * **Neither is a refusal of `drop_block`.** rig asks Anthropic's API to
 //!   drop thinking a change to the conversation made stale, as a backstop to
 //!   the view, which leaves it out itself -- for a model its catalog says
@@ -126,6 +134,14 @@ pub(crate) const CODE_UNFIT: &str = "outrig.unfit";
 /// The code a report carries when the session's spent token budget refused the
 /// request.
 pub(crate) const CODE_BUDGET_SPENT: &str = "outrig.budget-spent";
+
+/// How many times one call is sent again smaller to a candidate whose
+/// provider rejected it as over its input limit, before the rejection stands.
+/// Each resend goes to a window below the request rejected
+/// ([`Budget::rejected_at`]), so three cover a provider counting a request at
+/// several times what the window held it to; a provider still rejecting
+/// after that is refusing something else.
+pub(crate) const SIZE_RESENDS: u32 = 3;
 
 /// One candidate of a chain, behind an object-safe interface: run one
 /// completion, say what the provider composes, and carry what must be
@@ -296,10 +312,12 @@ pub(crate) struct Viewed {
     /// What the rule estimates the whole request at, before the candidate's
     /// scale: the number its provider's report of the request is compared with.
     estimate: u64,
-    /// The reply ceiling the call carries: the candidate's, unless the scale
-    /// would have refused the call's prompt and the view lowered it to carry
-    /// it ([`Budget::making_room_for`]).
-    max_tokens: Option<u32>,
+    /// The allowance the view was assembled at: the candidate's, unless the
+    /// scale would have refused the call's prompt and the view lowered it,
+    /// and the reply's ceiling with it, to carry it
+    /// ([`Budget::making_room_for`]). Its ceiling is the one the call
+    /// carries, and its scale the one the request's size is read at.
+    budget: Budget,
     /// The turn whose results the call answers, or `None` when its prompt is
     /// a round's opening.
     latest: Option<usize>,
@@ -323,12 +341,12 @@ impl View for History {
             messages,
             adjacent: manifest.adjacent.first().copied(),
             estimate: manifest.estimate,
-            max_tokens: manifest.budget.max_tokens,
             latest: manifest
                 .carried
                 .iter()
                 .find(|&&(_, why)| why == Why::Latest)
                 .map(|&(turn, _)| turn),
+            budget: manifest.budget,
         })
     }
 
@@ -441,11 +459,14 @@ impl FailoverModel {
     }
 
     /// What a call to the candidate at `index` is held to now: its budget at
-    /// the scale its provider's reports have set.
+    /// the scale its provider's reports have set, and within the window its
+    /// provider's rejections have set.
     fn held_to(&self, index: usize) -> Budget {
+        let calibration = &self.calibrations[index];
         self.candidates[index]
             .budget()
-            .scaled(self.calibrations[index].get())
+            .scaled(calibration.get())
+            .limited(calibration.limit())
     }
 
     /// The `[models.<name>]` row every call is tried against first.
@@ -643,18 +664,50 @@ fn refused(err: &ProviderError) -> bool {
         .is_some_and(|status| matches!(status.as_u16(), 400 | 422))
 }
 
+/// Whether `err` is a [refusal](refused) whose body names any of `terms`,
+/// compared without regard to case.
+fn refused_naming(err: &ProviderError, terms: &[&str]) -> bool {
+    refused(err)
+        && err.provider_response_body().is_some_and(|body| {
+            let body = body.to_ascii_lowercase();
+            terms.iter().any(|term| body.contains(term))
+        })
+}
+
 /// Whether `err` is an endpoint's refusal of a request for asking that stale
 /// thinking be dropped: one that names the field, the `thinking` it sits in,
 /// or the beta it needs. A model that takes no `adaptive` thinking, and a
 /// gateway that does not know the beta, refuse it so.
 fn refuses_binding(err: &ProviderError) -> bool {
-    refused(err)
-        && err.provider_response_body().is_some_and(|body| {
-            let body = body.to_ascii_lowercase();
-            ["block_binding", "thinking", "beta"]
-                .iter()
-                .any(|term| body.contains(term))
-        })
+    refused_naming(err, &["block_binding", "thinking", "beta"])
+}
+
+/// Whether `err` is a provider's rejection of a request as over its input
+/// limit: what rig's report of it reads as a context overflow -- the
+/// `context_length_exceeded` code, a 413, or any of the phrasings it knows,
+/// "prompt is too long" and "maximum context length" among them -- and two
+/// it does not: LiteLLM's `ContextWindowExceededError`, and Anthropic's
+/// "input length and `max_tokens` exceed context limit".
+fn rejected_for_size(err: &ProviderError) -> bool {
+    ErrorReport::from(err).is_context_overflow()
+        || refused_naming(err, &["contextwindowexceeded", "exceed context limit"])
+}
+
+/// The limit a rejection for size names, in the provider's tokens, when its
+/// body puts a number where those phrasings do: after `max input tokens`
+/// (LiteLLM), after `maximum context length is` (OpenAI), or on the right of
+/// a comparison of counts (Anthropic's `N tokens > M maximum` and
+/// `A + B > M`). Only a count's `>` counts: a gateway's `413` page is HTML,
+/// whose tags end in `>` too, and names no limit.
+fn named_limit(err: &ProviderError) -> Option<u64> {
+    static LIMIT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)(?:max[ _]?input[ _]?tokens\s*[=:]|maximum context length is|(?:\d|tokens)\s+>)\s*(\d+)",
+        )
+        .expect("a limit pattern")
+    });
+    let body = err.provider_response_body()?;
+    LIMIT.captures(body)?[1].parse().ok()
 }
 
 /// `history`, with the messages after the system prompt replaced by `view`.
@@ -783,7 +836,9 @@ impl FailoverModel {
         // cost is one attempt against a still-dead endpoint per call, which the
         // short pre-first-byte connect bound makes cheap.
         for (index, candidate) in self.candidates.iter().enumerate() {
-            let budget = self.held_to(index);
+            // Lowered when the candidate rejects the call for its size.
+            let mut budget = self.held_to(index);
+            let mut resent = 0u32;
             // Set once the candidate has refused the call for what it carried,
             // for the one time it is sent again.
             let mut withholding: Option<Refused> = None;
@@ -796,7 +851,7 @@ impl FailoverModel {
                 let viewed = self.view.view(&budget, call, withholding.as_ref());
                 let max_tokens = viewed
                     .as_ref()
-                    .map_or(budget.max_tokens, |viewed| viewed.max_tokens);
+                    .map_or(budget.max_tokens, |viewed| viewed.budget.max_tokens);
                 self.slot.candidate(
                     candidate.model_name(),
                     candidate.model_identifier(),
@@ -808,7 +863,12 @@ impl FailoverModel {
                 }
                 let viewed = viewed.map(|viewed| {
                     attempt.chat_history = after_system(&attempt.chat_history, viewed.messages);
-                    (viewed.adjacent, viewed.estimate, viewed.latest)
+                    (
+                        viewed.adjacent,
+                        viewed.estimate,
+                        viewed.latest,
+                        viewed.budget,
+                    )
                 });
                 // Both rewrites are per candidate. `max_tokens` is the
                 // load-bearing one: the agent carries none of its own, so
@@ -825,7 +885,7 @@ impl FailoverModel {
                     attempt = attempt.provider_option(OpenAiOptions::new().store(false));
                 }
 
-                let (adjacent, estimate, latest) = match viewed {
+                let (adjacent, estimate, latest, sent) = match viewed {
                     // Not made: the call cannot fit this candidate. Sending it
                     // again fails the same way, which is what a request error
                     // is to `is_recoverable`; the next round's view leaves the
@@ -859,6 +919,25 @@ impl FailoverModel {
                                  ({error}); sending it and every later call without asking, and \
                                  leaving out stale thinking as before",
                                 candidate.model_name()
+                            );
+                            continue;
+                        }
+                        // Rejected as over the provider's input limit: held
+                        // to a window below the request from here, as every
+                        // later call to it is, and sent again smaller. The
+                        // request's size is read at the scale it was sent at,
+                        // which the view may have lowered from the budget's.
+                        if rejected_for_size(&error) && resent < SIZE_RESENDS {
+                            let window = sent.rejected_at(estimate, named_limit(&error));
+                            self.calibrations[index].reject(window);
+                            budget = self.held_to(index);
+                            resent += 1;
+                            tracing::warn!(
+                                "model {} rejected the request as over its input limit ({}); \
+                                 holding it to a {}-token window and sending the call again",
+                                candidate.model_name(),
+                                candidate_failure_label(&error),
+                                budget.window,
                             );
                             continue;
                         }
@@ -918,6 +997,7 @@ mod tests {
     use crate::agent::history::Role;
     use crate::agent::ledger::{Ledger, Refusal};
     use crate::agent::mock_http::transport_failure;
+    use crate::harness::event::WindowSource;
 
     /// What a call to a test's candidate may carry: a window of no consequence,
     /// and `max_tokens`.
@@ -1073,6 +1153,12 @@ mod tests {
         )
     }
 
+    /// A provider's rejection of a request as over its input limit, worded
+    /// `body`.
+    fn rejection(body: &str) -> ProviderError {
+        ProviderError::from_http_response(reqwest::StatusCode::BAD_REQUEST, body)
+    }
+
     /// What a request gets once the session's token budget is spent.
     fn spent() -> ProviderError {
         BudgetSpent::error()
@@ -1094,9 +1180,13 @@ mod tests {
     /// after its own.
     #[derive(Default)]
     struct Views {
-        asked: Mutex<Vec<(String, Scale)>>,
+        /// The budget of each view asked for, in the order asked.
+        held: Mutex<Vec<Budget>>,
         /// The ceiling every view lowers the call to, if it does.
         lowered_to: Option<u32>,
+        /// The rule's tokens of every call's prompt, which a view makes room
+        /// for as a store's does ([`Budget::making_room_for`]).
+        prompt: u64,
         too_large_for: Vec<&'static str>,
         adjacent_for: Vec<&'static str>,
         /// The turn every view answers the results of, or `None` for a
@@ -1112,12 +1202,28 @@ mod tests {
     impl Views {
         /// The model and scale of each view asked for, in the order asked.
         fn asked(&self) -> Vec<(String, Scale)> {
-            self.asked.lock().expect("asked").clone()
+            self.held
+                .lock()
+                .expect("held")
+                .iter()
+                .map(|budget| (budget.model.clone(), budget.scale))
+                .collect()
         }
 
         /// The models of each view asked for, in the order asked.
         fn models(&self) -> Vec<String> {
             self.asked().into_iter().map(|(model, _)| model).collect()
+        }
+
+        /// The window and its source of each view asked for, in the order
+        /// asked.
+        fn windows(&self) -> Vec<(u32, WindowSource)> {
+            self.held
+                .lock()
+                .expect("held")
+                .iter()
+                .map(|budget| (budget.window, budget.window_source))
+                .collect()
         }
 
         /// Views whose calls answer the results of turn `turn`.
@@ -1150,10 +1256,7 @@ mod tests {
             _call: CallId,
             refused: Option<&Refused>,
         ) -> Result<Viewed, TooLarge> {
-            self.asked
-                .lock()
-                .expect("asked")
-                .push((budget.model.clone(), budget.scale));
+            self.held.lock().expect("held").push(budget.clone());
             if refused.is_some() {
                 self.without
                     .lock()
@@ -1173,12 +1276,18 @@ mod tests {
                 turn: Some(2),
                 role: Role::Assistant,
             });
+            let sent = budget.making_room_for(self.prompt);
             Ok(Viewed {
                 messages: vec![Message::user(format!("the view for {}", budget.model))],
                 adjacent,
-                estimate: ESTIMATE,
-                max_tokens: self.lowered_to.or(budget.max_tokens),
+                // Never more than the allowance admits, as a store's view is
+                // not.
+                estimate: self.prompt.max(ESTIMATE).min(sent.room()),
                 latest: self.latest,
+                budget: Budget {
+                    max_tokens: self.lowered_to.or(sent.max_tokens),
+                    ..sent
+                },
             })
         }
 
@@ -1420,6 +1529,188 @@ mod tests {
         let fault =
             failed_with([("bedrock", ProviderError::Provider("no such model".into()))]).await;
         assert!(!may_clear(&fault), "a provider-reported fault: {fault}");
+    }
+
+    /// A candidate that rejects the call as over its input limit is sent it
+    /// again, assembled for a window below the request -- the limit it named
+    /// -- and every later call to it is held to that window from the start.
+    #[tokio::test]
+    async fn a_call_rejected_for_size_is_sent_again_smaller_and_the_window_stays() {
+        let proxy = Scripted::new(
+            "proxy",
+            vec![
+                Err(rejection(
+                    r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1200 tokens > 900 maximum"}}"#,
+                )),
+                Ok("hi"),
+            ],
+        );
+        let calls = Arc::clone(&proxy.calls);
+        let views = Arc::new(Views::default());
+        let chain = chain_over(vec![Box::new(proxy)], views.clone(), CallSlot::default());
+
+        let reply = chain
+            .completion(request())
+            .await
+            .expect("the smaller request is answered");
+        assert!(format!("{:?}", reply.choice).contains("hi"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            views.windows(),
+            [
+                (100_000, WindowSource::Configured),
+                (900, WindowSource::Rejected)
+            ],
+            "the resend is assembled for the limit the provider named"
+        );
+
+        chain
+            .completion(request())
+            .await
+            .expect("answered from the script's last entry");
+        assert_eq!(
+            views.windows()[2],
+            (900, WindowSource::Rejected),
+            "the next call is held to it from its first request"
+        );
+    }
+
+    /// A candidate that rejects every size is sent the call smaller a bounded
+    /// number of times, each below the last, and then its rejection stands as
+    /// it was sent: a lone candidate's `400`, body and all.
+    #[tokio::test]
+    async fn a_call_rejected_past_the_resends_fails_with_the_rejection() {
+        let body = r#"{"error":{"message":"This model's maximum context length is 900 tokens.","code":"context_length_exceeded"}}"#;
+        let proxy = Scripted::failing("proxy", rejection(body));
+        let calls = Arc::clone(&proxy.calls);
+        let views = Arc::new(Views::default());
+        let err = chain_over(vec![Box::new(proxy)], views.clone(), CallSlot::default())
+            .completion(request())
+            .await
+            .expect_err("rejected every time");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1 + SIZE_RESENDS as usize);
+        let sizes: Vec<u32> = views.windows().iter().map(|&(window, _)| window).collect();
+        assert_eq!(sizes[0], 100_000);
+        assert_eq!(
+            sizes[1], 900,
+            "the limit named, while it is below the window"
+        );
+        assert!(
+            sizes.windows(2).all(|pair| pair[1] < pair[0]),
+            "each resend goes below the last: {sizes:?}"
+        );
+        assert_eq!(
+            err.provider_response_status().map(|status| status.as_u16()),
+            Some(400)
+        );
+        assert!(
+            err.provider_response_body()
+                .is_some_and(|got| got.contains("context_length_exceeded")),
+            "{err}"
+        );
+        assert!(!may_clear(&err), "a 400 is as terminal as it was");
+    }
+
+    /// A request the view sent under the candidate's scale, to carry a prompt
+    /// the scale would have refused, is read at the scale it was sent at when
+    /// its provider rejects it: at the candidate's, the request would be over
+    /// the window and the window would not go down, and the same request
+    /// would be sent again.
+    #[tokio::test]
+    async fn a_request_sent_under_the_scale_is_contracted_from_the_scale_it_was_sent_at() {
+        // Answered at twice the estimate, so the candidate's scale is two;
+        // then rejected, naming no limit; then answered.
+        let proxy = Scripted::new(
+            "proxy",
+            vec![Ok("hi"), Err(rejection("prompt is too long")), Ok("hi")],
+        )
+        .reporting(140_000);
+        let calls = Arc::clone(&proxy.calls);
+        // A prompt of 70,000 tokens fits the 100,000-token window at the rule
+        // but not at a scale of two, so the view lowers the scale to carry it.
+        let views = Arc::new(Views {
+            prompt: 70_000,
+            ..Views::default()
+        });
+        let chain = chain_over(vec![Box::new(proxy)], views.clone(), CallSlot::default());
+
+        chain.completion(request()).await.expect("answered");
+        chain
+            .completion(request())
+            .await
+            .expect("the smaller request is answered");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let windows = views.windows();
+        assert_eq!(windows[1], (100_000, WindowSource::Configured));
+        assert_eq!(
+            windows[2].1,
+            WindowSource::Rejected,
+            "the rejection lowered the window: {windows:?}"
+        );
+        assert!(
+            windows[2].0 < 100_000,
+            "the window goes below the one the request was held to: {windows:?}"
+        );
+    }
+
+    /// Which failures are a rejection for size -- rig's reading of a `400`,
+    /// a `413`, and the two phrasings it lacks -- and the limit each phrasing
+    /// names; a `400` for anything else is not one.
+    #[test]
+    fn a_rejection_for_size_is_known_by_its_phrasing_and_names_its_limit() {
+        for (body, limit) in [
+            (
+                "litellm.ContextWindowExceededError: Max Input Tokens=200000, Got=200344",
+                Some(200_000),
+            ),
+            (
+                "prompt is too long: 213456 tokens > 200000 maximum",
+                Some(200_000),
+            ),
+            (
+                "input length and `max_tokens` exceed context limit: 190000 + 20000 > 200000",
+                Some(200_000),
+            ),
+            (
+                "This model's maximum context length is 128000 tokens. However, you requested \
+                 130000 tokens (120000 in the messages, 10000 in the completion).",
+                Some(128_000),
+            ),
+            (r#"{"error":{"code":"context_length_exceeded"}}"#, None),
+        ] {
+            let err = rejection(body);
+            assert!(rejected_for_size(&err), "{body}");
+            assert_eq!(named_limit(&err), limit, "{body}");
+        }
+        assert!(!rejected_for_size(&http_status(400)));
+        assert!(!rejected_for_size(&rejection(
+            "messages: roles must alternate"
+        )));
+        assert!(
+            rejected_for_size(&http_status(413)),
+            "a request too large is a rejection for size whatever the body says"
+        );
+        let page = ProviderError::from_http_response(
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            "<html>\r\n<head><title>413 Request Entity Too Large</title></head>\r\n\
+             <body>\r\n<center><h1>413 Request Entity Too Large</h1></center>\r\n\
+             <hr><center>nginx/1.18.0</center>\r\n</body>\r\n</html>",
+        );
+        assert!(rejected_for_size(&page));
+        assert_eq!(
+            named_limit(&page),
+            None,
+            "a gateway's page names no limit, whatever number its tags end before"
+        );
+        assert!(
+            !rejected_for_size(&ProviderError::from_http_response(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "Rate limit reached: too many tokens per minute"
+            )),
+            "a rate limit that mentions tokens is not one"
+        );
     }
 
     /// What the round says of a refusal is about the view that was refused: the

@@ -1566,6 +1566,7 @@ pub outrig::harness::event::Why::Round
 pub outrig::harness::event::WindowSource::Assumed
 pub outrig::harness::event::WindowSource::Configured
 pub outrig::harness::event::WindowSource::Provider
+pub outrig::harness::event::WindowSource::Rejected
 pub struct outrig::harness::event::AgentInstanceId(_)
 impl outrig::harness::event::AgentInstanceId
 pub fn outrig::harness::event::AgentInstanceId::get(self) -> u64

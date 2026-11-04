@@ -1861,6 +1861,92 @@ async fn a_pruned_view_does_not_bring_back_what_it_left_out() {
     );
 }
 
+/// A provider whose input limit is below the row's `context-window` rejects a
+/// call that fit the window. The call is sent again, held to a window below
+/// the request it rejected, with the view cut to fit; the round completes,
+/// and the resend's manifest names the lowered window and where it came from.
+#[tokio::test]
+async fn a_call_the_provider_rejects_for_size_is_sent_again_cut_to_fit() {
+    let var = "OUTRIG_TEST_AGENT_REJECTED_FOR_SIZE";
+    let (addr, mut requests) = mock_http::start_limited(vec![
+        text_reply("first"),
+        submit("toolu_a", "print('needle-a-' + 'x' * 13000)"),
+        text_reply("second"),
+        submit("toolu_b", "print('needle-b-' + 'y' * 13000)"),
+        text_reply("done"),
+    ])
+    .await;
+    let cfg = config_in(
+        Style::Messages,
+        addr,
+        var,
+        MODEL,
+        "context-window = 200000",
+        "max-tokens = 1024",
+    );
+    let mut agent = agent_of(&cfg, var, Events::off()).await;
+    let seen = manifests(&agent);
+
+    assert_eq!(round(&mut agent, "one").await, "first");
+    assert_eq!(round(&mut agent, "two").await, "second");
+    assert_eq!(round(&mut agent, "three").await, "done");
+
+    let recorded = mock_http::drain(&mut requests);
+    // Round one's call, round two's two, and round three's: the call that
+    // was rejected, and the same call sent again smaller.
+    let sizes: Vec<usize> = recorded
+        .iter()
+        .map(|request| request.body["messages"].to_string().len())
+        .collect();
+    assert_eq!(
+        recorded.len(),
+        1 + 2 + 3,
+        "messages sent, in bytes: {sizes:?}"
+    );
+    let rejected = &recorded[4];
+    let resent = &recorded[5];
+    assert!(
+        position(rejected, "needle-a-").is_some() && position(rejected, "needle-b-").is_some(),
+        "the rejected call carried both results"
+    );
+    assert_eq!(
+        position(resent, "needle-a-"),
+        None,
+        "the cut left the earlier result out"
+    );
+    assert!(
+        position(resent, "needle-b-").is_some(),
+        "the turn the call answers is never left out"
+    );
+    assert!(
+        resent.body["messages"].to_string().len() <= mock_http::LIMIT_BYTES,
+        "the resend fits the provider's limit"
+    );
+
+    let seen = seen.lock().expect("manifests");
+    let budgets: Vec<_> = seen
+        .iter()
+        .map(|m| {
+            (
+                m.budget.window,
+                m.budget.window_source,
+                m.cut.is_some(),
+                m.evicted.len(),
+            )
+        })
+        .collect();
+    let (&(window, source, cut, evicted), before) = budgets.split_last().expect("the resend");
+    assert!(
+        before
+            .iter()
+            .all(|&(window, source, ..)| (window, source) == (200_000, WindowSource::Configured)),
+        "{budgets:?}"
+    );
+    assert_eq!(source, WindowSource::Rejected, "{budgets:?}");
+    assert!(window < 200_000, "{budgets:?}");
+    assert!(cut && evicted > 0, "the resend's view was cut: {budgets:?}");
+}
+
 /// The window the model is told about is the one it gets: the first two
 /// rounds and the six before the current one, so the tenth round is the first
 /// to leave one out, and says so.

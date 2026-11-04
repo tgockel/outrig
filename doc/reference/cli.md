@@ -426,6 +426,9 @@ turn that opens each first round and the current one, where the agent read what 
 too large for what is left is passed over and smaller ones still go. Each later call of the round is
 sent what the cut kept and every turn since, until that no longer fits and the view is cut again, so
 each request begins as the one before it did, which is all a provider's prompt cache can match. A
+provider whose own input limit is below the window says so only by rejecting a request as too long;
+that model is then held to a window below the request it rejected for the rest of the session, and
+the call is sent again, cut to fit. A
 turn a cut left out stays out until the next cut; a new round, a promotion, or a demotion chooses
 afresh. The turn a call answers -- the model's latest code and its results -- is never left out.
 When that alone does not fit, the call is not made: the round ends with `(round ended: turn N of

@@ -790,6 +790,11 @@ fn the_latest_turn_is_never_evicted_and_too_large_names_it() {
             true,
         ),
         (WindowSource::Configured, "token context window,", false),
+        (
+            WindowSource::Rejected,
+            "(lowered after small's provider rejected a larger request)",
+            true,
+        ),
     ] {
         let text = store
             .assemble(

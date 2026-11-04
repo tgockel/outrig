@@ -859,6 +859,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   warning that names the new value, on a provider and on a model alike. A later release will
   remove the spelling.
 
+### Fixed
+
+- **A call the provider rejects as over its input limit is sent again smaller.** A gateway or
+  provider whose own limit is below the model row's `context-window` -- a LiteLLM proxy capping a
+  model at 200,000 tokens in front of a row set to 1,000,000 -- rejected a call that fit the
+  window with a `400`, which ended the round in `model.round.failed` and left the agent idle with
+  nothing in the session to send less. Now a `400` whose body says the request was over the
+  limit (what rig reads as a context overflow -- OpenAI's `context_length_exceeded`, a `413`, and
+  the phrasings it knows -- plus LiteLLM's `ContextWindowExceededError` and Anthropic's "exceed
+  context limit")
+  holds that model to a window below the request rejected -- the limit the body names when it
+  does, otherwise a quarter below the request -- for the rest of the session, with the reply's
+  reserve and its `max_tokens` at most a quarter of it, and the call is assembled again for it,
+  cut where it has to be, and sent, at most three times for one call before the rejection ends
+  the round as before. The resend is recorded as a `model.call` whose `budget.window_source` is
+  the new `rejected`. (#833)
+
 ## [0.2.2](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.2) - 2026-10-20
 
 The second patch release since 0.2.0. Every change to the public surface is additive, and no

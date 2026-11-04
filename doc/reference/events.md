@@ -159,9 +159,11 @@ category says what it may hold.
   - `budget`: what it was held to: `model`; in tokens, `window`, `reserve`, `overhead`, and
     `max_tokens`, the reply ceiling the call carried, or `null`; `window_source`, where `window`
     came from: `configured`, the model row's `context-window`; `provider`, what the model's
-    provider reported when the session asked; or `assumed`, 128,000 tokens, which neither said;
-    `estimate_scale`, what `estimate` was multiplied by to be held to the window; and
-    `role_alternation`, `relaxed` or `strict`, as the model's provider row says.
+    provider reported when the session asked; `assumed`, 128,000 tokens, which neither said; or
+    `rejected`, a window lowered below a request the model's provider rejected as over its input
+    limit, which every later call to that model is held to; `estimate_scale`, what `estimate`
+    was multiplied by to be held to the window; and `role_alternation`, `relaxed` or `strict`,
+    as the model's provider row says.
   - `estimate`: the whole request's estimated tokens, before `estimate_scale`. The scale is `1.0`
     until the model's provider has reported what a request cost. From then on it is the ratio of
     the input tokens that model's latest answered call reported -- `usage.input_tokens` on its
@@ -209,7 +211,14 @@ moves is recorded again right after the `model.failover` that moved it. A model 
 cannot hold the call's latest turn is passed over, with the reason in the `model.failover` that
 moves the call on, and no `model.call` is recorded for it, since nothing was sent. A retry resends
 the same call, and records no new `model.call`. A call sent again to the same model without the
-results it was refused for is assembled again, and recorded right after its `model.withheld`.
+results it was refused for is assembled again, and recorded right after its `model.withheld`. A
+call a model rejected as over its provider's input limit -- a `400` or `413` whose body says so,
+recorded as the failed `model.attempt` -- is sent again to it, held to a window below the request
+rejected: the limit the body names when it does, otherwise a quarter below the request. The reserve
+is at most a quarter of that window and `max_tokens` comes down to the reserve, since a provider
+may count the reply's ceiling against its limit. The call is assembled again for that window, cut
+where it has to be, and recorded as a `model.call` whose `window_source` is `rejected`, at most
+three times for one call before the rejection ends it.
 
 ## Execution diagnostics
 

@@ -30,9 +30,17 @@
 //! one candidate's ratio says nothing of another's, since their tokenizers can
 //! differ. A scale never refuses a prompt the rule admits: the reply's reserve
 //! gives way first ([`Budget::making_room_for`]).
+//!
+//! A provider's own limit can be below the window all the same -- a gateway
+//! in front of a model that caps what it forwards, or a row whose
+//! `context-window` is more than the model takes -- and it says so only by
+//! rejecting a request. That rejection is the one thing it teaches: the
+//! candidate is held from then on to a window below the request it rejected
+//! ([`Budget::rejected_at`], [`Calibration::reject`]), and the call is sent
+//! again smaller.
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use rig::completion::message::{Api, AssistantContent, AssistantMessage};
 use rig::completion::{Message, Usage};
@@ -120,21 +128,46 @@ impl Scale {
     }
 }
 
-/// What one candidate's provider has been seen to count: the [`Scale`] of its
-/// latest answered call.
+/// What one candidate's provider has been seen to count, and to take: the
+/// [`Scale`] of its latest answered call, and the window it was held to once
+/// it rejected a request as over its input limit.
 #[derive(Debug)]
-pub(crate) struct Calibration(AtomicU64);
+pub(crate) struct Calibration {
+    scale: AtomicU64,
+    /// In the provider's tokens; `u32::MAX`, which no window reaches, until a
+    /// request has been rejected.
+    limit: AtomicU32,
+}
 
 impl Default for Calibration {
     fn default() -> Self {
-        Self(AtomicU64::new(Scale::RULE.0))
+        Self {
+            scale: AtomicU64::new(Scale::RULE.0),
+            limit: AtomicU32::new(u32::MAX),
+        }
     }
 }
 
 impl Calibration {
     /// The scale the candidate's next call is held to.
     pub(crate) fn get(&self) -> Scale {
-        Scale(self.0.load(Ordering::Relaxed))
+        Scale(self.scale.load(Ordering::Relaxed))
+    }
+
+    /// The window the candidate's next call is held to in place of its own,
+    /// once its provider has rejected a request: see [`Budget::limited`].
+    pub(crate) fn limit(&self) -> Option<u32> {
+        match self.limit.load(Ordering::Relaxed) {
+            u32::MAX => None,
+            limit => Some(limit),
+        }
+    }
+
+    /// The provider rejected a request as over its input limit: hold the
+    /// candidate to `window` from here, unless it is held lower already. A
+    /// limit only lowers; what a provider refused once it refuses again.
+    pub(crate) fn reject(&self, window: u32) {
+        self.limit.fetch_min(window, Ordering::Relaxed);
     }
 
     /// An answered call whose request the provider reported at `reported`
@@ -147,7 +180,7 @@ impl Calibration {
         if reported == 0 || estimate == 0 {
             return;
         }
-        self.0
+        self.scale
             .store(Scale::observed(reported, estimate).0, Ordering::Relaxed);
     }
 }
@@ -338,6 +371,58 @@ impl Budget {
         }
     }
 
+    /// This allowance held to `limit` in place of its window, when that is
+    /// less: the window its provider has been held to since it rejected a
+    /// request ([`Calibration::reject`]). As with any window the row did not
+    /// set, the reserve is at most a quarter of it, since the ceiling was
+    /// chosen against the model's whole window. Unlike an assumed window, the
+    /// ceiling comes down with the reserve: a provider may count the reply's
+    /// ceiling with the request against the limit it enforces -- Anthropic's
+    /// "input length and `max_tokens` exceed context limit" -- and a ceiling
+    /// left above the reserve would have the same request rejected again.
+    pub(crate) fn limited(&self, limit: Option<u32>) -> Budget {
+        match limit {
+            Some(window) if window < self.window => {
+                let reserve = self.reserve.min(window / 4);
+                Budget {
+                    window,
+                    window_source: WindowSource::Rejected,
+                    reserve,
+                    max_tokens: self.max_tokens.map(|ceiling| ceiling.min(reserve)),
+                    ..self.clone()
+                }
+            }
+            _ => self.clone(),
+        }
+    }
+
+    /// The window to hold this allowance's candidate to, once its provider
+    /// rejected a request the rule estimated at `estimate` -- the whole
+    /// request, overhead included -- as over its input limit, naming `limit`
+    /// in its reply when it did. Of the allowance the request was assembled
+    /// at: its scale is what the request's size is read at, and a view may
+    /// have sent the call under the candidate's ([`Budget::making_room_for`]).
+    ///
+    /// Always below the window the call was held to, so a request rejected
+    /// again is sent smaller again. The limit the provider named is taken
+    /// when it is below that window: a request just over it is then held to
+    /// the provider's own limit in one step, rather than to a guess under it.
+    /// Otherwise -- no limit named, or one at or above the window, which the
+    /// provider counts differently than the rule -- a quarter below the
+    /// request: with the reserve a quarter of the window, the next request is
+    /// at most nine sixteenths of the one rejected.
+    pub(crate) fn rejected_at(&self, estimate: u64, limit: Option<u64>) -> u32 {
+        let window = u64::from(self.window);
+        let refused = self.scale.of(estimate);
+        let below = refused - refused / 4;
+        let lowered = match limit {
+            Some(limit) if limit < window => limit,
+            _ => below,
+        };
+        // Below the window, which is a `u32`; the request was held to it.
+        u32::try_from(lowered.min(window)).expect("at most the window")
+    }
+
     /// This allowance for a call whose prompt, which the call cannot be sent
     /// without, is `prompt` tokens of the rule's: as it stands, unless its scale
     /// would refuse a prompt the rule admits.
@@ -422,6 +507,7 @@ pub(crate) fn too_small(budget: &Budget) -> String {
         WindowSource::Configured => "",
         WindowSource::Provider => " (reported by its provider)",
         WindowSource::Assumed => " (assumed)",
+        WindowSource::Rejected => " (lowered after its provider rejected a larger request)",
     };
     format!(
         "model {model:?}: a {window}-token context window{source} leaves about {} tokens for the \
@@ -808,6 +894,90 @@ mod tests {
         calibration.learn(0, 1_000);
         calibration.learn(1_000, 0);
         assert_eq!(calibration.get(), Scale(1_200));
+    }
+
+    /// A rejection holds the candidate to a window below the request rejected:
+    /// the limit the provider named when it is usable, capped at what the
+    /// request came to, and otherwise a quarter below the request.
+    #[test]
+    fn a_rejected_request_lowers_the_window_below_itself() {
+        let budget = Budget::new(&candidate("m", Some(1_000_000)), Some(128_000), 1_000).unwrap();
+        // The issue's call: a limit well under the request, which is taken.
+        assert_eq!(budget.rejected_at(271_335, Some(200_000)), 200_000);
+        // A limit above the request is still the limit: the provider counted
+        // the reply's ceiling with the request, and that comes down with the
+        // window.
+        assert_eq!(budget.rejected_at(150_000, Some(200_000)), 200_000);
+        // No limit named: a quarter below the request.
+        assert_eq!(budget.rejected_at(200_000, None), 150_000);
+        // Scaled first: the provider counted the request, not the rule.
+        let scaled = budget.scaled(Scale(1_500));
+        assert_eq!(scaled.rejected_at(200_000, None), 225_000);
+        assert_eq!(scaled.rejected_at(200_000, Some(250_000)), 250_000);
+
+        // A limit at or above the window the call was held to is no use: the
+        // window still goes down, and strictly.
+        let held = budget.limited(Some(200_000));
+        assert_eq!(held.rejected_at(200_000, Some(200_000)), 150_000);
+        assert_eq!(held.rejected_at(200_000, Some(1_000_000)), 150_000);
+        assert!(held.rejected_at(199_999, Some(199_999)) < 200_000);
+    }
+
+    /// A limit below the window is the window, with the reserve held to a
+    /// quarter of it as any window the row did not set is, and the ceiling
+    /// brought down to the reserve; one at or above the window changes
+    /// nothing.
+    #[test]
+    fn a_limit_below_the_window_is_the_window_and_the_source_says_so() {
+        let budget = Budget::new(&candidate("m", Some(1_000_000)), Some(128_000), 1_000).unwrap();
+        let limited = budget.limited(Some(200_000));
+        assert_eq!(
+            (
+                limited.window,
+                limited.window_source,
+                limited.reserve,
+                limited.max_tokens
+            ),
+            (200_000, WindowSource::Rejected, 50_000, Some(50_000))
+        );
+        assert_eq!(limited.room(), 150_000 - 1_000);
+        // Lowered again, the quarter is of the new window.
+        assert_eq!(limited.limited(Some(100_000)).reserve, 25_000);
+        // A reserve already under the quarter stays, and its ceiling with it;
+        // a row that sends no ceiling still sends none.
+        let small = Budget::new(&candidate("m", Some(1_000_000)), Some(4_096), 1_000).unwrap();
+        let small = small.limited(Some(200_000));
+        assert_eq!((small.reserve, small.max_tokens), (4_096, Some(4_096)));
+        let unsent = Budget::new(&candidate("m", Some(1_000_000)), None, 1_000).unwrap();
+        assert_eq!(unsent.limited(Some(200_000)).max_tokens, None);
+
+        assert_eq!(budget.limited(None), budget);
+        assert_eq!(budget.limited(Some(1_000_000)), budget);
+        assert_eq!(budget.limited(Some(2_000_000)), budget);
+
+        let text = too_small(&limited);
+        assert!(
+            text.contains("200000-token context window (lowered after its provider rejected"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_calibrations_limit_only_lowers() {
+        let calibration = Calibration::default();
+        assert_eq!(calibration.limit(), None);
+        calibration.reject(200_000);
+        assert_eq!(calibration.limit(), Some(200_000));
+        calibration.reject(300_000);
+        assert_eq!(calibration.limit(), Some(200_000));
+        calibration.reject(150_000);
+        assert_eq!(calibration.limit(), Some(150_000));
+        // The scale is learned apart from it.
+        calibration.learn(1_200, 1_000);
+        assert_eq!(
+            (calibration.get(), calibration.limit()),
+            (Scale(1_200), Some(150_000))
+        );
     }
 
     #[test]

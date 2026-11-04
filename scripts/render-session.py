@@ -92,7 +92,11 @@ USAGE = (
 )
 # What the token table says of where a call's window came from, by the manifest's
 # `window_source`. A window the model row set needs no note.
-WINDOW_SOURCES = {"assumed": " (assumed)", "provider": " (reported by provider)"}
+WINDOW_SOURCES = {
+    "assumed": " (assumed)",
+    "provider": " (reported by provider)",
+    "rejected": " (lowered after a rejection)",
+}
 # The token table's columns.
 TOKEN_COLUMNS = (
     ("round", False),

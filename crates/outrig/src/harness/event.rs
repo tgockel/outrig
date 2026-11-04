@@ -1013,6 +1013,9 @@ pub enum WindowSource {
     /// A window of 128,000 tokens, which the row and the provider both left
     /// unsaid.
     Assumed,
+    /// A window lowered from the one before it, because the model's provider
+    /// rejected a request as over its input limit.
+    Rejected,
 }
 
 /// A turn a call carried or left out, and why it was chosen.
