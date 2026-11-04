@@ -18,15 +18,22 @@
 //!   the editor for the REPL's lifetime, not on tokio's blocking pool: a pool
 //!   worker parked in `read()` is one `BlockingPool::drop` joins without a
 //!   timeout, which would wedge process exit.
+//!
+//! A read that cancellation leaves parked is not simply abandoned, though: it
+//! would go on consuming the keystrokes typed while the session tears down, so
+//! [`TerminalModeGuard`] makes it return first (see [`ReadInterrupt`]).
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::future::Future;
 use std::io::{IsTerminal, Write as _};
-use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::libc;
 use nix::sys::termios::{self, LocalFlags, SetArg, Termios};
 use rustyline::error::{ReadlineError, Signal};
@@ -139,6 +146,11 @@ impl TerminalLease {
         (!self.stopped.load(Ordering::SeqCst)).then_some(reading)
     }
 
+    /// Whether no read holds the terminal right now.
+    fn is_idle(&self) -> bool {
+        self.reading.try_lock().is_ok()
+    }
+
     /// Wait until restoring the terminal will actually stick.
     ///
     /// Taking the lease is not enough on its own. A reader that has taken it
@@ -157,7 +169,7 @@ impl TerminalLease {
     fn await_quiescence(&self, settled: &dyn Fn() -> bool, backstop: Duration) -> Quiescence {
         let deadline = Instant::now() + backstop;
         loop {
-            if self.reading.try_lock().is_ok() {
+            if self.is_idle() {
                 return Quiescence::Idle;
             }
             if settled() {
@@ -171,6 +183,118 @@ impl TerminalLease {
     }
 }
 
+/// How often [`ReadInterrupt::interrupt`] re-sends its wake-up while it waits.
+/// One signal is normally enough; another covers one that landed while the
+/// reader was between `read` calls rather than blocked in one.
+const INTERRUPT_KICK_INTERVAL: Duration = Duration::from_millis(10);
+
+/// What it takes to make a `readline` parked in `read(2)` return (#437).
+///
+/// rustyline offers no way to cancel `readline` from another thread, and a
+/// read left parked keeps the tty's input queue: whatever is typed while the
+/// session tears down -- seconds, since it stops containers -- is consumed by a
+/// thread that will never act on it, instead of waiting for the shell the user
+/// is about to get back. Two things together make the read give up without
+/// taking a byte:
+///
+/// - `O_NONBLOCK` on rustyline's own open file description, reached through a
+///   duplicate of its descriptor. Every later `read` on it fails `EAGAIN`, and
+///   rustyline returns that as an error, through its own way out of `readline`
+///   -- termios, bracketed paste, and SIGINT all put back by the code that
+///   changed them. The description is rustyline's private one: under
+///   `PreferTerm` it opened `/dev/tty` itself, so the flag reaches neither
+///   outrig's stdin nor the shell that shares it.
+/// - `SIGWINCH` to the reader thread, to wake the `read` already blocked: the
+///   tty driver only looks at the flag again once something wakes it. While
+///   `readline` runs, rustyline's own handler is installed without
+///   `SA_RESTART`, so the call ends `EINTR` and rustyline sees a resize, which
+///   it redraws for (only if the width changed) and reads again -- into the
+///   flag. Outside `readline` the signal finds `SIGWINCH`'s default
+///   disposition, which ignores it, so a signal that arrives late is harmless.
+struct ReadInterrupt {
+    /// A duplicate of the descriptor rustyline reads, so `O_NONBLOCK` set on it
+    /// lands on rustyline's file description, and it stays valid for as long as
+    /// this does, whatever becomes of the editor.
+    tty: OwnedFd,
+    /// The reader thread's kernel thread id, 0 until it has started.
+    tid: Arc<AtomicI32>,
+}
+
+impl ReadInterrupt {
+    /// Make the reader holding `lease` leave `readline`, and wait for it to.
+    /// `true` once the lease is free; `false` if the backstop ran out first, or
+    /// the reader cannot be reached.
+    fn interrupt(&self, lease: &TerminalLease, backstop: Duration) -> bool {
+        let tid = self.tid.load(Ordering::SeqCst);
+        if tid == 0 || set_nonblocking(self.tty.as_fd()).is_err() {
+            return false;
+        }
+        let deadline = Instant::now() + backstop;
+        loop {
+            // SAFETY: tgkill only delivers a signal; `getpid()` confines it to
+            // this process, so a thread id since reused could name only another
+            // thread of ours, for which SIGWINCH is ignored or rustyline's.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    libc::getpid(),
+                    tid,
+                    libc::SIGWINCH,
+                );
+            }
+            let kick_until = (Instant::now() + INTERRUPT_KICK_INTERVAL).min(deadline);
+            while Instant::now() < kick_until {
+                if lease.is_idle() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if lease.is_idle() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+}
+
+fn set_nonblocking(fd: BorrowedFd<'_>) -> nix::Result<()> {
+    let flags = OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL)?);
+    fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map(drop)
+}
+
+/// The open descriptors that are the device `rdev` names. Read from
+/// `/proc/self/fd`, following each link to the device it opens.
+fn descriptors_of(rdev: u64) -> BTreeSet<RawFd> {
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return BTreeSet::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let fd = entry.file_name().to_str()?.parse::<RawFd>().ok()?;
+            let meta = std::fs::metadata(entry.path()).ok()?;
+            (meta.file_type().is_char_device() && meta.rdev() == rdev).then_some(fd)
+        })
+        .collect()
+}
+
+/// The one descriptor on `rdev` opened between the two snapshots, duplicated.
+/// rustyline keeps its `/dev/tty` descriptor private; this is how it is found.
+/// Anything but exactly one candidate is `None`: better no interrupt than one
+/// aimed at a descriptor that is not the reader's.
+fn duplicate_new_descriptor(before: &BTreeSet<RawFd>, after: &BTreeSet<RawFd>) -> Option<OwnedFd> {
+    let mut opened = after.difference(before);
+    let (Some(&fd), None) = (opened.next(), opened.next()) else {
+        return None;
+    };
+    // SAFETY: `fd` was open a moment ago and belongs to the editor, which the
+    // caller still holds, so nothing can have closed it in between.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    borrowed.try_clone_to_owned().ok()
+}
+
 /// The controlling terminal's mode as it was before rustyline touched it.
 ///
 /// rustyline restores the mode when `readline` *returns*, from a guard local to
@@ -181,6 +305,10 @@ impl TerminalLease {
 /// process exit with the terminal still raw: the user would land back in a
 /// shell with `ECHO` and `ICANON` cleared, and would have to type `stty sane`
 /// blind.
+///
+/// So this guard first makes such a read return ([`ReadInterrupt`]), which runs
+/// rustyline's own restore, and then restores everything itself regardless --
+/// the only restore there is when the interrupt cannot be delivered.
 ///
 /// It works because it lives in [`EditorSource`], on the REPL future's stack:
 /// dropping that future runs it, ahead of teardown.
@@ -194,6 +322,9 @@ struct TerminalModeGuard {
     /// `Ctrl-C` for the rest of the process.
     saved_sigint: libc::sigaction,
     lease: Arc<TerminalLease>,
+    /// How to end a read left parked; `None` when rustyline's descriptor could
+    /// not be found, which leaves the read parked as before.
+    interrupt: Option<ReadInterrupt>,
 }
 
 impl TerminalModeGuard {
@@ -212,6 +343,7 @@ impl TerminalModeGuard {
             saved,
             saved_sigint,
             lease,
+            interrupt: None,
         })
     }
 
@@ -249,18 +381,35 @@ impl Drop for TerminalModeGuard {
         // `send` and the start of `readline` would re-enable raw mode *after*
         // this restore, with nothing left to undo it: rustyline's own restore
         // belongs to a `readline` that never returns.
-        if let Quiescence::Unresolved = self
+        match self
             .lease
             .await_quiescence(&|| self.reader_settled(), QUIESCENCE_BACKSTOP)
         {
-            tracing::warn!(
+            Quiescence::Idle => {}
+            // A read parked in `read(2)` would swallow what is typed during
+            // teardown. Ending it hands the tty's input back to the shell, and
+            // runs rustyline's own restore on the way out.
+            Quiescence::Reading => {
+                let returned = self
+                    .interrupt
+                    .as_ref()
+                    .is_some_and(|i| i.interrupt(&self.lease, QUIESCENCE_BACKSTOP));
+                if !returned {
+                    tracing::debug!(
+                        target: "outrig::repl",
+                        "line editor read left parked; it may take a keystroke typed during teardown",
+                    );
+                }
+            }
+            Quiescence::Unresolved => tracing::warn!(
                 target: "outrig::repl",
                 "line editor did not settle before teardown; the terminal may need `stty sane`",
-            );
+            ),
         }
 
         // Everything rustyline's own way out of `readline` would have done, in
-        // its order, since the call holding that teardown never returns.
+        // its order, for a read that is still parked. When the interrupt above
+        // ended it, rustyline has done all of this already.
         // Termios first -- TCSANOW rather than rustyline's TCSADRAIN, because
         // this path must not block on pending output. Then bracketed paste
         // off, or the shell that comes next sees every paste wrapped in
@@ -319,7 +468,11 @@ impl EditorSource {
         }
 
         let lease = Arc::new(TerminalLease::new());
-        let mode = TerminalModeGuard::capture(Arc::clone(&lease))?;
+        let mut mode = TerminalModeGuard::capture(Arc::clone(&lease))?;
+        // The device our own `/dev/tty` descriptor is, and so the one
+        // rustyline's will be: both open that path.
+        let tty_rdev = mode.tty.metadata()?.rdev();
+        let tty_fds_before = descriptors_of(tty_rdev);
 
         let config = Config::builder()
             // Prompt and echo go to /dev/tty, leaving stdout for replies.
@@ -332,6 +485,7 @@ impl EditorSource {
             .build();
 
         let editor = DefaultEditor::with_config(config)?;
+        let reader_tty = duplicate_new_descriptor(&tty_fds_before, &descriptors_of(tty_rdev));
 
         // Deliberately no `ExternalPrinter`. One would let a line raised from
         // another task -- a container death, a `tracing` warning -- redraw the
@@ -347,9 +501,24 @@ impl EditorSource {
         // once. Prompt-safe notices are #439.
         let (requests, inbox) = mpsc::channel();
         let reader_lease = Arc::clone(&lease);
+        let tid = Arc::new(AtomicI32::new(0));
+        let reader_tid = Arc::clone(&tid);
         std::thread::Builder::new()
             .name("outrig-readline".to_string())
-            .spawn(move || reader_loop(editor, &inbox, &reader_lease))?;
+            .spawn(move || {
+                // Before any read can start, so a guard that sees one running
+                // also sees where to send the wake-up.
+                // SAFETY: `gettid` takes nothing and cannot fail.
+                reader_tid.store(unsafe { libc::gettid() }, Ordering::SeqCst);
+                reader_loop(editor, &inbox, &reader_lease);
+            })?;
+        match reader_tty {
+            Some(tty) => mode.interrupt = Some(ReadInterrupt { tty, tid }),
+            None => tracing::debug!(
+                target: "outrig::repl",
+                "cannot find the line editor's terminal descriptor; a cancelled read stays parked",
+            ),
+        }
 
         Ok(Self {
             requests,
@@ -360,7 +529,9 @@ impl EditorSource {
 
 /// The reader thread. Owns the editor -- and with it the history -- for as long
 /// as the REPL is asking for lines. Detached, so tokio never waits on it: if
-/// the REPL is cancelled mid-read it stays parked here until the process exits.
+/// the REPL is cancelled mid-read, [`TerminalModeGuard`] makes that read fail
+/// and the thread ends here, or failing that it stays parked until the process
+/// exits.
 fn reader_loop(mut editor: DefaultEditor, inbox: &mpsc::Receiver<Request>, lease: &TerminalLease) {
     while let Ok(request) = inbox.recv() {
         let line = {
@@ -618,5 +789,156 @@ mod tests {
             BRACKETED_PASTE_OFF,
             "paste mode must be switched off"
         );
+    }
+
+    /// What `build` relies on to find rustyline's descriptor: one new
+    /// descriptor on the device is found and duplicated, sharing its file
+    /// description; any other count finds nothing.
+    #[test]
+    fn the_one_new_descriptor_on_a_device_is_found() {
+        let pty = nix::pty::openpty(None, None).expect("openpty");
+        let rdev = File::from(pty.slave.try_clone().expect("dup"))
+            .metadata()
+            .expect("fstat")
+            .rdev();
+        let before = descriptors_of(rdev);
+        assert!(before.contains(&pty.slave.as_raw_fd()));
+
+        let reopened = File::options()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/self/fd/{}", pty.slave.as_raw_fd()))
+            .expect("reopen the pty");
+        let after = descriptors_of(rdev);
+        let found = duplicate_new_descriptor(&before, &after).expect("one new descriptor");
+
+        // Same description: a status flag set through the duplicate shows on
+        // the descriptor it duplicates, and not on the pty opened separately.
+        set_nonblocking(found.as_fd()).expect("O_NONBLOCK");
+        let flags = |fd: BorrowedFd<'_>| {
+            OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).expect("F_GETFL"))
+        };
+        assert!(flags(reopened.as_fd()).contains(OFlag::O_NONBLOCK));
+        assert!(!flags(pty.slave.as_fd()).contains(OFlag::O_NONBLOCK));
+
+        assert!(duplicate_new_descriptor(&after, &after).is_none(), "none new");
+        assert!(
+            duplicate_new_descriptor(&BTreeSet::new(), &after).is_none(),
+            "more than one new",
+        );
+    }
+
+    /// Set in the environment of the child the pty test below spawns; names
+    /// the file it reports progress to.
+    const PTY_CHILD_REPORT: &str = "OUTRIG_TEST_EDITOR_PTY_REPORT";
+
+    /// #437 end to end, against real rustyline on a terminal that is the
+    /// child's controlling one: a prompt is up, the REPL future is dropped
+    /// (as the session watcher does when the primary container dies), and a
+    /// line typed during teardown must still be there for whoever reads the
+    /// terminal next -- not taken by the reader thread left behind.
+    #[test]
+    fn a_read_cancelled_mid_prompt_leaves_teardown_keystrokes_queued() {
+        if let Some(report) = std::env::var_os(PTY_CHILD_REPORT) {
+            pty_child(std::path::Path::new(&report));
+            return;
+        }
+        use std::os::unix::process::CommandExt as _;
+        use std::process::{Command, Stdio};
+
+        let pty = nix::pty::openpty(None, None).expect("openpty");
+        let report = std::env::temp_dir().join(format!(
+            "outrig-editor-pty-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_file(&report);
+        let slave = File::from(pty.slave);
+        let mut command = Command::new(std::env::current_exe().expect("test binary"));
+        command
+            .args([
+                "repl::editor::tests::a_read_cancelled_mid_prompt_leaves_teardown_keystrokes_queued",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PTY_CHILD_REPORT, &report)
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone().expect("dup")))
+            .stdout(Stdio::from(slave.try_clone().expect("dup")))
+            .stderr(Stdio::from(slave));
+        // SAFETY: the hook runs in the forked child, and calls only `setsid`
+        // and `ioctl`, both async-signal-safe: a new session, with the pty --
+        // already on stdin -- as its controlling terminal.
+        let mut child = unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+        }
+            .spawn()
+            .expect("spawn the child on the pty");
+
+        // Drain what the child draws, so it never blocks on a full pty.
+        let mut master = File::from(pty.master);
+        let mut drain = master.try_clone().expect("dup master");
+        std::thread::spawn(move || {
+            let mut sink = [0u8; 4096];
+            while matches!(std::io::Read::read(&mut drain, &mut sink), Ok(n) if n > 0) {}
+        });
+
+        let wait_for = |what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let text = std::fs::read_to_string(&report).unwrap_or_default();
+                if text.lines().any(|l| l.starts_with(what)) || Instant::now() >= deadline {
+                    return text;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        let text = wait_for("cancelled");
+        assert!(text.contains("cancelled"), "child never cancelled its read: {text:?}");
+        master.write_all(b"typed during teardown\n").expect("type");
+        let text = wait_for("read ");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&report);
+        assert!(
+            text.contains("read \"typed during teardown\\n\""),
+            "the line typed during teardown was swallowed: {text:?}",
+        );
+    }
+
+    /// The child's half: put a prompt up, drop it mid-read, then read the
+    /// terminal as the shell after outrig would.
+    fn pty_child(report: &std::path::Path) {
+        let log = |line: &str| {
+            let mut f = File::options()
+                .create(true)
+                .append(true)
+                .open(report)
+                .expect("report");
+            writeln!(f, "{line}").expect("report");
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut source = EditorSource::try_new().expect("a line editor on the pty");
+            let mut out = tokio::io::sink();
+            let read = source.read_line("> ", &mut out, std::future::pending());
+            let cancelled = tokio::time::timeout(Duration::from_millis(300), read).await;
+            assert!(cancelled.is_err(), "nothing was typed, so the read must still be up");
+            drop(source);
+        });
+        log("cancelled");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).expect("read stdin");
+        log(&format!("read {line:?}"));
     }
 }

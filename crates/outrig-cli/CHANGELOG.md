@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Keys typed while a cancelled session tears down reach the shell afterwards.** When the
+  primary container died (or a SIGTERM/SIGHUP ended the session) with the `>` prompt up, the
+  line editor's read was left parked on the terminal until outrig exited, so whatever was typed
+  during teardown -- seconds, while containers stop -- was taken by a thread that would never
+  act on it. That read is now ended as the prompt is dropped, without taking a byte, and the
+  input stays queued for the shell you return to. (#437)
+
 - **`--config` reports a file it cannot examine as what it is.** A `--config` path whose
   `stat` failed for any reason -- a directory without search permission, say -- was called
   "not an existing file", which sends the user looking for a file that is there. That message
