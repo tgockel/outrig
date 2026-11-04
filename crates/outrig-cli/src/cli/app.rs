@@ -400,11 +400,17 @@ fn raise_descriptor_limit() {
     }
 }
 
+/// The filter in force when neither `OUTRIG_LOG` nor `RUST_LOG` is set: outrig's own records at
+/// `info`, with rig's agent-loop instrumentation (a line per turn, the tool arguments and result,
+/// `Agent run finished`) held at `warn` so it does not land between the prompt and the reply.
+/// Naming `rig_core` in either variable is the opt-in.
+const DEFAULT_LOG_FILTER: &str = "info,rig_core=warn";
+
 fn init_tracing(verbose: u8) {
     let outrig_log = std::env::var("OUTRIG_LOG").ok();
     let rust_log = std::env::var("RUST_LOG").ok();
     let spec = log_filter_spec(outrig_log.as_deref(), rust_log.as_deref());
-    let mut filter = EnvFilter::try_new(spec).unwrap_or_else(|_| EnvFilter::new("info"));
+    let mut filter = EnvFilter::try_new(spec).unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
     if let Some(directive) = quiet_rustyline(spec) {
         filter = filter.add_directive(directive);
     }
@@ -425,7 +431,7 @@ fn init_tracing(verbose: u8) {
 }
 
 fn log_filter_spec<'a>(outrig_log: Option<&'a str>, rust_log: Option<&'a str>) -> &'a str {
-    outrig_log.or(rust_log).unwrap_or("info")
+    outrig_log.or(rust_log).unwrap_or(DEFAULT_LOG_FILTER)
 }
 
 /// Hold rustyline's own records at `warn` unless the filter names it.
@@ -581,8 +587,22 @@ mod tests {
     }
 
     #[test]
-    fn log_filter_defaults_to_info() {
-        assert_eq!(log_filter_spec(None, None), "info");
+    fn log_filter_defaults_to_info_with_rig_held_at_warn() {
+        assert_eq!(log_filter_spec(None, None), "info,rig_core=warn");
+    }
+
+    /// rig-core's `info!` calls are the noise; its `warn!`s and anything outrig logs stay, and
+    /// `OUTRIG_LOG=debug` brings rig's lines back.
+    #[test]
+    fn the_default_filter_quiets_rig_core_info_only() {
+        use tracing_subscriber::filter::LevelFilter;
+        let default = EnvFilter::new(log_filter_spec(None, None));
+        assert_eq!(default.max_level_hint(), Some(LevelFilter::INFO));
+        let rendered = default.to_string();
+        assert!(rendered.contains("rig_core=warn"), "{rendered}");
+        let opted_in = EnvFilter::new(log_filter_spec(Some("debug"), None));
+        assert_eq!(opted_in.max_level_hint(), Some(LevelFilter::DEBUG));
+        assert!(!opted_in.to_string().contains("rig_core"));
     }
 
     /// `--config` means the repo config, and `mcp` is the one subcommand that

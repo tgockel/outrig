@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig run` no longer prints rig's `INFO` lines between the prompt and the reply.** The
+  default log filter was `info` for every target, so each turn printed rig-core's
+  `Current conversation Turns`, `execute_tool`, and `Agent run finished` lines on stderr. The
+  default is now `info,rig_core=warn`; `OUTRIG_LOG` and `RUST_LOG` still override it, so
+  `OUTRIG_LOG=debug` shows them again.
 - **Keys typed while a cancelled session tears down reach the shell afterwards.** When the
   primary container died (or a SIGTERM/SIGHUP ended the session) with the `>` prompt up, the
   line editor's read was left parked on the terminal until outrig exited, so whatever was typed

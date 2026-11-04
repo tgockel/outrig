@@ -626,6 +626,8 @@ there; the run is reported in full, and the container is named on stderr.
 - `[providers.<name>].api-key` references via `${VAR}`: provider API key.
 - `OUTRIG_LOG`: preferred `tracing-subscriber` filter, e.g. `OUTRIG_LOG=debug`. When set it
   shadows `RUST_LOG` completely, including a value that filters out more than `RUST_LOG` would.
+  With neither set the filter is `info,rig_core=warn`: outrig's own `info` lines, without the
+  per-turn `info` lines of the agent library; `OUTRIG_LOG=debug` brings those back.
 - `RUST_LOG`: fallback tracing filter when `OUTRIG_LOG` is unset. At `debug`, adds one line per
   buildah/podman invocation (target `outrig::process`) naming the command, its exit status, and
   how long it took.
