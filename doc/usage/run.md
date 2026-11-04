@@ -63,7 +63,8 @@ outrig run [--agent <name>]
   on every connection. Port 22 is exempt. A program that opens many short connections to such
   a server should reuse them.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): this run's specific session
-  directory, which must be empty or not exist yet; symlinked from the root.
+  directory, which must be empty or not exist yet, and outside the session root; symlinked
+  from the root.
 - `--session-root <path>` (default: global config's `session-root`, else XDG): root directory
   containing all sessions.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
@@ -124,7 +125,9 @@ $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
 
 `<path>` has to be empty or not exist yet; outrig creates it, with any missing parents. A path
 that already holds anything -- even a `.gitkeep`, or an earlier run's `session.json` -- is
-refused, because `outrig discard` removes the directory along with the session. See
+refused, because `outrig discard` removes the directory along with the session. A path at or
+under `<session-root>` is refused too: it would give the session both the symlink and a
+directory entry of its own there, and `outrig ls` would show it twice (#429). See
 [Sessions](sessions.md#outrig-discard).
 
 ## Config-less runs

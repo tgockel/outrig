@@ -303,7 +303,7 @@ outrig run [--agent <name>]
   choose Podman's default networking, network audit logging, or global network filtering for
   this session.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): specific directory for this run;
-  must be empty or not exist yet.
+  must be empty or not exist yet, and must be outside the session root.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
   container, beyond the default workspace mount. Read-only unless `:rw`; host dir must exist. A
   relative host path resolves against the current directory, and a leading `~` is your home
@@ -317,8 +317,9 @@ When `--session-dir` is given, outrig writes this run's `session.json`, `logs/`,
 additionally creates a symlink `<session-root>/<sid> -> <path>` so
 `outrig ls`/`logs`/`discard`/`clean` still find it. A `<path>` that does not exist is created,
 with any missing parents; one that already holds anything is refused, as is the second of two
-launches started at once with one `<path>`. When omitted, outrig
-auto-generates a session id and writes to `<session-root>/<sid>/` directly.
+launches started at once with one `<path>`. A `<path>` at or under the session root is refused
+too -- it would give the one record both the symlink and a directory entry of its own (#429).
+When omitted, outrig auto-generates a session id and writes to `<session-root>/<sid>/` directly.
 
 Reads the global and repo configs, resolves agent -> model -> provider, builds the image
 (cache-hit if possible), starts the container, attaches every MCP server, opens the REPL. Exits

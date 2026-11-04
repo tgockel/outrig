@@ -23,7 +23,7 @@
 
 use std::fs;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use nix::fcntl::{FcntlArg, fcntl};
@@ -304,6 +304,24 @@ impl SessionStore {
                     dir.display()
                 )).into());
             }
+            // Refused before either side is created: a directory at or under
+            // the root would get its own entry there once `create_dir_all`
+            // below makes the root exist, on top of the `<root>/<sid>` link
+            // this function makes for it -- `list` reading the directory and
+            // the link as two sessions for the one record (#429).
+            // `canonicalize_prefix` resolves the longest existing ancestor of
+            // each side, so this runs before `dir` or `self.root` necessarily
+            // exist yet.
+            let dir_prefix = canonicalize_prefix(dir).path_ctx("resolve", dir)?;
+            let root_prefix = canonicalize_prefix(&self.root).path_ctx("resolve", &self.root)?;
+            if dir_prefix == root_prefix || dir_prefix.starts_with(&root_prefix) {
+                return Err(OutrigError::Configuration(format!(
+                    "--session-dir {} is inside the session root {}; omit --session-dir, \
+                     or name a directory outside it",
+                    dir.display(),
+                    self.root.display(),
+                )).into());
+            }
             fs::create_dir_all(dir).path_ctx("create directory", dir)?;
             if dir.join(SESSION_JSON).exists() {
                 return Err(OutrigError::Configuration(format!(
@@ -421,11 +439,37 @@ impl SessionStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
             Err(e) => return Err(e).path_ctx("read directory", &self.root).map_err(CliError::from),
         };
+        let entries: Vec<fs::DirEntry> = entries.collect::<std::io::Result<_>>()?;
+
+        // Canonical targets of every symlink directly under the root, so a
+        // plain directory that one of them also resolves to -- left by a
+        // `--session-dir` under the root before `create` refused that
+        // (#429) -- is not read as a second, unlinked session below: the
+        // link's row covers it.
+        let link_targets: std::collections::HashSet<PathBuf> = entries
+            .iter()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let meta = fs::symlink_metadata(&path).ok()?;
+                if !meta.file_type().is_symlink() {
+                    return None;
+                }
+                let target = fs::read_link(&path).ok()?;
+                let resolved = path.parent().map_or_else(|| target.clone(), |p| p.join(&target));
+                fs::canonicalize(&resolved).ok()
+            })
+            .collect();
+
         for entry in entries {
-            let entry = entry?;
             let Some((resolved, link_target)) = resolve_entry(&entry.path())? else {
                 continue;
             };
+            if link_target.is_none()
+                && fs::canonicalize(&resolved).is_ok_and(|canon| link_targets.contains(&canon))
+            {
+                // Covered by a link elsewhere under the root; see above.
+                continue;
+            }
             match read_session_json(&resolved.join(SESSION_JSON)) {
                 Ok(mut session) => {
                     session.link_target = link_target;
@@ -618,6 +662,85 @@ fn dir_names(dir: &Path) -> Result<Vec<String>> {
     }
     names.sort();
     Ok(names)
+}
+
+/// Canonicalize `path`, which may not exist yet: resolve the longest existing
+/// prefix, symlinks included, and apply whatever comes after it lexically.
+/// Lets [`SessionStore::create`] compare an explicit `--session-dir` against
+/// the session root for containment before either one is necessarily on disk
+/// (#429).
+///
+/// A relative `path` is anchored to the current directory first, the same
+/// base `fs::create_dir_all` and friends resolve it against: without this, a
+/// bare name like `new-run` would have no existing ancestor of its own to
+/// climb to.
+///
+/// Walks `path`'s components forward, growing `resolved` -- always a real,
+/// fully symlink-resolved path -- one at a time for as long as each next
+/// name exists on disk (`fs::canonicalize` on `resolved` plus that one name,
+/// so a symlink is followed exactly as the kernel would). The first name
+/// that is not there ends that growth; from there on, `missing` holds the
+/// rest lexically, and a `..` among it cancels the pending name nearest to
+/// it -- the last one still in `missing`, or, once `missing` empties again,
+/// one already folded into `resolved` -- which is sound because nothing
+/// `missing` names can be a symlink sending `..` elsewhere, and `resolved`
+/// has no symlink left in it to do that either, every one already having
+/// been followed on the way there. A name is tried against the real
+/// filesystem again the moment `missing` empties, even after an earlier one
+/// did not exist: `missing/../alias/...` resolves `alias`, symlink and all,
+/// exactly as it would with no `missing` in front of it, and a `..` right
+/// after it goes to *its* real parent, not lexically back to where `missing`
+/// was (caught in review of #429, alongside a path with more than one
+/// trailing `..` landing outside the session root entirely, which an earlier
+/// version of this walk -- shrinking the whole suffix backward instead of
+/// growing `resolved` forward -- misjudged as inside it).
+fn canonicalize_prefix(path: &Path) -> std::io::Result<PathBuf> {
+    let anchored;
+    let start: &Path = if path.is_absolute() {
+        path
+    } else {
+        anchored = std::env::current_dir()?.join(path);
+        &anchored
+    };
+
+    let mut parts = start.components();
+    let mut resolved = match parts.next() {
+        Some(root @ Component::RootDir) => PathBuf::from(root.as_os_str()),
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} has no root to resolve from", path.display()),
+            ));
+        }
+    };
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+
+    for comp in parts {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(name) if missing.is_empty() => {
+                match fs::canonicalize(resolved.join(name)) {
+                    Ok(canon) => resolved = canon,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        missing.push(name.to_os_string());
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Component::Normal(name) => missing.push(name.to_os_string()),
+            Component::ParentDir => {
+                if missing.pop().is_none() {
+                    resolved.pop();
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+
+    for part in missing {
+        resolved.push(part);
+    }
+    Ok(resolved)
 }
 
 /// Resolve a path under the session root. `Ok(None)` when the entry is

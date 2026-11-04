@@ -1582,6 +1582,62 @@ async fn clean_removes_symlinked_session_target_and_link() {
     assert!(err.contains("(symlink)"), "stderr:\n{err}");
 }
 
+/// #429: before `create` refused an explicit directory under the root, it
+/// left `<root>/x` (the directory) and `<root>/<sid>` (the link to it) as two
+/// entries for one record. `list` reads that as one row now, so `clean` sees
+/// one target and removes it once instead of previewing two and failing on
+/// the second.
+#[tokio::test]
+async fn clean_removes_a_directory_duplicated_by_its_own_link_once() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+    let sid = SessionId("20261005T200230-5c0d".into());
+
+    let dir = root.path().join("x");
+    std::fs::create_dir_all(&dir).expect("mkdir x");
+    let session = session_with_age(&sid, now, days(40), Some(days(31)));
+    std::fs::write(
+        dir.join("session.json"),
+        serde_json::to_string(&session).expect("to_string"),
+    )
+    .expect("write session.json");
+    let canon_dir = std::fs::canonicalize(&dir).expect("canon");
+    std::os::unix::fs::symlink(&canon_dir, root.path().join(sid.as_str()))
+        .expect("symlink sid -> x");
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        BTreeSet::new(),
+        Vec::new(),
+        Vec::new(),
+        no_removals,
+        no_build_removals,
+    )
+    .await
+    .expect("clean should remove the duplicate once and not fail on the second row");
+    drop(ew);
+
+    assert!(!dir.exists(), "the directory should be removed");
+    assert!(
+        std::fs::symlink_metadata(root.path().join(sid.as_str())).is_err(),
+        "the link should be removed"
+    );
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains("will remove 1 session"),
+        "previewed once, not twice: {err}"
+    );
+    assert!(err.contains("cleaned 1 session"), "{err}");
+}
+
 /// #326: `clean` batches its removals behind one prompt, so it is the likelier
 /// way to lose a directory. It removes the record and keeps the rest, and a
 /// kept directory is not a failure.

@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now stays for a path that is absent or not a regular file; any other failure reads
   `--config <path> cannot be read: <cause>`. (#496)
 
+- **A `--session-dir` inside the session root no longer lists twice or breaks `clean`.**
+  `outrig run --session-dir <session-root>/x` wrote the record into `x` and linked
+  `<session-root>/<sid>` to it, so the root held two entries for one record: `outrig ls`
+  showed it twice, a substring of its id was "ambiguous" with itself, and `outrig clean`
+  removed it and then failed stat-ing the second row, exiting 1 before its container and
+  build-container sweeps ran. `--session-dir` now refuses a path at or under the session
+  root, naming it; `outrig ls`/`logs`/`discard`/`clean` read a plain directory a root-level
+  link resolves to as the one session it is, for a record written this way before the fix.
+  (#429)
+
 - **A config file outrig refuses is named in the error.** `error: TOML parse error at line 2,
   column 14` left the reader to work out which file the excerpt came from, with the global
   config and a repo (or `--config`) file both in play; it now reads `error: ci/outrig.toml:
