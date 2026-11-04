@@ -1109,7 +1109,7 @@ pub(crate) mod fixtures {
     use super::*;
     use crate::llm::{ResolvedCandidate, ResolvedProvider};
     use outrig::config::{
-        Agent, AnthropicOptions, ApiKeyRef, ChatCompletionsOptions, LlmProvider, Model,
+        Agent, ApiKeyRef, ChatCompletionsOptions, LlmProvider, MessagesOptions, Model,
     };
 
     /// The env var the fixture provider's api-key points at. Unique to this
@@ -1260,10 +1260,10 @@ pub(crate) mod fixtures {
         let mut cfg = test_config();
         cfg.providers.insert(
             "anthropic".to_string(),
-            LlmProvider::anthropic(
+            LlmProvider::messages(
                 "http://127.0.0.1:9",
                 ApiKeyRef::parse(&format!("${{{KEY_VAR}}}")).expect("api-key ref parses"),
-                AnthropicOptions::new().with_request_timeout_secs(1),
+                MessagesOptions::new().with_request_timeout_secs(1),
             ),
         );
         cfg.models.insert(
@@ -4174,13 +4174,13 @@ mod tests {
         let resolved = resolve_launch_model(&registry.ctx, Some("claude")).expect("resolves");
         assert!(matches!(
             resolved.provider(),
-            crate::llm::ResolvedProvider::Anthropic { .. }
+            crate::llm::ResolvedProvider::Messages { .. }
         ));
         assert!(matches!(
             crate::llm::build_agent(&resolved, Vec::new())
                 .await
                 .expect("an anthropic agent builds without I/O"),
-            crate::llm::RigAgent::Anthropic { .. }
+            crate::llm::RigAgent::Messages { .. }
         ));
         assert!(
             usable_model_names(registry.config()).contains(&"claude".to_string()),

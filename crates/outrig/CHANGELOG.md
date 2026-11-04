@@ -656,7 +656,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LlmProvider::OpenAi` is `LlmProvider::ChatCompletions`, `LlmProvider::openai` is
   `LlmProvider::chat_completions`, and `OpenAiOptions` is `ChatCompletionsOptions`.
   `LlmProvider::style` returns `"chat-completions"`, and the unknown-style error lists
-  `chat-completions`, `responses` and `anthropic`.
+  `chat-completions`, `responses` and `messages`.
+- **Breaking: `style = "anthropic"` is `style = "messages"`.** `style` names the protocol each
+  model on a provider is called with, and the protocol is Anthropic's Messages API, not only
+  Anthropic's own endpoint: a model on a gateway reaches it the same way (#796). The Rust names
+  follow: `ApiStyle::Anthropic` is `ApiStyle::Messages`, `LlmProvider::Anthropic` is
+  `LlmProvider::Messages`, `LlmProvider::anthropic` is `LlmProvider::messages`, and
+  `AnthropicOptions` is `MessagesOptions`. `outrig config init` and the startup banner say
+  `messages`, and a model row's own `style` takes the same values a provider's does.
 - **The agent loop runs on rig 0.45** (`rig-core` 0.40 before), through the `rig` facade over
   `rig-core`, `rig-agent`, `rig-reqwest` and `rig-http`, and the minimum supported Rust is 1.97.1.
   No type of rig's crosses the public API, as before. What a session's record and its rounds show
@@ -820,6 +827,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`style = "openai"`** is still read, as `chat-completions`, with a `ConfigWarningKind::Deprecated`
   warning that names the new value. A later release will remove the spelling. Without it a 0.2.x
   global config would lose its `openai` provider and every model on it.
+- **`style = "anthropic"`** is still read, as `messages`, with a `ConfigWarningKind::Deprecated`
+  warning that names the new value, on a provider and on a model alike. A later release will
+  remove the spelling.
 
 ## [0.2.2](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.2) - 2026-10-20
 

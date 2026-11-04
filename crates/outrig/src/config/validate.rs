@@ -945,7 +945,7 @@ pub(super) fn validate_with_options(
                     request_timeout_secs,
                     ..
                 }
-                | LlmProvider::Anthropic {
+                | LlmProvider::Messages {
                     base_url,
                     retry_budget_secs,
                     request_timeout_secs,
@@ -1019,7 +1019,7 @@ pub(super) fn validate_with_options(
             // provider's.
             let style = model.effective_style(provider);
             match style {
-                ApiStyle::ChatCompletions | ApiStyle::Responses | ApiStyle::Anthropic => {
+                ApiStyle::ChatCompletions | ApiStyle::Responses | ApiStyle::Messages => {
                     validate_remote_model(style.as_str(), model_name, model)?
                 }
             }
@@ -1063,7 +1063,7 @@ pub(super) fn validate_as_repo(cfg: &Config) -> Result<(), ConfigValidationError
         // style has to say here whether a repo file may declare it.
         let (LlmProvider::ChatCompletions { api_key, .. }
         | LlmProvider::Responses { api_key, .. }
-        | LlmProvider::Anthropic { api_key, .. }) = provider;
+        | LlmProvider::Messages { api_key, .. }) = provider;
         return Err(ConfigValidationError::RepoProviderApiKey {
             provider: name.clone(),
             style: provider.style(),

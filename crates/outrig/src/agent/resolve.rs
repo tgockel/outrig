@@ -99,7 +99,7 @@ pub(crate) enum ResolvedProvider {
         retry_budget_secs: Option<u64>,
         role_alternation: RoleAlternation,
     },
-    Anthropic {
+    Messages {
         base_url: String,
         api_key: Redacted,
         request_timeout_secs: Option<u64>,
@@ -149,7 +149,7 @@ impl ResolvedProvider {
                 request_timeout_secs,
                 ..
             }
-            | Self::Anthropic {
+            | Self::Messages {
                 request_timeout_secs,
                 ..
             } => *request_timeout_secs,
@@ -166,7 +166,7 @@ impl ResolvedProvider {
             | Self::Responses {
                 retry_budget_secs, ..
             }
-            | Self::Anthropic {
+            | Self::Messages {
                 retry_budget_secs, ..
             } => *retry_budget_secs,
         }
@@ -182,7 +182,7 @@ impl ResolvedProvider {
             | Self::Responses {
                 role_alternation, ..
             }
-            | Self::Anthropic {
+            | Self::Messages {
                 role_alternation, ..
             } => *role_alternation,
         }
@@ -270,7 +270,7 @@ fn selectability(cfg: &Config, model_name: &str, secrets: &dyn Secrets) -> Resul
     })?;
     let (LlmProvider::ChatCompletions { api_key, .. }
     | LlmProvider::Responses { api_key, .. }
-    | LlmProvider::Anthropic { api_key, .. }) = provider;
+    | LlmProvider::Messages { api_key, .. }) = provider;
     // Through `resolve_with` rather than asking `secrets` directly, so "not
     // set" and "not valid UTF-8" read exactly as they will when the session
     // resolves.
@@ -518,7 +518,7 @@ fn resolve_candidate(
         role_alternation,
         ..
     }
-    | LlmProvider::Anthropic {
+    | LlmProvider::Messages {
         base_url,
         api_key,
         request_timeout_secs,
@@ -546,7 +546,7 @@ fn resolve_candidate(
             retry_budget_secs,
             role_alternation,
         },
-        ApiStyle::Anthropic => ResolvedProvider::Anthropic {
+        ApiStyle::Messages => ResolvedProvider::Messages {
             base_url,
             api_key,
             request_timeout_secs,

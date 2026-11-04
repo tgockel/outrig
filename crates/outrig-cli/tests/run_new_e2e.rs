@@ -122,7 +122,7 @@ fn repo_with(addr: std::net::SocketAddr, extra: &str) -> RepoDir {
         format!(
             r#"
 [providers.claude]
-style                = "anthropic"
+style                = "messages"
 base-url             = "http://{addr}"
 api-key              = "${{{KEY_VAR}}}"
 request-timeout-secs = 30

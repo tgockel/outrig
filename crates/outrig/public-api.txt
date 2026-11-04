@@ -17,8 +17,8 @@ pub outrig::config::ApiKeyError::NotUnicode::var: alloc::string::String
 pub outrig::config::ApiKeyError::Unresolved
 pub outrig::config::ApiKeyError::Unresolved::var: alloc::string::String
 #[non_exhaustive] pub enum outrig::config::ApiStyle
-pub outrig::config::ApiStyle::Anthropic
 pub outrig::config::ApiStyle::ChatCompletions
+pub outrig::config::ApiStyle::Messages
 pub outrig::config::ApiStyle::Responses
 impl outrig::config::ApiStyle
 pub fn outrig::config::ApiStyle::as_str(self) -> &'static str
@@ -391,18 +391,18 @@ pub outrig::config::ImageSourceRef::Build::dockerfile: &'a std::path::Path
 #[non_exhaustive] pub outrig::config::ImageSourceRef::Image
 pub outrig::config::ImageSourceRef::Image::image_name: &'a str
 #[non_exhaustive] pub enum outrig::config::LlmProvider
-#[non_exhaustive] pub outrig::config::LlmProvider::Anthropic
-pub outrig::config::LlmProvider::Anthropic::api_key: outrig::config::ApiKeyRef
-pub outrig::config::LlmProvider::Anthropic::base_url: alloc::string::String
-pub outrig::config::LlmProvider::Anthropic::request_timeout_secs: core::option::Option<u64>
-pub outrig::config::LlmProvider::Anthropic::retry_budget_secs: core::option::Option<u64>
-pub outrig::config::LlmProvider::Anthropic::role_alternation: core::option::Option<outrig::config::RoleAlternation>
 #[non_exhaustive] pub outrig::config::LlmProvider::ChatCompletions
 pub outrig::config::LlmProvider::ChatCompletions::api_key: outrig::config::ApiKeyRef
 pub outrig::config::LlmProvider::ChatCompletions::base_url: alloc::string::String
 pub outrig::config::LlmProvider::ChatCompletions::request_timeout_secs: core::option::Option<u64>
 pub outrig::config::LlmProvider::ChatCompletions::retry_budget_secs: core::option::Option<u64>
 pub outrig::config::LlmProvider::ChatCompletions::role_alternation: core::option::Option<outrig::config::RoleAlternation>
+#[non_exhaustive] pub outrig::config::LlmProvider::Messages
+pub outrig::config::LlmProvider::Messages::api_key: outrig::config::ApiKeyRef
+pub outrig::config::LlmProvider::Messages::base_url: alloc::string::String
+pub outrig::config::LlmProvider::Messages::request_timeout_secs: core::option::Option<u64>
+pub outrig::config::LlmProvider::Messages::retry_budget_secs: core::option::Option<u64>
+pub outrig::config::LlmProvider::Messages::role_alternation: core::option::Option<outrig::config::RoleAlternation>
 #[non_exhaustive] pub outrig::config::LlmProvider::Responses
 pub outrig::config::LlmProvider::Responses::api_key: outrig::config::ApiKeyRef
 pub outrig::config::LlmProvider::Responses::base_url: alloc::string::String
@@ -410,8 +410,8 @@ pub outrig::config::LlmProvider::Responses::request_timeout_secs: core::option::
 pub outrig::config::LlmProvider::Responses::retry_budget_secs: core::option::Option<u64>
 pub outrig::config::LlmProvider::Responses::role_alternation: core::option::Option<outrig::config::RoleAlternation>
 impl outrig::config::LlmProvider
-pub fn outrig::config::LlmProvider::anthropic(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, outrig::config::AnthropicOptions) -> Self
 pub fn outrig::config::LlmProvider::chat_completions(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, outrig::config::ChatCompletionsOptions) -> Self
+pub fn outrig::config::LlmProvider::messages(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, outrig::config::MessagesOptions) -> Self
 pub fn outrig::config::LlmProvider::responses(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, outrig::config::ResponsesOptions) -> Self
 pub fn outrig::config::LlmProvider::style(&self) -> &'static str
 #[non_exhaustive] pub enum outrig::config::McpServerSpec
@@ -527,15 +527,6 @@ pub outrig::config::Agent::tool_call_max: core::option::Option<u32>
 pub outrig::config::Agent::tool_result_max: core::option::Option<u32>
 impl outrig::config::Agent
 pub fn outrig::config::Agent::subagents_enabled(&self) -> bool
-#[non_exhaustive] pub struct outrig::config::AnthropicOptions
-pub outrig::config::AnthropicOptions::request_timeout_secs: core::option::Option<u64>
-pub outrig::config::AnthropicOptions::retry_budget_secs: core::option::Option<u64>
-pub outrig::config::AnthropicOptions::role_alternation: core::option::Option<outrig::config::RoleAlternation>
-impl outrig::config::AnthropicOptions
-pub fn outrig::config::AnthropicOptions::new() -> Self
-pub fn outrig::config::AnthropicOptions::with_request_timeout_secs(self, u64) -> Self
-pub fn outrig::config::AnthropicOptions::with_retry_budget_secs(self, u64) -> Self
-pub fn outrig::config::AnthropicOptions::with_role_alternation(self, outrig::config::RoleAlternation) -> Self
 pub struct outrig::config::ApiKeyRef(_)
 impl outrig::config::ApiKeyRef
 pub fn outrig::config::ApiKeyRef::parse(&str) -> outrig::error::Result<Self>
@@ -662,6 +653,15 @@ pub fn outrig::config::ImageConfig::security_mut(&mut self) -> &mut outrig::conf
 pub fn outrig::config::ImageConfig::set_build_paths(&mut self, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>)
 pub fn outrig::config::ImageConfig::set_image_name(&mut self, impl core::convert::Into<alloc::string::String>)
 pub fn outrig::config::ImageConfig::source(&self) -> outrig::config::ImageSourceRef<'_>
+#[non_exhaustive] pub struct outrig::config::MessagesOptions
+pub outrig::config::MessagesOptions::request_timeout_secs: core::option::Option<u64>
+pub outrig::config::MessagesOptions::retry_budget_secs: core::option::Option<u64>
+pub outrig::config::MessagesOptions::role_alternation: core::option::Option<outrig::config::RoleAlternation>
+impl outrig::config::MessagesOptions
+pub fn outrig::config::MessagesOptions::new() -> Self
+pub fn outrig::config::MessagesOptions::with_request_timeout_secs(self, u64) -> Self
+pub fn outrig::config::MessagesOptions::with_retry_budget_secs(self, u64) -> Self
+pub fn outrig::config::MessagesOptions::with_role_alternation(self, outrig::config::RoleAlternation) -> Self
 #[non_exhaustive] pub struct outrig::config::Model
 pub outrig::config::Model::alias: core::option::Option<alloc::vec::Vec<alloc::string::String>>
 pub outrig::config::Model::context_window: core::option::Option<u32>

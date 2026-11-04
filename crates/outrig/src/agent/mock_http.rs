@@ -206,7 +206,7 @@ pub(super) fn message(content: Value, stop_reason: &str) -> CannedResponse {
 /// A `200 OK` rig cannot make a completion of: no content at all. Its
 /// `stop_reason` is not `end_turn`, which rig would read as an empty reply.
 pub(super) fn unusable() -> CannedResponse {
-    Style::Anthropic.unusable()
+    Style::Messages.unusable()
 }
 
 /// One text block, round over.
@@ -216,24 +216,24 @@ pub(super) fn text_reply(text: &str) -> CannedResponse {
 
 /// A turn that asks for `submit_python` with `source`.
 pub(super) fn submit(id: &str, source: &str) -> CannedResponse {
-    Style::Anthropic.submit(id, source)
+    Style::Messages.submit(id, source)
 }
 
 /// Which provider's protocol a canned response speaks, and a config names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Style {
-    Anthropic,
+    Messages,
     ChatCompletions,
     Responses,
 }
 
 impl Style {
-    pub(super) const ALL: [Style; 3] = [Style::Anthropic, Style::ChatCompletions, Style::Responses];
+    pub(super) const ALL: [Style; 3] = [Style::Messages, Style::ChatCompletions, Style::Responses];
 
     /// What `[providers.<name>].style` says for it.
     pub(super) fn name(self) -> &'static str {
         match self {
-            Style::Anthropic => "anthropic",
+            Style::Messages => "messages",
             Style::ChatCompletions => "chat-completions",
             Style::Responses => "responses",
         }
@@ -242,7 +242,7 @@ impl Style {
     /// One text reply, round over.
     pub(super) fn text(self, text: &str) -> CannedResponse {
         match self {
-            Style::Anthropic => text_reply(text),
+            Style::Messages => text_reply(text),
             Style::ChatCompletions => chat(json!({"role": "assistant", "content": text}), "stop"),
             Style::Responses => responses(
                 json!([{
@@ -260,7 +260,7 @@ impl Style {
     /// A `200 OK` rig cannot make a completion of: no content at all, cut off.
     pub(super) fn unusable(self) -> CannedResponse {
         match self {
-            Style::Anthropic => self.empty("max_tokens"),
+            Style::Messages => self.empty("max_tokens"),
             Style::ChatCompletions | Style::Responses => self.empty("length"),
         }
     }
@@ -269,7 +269,7 @@ impl Style {
     /// `finish_reason`.
     pub(super) fn empty(self, finish_reason: &str) -> CannedResponse {
         match self {
-            Style::Anthropic => message(json!([]), finish_reason),
+            Style::Messages => message(json!([]), finish_reason),
             Style::ChatCompletions => {
                 chat(json!({"role": "assistant", "content": ""}), finish_reason)
             }
@@ -281,7 +281,7 @@ impl Style {
     /// finish reason a provider gives for the model stopping of its own accord.
     pub(super) fn empty_stop(self) -> CannedResponse {
         match self {
-            Style::Anthropic => self.empty("end_turn"),
+            Style::Messages => self.empty("end_turn"),
             Style::ChatCompletions | Style::Responses => self.empty("stop"),
         }
     }
@@ -294,7 +294,7 @@ impl Style {
     /// A turn that asks for `submit_python` once per `(id, source)`.
     pub(super) fn batch(self, calls: &[(&str, &str)]) -> CannedResponse {
         match self {
-            Style::Anthropic => message(
+            Style::Messages => message(
                 calls
                     .iter()
                     .map(|(id, source)| {
@@ -349,7 +349,7 @@ impl Style {
     /// model object, or a LiteLLM proxy's `model/info`.
     pub(super) fn window(self, identifier: &str, tokens: Option<u64>) -> CannedResponse {
         match self {
-            Style::Anthropic => CannedResponse::new(
+            Style::Messages => CannedResponse::new(
                 200,
                 json!({
                     "type": "model",
@@ -367,7 +367,7 @@ impl Style {
     /// The provider refusing a request with `status`.
     pub(super) fn failure(self, status: u16) -> CannedResponse {
         match self {
-            Style::Anthropic => failure(status),
+            Style::Messages => failure(status),
             Style::ChatCompletions | Style::Responses => CannedResponse::new(
                 status,
                 json!({
@@ -385,7 +385,7 @@ impl Style {
     /// rig reads it as a provider response with a success status.
     pub(super) fn failed_after_accepting(self) -> CannedResponse {
         match self {
-            Style::Anthropic => {
+            Style::Messages => {
                 CannedResponse::new(200, json!({ "type": "error", "message": "Overloaded" }))
             }
             Style::ChatCompletions | Style::Responses => CannedResponse::new(
@@ -511,7 +511,7 @@ pub(super) fn check_wire(style: Style, body: &Value) -> Wire {
     let role = |n: usize| messages[n]["role"].as_str().unwrap_or("").to_string();
     let mut wire = Wire::default();
     match style {
-        Style::Anthropic => {
+        Style::Messages => {
             let blocks = |n: usize, kind: &str, key: &str| -> Vec<String> {
                 messages[n]["content"]
                     .as_array()
@@ -733,7 +733,7 @@ fn content_refusal(body: &Value) -> Option<CannedResponse> {
         return None;
     }
     Some(match body.get("system") {
-        Some(_) => Style::Anthropic.empty("refusal"),
+        Some(_) => Style::Messages.empty("refusal"),
         None => Style::ChatCompletions.empty("content_filter"),
     })
 }

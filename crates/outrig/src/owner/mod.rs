@@ -387,7 +387,7 @@ pub(crate) fn view(config: &Config, repo_root: &Path) -> Result<Value, OutrigErr
         .map(|(name, provider)| {
             let (LlmProvider::ChatCompletions { base_url, .. }
             | LlmProvider::Responses { base_url, .. }
-            | LlmProvider::Anthropic { base_url, .. }) = provider;
+            | LlmProvider::Messages { base_url, .. }) = provider;
             let row = json!({ "style": provider.style(), "base_url": base_url });
             (name.clone(), row)
         })

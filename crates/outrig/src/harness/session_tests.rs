@@ -28,7 +28,7 @@ fn config(addr: impl std::fmt::Display, default: bool) -> Config {
 {default}
 
 [providers.claude]
-style    = "anthropic"
+style    = "messages"
 base-url = "http://{addr}"
 api-key  = "${{{VAR}}}"
 

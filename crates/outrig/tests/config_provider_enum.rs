@@ -7,8 +7,8 @@
 use std::path::Path;
 
 use outrig::config::{
-    AnthropicOptions, ApiKeyRef, ApiStyle, ChatCompletionsOptions, Config, ConfigValidationError,
-    ConfigWarningKind, LlmProvider, RoleAlternation,
+    ApiKeyRef, ApiStyle, ChatCompletionsOptions, Config, ConfigValidationError, ConfigWarningKind,
+    LlmProvider, MessagesOptions, RoleAlternation,
 };
 use outrig::error::OutrigError;
 
@@ -28,11 +28,11 @@ fn expect_validation_err(cfg: &Config, repo_root: Option<&Path>) -> ConfigValida
 /// and survives a serialize/parse round trip, including the model-level
 /// `max-tokens` its API needs and the `context-window` `run-new` budgets to.
 #[test]
-fn anthropic_provider_parses_validates_and_round_trips() {
+fn messages_provider_parses_validates_and_round_trips() {
     let cfg = parse(
         r#"
 [providers.claude]
-style                = "anthropic"
+style                = "messages"
 base-url             = "https://api.anthropic.com"
 api-key              = "${ANTHROPIC_API_KEY}"
 request-timeout-secs = 120
@@ -47,7 +47,7 @@ context-window = 200000
     );
     cfg.validate(None).expect("validates");
 
-    let LlmProvider::Anthropic {
+    let LlmProvider::Messages {
         base_url,
         api_key,
         request_timeout_secs,
@@ -55,7 +55,7 @@ context-window = 200000
         ..
     } = &cfg.providers["claude"]
     else {
-        panic!("expected the Anthropic variant, got: {:?}", cfg.providers);
+        panic!("expected the Messages variant, got: {:?}", cfg.providers);
     };
     assert_eq!(base_url, "https://api.anthropic.com");
     assert_eq!(api_key.var_name(), "ANTHROPIC_API_KEY");
@@ -70,7 +70,7 @@ context-window = 200000
         "the key round-trips in its documented spelling, got: {serialized}"
     );
     assert!(
-        serialized.contains(r#"style = "anthropic""#),
+        serialized.contains(r#"style = "messages""#),
         "style should round-trip as the documented tag, got: {serialized}"
     );
     let again = Config::load_from_str(&serialized).expect("reserialized parses");
@@ -82,22 +82,22 @@ context-window = 200000
 /// silently ignored -- which a config file's load turns into a warning naming
 /// it.
 #[test]
-fn anthropic_provider_field_rules() {
+fn messages_provider_field_rules() {
     let cfg = parse(
         r#"
 [providers.claude]
-style    = "anthropic"
+style    = "messages"
 base-url = "https://api.anthropic.com"
 api-key  = "${ANTHROPIC_API_KEY}"
 "#,
     );
-    let LlmProvider::Anthropic {
+    let LlmProvider::Messages {
         request_timeout_secs,
         retry_budget_secs,
         ..
     } = &cfg.providers["claude"]
     else {
-        panic!("expected the Anthropic variant");
+        panic!("expected the Messages variant");
     };
     assert_eq!(*request_timeout_secs, None);
     assert_eq!(*retry_budget_secs, None);
@@ -107,7 +107,7 @@ api-key  = "${ANTHROPIC_API_KEY}"
             "base-url",
             r#"
 [providers.claude]
-style   = "anthropic"
+style   = "messages"
 api-key = "${ANTHROPIC_API_KEY}"
 "#,
         ),
@@ -115,7 +115,7 @@ api-key = "${ANTHROPIC_API_KEY}"
             "api-key",
             r#"
 [providers.claude]
-style    = "anthropic"
+style    = "messages"
 base-url = "https://api.anthropic.com"
 "#,
         ),
@@ -129,7 +129,7 @@ base-url = "https://api.anthropic.com"
 
     let with_max_tokens = r#"
 [providers.claude]
-style      = "anthropic"
+style      = "messages"
 base-url   = "https://api.anthropic.com"
 api-key    = "${ANTHROPIC_API_KEY}"
 max-tokens = 4096
@@ -144,16 +144,16 @@ max-tokens = 4096
     assert_eq!(keys, ["providers.claude.max-tokens"]);
     assert!(matches!(
         cfg.providers["claude"],
-        LlmProvider::Anthropic { .. }
+        LlmProvider::Messages { .. }
     ));
 }
 
 #[test]
-fn anthropic_model_missing_identifier_fails_validate() {
+fn messages_model_missing_identifier_fails_validate() {
     let cfg = parse(
         r#"
 [providers.claude]
-style    = "anthropic"
+style    = "messages"
 base-url = "https://api.anthropic.com"
 api-key  = "${ANTHROPIC_API_KEY}"
 
@@ -166,12 +166,12 @@ provider = "claude"
         matches!(
             err,
             ConfigValidationError::RemoteModelMissingIdentifier { ref model, style, .. }
-                if model == "sonnet" && style == "anthropic"
+                if model == "sonnet" && style == "messages"
         ),
         "got: {err:?}",
     );
     assert!(
-        err.to_string().contains("(style=anthropic)"),
+        err.to_string().contains("(style=messages)"),
         "message should name the style the user wrote, got: {err}"
     );
 }
@@ -308,6 +308,65 @@ identifier = "gpt-4o-mini"
     );
 }
 
+/// A config written before the rename says `style = "anthropic"`. It loads as
+/// `messages`, the provider is not dropped and the models on it validate, and
+/// the warning names the spelling to use now -- the same shape as the
+/// deprecated `openai` above.
+#[test]
+fn the_deprecated_anthropic_style_loads_as_messages_and_warns() {
+    let cfg = parse(
+        r#"
+[providers.claude]
+style    = "anthropic"
+base-url = "https://api.anthropic.com"
+api-key  = "${ANTHROPIC_API_KEY}"
+
+[models.sonnet]
+provider   = "claude"
+identifier = "claude-sonnet-4-6"
+max-tokens = 16384
+"#,
+    );
+    cfg.validate(None).expect("the model on it validates");
+    let LlmProvider::Messages { .. } = &cfg.providers["claude"] else {
+        panic!("expected messages, got: {:?}", cfg.providers);
+    };
+    assert_eq!(cfg.providers["claude"].style(), "messages");
+    let [warning] = cfg.warnings() else {
+        panic!("one warning, got: {:?}", cfg.warnings());
+    };
+    assert_eq!(warning.key(), "providers.claude.style");
+    assert_eq!(warning.line(), 3);
+    let ConfigWarningKind::Deprecated { replacement, .. } = warning.kind() else {
+        panic!("a deprecation, got: {:?}", warning.kind());
+    };
+    assert_eq!(*replacement, "messages");
+    assert!(
+        warning.to_string().contains(r#"use "messages""#),
+        "{warning}"
+    );
+}
+
+/// Change 4 of the rename: a model row's own `style = "anthropic"` is read as
+/// `messages` too, with a warning -- not left to the rule that sets aside a
+/// model `style` this build does not know (pinned separately below).
+#[test]
+fn a_models_deprecated_anthropic_style_loads_as_messages_and_warns() {
+    let cfg = parse(&gateway(
+        "identifier = \"claude-sonnet-4-6\"\nstyle = \"anthropic\"",
+    ));
+    cfg.validate(None).expect("the model validates");
+    assert_eq!(cfg.models["sonnet"].style, Some(ApiStyle::Messages));
+    let [warning] = cfg.warnings() else {
+        panic!("one warning, got: {:?}", cfg.warnings());
+    };
+    assert_eq!(warning.key(), "models.sonnet.style");
+    let ConfigWarningKind::Deprecated { replacement, .. } = warning.kind() else {
+        panic!("a deprecation, got: {:?}", warning.kind());
+    };
+    assert_eq!(*replacement, "messages");
+}
+
 /// Pin the unknown-style error so a teammate's typo (`open-ai` vs `openai`)
 /// lands on a useful message rather than a cryptic serde dump. The contract is
 /// "the message names what the user typed and every legal style" -- the
@@ -329,7 +388,7 @@ api-key  = "${KEY}"
         "error should quote the offending value, got: {msg}",
     );
     assert!(
-        msg.contains("chat-completions") && msg.contains("responses") && msg.contains("anthropic"),
+        msg.contains("chat-completions") && msg.contains("responses") && msg.contains("messages"),
         "error should name at least one legal variant, got: {msg}",
     );
 }
@@ -359,7 +418,7 @@ provider = "gateway"
 fn a_models_style_overrides_its_providers_and_round_trips() {
     let cfg = parse(&format!(
         "{}\n[models.fast]\nprovider = \"gateway\"\nidentifier = \"gpt-4o-mini\"\n",
-        gateway("identifier = \"claude-sonnet-4-6\"\nstyle = \"anthropic\"\nmax-tokens = 16384"),
+        gateway("identifier = \"claude-sonnet-4-6\"\nstyle = \"messages\"\nmax-tokens = 16384"),
     ));
     cfg.validate(None).expect("validates");
     assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
@@ -371,14 +430,14 @@ fn a_models_style_overrides_its_providers_and_round_trips() {
         cfg.models["fast"].effective_style(provider),
         ApiStyle::ChatCompletions
     );
-    assert_eq!(cfg.models["sonnet"].style, Some(ApiStyle::Anthropic));
+    assert_eq!(cfg.models["sonnet"].style, Some(ApiStyle::Messages));
     assert_eq!(
         cfg.models["sonnet"].effective_style(provider),
-        ApiStyle::Anthropic
+        ApiStyle::Messages
     );
 
     let text = toml::to_string(&cfg).expect("serializes");
-    assert!(text.contains(r#"style = "anthropic""#), "{text}");
+    assert!(text.contains(r#"style = "messages""#), "{text}");
     assert_eq!(parse(&text), cfg);
 }
 
@@ -435,17 +494,17 @@ fn an_unknown_model_style_is_set_aside_only_from_the_global_config() {
 /// its error names that style: the model's own, not its provider's.
 #[test]
 fn a_model_missing_identifier_names_its_own_style() {
-    let cfg = parse(&gateway("style = \"anthropic\""));
+    let cfg = parse(&gateway("style = \"messages\""));
     let err = expect_validation_err(&cfg, None);
     assert!(
         matches!(
             err,
             ConfigValidationError::RemoteModelMissingIdentifier { ref model, style, .. }
-                if model == "sonnet" && style == "anthropic"
+                if model == "sonnet" && style == "messages"
         ),
         "got: {err:?}",
     );
-    assert!(err.to_string().contains("(style=anthropic)"), "{err}");
+    assert!(err.to_string().contains("(style=messages)"), "{err}");
 }
 
 /// `style = "mistralrs"` was removed rather than kept parsing: the tagged enum
@@ -464,7 +523,7 @@ fn the_removed_mistralrs_style_is_a_parse_error() {
         "error should quote the offending value, got: {msg}",
     );
     assert!(
-        msg.contains("chat-completions") && msg.contains("responses") && msg.contains("anthropic"),
+        msg.contains("chat-completions") && msg.contains("responses") && msg.contains("messages"),
         "error should name at least one legal style, got: {msg}",
     );
 }
@@ -487,7 +546,7 @@ fn removed_local_llm_keys_are_set_aside_with_a_warning() {
         let toml = format!(
             r#"
 [providers.claude]
-style    = "anthropic"
+style    = "messages"
 base-url = "https://api.anthropic.com"
 api-key  = "${{ANTHROPIC_API_KEY}}"
 
@@ -568,15 +627,15 @@ fn remote_provider_options_populate_remote_variants() {
     );
 
     let key = ApiKeyRef::parse("${ANTHROPIC_API_KEY}").expect("api-key ref parses");
-    let anthropic = LlmProvider::anthropic(
+    let anthropic = LlmProvider::messages(
         "https://api.anthropic.com",
         key,
-        AnthropicOptions::new().with_retry_budget_secs(0),
+        MessagesOptions::new().with_retry_budget_secs(0),
     );
     assert!(
         matches!(
             anthropic,
-            LlmProvider::Anthropic {
+            LlmProvider::Messages {
                 request_timeout_secs: None,
                 retry_budget_secs: Some(0),
                 ..
@@ -595,7 +654,7 @@ fn remote_provider_options_populate_remote_variants() {
         ChatCompletionsOptions::new(),
         ChatCompletionsOptions::default()
     );
-    assert_eq!(AnthropicOptions::new(), AnthropicOptions::default());
+    assert_eq!(MessagesOptions::new(), MessagesOptions::default());
 }
 
 /// `role-alternation` is optional on both styles and takes its two values; a
@@ -613,7 +672,7 @@ api-key          = "${GATEWAY_KEY}"
 role-alternation = "strict"
 
 [providers.claude]
-style            = "anthropic"
+style            = "messages"
 base-url         = "https://api.anthropic.com"
 api-key          = "${ANTHROPIC_API_KEY}"
 role-alternation = "relaxed"
@@ -629,7 +688,7 @@ api-key  = "${OPENAI_API_KEY}"
         LlmProvider::ChatCompletions {
             role_alternation, ..
         }
-        | LlmProvider::Anthropic {
+        | LlmProvider::Messages {
             role_alternation, ..
         } => *role_alternation,
         other => panic!("unexpected style: {other:?}"),
@@ -681,17 +740,17 @@ role-alternation = "loose"
     );
     assert_eq!(alternation(&built), Some(RoleAlternation::Strict));
     let key = ApiKeyRef::parse("${ANTHROPIC_API_KEY}").expect("api-key ref parses");
-    let built = LlmProvider::anthropic(
+    let built = LlmProvider::messages(
         "https://api.anthropic.com",
         key,
-        AnthropicOptions::new().with_role_alternation(RoleAlternation::Strict),
+        MessagesOptions::new().with_role_alternation(RoleAlternation::Strict),
     );
     assert_eq!(alternation(&built), Some(RoleAlternation::Strict));
     assert_eq!(
-        alternation(&LlmProvider::anthropic(
+        alternation(&LlmProvider::messages(
             "https://api.anthropic.com",
             ApiKeyRef::parse("${ANTHROPIC_API_KEY}").expect("api-key ref parses"),
-            AnthropicOptions::new(),
+            MessagesOptions::new(),
         )),
         None
     );

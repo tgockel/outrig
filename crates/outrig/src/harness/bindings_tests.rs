@@ -74,7 +74,7 @@ impl Bed {
 default-model = "sonnet"
 
 [providers.claude]
-style    = "anthropic"
+style    = "messages"
 base-url = "http://127.0.0.1:9"
 api-key  = "${{{VAR}}}"
 

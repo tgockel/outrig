@@ -513,9 +513,10 @@ A provider tells outrig how to reach a model: an endpoint that speaks a known wi
 style carries an `api-key`, which names a variable in the operator's environment, so providers
 belong to the global config: a repo config that declares one is rejected at load, whatever name
 it uses, and its models name the global config's providers. The accepted `style` values are
-`"chat-completions"`, `"responses"`, and `"anthropic"`. Which other fields are valid depends on
-`style`. `"openai"`, the 0.2.x spelling of `"chat-completions"`, is still read as it, with a
-warning that names the new value; a later release will remove it. A provider's `style` is the
+`"chat-completions"`, `"responses"`, and `"messages"`. Which other fields are valid depends on
+`style`. `"openai"`, the 0.2.x spelling of `"chat-completions"`, and `"anthropic"`, the earlier
+spelling of `"messages"`, are still read as their replacements, each with a warning that names
+the new value; a later release will remove both. A provider's `style` is the
 default for the models on it, and a model can set its own: see
 [Remote-provider models](#remote-provider-models).
 
@@ -633,7 +634,7 @@ The system prompt goes in `instructions`. The ceiling a call carries is sent as
 model row that wrote it; one a call would carry to any other row is left out. Hosted tools
 (web search, file search, code interpreter, remote MCP) are not used.
 
-### `style = "anthropic"`
+### `style = "messages"`
 
 Anthropic's native Messages API: requests go to `{base-url}/v1/messages` and authenticate
 with the `x-api-key` header. Use this to reach Claude directly. Reaching Claude through an
@@ -642,14 +643,14 @@ at that bridge instead -- both work, and they are different rows.
 
 ```toml
 [providers.anthropic]
-style    = "anthropic"
+style    = "messages"
 base-url = "https://api.anthropic.com"
 api-key  = "${ANTHROPIC_API_KEY}"
 ```
 
 | Key                    | Type         | Required | Default | Description                         |
 |------------------------|--------------|----------|---------|-------------------------------------|
-| `style`                | string       | yes      | --      | Must be `"anthropic"` for this row. |
+| `style`                | string       | yes      | --      | Must be `"messages"` for this row.  |
 | `base-url`             | string (URL) | yes      | --      | HTTPS endpoint for the provider.    |
 | `api-key`              | string       | yes      | --      | Env-var reference, see below.       |
 | `request-timeout-secs` | integer      | no       | `600`   | HTTP timeout for LLM calls.         |
@@ -776,7 +777,7 @@ one in a shared repo config.
 ### Remote-provider models
 
 Models on a remote provider -- `style = "chat-completions"`, `style = "responses"`, or
-`style = "anthropic"` -- name their model with an `identifier`.
+`style = "messages"` -- name their model with an `identifier`.
 
 ```toml
 [models.fast]
@@ -800,8 +801,9 @@ identifier = "gpt-4o"
 -- `style`, `max-tokens` and `context-window` included.
 
 `style` is the API a model is called with, in place of its provider's: `"chat-completions"`,
-`"responses"`, or `"anthropic"`, the values a provider's takes. The deprecated `"openai"` is a
-provider's spelling only, and a model refuses it. Unset, the model is called with its provider's
+`"responses"`, or `"messages"`, the values a provider's takes. The deprecated `"anthropic"` is
+read here too, as `"messages"`, with a warning; the deprecated `"openai"` is a provider's
+spelling only, and a model refuses it. Unset, the model is called with its provider's
 `style`. The request still goes to the provider's `base-url` with its `api-key`, under its
 `request-timeout-secs`, `retry-budget-secs`, and `role-alternation`; the path, the auth header,
 and the wire format follow the model's style. So one endpoint that serves two APIs is one
@@ -820,7 +822,7 @@ identifier = "gpt-4o-mini"          # chat-completions, from the provider
 [models.sonnet]
 provider   = "gateway"
 identifier = "claude-sonnet-4-6"
-style      = "anthropic"            # this model only
+style      = "messages"             # this model only
 max-tokens = 16384
 ```
 
@@ -855,7 +857,7 @@ holds each call to the window it reports. The question is one `GET` against the 
 `base-url`, with the provider's own key, that is not retried and is given 10 seconds, at the
 route of the style the model is called with:
 
-- `style = "anthropic"`: `{base-url}/v1/models/{identifier}`, and its `max_input_tokens`.
+- `style = "messages"`: `{base-url}/v1/models/{identifier}`, and its `max_input_tokens`.
 - `style = "chat-completions"` or `style = "responses"`: `{base-url}/model/info`, which a LiteLLM
   proxy answers, and the `model_info.max_input_tokens` of the entry whose `model_name` is the
   `identifier` -- the smallest, when a proxy lists the name once for each deployment behind it.
@@ -1688,7 +1690,7 @@ base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
 [providers.anthropic]
-style    = "anthropic"
+style    = "messages"
 base-url = "https://api.anthropic.com"
 api-key  = "${ANTHROPIC_API_KEY}"
 
@@ -1833,9 +1835,10 @@ image-config in the merged config but does not require agent/model/provider wiri
   configuration, and the limit is what makes it report as one.
 - Every `agents.<name>.image` (if set) must name an existing `[images.<name>]`.
 - Every `providers.<name>.style` and `models.<name>.style` must be one of
-  `{"chat-completions", "responses", "anthropic"}`. A provider's may also be the deprecated
-  `"openai"`, which loads as `"chat-completions"` with a warning. Other styles are reserved for
-  future Rig adapters and listed as TODO in the providers concept page.
+  `{"chat-completions", "responses", "messages"}`. Either may also be the deprecated
+  `"anthropic"`, which loads as `"messages"` with a warning, and a provider's may also be the
+  deprecated `"openai"`, which loads as `"chat-completions"` with a warning. Other styles are
+  reserved for future Rig adapters and listed as TODO in the providers concept page.
 - Every `providers.<name>.api-key` (on a remote style) must match
   `^\$\{[A-Z_][A-Z0-9_]*\}$`.
 - Every `providers.<name>.base-url` (on a remote style) must be an `http://` or `https://` URL.
@@ -1865,7 +1868,7 @@ image-config in the merged config but does not require agent/model/provider wiri
   requires at least one global `allow` or `deny` entry.
 - A repo config may set `[network].mode` only; `[network].default`, `[network].allow`, and
   `[network].deny` are rejected there.
-- A repo config may declare no provider: a `chat-completions`, `responses`, or `anthropic`
+- A repo config may declare no provider: a `chat-completions`, `responses`, or `messages`
   provider in `.agents/outrig/config.toml`, or in a `--config` file, is rejected there, naming the
   provider and the variable its key references. A repo model may name a global provider and set
   its own `style`.

@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider's, so one provider can serve models over different APIs: see the library's changelog.
   The banner names the style the model is called with.
 - **`style = "responses"` in `outrig config init` and `outrig run`.** The picker offers it beside
-  `chat-completions` and `anthropic`, and a `responses` provider runs a model against
+  `chat-completions` and `messages`, and a `responses` provider runs a model against
   `{base-url}/responses`: see the library's changelog for what a call sends.
 - **`outrig run-new`, a preview session whose agent acts by writing Python.** The model's one
   tool runs source in a persistent interpreter inside the session's container, so names it binds
@@ -186,6 +186,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `outrig init` writes, the startup banner and the docs. The old spelling still loads, as the new
   one, with a warning that names it; `outrig mcp`'s `validate_config` reports it as
   `deprecated_config_value`.
+- **`style = "anthropic"` is `style = "messages"`** in `outrig config init`, the configs
+  `outrig init` writes, the startup banner and the docs. The old spelling still loads, as the new
+  one, with a warning that names it, on a provider and on a model alike.
 - **`outrig discard` and `outrig clean` remove a session's whole directory.** 0.2.2 removed only
   `session.json`, `logs/` and `outrig-enter`, and kept a directory holding anything else, because
   a `--session-dir` once took any existing directory. It takes only a new or empty one now, so
@@ -193,7 +196,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   beside the record, which 0.2.2 kept. A session started before 0.2.2 in a directory that already
   held other files loses them with it.
 
-- **`outrig run` asks for prompt caching on a model with `style = "anthropic"`.** Each request
+- **`outrig run` asks for prompt caching on a model with `style = "messages"`.** Each request
   carries a `cache_control` marker on the last tool definition, on the last system block, and on
   the last block of the last user message -- the one that moves as the history grows -- so a call
   reads back what the one before it wrote instead of paying full price for the whole history. All
@@ -306,6 +309,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`style = "openai"`** loads as `chat-completions` with a warning. A later release will remove
   the spelling.
+- **`style = "anthropic"`** loads as `messages` with a warning, on a provider and on a model
+  alike. A later release will remove the spelling.
 
 ## [0.2.2](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.2) - 2026-10-20
 

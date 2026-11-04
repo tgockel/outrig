@@ -24,7 +24,7 @@ fn candidate_on(style: Style, base_url: String, context_window: Option<u32>) -> 
     let (request_timeout_secs, retry_budget_secs, role_alternation) =
         (None, None, RoleAlternation::Relaxed);
     let provider = match style {
-        Style::Anthropic => ResolvedProvider::Anthropic {
+        Style::Messages => ResolvedProvider::Messages {
             base_url,
             api_key: KEY.into(),
             request_timeout_secs,
@@ -57,7 +57,7 @@ fn candidate_on(style: Style, base_url: String, context_window: Option<u32>) -> 
 /// OpenAI-style one names the API's `/v1`.
 fn base(style: Style, addr: SocketAddr) -> String {
     match style {
-        Style::Anthropic => format!("http://{addr}"),
+        Style::Messages => format!("http://{addr}"),
         Style::ChatCompletions | Style::Responses => format!("http://{addr}/v1"),
     }
 }
@@ -96,7 +96,7 @@ async fn a_provider_is_asked_for_the_window_of_the_model_it_serves() {
         assert_eq!(asked.len(), 1, "{style:?}: asked once");
         assert_eq!(asked[0].method, "GET", "{style:?}");
         match style {
-            Style::Anthropic => {
+            Style::Messages => {
                 assert_eq!(asked[0].path, format!("/v1/models/{IDENTIFIER}"));
                 assert_eq!(asked[0].header("x-api-key"), Some(KEY));
                 assert!(asked[0].header("anthropic-version").is_some());
@@ -118,9 +118,9 @@ async fn a_provider_is_asked_for_the_window_of_the_model_it_serves() {
 async fn an_anthropic_base_url_is_normalized_as_a_call_to_it_is() {
     for suffix in ["", "/", "/v1", "/v1/", "/v1/messages"] {
         let (addr, mut requests) =
-            mock_http::start_reporting(vec![], Style::Anthropic.window(IDENTIFIER, Some(200_000)))
+            mock_http::start_reporting(vec![], Style::Messages.window(IDENTIFIER, Some(200_000)))
                 .await;
-        let mut candidate = candidate_on(Style::Anthropic, format!("http://{addr}{suffix}"), None);
+        let mut candidate = candidate_on(Style::Messages, format!("http://{addr}{suffix}"), None);
         ask(&mut candidate).await;
 
         assert_eq!(candidate.reported_window, Some(Ok(200_000)), "{suffix:?}");
@@ -282,13 +282,13 @@ async fn the_models_of_an_alias_are_asked_at_once() {
     let second = TcpListener::bind("127.0.0.1:0").await.expect("a listener");
     let mut candidates = [
         candidate_on(
-            Style::Anthropic,
-            base(Style::Anthropic, first.local_addr().expect("its address")),
+            Style::Messages,
+            base(Style::Messages, first.local_addr().expect("its address")),
             None,
         ),
         candidate_on(
-            Style::Anthropic,
-            base(Style::Anthropic, second.local_addr().expect("its address")),
+            Style::Messages,
+            base(Style::Messages, second.local_addr().expect("its address")),
             None,
         ),
     ];

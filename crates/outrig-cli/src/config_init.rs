@@ -18,7 +18,7 @@ use crate::error::{OutrigError, Result};
 use crate::init::prompt::{self, Field, PromptSource};
 use crate::paths::{global_config_path, write_atomic};
 use outrig::config::{
-    AnthropicOptions, ApiKeyRef, ChatCompletionsOptions, Config, LlmProvider, Model, ResponsesOptions,
+    MessagesOptions, ApiKeyRef, ChatCompletionsOptions, Config, LlmProvider, Model, ResponsesOptions,
 };
 
 /// Public entry: resolve the path, pick a `PromptSource` via
@@ -74,7 +74,7 @@ const STYLES: &[(&str, &str)] = &[
         "OpenAI Responses wire format. Works with OpenAI, Ollama, LM Studio.",
     ),
     (
-        "anthropic",
+        "messages",
         "Anthropic's native Messages wire format. Talks to Claude directly.",
     ),
 ];
@@ -263,7 +263,7 @@ async fn prompt_provider_body(
     match style {
         "chat-completions" => prompt_chat_completions_provider(prompt, name).await,
         "responses" => prompt_responses_provider(prompt, name).await,
-        "anthropic" => prompt_anthropic_provider(prompt, name).await,
+        "messages" => prompt_anthropic_provider(prompt, name).await,
         other => Err(OutrigError::Configuration(format!("unknown provider style: {other}")).into()),
     }
 }
@@ -311,10 +311,10 @@ async fn prompt_anthropic_provider(
     )
     .await?;
     let api_key = ask_api_key_env(prompt, "ANTHROPIC_API_KEY").await?;
-    Ok(LlmProvider::anthropic(
+    Ok(LlmProvider::messages(
         base_url,
         api_key,
-        AnthropicOptions::new(),
+        MessagesOptions::new(),
     ))
 }
 
@@ -441,7 +441,7 @@ pub(crate) async fn prompt_models_loop(
         // Anthropic gets its own arm on top of that, for the ceiling its API
         // insists on.
         let model = match provider {
-            LlmProvider::Anthropic { .. } => prompt_anthropic_model(prompt, provider_name).await?,
+            LlmProvider::Messages { .. } => prompt_anthropic_model(prompt, provider_name).await?,
             _ => {
                 let identifier = prompt
                     .ask_string(&MODEL_IDENTIFIER_FIELD, "gpt-4o-mini")

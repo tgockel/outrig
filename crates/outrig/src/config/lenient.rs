@@ -143,19 +143,16 @@ pub(super) fn parse(text: &str, file: Option<&Path>, skip_bad_values: bool) -> R
         let pruned = Spanned::new(doc.span(), prune(doc.get_ref(), &dropped));
         let err = match Config::deserialize(ValueDeserializer::from(pruned)) {
             Ok(mut cfg) => {
-                for (name, offset) in &deprecated {
-                    if dropped.contains(&offset.0) {
+                for renamed in &deprecated {
+                    if dropped.contains(&renamed.table_offset)
+                        || dropped.contains(&renamed.key_offset)
+                    {
                         continue;
                     }
-                    let path = [
-                        Seg::Key("providers".to_string()),
-                        Seg::Key(name.clone()),
-                        Seg::Key("style".to_string()),
-                    ];
                     let kind = ConfigWarningKind::Deprecated {
-                        replacement: "chat-completions",
+                        replacement: renamed.replacement,
                     };
-                    warnings.push(warning(&path, offset.1, kind));
+                    warnings.push(warning(&renamed.path, renamed.value_offset, kind));
                 }
                 warnings.sort_by_key(|w| w.line);
                 cfg.warnings = warnings;
@@ -249,34 +246,111 @@ fn prune<'i>(node: &DeValue<'i>, dropped: &HashSet<usize>) -> DeValue<'i> {
     }
 }
 
-/// Read each `style = "openai"` -- the 0.2.x spelling of `"chat-completions"`
-/// -- as the new one. Returns each such provider's name with the offsets of
-/// its key and of the value, for a warning once the provider is known to load.
-fn rename_deprecated_styles(doc: &mut Spanned<DeValue<'_>>) -> Vec<(String, (usize, usize))> {
-    let DeValue::Table(top) = doc.get_mut() else {
-        return Vec::new();
-    };
-    let Some(DeValue::Table(providers)) = top.get_mut("providers").map(|p| p.get_mut()) else {
-        return Vec::new();
-    };
+/// One `style` this loader still reads under an older spelling: what table it
+/// is on, where its key and its value were in the document, and what it
+/// becomes. [`rename_deprecated_styles`] rewrites the value in place and
+/// returns one of these per rewrite, for a warning once the table it sits in
+/// is known to load.
+struct DeprecatedStyle {
+    path: Vec<Seg>,
+    /// Where the provider or model name itself starts, in `[providers.<name>]`
+    /// or `[models.<name>]` -- what `prune` drops the whole entry by, when a
+    /// sibling key (an unparseable `api-key`, say) costs the table the field a
+    /// required variant needs and the retry that follows has nothing left to
+    /// deserialize into that variant at all. A rewrite whose table went this
+    /// way never loaded, so it earns no warning of its own: the one over the
+    /// sibling that actually failed says what happened.
+    table_offset: usize,
+    key_offset: usize,
+    value_offset: usize,
+    replacement: &'static str,
+}
+
+/// Read each deprecated `style` spelling as its replacement, in place, before
+/// the deserialize loop runs: `"openai"` -- the 0.2.x spelling of
+/// `"chat-completions"` -- on a provider, and `"anthropic"` -- the spelling of
+/// `"messages"` before the rename -- on a provider or a model. A model's
+/// `style` never took `"openai"`, so that spelling is read there, not here.
+fn rename_deprecated_styles(doc: &mut Spanned<DeValue<'_>>) -> Vec<DeprecatedStyle> {
     let mut found = Vec::new();
-    for (name, provider) in providers.iter_mut() {
-        let DeValue::Table(table) = provider.get_mut() else {
-            continue;
-        };
-        let Some(key) = table.get_key_value("style").map(|(k, _)| k.span().start) else {
-            continue;
-        };
-        let Some(style) = table.get_mut("style") else {
-            continue;
-        };
-        if matches!(style.get_ref(), DeValue::String(s) if s == "openai") {
-            let at = style.span().start;
-            *style.get_mut() = DeValue::String("chat-completions".into());
-            found.push((name.get_ref().to_string(), (key, at)));
+    let DeValue::Table(top) = doc.get_mut() else {
+        return found;
+    };
+    if let Some(DeValue::Table(providers)) = top.get_mut("providers").map(|p| p.get_mut()) {
+        for (name, provider) in providers.iter_mut() {
+            let DeValue::Table(table) = provider.get_mut() else {
+                continue;
+            };
+            let path = vec![
+                Seg::Key("providers".to_string()),
+                Seg::Key(name.get_ref().to_string()),
+            ];
+            rename_style(
+                table,
+                name.span().start,
+                path,
+                &[("openai", "chat-completions"), ("anthropic", "messages")],
+                &mut found,
+            );
+        }
+    }
+    if let Some(DeValue::Table(models)) = top.get_mut("models").map(|p| p.get_mut()) {
+        for (name, model) in models.iter_mut() {
+            let DeValue::Table(table) = model.get_mut() else {
+                continue;
+            };
+            let path = vec![
+                Seg::Key("models".to_string()),
+                Seg::Key(name.get_ref().to_string()),
+            ];
+            rename_style(
+                table,
+                name.span().start,
+                path,
+                &[("anthropic", "messages")],
+                &mut found,
+            );
         }
     }
     found
+}
+
+/// Rewrite `table`'s `style`, in place, to the replacement one of `renames`'
+/// old spellings names, and record it in `found` under `holder`, at
+/// `table_offset` -- so every later pass of the deserialize loop sees the
+/// replacement, and a value this build never took an old spelling for (a
+/// model's `openai`, anything else unknown) is left alone for the usual
+/// unknown-value handling.
+fn rename_style(
+    table: &mut DeTable<'_>,
+    table_offset: usize,
+    holder: Vec<Seg>,
+    renames: &[(&str, &'static str)],
+    found: &mut Vec<DeprecatedStyle>,
+) {
+    let Some(key_offset) = table.get_key_value("style").map(|(k, _)| k.span().start) else {
+        return;
+    };
+    let Some(style) = table.get_mut("style") else {
+        return;
+    };
+    let DeValue::String(s) = style.get_ref() else {
+        return;
+    };
+    let Some(&(_, replacement)) = renames.iter().find(|(old, _)| s == old) else {
+        return;
+    };
+    let value_offset = style.span().start;
+    *style.get_mut() = DeValue::String(replacement.into());
+    let mut path = holder;
+    path.push(Seg::Key("style".to_string()));
+    found.push(DeprecatedStyle {
+        path,
+        table_offset,
+        key_offset,
+        value_offset,
+        replacement,
+    });
 }
 
 /// Whether the key at `offset` follows an unquoted `.` inside a `[...]`

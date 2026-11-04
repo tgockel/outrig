@@ -2280,7 +2280,7 @@ base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
 [providers.anthropic]
-style    = "anthropic"
+style    = "messages"
 base-url = "https://api.anthropic.com"
 api-key  = "${ANTHROPIC_API_KEY}"
 "#,
@@ -3534,11 +3534,7 @@ mode = "filter"
                 "OPENAI_API_KEY",
             ),
             ("responses", "https://api.openai.com/v1", "OPENAI_API_KEY"),
-            (
-                "anthropic",
-                "https://api.anthropic.com",
-                "ANTHROPIC_API_KEY",
-            ),
+            ("messages", "https://api.anthropic.com", "ANTHROPIC_API_KEY"),
         ] {
             let tmp = tempdir().unwrap();
             write_repo_cfg(
@@ -3593,7 +3589,7 @@ mode = "filter"
             tmp.path(),
             r#"
 [providers.anthropic]
-style    = "anthropic"
+style    = "messages"
 base-url = "https://api.anthropic.com"
 api-key  = "${ANTHROPIC_API_KEY}"
 "#,
@@ -3602,7 +3598,7 @@ api-key  = "${ANTHROPIC_API_KEY}"
             tmp.path(),
             r#"
 [providers.anthropic]
-style    = "anthropic"
+style    = "messages"
 base-url = "https://evil.example"
 api-key  = "${ANTHROPIC_API_KEY}"
 "#,
@@ -3629,7 +3625,7 @@ api-key  = "${ANTHROPIC_API_KEY}"
             tmp.path(),
             r#"
 [providers.anthropic]
-style    = "anthropic"
+style    = "messages"
 base-url = "https://api.anthropic.com"
 api-key  = "${ANTHROPIC_API_KEY}"
 "#,
@@ -3647,7 +3643,7 @@ identifier = "claude-sonnet-4-6"
 
         let cfg = Config::load(tmp.path(), Some(&global))
             .expect("a repo model may name a global provider");
-        let LlmProvider::Anthropic { base_url, .. } = &cfg.providers["anthropic"] else {
+        let LlmProvider::Messages { base_url, .. } = &cfg.providers["anthropic"] else {
             panic!("expected the global Anthropic provider");
         };
         assert_eq!(base_url, "https://api.anthropic.com");
@@ -6200,7 +6196,7 @@ api-key  = \"${{KEY}}\"
         assert!(
             cfg.warnings()[1]
                 .to_string()
-                .ends_with("`providers.newer.style` ignored: unknown variant `openai-responses`, expected one of `chat-completions`, `responses`, `anthropic`"),
+                .ends_with("`providers.newer.style` ignored: unknown variant `openai-responses`, expected one of `chat-completions`, `responses`, `messages`"),
             "{}",
             cfg.warnings()[1],
         );
@@ -6242,6 +6238,36 @@ api-key  = \"${{KEY}}\"
                 "{shown}"
             );
         }
+    }
+
+    /// A global provider's `style = "anthropic"` is rewritten to `"messages"`
+    /// in the document before the first deserialize attempt even runs
+    /// (`rename_deprecated_styles`), so when a sibling key costs the provider
+    /// as a whole -- an `api-key` that is not a `${VAR}` reference, here, same
+    /// as `a_dropped_api_key_is_not_repeated_in_its_warning` above -- the
+    /// table never survives pruning to be the one this build read `anthropic`
+    /// into. The rewrite earns no warning of its own then: only the table's
+    /// own `InvalidValue` warning says what happened, and nothing here was
+    /// deprecated.
+    #[test]
+    fn a_discarded_legacy_provider_gets_no_deprecation_warning() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            "[providers.leaky]\nstyle    = \"anthropic\"\n             base-url = \"https://api.anthropic.com\"\napi-key  = \"sk-secret-key-123\"\n",
+        );
+
+        let cfg = Config::load_global(&global).expect("loads without the provider");
+        assert!(cfg.providers.is_empty());
+        let [warning] = cfg.warnings() else {
+            panic!("expected one warning, got {:?}", cfg.warnings());
+        };
+        assert_eq!(warning.key(), "providers.leaky");
+        assert!(
+            matches!(warning.kind(), ConfigWarningKind::InvalidValue { .. }),
+            "got: {:?}",
+            warning.kind()
+        );
     }
 
     /// Only the entry whose error quotes an `api-key` gets the redacted reason:

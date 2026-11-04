@@ -1058,7 +1058,7 @@ fn render_banner(banner: StartupBanner<'_>) -> String {
     let provider_label = match resolved.provider() {
         llm::ResolvedProvider::ChatCompletions { .. } => "chat-completions",
         llm::ResolvedProvider::Responses { .. } => "responses",
-        llm::ResolvedProvider::Anthropic { .. } => "anthropic",
+        llm::ResolvedProvider::Messages { .. } => "messages",
     };
     let mut buf = String::new();
     // Shows the `alias -> concrete` hop when the session resolved through one,
@@ -1094,7 +1094,7 @@ fn render_banner(banner: StartupBanner<'_>) -> String {
     // this is always a `base-url` the operator's own file set.
     let (llm::ResolvedProvider::ChatCompletions { base_url, .. }
     | llm::ResolvedProvider::Responses { base_url, .. }
-    | llm::ResolvedProvider::Anthropic { base_url, .. }) = resolved.provider();
+    | llm::ResolvedProvider::Messages { base_url, .. }) = resolved.provider();
     let _ = writeln!(
         buf,
         "[outrig] base-url:          {}",
@@ -1387,7 +1387,7 @@ mod tests {
     #[test]
     fn the_banner_masks_credentials_embedded_in_the_base_url() {
         let mut remote = test_resolved_agent();
-        remote.candidates[0].provider = llm::ResolvedProvider::Anthropic {
+        remote.candidates[0].provider = llm::ResolvedProvider::Messages {
             base_url: "https://gateway-user:SECRET-PASS@proxy.corp.example/anthropic".to_string(),
             api_key: "sk-PROBE-KEY-123".to_string(),
             request_timeout_secs: None,

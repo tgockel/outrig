@@ -38,7 +38,7 @@ request-timeout-secs = 90
 retry-budget-secs    = 120
 
 [providers.anthropic]
-style    = "anthropic"
+style    = "messages"
 base-url = "https://api.anthropic.com"
 api-key  = "${ANTHROPIC_API_KEY}"
 

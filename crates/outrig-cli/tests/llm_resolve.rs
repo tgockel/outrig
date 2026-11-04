@@ -600,7 +600,7 @@ preamble = "you are a careful coder"
     let r = resolve_agent(&cfg, Some("coding")).expect("resolves");
     assert_eq!(r.model_identifier(), "claude-sonnet-4-6");
     assert_eq!(r.provider_name(), "claude");
-    let ResolvedProvider::Anthropic {
+    let ResolvedProvider::Messages {
         base_url,
         api_key,
         request_timeout_secs,
@@ -881,7 +881,7 @@ fn alias_selects_the_first_candidate_whose_key_is_set() {
     assert_eq!(r.model_name(), "opus-5-anthropic");
     assert_eq!(r.alias_name.as_deref(), Some("smart"));
     assert_eq!(r.model_identifier(), "claude-opus-5");
-    assert!(matches!(r.provider(), ResolvedProvider::Anthropic { .. }));
+    assert!(matches!(r.provider(), ResolvedProvider::Messages { .. }));
 
     // With the first also set, preference order decides.
     set_env(vars[0], "sk-test");
@@ -1049,7 +1049,7 @@ fn on_the_gateway(style: &str, request_timeout_secs: Option<u64>) -> ResolvedPro
             request_timeout_secs,
             retry_budget_secs,
         },
-        "anthropic" => ResolvedProvider::Anthropic {
+        "anthropic" => ResolvedProvider::Messages {
             base_url,
             api_key,
             request_timeout_secs,

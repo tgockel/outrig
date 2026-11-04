@@ -98,7 +98,7 @@ reasoning-effort = "high"
         let cfg = Config::load_from_str(
             r#"
 [providers.p]
-style    = "anthropic"
+style    = "messages"
 base-url = "https://api.anthropic.com"
 api-key  = "${KEY}"
 alpha    = 1
@@ -374,7 +374,7 @@ srv = { command = ["bin", "arg1"] }
             Some(120),
             "a provider's own budget overrides the top-level 300",
         );
-        let LlmProvider::Anthropic {
+        let LlmProvider::Messages {
             base_url: anthropic_base_url,
             api_key: anthropic_key,
             request_timeout_secs: anthropic_timeout,

@@ -80,7 +80,7 @@ pub(super) fn load(toml: &str) -> Config {
 /// A config with an `anthropic` provider at `addr` and a `coding` agent whose
 /// block carries `agent_keys`.
 fn config(addr: std::net::SocketAddr, var: &str, identifier: &str, agent_keys: &str) -> Config {
-    config_in(Style::Anthropic, addr, var, identifier, "", agent_keys)
+    config_in(Style::Messages, addr, var, identifier, "", agent_keys)
 }
 
 /// A config with a provider of `style` at `addr`, a `sonnet` model on it whose
@@ -133,7 +133,7 @@ async fn agent_over(
     Session,
     tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
-    agent_in(Style::Anthropic, var, identifier, "", agent_keys, script).await
+    agent_in(Style::Messages, var, identifier, "", agent_keys, script).await
 }
 
 /// [`agent_over`] against a provider of `style`, whose model row carries
@@ -613,7 +613,7 @@ async fn a_round_that_ends_on_a_refused_connection_names_the_cause() {
     let var = "OUTRIG_TEST_AGENT_REFUSED_CONNECTION";
     // Nothing listens there, so every connection is refused.
     let cfg = config_in(
-        Style::Anthropic,
+        Style::Messages,
         std::net::SocketAddr::from(([127, 0, 0, 1], mock_http::REFUSED_PORT)),
         var,
         MODEL,
@@ -774,7 +774,7 @@ async fn a_round_dropped_after_it_ran_python_keeps_what_it_ran() {
 /// that it had not returned, the one after with a note that it never started.
 #[tokio::test]
 async fn a_round_dropped_mid_batch_keeps_the_calls_that_returned() {
-    let batch = Style::Anthropic.batch(&[
+    let batch = Style::Messages.batch(&[
         ("toolu_a", "x = 41\nprint('a ran')"),
         ("toolu_b", "import time\ntime.sleep(30)"),
         ("toolu_c", "print('c ran')"),
@@ -782,7 +782,7 @@ async fn a_round_dropped_mid_batch_keeps_the_calls_that_returned() {
     let (events, mut submitted) = watched(None).await;
     let (mut agent, mut requests) = agent_with(
         events,
-        Style::Anthropic,
+        Style::Messages,
         "OUTRIG_TEST_AGENT_DROPPED_BATCH",
         MODEL,
         "",
@@ -815,7 +815,7 @@ async fn a_refused_submission_is_not_published_as_running() {
     let (events, mut submitted) = watched(None).await;
     let (mut agent, _requests) = agent_with(
         events,
-        Style::Anthropic,
+        Style::Messages,
         "OUTRIG_TEST_AGENT_OBSERVER_REFUSED",
         MODEL,
         "",
@@ -846,7 +846,7 @@ async fn each_source_that_runs_is_published() {
     let (events, mut submitted) = watched(None).await;
     let (mut agent, _requests) = agent_with(
         events,
-        Style::Anthropic,
+        Style::Messages,
         "OUTRIG_TEST_AGENT_OBSERVER",
         MODEL,
         "",
@@ -940,7 +940,7 @@ async fn agent_in_workspace(
 ) {
     let (addr, requests) = mock_http::start(vec![text_reply("hi")]).await;
     let keys = format!("max-tokens = 4096\n{agent_keys}");
-    let cfg = config_in(Style::Anthropic, addr, var, MODEL, "", &keys);
+    let cfg = config_in(Style::Messages, addr, var, MODEL, "", &keys);
     let session = host_session(&cfg, Some("coding"), None, events)
         .host_workspace(workspace)
         .secrets(keyed(var))
@@ -1919,7 +1919,7 @@ async fn run_new_keeps_the_conversation_when_a_round_is_interrupted() {
     let (events, mut submitted) = watched(None).await;
     let (mut agent, mut requests) = agent_with(
         events,
-        Style::Anthropic,
+        Style::Messages,
         "OUTRIG_TEST_AGENT_INTERRUPTED",
         MODEL,
         "",
@@ -2134,7 +2134,7 @@ fn count(request: &RecordedRequest, needle: &str) -> usize {
 #[tokio::test]
 async fn a_turn_too_large_for_the_window_ends_its_round_and_later_rounds_go_on() {
     let (mut agent, mut requests) = agent_in(
-        Style::Anthropic,
+        Style::Messages,
         "OUTRIG_TEST_AGENT_TOO_LARGE",
         MODEL,
         "context-window = 7000",
@@ -2287,13 +2287,13 @@ async fn a_round_ended_mid_batch_keeps_an_incomplete_turn_and_runs_nothing_again
     let (events, mut submitted) = watched(None).await;
     let (mut agent, mut requests) = agent_with(
         events,
-        Style::Anthropic,
+        Style::Messages,
         "OUTRIG_TEST_AGENT_INCOMPLETE",
         MODEL,
         "",
         "max-tokens = 4096",
         vec![
-            Style::Anthropic.batch(&[
+            Style::Messages.batch(&[
                 ("toolu_a", "print('a ran')"),
                 ("toolu_b", "import time\ntime.sleep(3)"),
                 ("toolu_c", "print('c ran')"),
@@ -2389,7 +2389,7 @@ fn on_the_wire(style: Style, messages: Vec<rig::completion::Message>) -> Vec<ser
         mock_http::conversation_of(&body)
     }
     match style {
-        Style::Anthropic => encoded(&AnthropicConfig::new(KEY).completion(MODEL), messages),
+        Style::Messages => encoded(&AnthropicConfig::new(KEY).completion(MODEL), messages),
         Style::ChatCompletions => encoded(
             &rig::providers::openai::OpenAIConfig::new(KEY).chat(MODEL),
             messages,
@@ -2407,7 +2407,7 @@ fn on_the_wire(style: Style, messages: Vec<rig::completion::Message>) -> Vec<ser
 /// The messages `request` carried, without the system prompt OpenAI's
 /// protocol carries among them.
 fn conversation(style: Style, request: &RecordedRequest) -> Vec<serde_json::Value> {
-    let skip = usize::from(style != Style::Anthropic);
+    let skip = usize::from(style != Style::Messages);
     messages(request)[skip..].to_vec()
 }
 
@@ -2781,7 +2781,7 @@ async fn a_strict_provider_whose_row_does_not_say_so_refuses_and_the_error_names
             agent_on_a_strict_mock(style, &var, false, Events::off()).await;
         let err = refused_fourth_round(&mut agent).await;
         let (pair, calls) = match style {
-            Style::Anthropic => (
+            Style::Messages => (
                 "two of the model's replies in a row, where turn 2 begins",
                 9,
             ),
@@ -2818,7 +2818,7 @@ async fn an_explicit_context_window_is_the_budget_a_call_is_held_to() {
         (1_000_000, "max-tokens = 999999", MODEL_CEILING),
     ] {
         let (mut agent, _requests) = agent_in(
-            Style::Anthropic,
+            Style::Messages,
             "OUTRIG_TEST_AGENT_EXPLICIT_WINDOW",
             MODEL,
             &format!("context-window = {window}"),
@@ -2858,7 +2858,7 @@ async fn a_request_reported_over_its_estimate_scales_the_next_calls_allowance() 
         // About 60,000 tokens against an estimate of a few thousand, which is
         // past anything the scale is allowed to believe.
         let large = match style {
-            Style::Anthropic => json!({
+            Style::Messages => json!({
                 "input_tokens": 10,
                 "output_tokens": 7,
                 "cache_read_input_tokens": 60_000,
@@ -2911,9 +2911,9 @@ async fn a_request_reported_over_its_estimate_scales_the_next_calls_allowance() 
 #[tokio::test]
 async fn no_context_window_assumes_one_whatever_the_identifier() {
     for (style, identifier, reserve) in [
-        (Style::Anthropic, MODEL, ASSUMED_CONTEXT_WINDOW / 4),
+        (Style::Messages, MODEL, ASSUMED_CONTEXT_WINDOW / 4),
         (
-            Style::Anthropic,
+            Style::Messages,
             UNRECOGNIZED_MODEL,
             ASSUMED_CONTEXT_WINDOW / 4,
         ),
@@ -3000,7 +3000,7 @@ async fn a_window_the_reply_or_the_prompt_fills_is_refused() {
     const VAR: &str = "OUTRIG_TEST_AGENT_WINDOW_FILLED";
     let (addr, _requests) = mock_http::start(vec![text_reply("never")]).await;
     let cfg = config_in(
-        Style::Anthropic,
+        Style::Messages,
         addr,
         VAR,
         MODEL,
@@ -3020,7 +3020,7 @@ async fn a_window_the_reply_or_the_prompt_fills_is_refused() {
     );
 
     let cfg = config_in(
-        Style::Anthropic,
+        Style::Messages,
         addr,
         VAR,
         MODEL,
@@ -3512,7 +3512,7 @@ fn anthropic_candidate(identifier: &str, max_tokens: Option<u32>) -> ResolvedCan
         model_name: identifier.to_string(),
         model_identifier: identifier.to_string(),
         provider_name: "claude".to_string(),
-        provider: ResolvedProvider::Anthropic {
+        provider: ResolvedProvider::Messages {
             base_url: "http://127.0.0.1:1".to_string(),
             api_key: KEY.into(),
             request_timeout_secs: None,
@@ -3621,7 +3621,7 @@ fn two_provider_config(vars: &str, agent_keys: &str) -> Config {
 default-model = "head"
 
 [providers.first]
-style    = "anthropic"
+style    = "messages"
 base-url = "http://127.0.0.1:1"
 api-key  = "${{{vars}_FIRST}}"
 
@@ -3715,9 +3715,9 @@ fn a_model_resolves_to_its_own_style_else_its_providers() {
                 ResolvedProvider::Responses {
                     base_url, api_key, ..
                 } => (Style::Responses, base_url, api_key),
-                ResolvedProvider::Anthropic {
+                ResolvedProvider::Messages {
                     base_url, api_key, ..
-                } => (Style::Anthropic, base_url, api_key),
+                } => (Style::Messages, base_url, api_key),
             };
             let case = format!("a {provider_style:?} provider's model setting {own:?}");
             assert_eq!(style, own.unwrap_or(provider_style), "{case}");
@@ -3830,7 +3830,7 @@ async fn a_recorded_session_is_the_agents_timeline() {
     let dir = tempfile::tempdir().expect("a log dir");
     let (mut agent, _requests) = agent_with(
         events::opened(dir.path()).await,
-        Style::Anthropic,
+        Style::Messages,
         "OUTRIG_TEST_AGENT_EVENTS_TIMELINE",
         MODEL,
         "",
@@ -3979,7 +3979,7 @@ async fn token_usage_is_what_the_provider_reported() {
     let dir = tempfile::tempdir().expect("a log dir");
     let (mut agent, _requests) = agent_with(
         events::opened(dir.path()).await,
-        Style::Anthropic,
+        Style::Messages,
         "OUTRIG_TEST_AGENT_EVENTS_USAGE",
         MODEL,
         "",
@@ -4157,7 +4157,7 @@ async fn each_call_is_rebuilt_from_the_event_log_alone() {
             .expect("a preamble")
             .to_string();
         let sent = match style {
-            Style::Anthropic => system_prompt(&recorded[0]),
+            Style::Messages => system_prompt(&recorded[0]),
             Style::ChatCompletions | Style::Responses => {
                 text_of(&messages(&recorded[0])[0]["content"])
             }
@@ -4230,7 +4230,7 @@ async fn failed_dropped_and_truncated_are_recorded() {
     let (events, mut submitted) = watched(Some(dir.path())).await;
     let (mut agent, _requests) = agent_with(
         events,
-        Style::Anthropic,
+        Style::Messages,
         "OUTRIG_TEST_AGENT_EVENTS_ENDINGS",
         MODEL,
         "",
@@ -4287,7 +4287,7 @@ async fn retrying_agent(
     Session,
     tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
-    retrying_agent_in(Style::Anthropic, var, events, script).await
+    retrying_agent_in(Style::Messages, var, events, script).await
 }
 
 /// [`retrying_agent`] against a provider of `style`.
@@ -4323,7 +4323,7 @@ fn usage_json(input: u64, output: u64) -> serde_json::Value {
 fn retrying(cfg: &mut Config, provider: &str) {
     match cfg.providers.get_mut(provider) {
         Some(
-            LlmProvider::Anthropic {
+            LlmProvider::Messages {
                 retry_budget_secs, ..
             }
             | LlmProvider::Responses {
@@ -4342,7 +4342,7 @@ fn retrying(cfg: &mut Config, provider: &str) {
 fn strict(cfg: &mut Config, provider: &str) {
     match cfg.providers.get_mut(provider) {
         Some(
-            LlmProvider::Anthropic {
+            LlmProvider::Messages {
                 role_alternation, ..
             }
             | LlmProvider::Responses {
@@ -4535,7 +4535,7 @@ async fn an_unusable_response_that_spends_the_budget_is_not_retried() {
     let (addr, mut requests) =
         mock_http::start(vec![mock_http::unusable(), text_reply("never sent")]).await;
     let mut cfg = config_in(
-        Style::Anthropic,
+        Style::Messages,
         addr,
         var,
         MODEL,
@@ -4640,7 +4640,7 @@ async fn an_empty_reply_the_model_ended_on_its_own_ends_the_round_without_a_retr
             "{style:?}"
         );
         let (asked, stopped) = match style {
-            Style::Anthropic => ("tool_use", "end_turn"),
+            Style::Messages => ("tool_use", "end_turn"),
             Style::ChatCompletions => ("tool_calls", "stop"),
             Style::Responses => ("completed", "completed"),
         };
@@ -4699,7 +4699,7 @@ async fn the_round_after_an_empty_reply_is_sent_no_trace_of_it() {
         // between them. rig sends the opening in the result's user message,
         // which on OpenAI's wire is a `tool` message the opening follows.
         let opening = match style {
-            Style::Anthropic => 0,
+            Style::Messages => 0,
             Style::ChatCompletions | Style::Responses => 1,
         };
         assert_eq!(
@@ -4799,7 +4799,7 @@ async fn a_rejected_reply_that_is_no_empty_stop_fails_the_round(
 
 #[tokio::test]
 async fn an_anthropic_reply_cut_off_with_nothing_in_it_still_fails_the_round() {
-    let style = Style::Anthropic;
+    let style = Style::Messages;
     a_rejected_reply_that_is_no_empty_stop_fails_the_round(
         style,
         "max_tokens",
@@ -4839,7 +4839,7 @@ async fn an_openai_reply_filtered_to_nothing_still_fails_the_round() {
 /// ending the round as an answer and losing the call.
 #[tokio::test]
 async fn an_anthropic_reply_that_ends_in_a_tool_call_and_holds_none_still_fails_the_round() {
-    let style = Style::Anthropic;
+    let style = Style::Messages;
     a_rejected_reply_that_is_no_empty_stop_fails_the_round(
         style,
         "tool_use",
@@ -4866,7 +4866,7 @@ async fn an_openai_reply_that_ends_in_a_tool_call_and_holds_none_still_fails_the
 fn said(style: Style, content: &str, finish_reason: &str) -> mock_http::CannedResponse {
     let reasoned = |reply: mock_http::CannedResponse| reply.with_reasoning("weighing the request");
     match style {
-        Style::Anthropic => reasoned(mock_http::message(
+        Style::Messages => reasoned(mock_http::message(
             json!([{ "type": "text", "text": content }]),
             finish_reason,
         )),
@@ -4894,7 +4894,7 @@ fn said(style: Style, content: &str, finish_reason: &str) -> mock_http::CannedRe
 #[tokio::test]
 async fn a_reply_filtered_after_the_model_reasoned_fails_the_round() {
     for (style, reason) in [
-        (Style::Anthropic, "refusal"),
+        (Style::Messages, "refusal"),
         (Style::ChatCompletions, "content_filter"),
         (Style::Responses, "content_filter"),
     ] {
@@ -4954,8 +4954,8 @@ async fn the_round_after_a_filtered_reply_is_sent_no_trace_of_it() {
 #[tokio::test]
 async fn a_reply_that_stops_or_runs_to_length_with_the_same_content_is_unchanged() {
     for (style, reason) in [
-        (Style::Anthropic, "end_turn"),
-        (Style::Anthropic, "max_tokens"),
+        (Style::Messages, "end_turn"),
+        (Style::Messages, "max_tokens"),
         (Style::ChatCompletions, "stop"),
         (Style::ChatCompletions, "length"),
     ] {
@@ -5045,7 +5045,7 @@ async fn a_result_the_provider_will_not_read_is_left_out_and_the_round_goes_on()
 
         let records = events::recorded(dir.path());
         let reason = match style {
-            Style::Anthropic => "refusal",
+            Style::Messages => "refusal",
             Style::ChatCompletions | Style::Responses => "content_filter",
         };
         let withheld = events::of_kind(&records, "model.withheld");
@@ -5157,8 +5157,8 @@ async fn an_unreachable_head_moves_to_the_next_model_which_is_named_as_answering
     // The discard port: nothing listens there, so every connection is refused.
     let cfg = chain_config(
         vars,
-        (Style::Anthropic, "http://127.0.0.1:9", ""),
-        (Style::Anthropic, &format!("http://{tail}"), ""),
+        (Style::Messages, "http://127.0.0.1:9", ""),
+        (Style::Messages, &format!("http://{tail}"), ""),
     );
     let dir = tempfile::tempdir().expect("a log dir");
     let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
@@ -5314,14 +5314,14 @@ async fn a_chain_moves_between_every_pair_of_styles() {
 /// `x-api-key`, and OpenAI's two post to their own paths with a bearer token.
 fn sent_in(request: &RecordedRequest) -> Style {
     let style = match request.path.as_str() {
-        "/v1/messages" => Style::Anthropic,
+        "/v1/messages" => Style::Messages,
         "/v1/chat/completions" => Style::ChatCompletions,
         "/v1/responses" => Style::Responses,
         other => panic!("no style posts to {other}"),
     };
     let bearer = format!("Bearer {KEY}");
     let expected = match style {
-        Style::Anthropic => (Some(KEY), None),
+        Style::Messages => (Some(KEY), None),
         Style::ChatCompletions | Style::Responses => (None, Some(bearer.as_str())),
     };
     let auth = (request.header("x-api-key"), request.header("authorization"));
@@ -5342,7 +5342,7 @@ async fn one_provider_serves_each_model_in_its_own_style() {
     let (addr, mut requests) = mock_http::start_reporting(
         vec![
             Style::ChatCompletions.text("over chat completions"),
-            Style::Anthropic.text("over messages"),
+            Style::Messages.text("over messages"),
         ],
         failure(404),
     )
@@ -5371,7 +5371,7 @@ identifier = "{MODEL}"
 [models.sonnet]
 provider   = "gateway"
 identifier = "{MODEL}"
-style      = "anthropic"
+style      = "messages"
 "#
     );
     std::fs::write(repo.join(".agents/outrig/config.toml"), models).expect("write the repo config");
@@ -5393,7 +5393,7 @@ style      = "anthropic"
     let recorded = mock_http::drain(&mut requests);
     let (asked, called): (Vec<_>, Vec<_>) = recorded.iter().partition(|r| r.method == "GET");
     let called: Vec<_> = called.into_iter().map(sent_in).collect();
-    assert_eq!(called, [Style::ChatCompletions, Style::Anthropic]);
+    assert_eq!(called, [Style::ChatCompletions, Style::Messages]);
     let window = format!("/v1/models/{MODEL}");
     let paths: Vec<_> = asked.iter().map(|r| r.path.as_str()).collect();
     assert_eq!(paths, ["/v1/model/info", window.as_str()]);
@@ -5411,7 +5411,7 @@ style      = "anthropic"
 #[tokio::test]
 async fn a_providers_redirect_is_not_followed() {
     let (elsewhere, mut sent_elsewhere) =
-        mock_http::start_reporting(vec![Style::Anthropic.text("leaked")], failure(404)).await;
+        mock_http::start_reporting(vec![Style::Messages.text("leaked")], failure(404)).await;
     let location = format!("http://{elsewhere}/v1/messages");
     for style in Style::ALL {
         for status in [302, 307] {
@@ -5652,8 +5652,8 @@ async fn python_run_before_a_move_is_not_run_again() {
         mock_http::start(vec![text_reply("finished on the tail")]).await;
     let cfg = chain_config(
         vars,
-        (Style::Anthropic, &format!("http://{head}"), ""),
-        (Style::Anthropic, &format!("http://{tail}"), ""),
+        (Style::Messages, &format!("http://{head}"), ""),
+        (Style::Messages, &format!("http://{tail}"), ""),
     );
     let dir = tempfile::tempdir().expect("a log dir");
     let (events, mut submitted) = watched(Some(dir.path())).await;
@@ -5696,8 +5696,8 @@ async fn an_exhausted_chain_ends_the_round_and_keeps_what_it_ran() {
     let (tail, _tail_requests) = mock_http::start(vec![failure(401)]).await;
     let cfg = chain_config(
         vars,
-        (Style::Anthropic, &format!("http://{head}"), ""),
-        (Style::Anthropic, &format!("http://{tail}"), ""),
+        (Style::Messages, &format!("http://{head}"), ""),
+        (Style::Messages, &format!("http://{tail}"), ""),
     );
     let (events, mut submitted) = watched(None).await;
     let mut agent = chained_agent(vars, events, &cfg).await;
@@ -5755,8 +5755,8 @@ async fn a_key_every_model_refuses_is_not_worth_resending() {
     let (tail, _tail_requests) = mock_http::start(vec![failure(401)]).await;
     let cfg = chain_config(
         vars,
-        (Style::Anthropic, &format!("http://{head}"), ""),
-        (Style::Anthropic, &format!("http://{tail}"), ""),
+        (Style::Messages, &format!("http://{head}"), ""),
+        (Style::Messages, &format!("http://{tail}"), ""),
     );
     let mut agent = chained_agent(vars, Events::off(), &cfg).await;
 
@@ -5792,8 +5792,8 @@ async fn a_refusal_after_python_ran_keeps_it_and_says_resending_will_not_help() 
     let (tail, _tail_requests) = mock_http::start(vec![failure(403)]).await;
     let cfg = chain_config(
         vars,
-        (Style::Anthropic, &format!("http://{head}"), ""),
-        (Style::Anthropic, &format!("http://{tail}"), ""),
+        (Style::Messages, &format!("http://{head}"), ""),
+        (Style::Messages, &format!("http://{tail}"), ""),
     );
     let (events, mut submitted) = watched(None).await;
     let mut agent = chained_agent(vars, events, &cfg).await;
@@ -5870,8 +5870,8 @@ async fn a_rate_limit_that_outlasted_the_budget_still_says_to_send_another() {
     let (tail, _tail_requests) = mock_http::start(vec![failure(429)]).await;
     let cfg = chain_config(
         vars,
-        (Style::Anthropic, &format!("http://{head}"), ""),
-        (Style::Anthropic, &format!("http://{tail}"), ""),
+        (Style::Messages, &format!("http://{head}"), ""),
+        (Style::Messages, &format!("http://{tail}"), ""),
     );
     let mut agent = chained_agent(vars, Events::off(), &cfg).await;
     post(&agent, "hello").await;
@@ -5973,9 +5973,9 @@ async fn a_turn_a_fallback_cannot_hold_does_not_end_the_session() {
     .await;
     let cfg = chain_config(
         vars,
-        (Style::Anthropic, &format!("http://{head}"), ""),
+        (Style::Messages, &format!("http://{head}"), ""),
         (
-            Style::Anthropic,
+            Style::Messages,
             &format!("http://{tail}"),
             "context-window = 7000\nmax-tokens = 1024",
         ),
@@ -6036,8 +6036,8 @@ async fn a_refused_call_through_a_chain_says_where_it_was_refused() {
     let (tail, _tail_requests) = mock_http::start(vec![failure(401)]).await;
     let cfg = chain_config(
         vars,
-        (Style::Anthropic, &format!("http://{head}"), ""),
-        (Style::Anthropic, &format!("http://{tail}"), ""),
+        (Style::Messages, &format!("http://{head}"), ""),
+        (Style::Messages, &format!("http://{tail}"), ""),
     );
     let mut agent = chained_agent(vars, Events::off(), &cfg).await;
 
@@ -6066,8 +6066,8 @@ async fn a_later_models_refusal_earns_a_hint_naming_its_own_row() {
     let (tail, _tail_requests) = mock_http::start(vec![failure(400)]).await;
     let cfg = chain_config(
         vars,
-        (Style::Anthropic, &format!("http://{head}"), ""),
-        (Style::Anthropic, &format!("http://{tail}"), ""),
+        (Style::Messages, &format!("http://{head}"), ""),
+        (Style::Messages, &format!("http://{tail}"), ""),
     );
     let mut agent = chained_agent(vars, Events::off(), &cfg).await;
 
@@ -6106,7 +6106,7 @@ async fn a_move_to_a_strict_model_is_sent_a_conversation_that_alternates() {
     let mut cfg = chain_config(
         vars,
         (
-            Style::Anthropic,
+            Style::Messages,
             &format!("http://{head}"),
             "max-tokens = 4096",
         ),
@@ -6154,7 +6154,7 @@ async fn a_move_to_a_strict_model_is_sent_a_conversation_that_alternates() {
     // turn 2.
     let (headed, moved) = (&at_head[6], &at_tail[0]);
     assert_eq!(
-        check_wire(Style::Anthropic, &headed.body).adjacent.len(),
+        check_wire(Style::Messages, &headed.body).adjacent.len(),
         1,
         "{:#}",
         headed.body
@@ -6192,7 +6192,7 @@ async fn a_move_to_a_strict_model_is_sent_a_conversation_that_alternates() {
     each_call_rebuilds(
         &records,
         &[
-            ("head", Style::Anthropic, &at_head),
+            ("head", Style::Messages, &at_head),
             ("tail", Style::ChatCompletions, &at_tail),
         ],
     );
@@ -6217,12 +6217,12 @@ async fn a_move_to_a_smaller_window_is_sent_a_view_assembled_for_it() {
     let cfg = chain_config(
         vars,
         (
-            Style::Anthropic,
+            Style::Messages,
             &format!("http://{head}"),
             "max-tokens = 4096",
         ),
         (
-            Style::Anthropic,
+            Style::Messages,
             &format!("http://{tail}"),
             "max-tokens = 1024\ncontext-window = 6000",
         ),
@@ -6253,11 +6253,7 @@ async fn a_move_to_a_smaller_window_is_sent_a_view_assembled_for_it() {
         "the tail's window leaves the large turn out: {:#}",
         moved.body
     );
-    assert!(
-        check_wire(Style::Anthropic, &moved.body)
-            .unpaired
-            .is_empty()
-    );
+    assert!(check_wire(Style::Messages, &moved.body).unpaired.is_empty());
     assert_eq!(headed.body["max_tokens"], 4096);
     assert_eq!(moved.body["max_tokens"], 1024);
 
@@ -6301,8 +6297,8 @@ async fn a_move_to_a_smaller_window_is_sent_a_view_assembled_for_it() {
         .collect();
     for (call, request) in [(head_call, headed), (moved_call, moved)] {
         assert_eq!(
-            on_the_wire(Style::Anthropic, rebuilt(&turns, call)),
-            conversation(Style::Anthropic, request)
+            on_the_wire(Style::Messages, rebuilt(&turns, call)),
+            conversation(Style::Messages, request)
         );
     }
 }
@@ -6322,11 +6318,11 @@ async fn a_turn_too_large_for_the_head_is_sent_to_a_fallback_that_holds_it() {
     let cfg = chain_config(
         vars,
         (
-            Style::Anthropic,
+            Style::Messages,
             &format!("http://{head}"),
             "context-window = 7000\nmax-tokens = 1024",
         ),
-        (Style::Anthropic, &format!("http://{tail}"), ""),
+        (Style::Messages, &format!("http://{tail}"), ""),
     );
     let dir = tempfile::tempdir().expect("a log dir");
     let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
@@ -6368,8 +6364,8 @@ async fn a_turn_too_large_for_the_head_is_sent_to_a_fallback_that_holds_it() {
     each_call_rebuilds(
         &records,
         &[
-            ("head", Style::Anthropic, &at_head),
-            ("tail", Style::Anthropic, &at_tail),
+            ("head", Style::Messages, &at_head),
+            ("tail", Style::Messages, &at_tail),
         ],
     );
 }
@@ -6390,12 +6386,12 @@ async fn a_turn_no_model_of_the_chain_can_hold_ends_its_round_and_later_rounds_g
     let cfg = chain_config(
         vars,
         (
-            Style::Anthropic,
+            Style::Messages,
             &format!("http://{head}"),
             "context-window = 7000\nmax-tokens = 1024",
         ),
         (
-            Style::Anthropic,
+            Style::Messages,
             &format!("http://{tail}"),
             "context-window = 8000\nmax-tokens = 1024",
         ),
@@ -6506,7 +6502,7 @@ async fn a_refused_drop_block_is_sent_again_without_it() {
     ])
     .await;
     let cfg = config_in(
-        Style::Anthropic,
+        Style::Messages,
         addr,
         var,
         BINDING_MODEL,
@@ -6563,7 +6559,7 @@ async fn reasoning_another_provider_wrote_is_not_sent_to_anthropic() {
     let cfg = chain_config(
         vars,
         (Style::ChatCompletions, &format!("http://{head}"), ""),
-        (Style::Anthropic, &format!("http://{tail}"), ""),
+        (Style::Messages, &format!("http://{tail}"), ""),
     );
     let dir = tempfile::tempdir().expect("a log dir");
     let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
@@ -6579,7 +6575,7 @@ async fn reasoning_another_provider_wrote_is_not_sent_to_anthropic() {
         moved[0].body
     );
     assert!(
-        check_wire(Style::Anthropic, &moved[0].body)
+        check_wire(Style::Messages, &moved[0].body)
             .unpaired
             .is_empty()
     );
@@ -6600,7 +6596,7 @@ async fn reasoning_another_provider_wrote_is_not_sent_to_anthropic() {
         &records,
         &[
             ("head", Style::ChatCompletions, &headed),
-            ("tail", Style::Anthropic, &moved),
+            ("tail", Style::Messages, &moved),
         ],
     );
 }
@@ -6621,7 +6617,7 @@ async fn the_anthropic_head_is_sent_none_of_the_reasoning_its_fallback_wrote() {
     .await;
     let cfg = chain_config(
         vars,
-        (Style::Anthropic, &format!("http://{head}"), ""),
+        (Style::Messages, &format!("http://{head}"), ""),
         (Style::ChatCompletions, &format!("http://{tail}"), ""),
     );
     let dir = tempfile::tempdir().expect("a log dir");
@@ -6653,7 +6649,7 @@ async fn the_anthropic_head_is_sent_none_of_the_reasoning_its_fallback_wrote() {
     each_call_rebuilds(
         &records,
         &[
-            ("head", Style::Anthropic, &headed),
+            ("head", Style::Messages, &headed),
             ("tail", Style::ChatCompletions, &moved),
         ],
     );
@@ -6671,8 +6667,8 @@ async fn a_redirect_moves_on_without_retrying() {
     let (tail, _tail_requests) = mock_http::start(vec![text_reply("from the tail")]).await;
     let mut cfg = chain_config(
         vars,
-        (Style::Anthropic, &format!("http://{head}"), ""),
-        (Style::Anthropic, &format!("http://{tail}"), ""),
+        (Style::Messages, &format!("http://{head}"), ""),
+        (Style::Messages, &format!("http://{tail}"), ""),
     );
     retrying(&mut cfg, "first");
     let dir = tempfile::tempdir().expect("a log dir");
@@ -6719,8 +6715,8 @@ async fn assert_retried_rather_than_left(vars: &str, status: u16) {
     let (tail, mut tail_requests) = mock_http::start(vec![text_reply("from the tail")]).await;
     let mut cfg = chain_config(
         vars,
-        (Style::Anthropic, &format!("http://{head}"), ""),
-        (Style::Anthropic, &format!("http://{tail}"), ""),
+        (Style::Messages, &format!("http://{head}"), ""),
+        (Style::Messages, &format!("http://{tail}"), ""),
     );
     retrying(&mut cfg, "first");
     let dir = tempfile::tempdir().expect("a log dir");
@@ -7152,7 +7148,7 @@ async fn a_stalled_subscriber_never_delays_a_round() {
     let mut stalled = stream.subscribe(1);
     let (mut agent, _requests) = agent_with(
         stream.build(),
-        Style::Anthropic,
+        Style::Messages,
         "OUTRIG_TEST_AGENT_STALLED_SUBSCRIBER",
         MODEL,
         "",
@@ -7198,12 +7194,12 @@ async fn a_retried_then_moved_call_has_one_call_id_and_three_attempts() {
     let mut cfg = chain_config(
         vars,
         (
-            Style::Anthropic,
+            Style::Messages,
             &format!("http://{head}"),
             "max-tokens = 1024",
         ),
         (
-            Style::Anthropic,
+            Style::Messages,
             &format!("http://{tail}"),
             "max-tokens = 2048",
         ),
@@ -7476,7 +7472,7 @@ async fn a_session_publishes_its_states_in_order() {
     let (events, mut watched) = watched(None).await;
     let (mut agent, _requests) = agent_with(
         events,
-        Style::Anthropic,
+        Style::Messages,
         "OUTRIG_TEST_AGENT_STATES",
         MODEL,
         "",
@@ -7513,7 +7509,7 @@ async fn the_interpreter_exiting_is_an_event_then_a_close() {
     let (events, mut watched) = watched(None).await;
     let (mut agent, _requests) = agent_with(
         events,
-        Style::Anthropic,
+        Style::Messages,
         "OUTRIG_TEST_AGENT_EXIT",
         MODEL,
         "",
@@ -7725,7 +7721,7 @@ async fn after_the_close_round_refuses_and_a_running_round_reads_why() {
     let (events, mut watched) = watched(None).await;
     let (mut agent, mut requests) = agent_with(
         events,
-        Style::Anthropic,
+        Style::Messages,
         "OUTRIG_TEST_AGENT_CLOSE",
         MODEL,
         "",
@@ -7926,7 +7922,7 @@ mod e2e {
         let (addr, mut requests) = mock_http::start(vec![text_reply("hi")]).await;
         let var = "OUTRIG_TEST_AGENT_E2E_INSTRUCTIONS";
         let cfg = config_in(
-            Style::Anthropic,
+            Style::Messages,
             addr,
             var,
             MODEL,
@@ -7984,7 +7980,7 @@ mod e2e {
         // The model row's keys end the row, so a table after them is the
         // config's own.
         let cfg = config_in(
-            Style::Anthropic,
+            Style::Messages,
             addr,
             var,
             MODEL,
@@ -8159,7 +8155,7 @@ mod e2e {
     /// no other input.
     #[tokio::test]
     async fn a_config_built_in_code_starts_with_one_call() {
-        use crate::config::{AnthropicOptions, ApiKeyRef, ImageConfig, LlmProvider, Model};
+        use crate::config::{ApiKeyRef, ImageConfig, LlmProvider, MessagesOptions, Model};
 
         pull(ALPINE).await;
         let sessions = tempfile::tempdir().expect("a session root");
@@ -8168,10 +8164,10 @@ mod e2e {
         let mut cfg = Config::default();
         cfg.providers.insert(
             "claude".to_string(),
-            LlmProvider::anthropic(
+            LlmProvider::messages(
                 format!("http://{addr}"),
                 ApiKeyRef::parse(&format!("${{{var}}}")).expect("a reference"),
-                AnthropicOptions::new(),
+                MessagesOptions::new(),
             ),
         );
         let mut model = Model::new("claude");

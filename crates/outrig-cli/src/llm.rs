@@ -140,7 +140,7 @@ pub enum ResolvedProvider {
         request_timeout_secs: Option<u64>,
         retry_budget_secs: Option<u64>,
     },
-    Anthropic {
+    Messages {
         base_url: String,
         api_key: String,
         request_timeout_secs: Option<u64>,
@@ -159,7 +159,7 @@ impl ResolvedProvider {
             | Self::Responses {
                 retry_budget_secs, ..
             }
-            | Self::Anthropic {
+            | Self::Messages {
                 retry_budget_secs, ..
             } => *retry_budget_secs,
         }
@@ -379,12 +379,12 @@ pub(crate) fn selectability(
     })?;
     let known_style = matches!(
         model.effective_style(provider),
-        ApiStyle::ChatCompletions | ApiStyle::Responses | ApiStyle::Anthropic
+        ApiStyle::ChatCompletions | ApiStyle::Responses | ApiStyle::Messages
     );
     match provider {
         LlmProvider::ChatCompletions { api_key, .. }
         | LlmProvider::Responses { api_key, .. }
-        | LlmProvider::Anthropic { api_key, .. }
+        | LlmProvider::Messages { api_key, .. }
             if known_style =>
         {
             // Through `resolve` rather than `env::var` so "not set" and "not
@@ -691,7 +691,7 @@ fn resolve_candidate(
         retry_budget_secs,
         ..
     }
-    | LlmProvider::Anthropic {
+    | LlmProvider::Messages {
         base_url,
         api_key,
         request_timeout_secs,
@@ -718,7 +718,7 @@ fn resolve_candidate(
             request_timeout_secs,
             retry_budget_secs,
         },
-        ApiStyle::Anthropic => ResolvedProvider::Anthropic {
+        ApiStyle::Messages => ResolvedProvider::Messages {
             base_url,
             api_key,
             request_timeout_secs,
@@ -796,7 +796,7 @@ pub struct BuiltAgent {
 pub enum RigAgent {
     ChatCompletions(BuiltAgent),
     Responses(BuiltAgent),
-    Anthropic(BuiltAgent),
+    Messages(BuiltAgent),
     /// A multi-candidate alias: a chain that moves between provider-equivalent
     /// rows when one fails mid-turn, which may span both styles.
     Failover(BuiltAgent),
@@ -917,7 +917,7 @@ pub(crate) async fn build_agent_with_ceilings(
     let agent = match (resolved.candidates.len(), resolved.provider()) {
         (1, ResolvedProvider::ChatCompletions { .. }) => RigAgent::ChatCompletions(built),
         (1, ResolvedProvider::Responses { .. }) => RigAgent::Responses(built),
-        (1, ResolvedProvider::Anthropic { .. }) => RigAgent::Anthropic(built),
+        (1, ResolvedProvider::Messages { .. }) => RigAgent::Messages(built),
         _ => RigAgent::Failover(built),
     };
     Ok((agent, ceilings))
@@ -979,7 +979,7 @@ fn build_candidate(
                 EffectiveCeiling::new(candidate, candidate.max_tokens),
             ))
         }
-        ResolvedProvider::Anthropic {
+        ResolvedProvider::Messages {
             base_url,
             api_key,
             request_timeout_secs,
@@ -1177,7 +1177,7 @@ impl RigAgent {
         match self {
             RigAgent::ChatCompletions(built)
             | RigAgent::Responses(built)
-            | RigAgent::Anthropic(built)
+            | RigAgent::Messages(built)
             | RigAgent::Failover(built) => built,
         }
     }
@@ -1211,7 +1211,7 @@ impl RigAgent {
             // session.
             RigAgent::ChatCompletions(built)
             | RigAgent::Responses(built)
-            | RigAgent::Anthropic(built) => {
+            | RigAgent::Messages(built) => {
                 built.chain.take_answered();
                 Vec::new()
             }

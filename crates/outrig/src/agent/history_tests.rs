@@ -1289,7 +1289,7 @@ fn a_cut_leaves_out_the_thinking_it_made_stale_and_no_more() {
     use crate::agent::budget::Wire;
 
     let anthropic = Budget {
-        wire: Wire::Anthropic,
+        wire: Wire::Messages,
         ..Budget::with_room("m", 100)
     };
     let mut store = Store::default();
@@ -1366,7 +1366,7 @@ fn a_window_that_moves_on_leaves_out_the_thinking_after_the_gap() {
         ..Store::default()
     };
     let anthropic = Budget {
-        wire: Wire::Anthropic,
+        wire: Wire::Messages,
         ..Budget::with_room("m", ROOMY)
     };
     let mut sent = Vec::new();
@@ -1409,7 +1409,7 @@ fn a_promotion_sent_as_nothing_leaves_the_thinking_after_it() {
     round_of_calls(&mut store, "round 3", &[], Some("done"));
     store.begin_round(Message::user("round 4"));
     let anthropic = Budget {
-        wire: Wire::Anthropic,
+        wire: Wire::Messages,
         ..Budget::with_room("m", ROOMY)
     };
     store.assemble(&anthropic, None).expect("room");
@@ -1454,7 +1454,7 @@ fn a_call_is_sent_only_the_reasoning_its_provider_takes() {
 
     for (wire, left_out) in [
         (
-            Wire::Anthropic,
+            Wire::Messages,
             vec![
                 LeftOut {
                     turn: 0,
@@ -1637,7 +1637,7 @@ fn a_withheld_turn_makes_the_thinking_after_it_stale_only_once_it_is_sent() {
     let mut store = one_round_cut_short();
     store.begin_round(Message::user("round 5"));
     let anthropic = Budget {
-        wire: Wire::Anthropic,
+        wire: Wire::Messages,
         ..Budget::with_room("m", ROOMY)
     };
     let strict = anthropic.clone().strict();
@@ -1682,7 +1682,7 @@ fn a_strict_view_withholds_the_results_stale_thinking_answered() {
     store.commit(vec![thinking_alone(signed("r3"))]);
     store.begin_round(Message::user("round 4"));
     let strict = Budget {
-        wire: Wire::Anthropic,
+        wire: Wire::Messages,
         ..Budget::with_room("m", ROOMY)
     }
     .strict();
@@ -1799,7 +1799,7 @@ fn an_emptied_reply_leaves_its_round_ending_on_results() {
     store.begin_round(Message::user("round 3"));
 
     let anthropic = Budget {
-        wire: Wire::Anthropic,
+        wire: Wire::Messages,
         ..Budget::with_room("m", ROOMY).strict()
     };
     let (sent, manifest) = store.assemble(&anthropic, None).expect("room");

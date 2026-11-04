@@ -67,7 +67,7 @@ The prompts that follow depend on the style you pick.
 (`https://api.openai.com/v1`, `OPENAI_API_KEY`). The provider name is suggested as `openai` for
 `chat-completions` and as the style's own name for the others.
 
-`anthropic` asks the same connection questions with its own defaults
+`messages` asks the same connection questions with its own defaults
 (`https://api.anthropic.com`, `ANTHROPIC_API_KEY`), and its models get one extra prompt:
 
 ```sh
@@ -78,7 +78,7 @@ The prompts that follow depend on the style you pick.
 Anthropic's API requires an output-token ceiling on every request, so the generated config
 carries one explicitly rather than leaving a model whose identifier outrig does not
 recognize to run on the conservative fallback outrig would otherwise apply. See
-[Concepts -> LLM Providers](../concepts/llm-providers.md#native-anthropic-style--anthropic).
+[Concepts -> LLM Providers](../concepts/llm-providers.md#native-anthropic-style--messages).
 
 ### Help at any prompt
 
@@ -93,7 +93,7 @@ can answer:
   Which wire format this provider speaks.
   chat-completions  OpenAI Chat Completions wire format. Works with OpenAI, OpenRouter, vLLM.
   responses  OpenAI Responses wire format. Works with OpenAI, Ollama, LM Studio.
-  anthropic  Anthropic's native Messages wire format. Talks to Claude directly.
+  messages  Anthropic's native Messages wire format. Talks to Claude directly.
 
   See: https://tgockel.github.io/outrig/concepts/llm-providers.html
 

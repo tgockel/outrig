@@ -167,7 +167,7 @@ fn mock_config(
 default-model = "sonnet"
 
 [providers.claude]
-style                = "anthropic"
+style                = "messages"
 base-url             = "http://{addr}"
 api-key              = "${{{var}}}"
 request-timeout-secs = 10
@@ -203,14 +203,14 @@ fn mock_chain_config(head: SocketAddr, next: SocketAddr, vars: [&str; 2]) -> Con
 default-model = "chain"
 
 [providers.head]
-style                = "anthropic"
+style                = "messages"
 base-url             = "http://{head}"
 api-key              = "${{{head_var}}}"
 request-timeout-secs = 10
 retry-budget-secs    = 0
 
 [providers.next]
-style                = "anthropic"
+style                = "messages"
 base-url             = "http://{next}"
 api-key              = "${{{next_var}}}"
 request-timeout-secs = 10
@@ -451,7 +451,7 @@ identifier = "gpt-4o"
 [models.sonnet]
 provider   = "gateway"
 identifier = "{MODEL}"
-style      = "anthropic"
+style      = "messages"
 
 [agents.coding]
 preamble = "{PREAMBLE}"

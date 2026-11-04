@@ -207,7 +207,7 @@ pub(crate) struct Budget {
 pub(crate) enum Wire {
     ChatCompletions,
     Responses,
-    Anthropic,
+    Messages,
 }
 
 /// The wire format whose provider items carry Anthropic's thinking signatures.
@@ -223,7 +223,7 @@ impl Wire {
     /// `foreign` turn is one another `[models.<name>]` row wrote.
     pub(crate) fn takes(self, part: &AssistantContent, stale: bool, foreign: bool) -> bool {
         match (self, part) {
-            (Wire::Anthropic, AssistantContent::Reasoning(reasoning)) => {
+            (Wire::Messages, AssistantContent::Reasoning(reasoning)) => {
                 !stale
                     && reasoning
                         .native
@@ -296,7 +296,7 @@ impl Budget {
             wire: match candidate.provider {
                 ResolvedProvider::ChatCompletions { .. } => Wire::ChatCompletions,
                 ResolvedProvider::Responses { .. } => Wire::Responses,
-                ResolvedProvider::Anthropic { .. } => Wire::Anthropic,
+                ResolvedProvider::Messages { .. } => Wire::Messages,
             },
             alternation: candidate.provider.role_alternation(),
         };
@@ -769,9 +769,9 @@ mod tests {
         // cache reads and writes into `input_tokens` as OpenAI's are.
         assert_eq!(Wire::ChatCompletions.reported_input(&usage), 100);
         assert_eq!(Wire::Responses.reported_input(&usage), 100);
-        assert_eq!(Wire::Anthropic.reported_input(&usage), 100);
+        assert_eq!(Wire::Messages.reported_input(&usage), 100);
         // A count nobody gave reads as zero.
-        assert_eq!(Wire::Anthropic.reported_input(&Usage::new()), 0);
+        assert_eq!(Wire::Messages.reported_input(&Usage::new()), 0);
     }
 
     #[test]

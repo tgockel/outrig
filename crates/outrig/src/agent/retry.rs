@@ -1814,7 +1814,7 @@ mod tests {
 
         let fixtures = [
             (
-                Style::Anthropic,
+                Style::Messages,
                 serde_json::json!({
                     "input_tokens": 12,
                     "output_tokens": 7,
@@ -1855,7 +1855,7 @@ mod tests {
             ),
             // Anthropic with no output count, as a reply cut off before any
             // leaves it.
-            (Style::Anthropic, serde_json::json!({ "input_tokens": 12 })),
+            (Style::Messages, serde_json::json!({ "input_tokens": 12 })),
         ];
         for (style, usage) in fixtures {
             use rig::wire::{Mode, WireFrame, decode_reply};
@@ -1863,7 +1863,7 @@ mod tests {
             let bytes = serde_json::to_vec(&body).expect("serializes");
             let request = CompletionRequest::new("hi");
             let rigs = match style {
-                Style::Anthropic => {
+                Style::Messages => {
                     let wire = rig::providers::anthropic::wire::AnthropicConfig::new("k")
                         .completion(crate::agent::mock_http::MODEL);
                     decode_reply(&wire, &request, Mode::Unary, [WireFrame::Bytes(bytes)])

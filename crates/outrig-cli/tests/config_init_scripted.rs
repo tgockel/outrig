@@ -74,10 +74,10 @@ async fn writes_anthropic_config_with_max_tokens() {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("config.toml");
 
-    // style=anthropic, name=claude, then defaults: base-url, env-var, no
+    // style=messages, name=claude, then defaults: base-url, env-var, no
     // extra provider, define a model, name=sonnet, provider (default), then
     // identifier + max-tokens defaults, no extra models, use as default-model.
-    let script = b"anthropic\nclaude\n\n\n\n\nsonnet\n\n\n\n\n\n";
+    let script = b"messages\nclaude\n\n\n\n\nsonnet\n\n\n\n\n\n";
     let (mut prompt, _stderr_r) = scripted_prompt(script).await;
 
     timeout(TEST_TIMEOUT, run_with(false, &target, &mut prompt))
@@ -91,7 +91,7 @@ async fn writes_anthropic_config_with_max_tokens() {
 
     for expected in [
         "[providers.claude]",
-        "style = \"anthropic\"",
+        "style = \"messages\"",
         // The bare endpoint: rig appends `/v1/messages` itself.
         "base-url = \"https://api.anthropic.com\"",
         "api-key = \"${ANTHROPIC_API_KEY}\"",
@@ -322,7 +322,7 @@ async fn a_zero_max_tokens_answer_is_asked_again() {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("config.toml");
 
-    let script = b"anthropic\nclaude\n\n\n\n\nsonnet\n\n\n0\n32000\n\n\n";
+    let script = b"messages\nclaude\n\n\n\n\nsonnet\n\n\n0\n32000\n\n\n";
     let (text, shown) = write_config(&target, script).await;
     Config::load_from_str(&text)
         .unwrap()
@@ -348,7 +348,7 @@ async fn a_max_tokens_answer_that_is_not_a_number_is_asked_again() {
 
     // The script of `writes_anthropic_config_with_max_tokens`, answering
     // max-tokens with `64k` -- refused, so asked again -- and then `32000`.
-    let script = b"anthropic\nclaude\n\n\n\n\nsonnet\n\n\n64k\n32000\n\n\n";
+    let script = b"messages\nclaude\n\n\n\n\nsonnet\n\n\n64k\n32000\n\n\n";
     let (text, shown) = write_config(&target, script).await;
     Config::load_from_str(&text)
         .unwrap()

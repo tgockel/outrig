@@ -114,7 +114,7 @@ async fn lookup(candidate: &ResolvedCandidate, timeout: Duration) -> Reported {
         .map_err(|e| failed(e, timeout))?;
     let identifier = &candidate.model_identifier;
     let request = match &candidate.provider {
-        ResolvedProvider::Anthropic {
+        ResolvedProvider::Messages {
             base_url, api_key, ..
         } => http
             .get(url(
@@ -141,7 +141,7 @@ async fn lookup(candidate: &ResolvedCandidate, timeout: Duration) -> Reported {
     let body: Value =
         serde_json::from_slice(&body).map_err(|_| "the reply is not JSON".to_string())?;
     match candidate.provider {
-        ResolvedProvider::Anthropic { .. } => max_input_tokens(&body),
+        ResolvedProvider::Messages { .. } => max_input_tokens(&body),
         ResolvedProvider::ChatCompletions { .. } | ResolvedProvider::Responses { .. } => {
             proxy_window(&body, identifier)
         }

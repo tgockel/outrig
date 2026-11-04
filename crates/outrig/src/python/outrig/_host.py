@@ -313,7 +313,7 @@ class Alias:
 @dataclasses.dataclass(frozen=True)
 class Provider:
     """A `[providers.<name>]` table: its `style` -- `"chat-completions"`, `"responses"` or
-    `"anthropic"`, the default for the models on it -- and its `base-url`. Its key is not here,
+    `"messages"`, the default for the models on it -- and its `base-url`. Its key is not here,
     nor the variable that holds it."""
 
     name: str

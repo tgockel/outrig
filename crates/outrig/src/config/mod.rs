@@ -692,7 +692,7 @@ impl Config {
         let keys = self.providers.values().map(|provider| {
             let (LlmProvider::ChatCompletions { api_key, .. }
             | LlmProvider::Responses { api_key, .. }
-            | LlmProvider::Anthropic { api_key, .. }) = provider;
+            | LlmProvider::Messages { api_key, .. }) = provider;
             api_key.var_name().to_string()
         });
         let values = self.images.values().flat_map(|image| {
@@ -1093,7 +1093,7 @@ impl ChatCompletionsOptions {
 /// the two paths. Construct it the same way: [`new`](Self::new), then `with_*`.
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
-pub struct AnthropicOptions {
+pub struct MessagesOptions {
     /// Per-request HTTP timeout in seconds. `None` uses the client default.
     pub request_timeout_secs: Option<u64>,
     /// Transient-retry budget in seconds. `None` uses the top-level setting,
@@ -1104,7 +1104,7 @@ pub struct AnthropicOptions {
     pub role_alternation: Option<RoleAlternation>,
 }
 
-impl AnthropicOptions {
+impl MessagesOptions {
     /// Options that override nothing: every field below stays `None`.
     pub fn new() -> Self {
         Self::default()
@@ -1135,7 +1135,7 @@ impl AnthropicOptions {
 /// Optional settings for a Responses provider.
 ///
 /// The twin of [`ChatCompletionsOptions`], and a separate type for the same reason as
-/// [`AnthropicOptions`]. Construct it the same way: [`new`](Self::new), then `with_*`.
+/// [`MessagesOptions`]. Construct it the same way: [`new`](Self::new), then `with_*`.
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct ResponsesOptions {
@@ -1198,7 +1198,7 @@ pub enum ApiStyle {
     Responses,
     /// Anthropic's Messages API: `POST {base-url}/v1/messages` with
     /// `x-api-key` auth.
-    Anthropic,
+    Messages,
 }
 
 impl ApiStyle {
@@ -1210,7 +1210,7 @@ impl ApiStyle {
         match self {
             Self::ChatCompletions => "chat-completions",
             Self::Responses => "responses",
-            Self::Anthropic => "anthropic",
+            Self::Messages => "messages",
         }
     }
 }
@@ -1256,7 +1256,7 @@ pub enum LlmProvider {
     /// OpenAI-compatible bridge, which is a `style = "chat-completions"` provider
     /// pointed at that bridge.
     #[non_exhaustive]
-    Anthropic {
+    Messages {
         base_url: String,
         api_key: ApiKeyRef,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1282,7 +1282,7 @@ impl LlmProvider {
         match self {
             Self::ChatCompletions { .. } => ApiStyle::ChatCompletions,
             Self::Responses { .. } => ApiStyle::Responses,
-            Self::Anthropic { .. } => ApiStyle::Anthropic,
+            Self::Messages { .. } => ApiStyle::Messages,
         }
     }
 
@@ -1319,12 +1319,12 @@ impl LlmProvider {
     /// Anthropic's native Messages API at `base_url` -- the official endpoint
     /// is `https://api.anthropic.com`. A trailing `/v1`, `/messages`, or
     /// `/v1/messages` is normalized away by the client, so either form works.
-    pub fn anthropic(
+    pub fn messages(
         base_url: impl Into<String>,
         api_key: ApiKeyRef,
-        options: AnthropicOptions,
+        options: MessagesOptions,
     ) -> Self {
-        Self::Anthropic {
+        Self::Messages {
             base_url: base_url.into(),
             api_key,
             request_timeout_secs: options.request_timeout_secs,

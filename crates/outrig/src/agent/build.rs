@@ -210,7 +210,7 @@ fn build_candidate(
                 None,
             )
         }
-        ResolvedProvider::Anthropic {
+        ResolvedProvider::Messages {
             base_url, api_key, ..
         } => {
             // Rig's client owns the protocol: `x-api-key`, the

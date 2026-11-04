@@ -40,7 +40,7 @@ default-model = "sonnet"
 {top}
 
 [providers.claude]
-style                = "anthropic"
+style                = "messages"
 base-url             = "http://{addr}"
 api-key              = "${{{var}}}"
 request-timeout-secs = 30
@@ -269,7 +269,7 @@ async fn a_child_is_held_to_the_window_its_sessions_provider_reported() {
             ),
         ],
         None,
-        Some(Style::Anthropic.window(MODEL, Some(1_000_000))),
+        Some(Style::Messages.window(MODEL, Some(1_000_000))),
     )
     .await;
     let mut tree = tree_over("OUTRIG_TEST_CHILD_WINDOW", "", mock, |builder| builder).await;
@@ -557,7 +557,7 @@ const FILTERED_CALLS: usize = 2;
 async fn a_rejection_chains_the_round_a_filtered_reply_failed() {
     let mut child = vec![submit("c1", &py("print('ran')"))];
     child.extend(std::iter::repeat_n(
-        mock_http::Style::Anthropic.empty("refusal"),
+        mock_http::Style::Messages.empty("refusal"),
         FILTERED_CALLS,
     ));
     child.push(text_reply("done"));

@@ -730,7 +730,7 @@ max-tokens     = 4000
 [models.slow]
 provider   = "local"
 identifier = "slow-wire-name"
-style      = "anthropic"
+style      = "messages"
 
 [models.either]
 alias = ["fast", "slow"]
@@ -791,7 +791,7 @@ async fn the_view_holds_the_configuration_and_no_secret() {
             "['fast', 'slow'] ['chain', 'either'] ['local']",
             "Model(name='fast', provider='local', style='chat-completions', \
              identifier='fast-wire-name', context_window=32000, max_tokens=4000)",
-            "Model(name='slow', provider='local', style='anthropic', \
+            "Model(name='slow', provider='local', style='messages', \
              identifier='slow-wire-name', context_window=None, max_tokens=None)",
             "Alias(name='chain', candidates=('fast', 'slow'))",
             "Provider(name='local', style='chat-completions', base_url='http://127.0.0.1:1/v1')",
@@ -813,7 +813,7 @@ fn the_view_falls_back_to_the_rows_name_and_no_workspace() {
     let config = Config::load_from_str(
         r#"
         [providers.local]
-        style    = "anthropic"
+        style    = "messages"
         base-url = "http://127.0.0.1:1"
         api-key  = "${OUTRIG_TEST_PROGRAM_KEY}"
 
@@ -826,10 +826,10 @@ fn the_view_falls_back_to_the_rows_name_and_no_workspace() {
     assert_eq!(
         view,
         json!({
-            "models": {"bare": {"provider": "local", "style": "anthropic", "identifier": "bare",
+            "models": {"bare": {"provider": "local", "style": "messages", "identifier": "bare",
                                 "context_window": null, "max_tokens": null}},
             "aliases": {},
-            "providers": {"local": {"style": "anthropic", "base_url": "http://127.0.0.1:1"}},
+            "providers": {"local": {"style": "messages", "base_url": "http://127.0.0.1:1"}},
             "default_model": null,
             "workspace": null,
             "events": {"mode": "off"},

@@ -53,9 +53,10 @@ api-key  = "${OPENAI_API_KEY}"
 (see [A model's own `style`](#a-models-own-style) below). v0 wires `"chat-completions"` for any
 endpoint that speaks OpenAI's Chat Completions API -- a model served on your own machine
 included, see [Local models](#local-models) -- `"responses"` for OpenAI's Responses API (see
-[Responses](#responses-style--responses) below), and `"anthropic"` for Anthropic's native
-Messages API (see [Native Anthropic](#native-anthropic-style--anthropic) below). `openai`, the
-0.2.x name of `"chat-completions"`, is still read as it, with a warning. `base-url` is the HTTPS
+[Responses](#responses-style--responses) below), and `"messages"` for Anthropic's native
+Messages API (see [Native Anthropic](#native-anthropic-style--messages) below). `openai`, the
+0.2.x name of `"chat-completions"`, and `anthropic`, the earlier name of `"messages"`, are still
+read as their replacements, each with a warning. `base-url` is the HTTPS
 endpoint. `api-key` **must** be the `${ENV_VAR}` form -- outrig resolves it at run time,
 never reads a key from disk. See
 [Reference -> Config](../reference/config.md#api-key-syntax) for the exact rules.
@@ -107,7 +108,7 @@ identifier = "gpt-4o-mini"          # chat-completions, from the provider
 [models.sonnet]
 provider   = "gateway"
 identifier = "claude-sonnet-4-6"
-style      = "anthropic"            # this model only
+style      = "messages"             # this model only
 max-tokens = 16384
 ```
 
@@ -115,8 +116,9 @@ A model's `style` changes the protocol and nothing else: the request still goes 
 provider's `base-url` with its `api-key`, and the provider's timeouts, retry budget and
 `role-alternation` still apply. One `base-url` ending in `/v1` serves all three styles:
 `chat-completions` appends `/chat/completions` to it and `responses` appends `/responses`, while
-`anthropic` trims the `/v1` and appends `/v1/messages`. The model's `style` takes the values a
-provider's does, except the deprecated `openai`.
+`messages` trims the `/v1` and appends `/v1/messages`. The model's `style` takes the values a
+provider's does, including the deprecated `anthropic`, except the deprecated `openai`, which a
+provider alone takes.
 
 ### Aliases
 
@@ -260,7 +262,7 @@ under -- the place to encode role, scope, voice. It is optional as well: an agen
 with different sampling for different tasks (e.g. low temperature for code, higher for
 brainstorming). `max-tokens` may also be set on the model, which covers every agent pointed at
 it; the agent's value wins where both are set. That matters for Anthropic models, whose API
-requires a ceiling on every request -- see [Native Anthropic](#native-anthropic-style--anthropic).
+requires a ceiling on every request -- see [Native Anthropic](#native-anthropic-style--messages).
 `context-window` lives only on the model, because a window belongs to the model a provider
 serves: it tells `outrig run-new` how much of a conversation one call can carry. See
 [Remote-provider models](../reference/config.md#remote-provider-models).
@@ -426,16 +428,17 @@ back in the reply as items, and `store: false` means each is replayed with its
 `encrypted_content`; a call sends only those. Hosted tools -- web search, file search, the code
 interpreter, remote MCP -- are not used.
 
-## Native Anthropic (`style = "anthropic"`)
+## Native Anthropic (`style = "messages"`)
 
-`style = "anthropic"` talks to Anthropic's own Messages API rather than to an
+`style = "messages"` talks to Anthropic's own Messages API rather than to an
 OpenAI-compatible translation of it. Requests go to `{base-url}/v1/messages` and carry the
 `x-api-key` header; tools are advertised in Anthropic's `input_schema` shape, the model
 answers with `tool_use` blocks, and outrig sends each result back as a `tool_result` block.
+The deprecated `style = "anthropic"` is still read as `"messages"`, with a warning.
 
 ```toml
 [providers.anthropic]
-style    = "anthropic"
+style    = "messages"
 base-url = "https://api.anthropic.com"
 api-key  = "${ANTHROPIC_API_KEY}"
 
@@ -450,7 +453,7 @@ OpenAI-compatible bridge to Claude (the `openrouter` provider above, with an
 `anthropic/claude-*` identifier) work, and they are genuinely different paths: the bridge
 translates to and from chat-completions on someone else's server, while this one is the
 native protocol end to end. Prefer the native style when you hold an Anthropic key. A gateway
-that answers both for its Claude models stays one provider: set `style = "anthropic"` on those
+that answers both for its Claude models stays one provider: set `style = "messages"` on those
 models (see [A model's own `style`](#a-models-own-style)).
 
 The one thing it asks of you is `max-tokens`. The Messages API requires an output-token
@@ -600,7 +603,7 @@ stay up.
 
 ## Other Rig provider styles
 
-> **TODO: Incomplete** -- v0 wires `"chat-completions"`, `"responses"`, and `"anthropic"`. The
+> **TODO: Incomplete** -- v0 wires `"chat-completions"`, `"responses"`, and `"messages"`. The
 > other styles Rig ships adapters for (Cohere, Gemini, and friends) are not exposed yet, and
 > neither are the Anthropic-specific extras -- citations, configurable API versions, and prompt
 > caching in `run-new` and the library loop.

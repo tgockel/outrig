@@ -119,7 +119,7 @@ fn global_config(addr: std::net::SocketAddr) -> String {
     format!(
         r#"
 [providers.mock]
-style    = "anthropic"
+style    = "messages"
 base-url = "http://{addr}"
 api-key  = "${{OUTRIG_TEST_PROGRAM_KEY}}"
 "#

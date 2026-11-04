@@ -33,7 +33,7 @@ default-model = "sonnet"
 mode = "record"
 
 [providers.claude]
-style                = "anthropic"
+style                = "messages"
 base-url             = "http://{addr}"
 api-key              = "${{{var}}}"
 request-timeout-secs = 30
