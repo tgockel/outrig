@@ -5,7 +5,7 @@
 > compile-only `e2e` matrix row this entry's efficiency items were written about; see the two
 > notes below. The `cargo publish --dry-run` item has **landed** too -- 0002-52 added a
 > `package` job; see the entry for it. What stays here: the generalizing `cargo hack
-> --each-feature` job, the MSRV check, and the sccache cleanup. The
+> --each-feature` job and the sccache cleanup. The
 > `macos-latest` x `local-llm,metal` item **survives**: 0002-46 decided that 0.2.0 ships
 > `style = "mistralrs"` operational, so the feature and its macOS dependency block are still
 > real for at least this release. It evaporates with
@@ -44,8 +44,9 @@ no target is orphaned right now, but `--features local-llm` is the configuration
 install, and its e2e binaries would link against a lib built with a different feature set than
 either row produces. Cheap to close via cargo-hack.
 
-**`rust-version = "1.87"` is never verified.** All jobs use `dtolnay/rust-toolchain@stable`, so a
-dependency bump or newly stabilized API can silently raise the true MSRV above the declared one.
+**~~`rust-version` is never verified.~~ Landed with #838** as an `msrv` job running `cargo check
+--locked --workspace --all-targets` on the toolchain `Cargo.toml` declares. It found that the
+`rustyline` git pin needed Rust 1.95 while the manifest promised 1.88.
 
 **~~No `cargo publish --dry-run` / `cargo package` job.~~ Landed in 0002-52** as a `package`
 job running `cargo package --locked -p outrig -p outrig-cli` with `OUTRIG_REQUIRE_ENTER=1`.

@@ -287,6 +287,27 @@ jobs:
           targets: x86_64-unknown-linux-musl
       - run: cargo package --locked -p outrig -p outrig-cli
 
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain is read from the manifest, so the declared `rust-version` is the single
+      # source of truth and cannot drift from what this job builds. Every other job runs on
+      # `stable`, which cannot notice a dependency (or a git pin in `Cargo.lock`) that quietly
+      # raised the real minimum above the promised one (#838). The musl target is there so
+      # `crates/outrig/build.rs` compiles the `outrig-enter` launcher instead of degrading it
+      # to a warning.
+      - id: msrv
+        run: echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - run: |
+          test -n "${{ steps.msrv.outputs.version }}"
+          rustup toolchain install "${{ steps.msrv.outputs.version }}" --profile minimal \
+            --target x86_64-unknown-linux-musl
+          rustup default "${{ steps.msrv.outputs.version }}"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --workspace --all-targets
+
   doc-style:
     name: doc-style
     runs-on: ubuntu-latest
