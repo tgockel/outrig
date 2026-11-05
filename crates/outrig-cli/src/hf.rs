@@ -141,18 +141,41 @@ pub fn filter_gguf(files: Vec<HfFile>) -> Vec<HfFile> {
     out
 }
 
-/// Whether `path` is one shard of a split quantization, which llama.cpp's
-/// gguf-split names `<name>-00001-of-00003.gguf`. A shard is not a model by
-/// itself: mistralrs refuses a set with any of its shards missing.
-pub fn is_split_shard(path: &str) -> bool {
+/// A split-quantization shard's name, taken apart.
+///
+/// llama.cpp's gguf-split names the shards `<name>-00001-of-00003.gguf`; the
+/// shards of one set differ only in the index, so `prefix` and `suffix` (which
+/// carries the total) identify the set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SplitShard<'a> {
+    /// The path up to the index, ending in its `-`.
+    pub prefix: &'a str,
+    /// The path after the index: `-of-NNNNN.gguf`.
+    pub suffix: &'a str,
+    /// The 1-based position of this shard in its set.
+    pub index: u32,
+    /// How many shards the set claims to have.
+    pub count: u32,
+}
+
+/// Read `path` as one shard of a split quantization, or `None` if it is not one.
+pub fn split_shard(path: &str) -> Option<SplitShard<'_>> {
     let stem = path.rsplit_once('.').map_or(path, |(stem, _)| stem);
-    let Some((head, count)) = stem.rsplit_once("-of-") else {
-        return false;
+    let (head, count) = stem.rsplit_once("-of-")?;
+    let (before, index) = head.rsplit_once('-')?;
+    let number = |n: &str| {
+        if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        n.parse::<u32>().ok()
     };
-    let index = head.rsplit_once('-').map_or("", |(_, index)| index);
-    [index, count]
-        .iter()
-        .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    let prefix_len = before.len() + 1;
+    Some(SplitShard {
+        prefix: &path[..prefix_len],
+        suffix: &path[prefix_len + index.len()..],
+        index: number(index)?,
+        count: number(count)?,
+    })
 }
 
 /// Render a byte count as a human-readable string (e.g. "1.4 GiB").
@@ -211,13 +234,13 @@ mod tests {
     }
 
     #[test]
-    fn is_split_shard_reads_gguf_split_names() {
+    fn split_shard_reads_gguf_split_names() {
         for shard in [
             "model-00001-of-00002.gguf",
             "BF16/gemma-3-27b-it-BF16-00002-of-00002.gguf",
             "DeepSeek-R1-BF16/DeepSeek-R1.BF16-00001-of-00030.GGUF",
         ] {
-            assert!(is_split_shard(shard), "{shard} is a shard");
+            assert!(split_shard(shard).is_some(), "{shard} is a shard");
         }
         for whole in [
             "gemma-3-27b-it-IQ4_NL.gguf",
@@ -225,8 +248,17 @@ mod tests {
             "state-of-the-art-q4.gguf",
             "model-of-00002.gguf",
         ] {
-            assert!(!is_split_shard(whole), "{whole} is not a shard");
+            assert!(split_shard(whole).is_none(), "{whole} is not a shard");
         }
+    }
+
+    #[test]
+    fn split_shard_takes_the_name_apart() {
+        let shard = split_shard("Q4/DeepSeek-R1-Q4_K_M-00002-of-00009.gguf").unwrap();
+        assert_eq!(shard.prefix, "Q4/DeepSeek-R1-Q4_K_M-");
+        assert_eq!(shard.suffix, "-of-00009.gguf");
+        assert_eq!((shard.index, shard.count), (2, 9));
+        assert_eq!(split_shard("model-Q4_K_M.gguf"), None);
     }
 
     #[test]

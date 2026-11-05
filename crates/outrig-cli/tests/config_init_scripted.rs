@@ -368,8 +368,9 @@ async fn writes_mistralrs_config_with_nested_model_file_pick() {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("config.toml");
 
-    // Path order puts the `Q4_K_M/` shards ahead of the root file ('Q' sorts
-    // before 'm'), so `1` and the second shard's path pick both shards.
+    // Path order puts the `Q4_K_M/` set ahead of the root file ('Q' sorts
+    // before 'm'), so `1` picks the set; the second shard's path names the
+    // same set, and adds nothing.
     let script = b"mistralrs\nlocal\nn\n\nqwen\nlocal\n\nsome/repo\n\n\
                    1,Q4_K_M/model-Q4_K_M-00002-of-00002.gguf\n\nn\n\n";
     let mut hf = StubHfTreeFetcher::with_files([
@@ -426,15 +427,15 @@ async fn picker_default_skips_split_shards() {
     );
 }
 
-/// A repo of nothing but shards offers no default: Enter asks again, and the
-/// pick has to name the shards.
+/// A repo of nothing but shards still offers a default -- the first split set
+/// the repo lists in full -- and Enter takes every shard of it.
 #[tokio::test]
-async fn picker_has_no_default_when_every_file_is_a_shard() {
+async fn picker_defaults_to_first_complete_set_when_every_file_is_a_shard() {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("config.toml");
 
-    // Enter at the picker, then both `Q4_K_M/` shards.
-    let script = b"mistralrs\nlocal\nn\n\nds\nlocal\n\nsome/repo\n\n\n1,2\n\nn\n\n";
+    // Enter at the picker, after the blank revision.
+    let script = b"mistralrs\nlocal\nn\n\nds\nlocal\n\nsome/repo\n\n\n\nn\n\n";
     let mut hf = StubHfTreeFetcher::with_files([
         "Q4_K_M/model-Q4_K_M-00001-of-00002.gguf",
         "Q4_K_M/model-Q4_K_M-00002-of-00002.gguf",
@@ -444,10 +445,9 @@ async fn picker_has_no_default_when_every_file_is_a_shard() {
 
     let (text, shown) = write_config(&target, script, &mut hf).await;
 
-    assert_eq!(
-        shown.matches("? Pick GGUF file(s) from the repo: ").count(),
-        2,
-        "Enter must ask again, with no default offered:\n{shown}"
+    assert!(
+        shown.contains("[default: Q4_K_M/model-Q4_K_M-*-of-00002.gguf]: "),
+        "the default is not the first split set:\n{shown}"
     );
     let cfg = Config::load_from_str(&text).unwrap();
     cfg.validate(None).unwrap();
@@ -457,8 +457,101 @@ async fn picker_has_no_default_when_every_file_is_a_shard() {
             "Q4_K_M/model-Q4_K_M-00001-of-00002.gguf".into(),
             "Q4_K_M/model-Q4_K_M-00002-of-00002.gguf".into(),
         ]),
-        "picker didn't write both shards:\n{text}"
+        "Enter didn't take every shard:\n{text}"
     );
+}
+
+/// One number picks every shard of a split set, however many it has.
+#[tokio::test]
+async fn picker_one_number_selects_a_whole_split_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+
+    let script = b"mistralrs\nlocal\nn\n\nds\nlocal\n\nsome/repo\n\n2\n\nn\n\n";
+    let shards: Vec<String> = (1..=9)
+        .map(|i| format!("Q8_0/model-Q8_0-{i:05}-of-00009.gguf"))
+        .collect();
+    let mut hf = StubHfTreeFetcher::with_files(
+        ["Q4_K_M/model-Q4_K_M-00001-of-00001.gguf".to_string()]
+            .into_iter()
+            .chain(shards.iter().cloned()),
+    );
+
+    let (text, _) = write_config(&target, script, &mut hf).await;
+
+    let cfg = Config::load_from_str(&text).unwrap();
+    cfg.validate(None).unwrap();
+    assert_eq!(
+        cfg.models["ds"].model_file,
+        Some(shards),
+        "`2` didn't take all nine shards:\n{text}"
+    );
+}
+
+/// A set with a shard missing from the repo cannot load, so it is neither the
+/// default nor pickable; the prompt says so and asks again.
+#[tokio::test]
+async fn picker_refuses_a_split_set_with_a_shard_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+
+    // Row 1 is the short set: name a shard of it, then take the whole file.
+    let script = b"mistralrs\nlocal\nn\n\nds\nlocal\n\nsome/repo\n\n\
+                   Q4_K_M/model-Q4_K_M-00001-of-00003.gguf\n2\n\nn\n\n";
+    let mut hf = StubHfTreeFetcher::with_files([
+        "Q4_K_M/model-Q4_K_M-00001-of-00003.gguf",
+        "Q4_K_M/model-Q4_K_M-00003-of-00003.gguf",
+        "model-Q8_0.gguf",
+    ]);
+
+    let (text, shown) = write_config(&target, script, &mut hf).await;
+
+    assert!(
+        shown.contains("[default: model-Q8_0.gguf]: "),
+        "an incomplete set was offered as the default:\n{shown}"
+    );
+    assert_eq!(
+        shown.matches("? Pick GGUF file(s) from the repo").count(),
+        2,
+        "the incomplete set was not refused:\n{shown}"
+    );
+    let cfg = Config::load_from_str(&text).unwrap();
+    cfg.validate(None).unwrap();
+    assert_eq!(
+        cfg.models["ds"].model_file,
+        Some(vec!["model-Q8_0.gguf".into()]),
+        "the whole file was not taken:\n{text}"
+    );
+}
+
+/// A listing of nothing but incomplete split sets has nothing the picker could
+/// accept, so it reaches the free-form prompt rather than looping.
+#[tokio::test]
+async fn picker_falls_back_to_free_form_when_every_set_is_incomplete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+
+    let script = b"mistralrs\nlocal\nn\n\nds\nlocal\n\nsome/repo\n\n\
+                   Q4_K_M/model-Q4_K_M-00001-of-00003.gguf\n\nn\n\n";
+    let mut hf = StubHfTreeFetcher::with_files([
+        "Q4_K_M/model-Q4_K_M-00001-of-00003.gguf",
+        "Q4_K_M/model-Q4_K_M-00003-of-00003.gguf",
+    ]);
+
+    let (text, shown) = write_config(&target, script, &mut hf).await;
+
+    assert!(
+        shown.contains("? GGUF model-file (path inside the HF repo): "),
+        "no free-form prompt:\n{shown}"
+    );
+    assert!(
+        !shown.contains("? Pick GGUF file(s)"),
+        "the picker was offered:\n{shown}"
+    );
+    Config::load_from_str(&text)
+        .unwrap()
+        .validate(None)
+        .unwrap();
 }
 
 /// Drive the mistralrs local-path branch, giving `path_answers` at the

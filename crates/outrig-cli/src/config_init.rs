@@ -185,12 +185,12 @@ const MODEL_FILE_FIELD: Field = Field {
 
 const MODEL_FILE_PICK_FIELD: Field = Field {
     name: "Pick GGUF file(s) from the repo",
-    description: "Comma-separated numbers (e.g. `1,3`) or paths as listed. Pick \
-                  multiple only when one quantization is split across \
-                  shards (model-00001-of-00003.gguf, ...), and then pick \
-                  every shard. The default is the first file that is a \
-                  whole model by itself; a shard never is, so a repo of \
-                  nothing but shards has no default.",
+    description: "Comma-separated numbers (e.g. `1,3`) or paths as listed. A \
+                  quantization split across shards (model-00001-of-00003.gguf, \
+                  ...) is one row: picking it, by number, by its row, or by any \
+                  one of its shards, takes every shard. The default is the first \
+                  file that is a whole model by itself, else the first complete \
+                  split set.",
     options: &[],
     doc_link: "doc/concepts/in-process-llm.md",
 };
@@ -600,19 +600,20 @@ async fn prompt_mistralrs_model(
     Ok(model)
 }
 
-/// Discover GGUF files in `model_id` via `hf` and pick one or more. On a
-/// successful query: 1 file -> auto-pick (status line, no prompt), many ->
-/// render a numbered list (with sizes) and prompt for a comma-separated
-/// choice (numbers or paths), defaulting to the first file that is a whole
-/// model rather than a shard. No file, or any HF error (offline, build
-/// without `local-llm`, transient outage), falls back to the free-form
-/// `MODEL_FILE_FIELD` text prompt so the flow still completes -- the
-/// listing is a convenience, and a user who knows the path can still give
-/// it.
+/// Discover GGUF files in `model_id` via `hf` and pick one or more. The
+/// listing is grouped into rows -- a file that is a whole model by itself,
+/// or all the shards of one split quantization -- so a single pick can never
+/// leave a set incomplete. On a successful query: 1 complete row ->
+/// auto-pick (status line, no prompt), many -> render a numbered list (with
+/// sizes) and prompt for a comma-separated choice (numbers or paths),
+/// defaulting to the first whole-model file, else the first complete split
+/// set. A listing with no complete row takes the free-form prompt. No file, or any HF error (offline, build without `local-llm`,
+/// transient outage), falls back to the free-form `MODEL_FILE_FIELD` text
+/// prompt so the flow still completes -- the listing is a convenience, and
+/// a user who knows the path can still give it.
 ///
-/// Multi-select supports split-quantization repos where one quantization
-/// is sharded across multiple `model-NNNNN-of-NNNNN.gguf` files;
-/// mistralrs's GGUF loader takes the whole list.
+/// A split set picks as several files: mistralrs's GGUF loader takes the
+/// whole list.
 async fn resolve_model_file(
     prompt: &mut impl PromptSource,
     hf: &mut impl HfTreeFetcher,
@@ -626,58 +627,173 @@ async fn resolve_model_file(
             return ask_model_file(prompt, &why).await;
         }
     };
+    if files.is_empty() {
+        let why = format!(
+            "no .gguf file anywhere in {model_id:?} at revision {:?}",
+            revision.unwrap_or("main")
+        );
+        return ask_model_file(prompt, &why).await;
+    }
 
-    match files.as_slice() {
-        [] => {
-            let why = format!(
-                "no .gguf file anywhere in {model_id:?} at revision {:?}",
-                revision.unwrap_or("main")
-            );
-            ask_model_file(prompt, &why).await
-        }
-        [only] => {
-            let label = format_file_label(only);
-            eprintln!("[outrig] found one GGUF in {model_id:?}: {label}; using it");
-            Ok(vec![only.path.clone()])
-        }
-        many => {
-            eprintln!("[outrig] {} GGUF files in {model_id:?}:", many.len());
-            let idx_w = (many.len() as f64).log10().floor() as usize + 1;
-            for (i, file) in many.iter().enumerate() {
-                eprintln!("  {:>idx_w$}: {}", i + 1, format_file_label(file));
-            }
-            // Enter takes the first file that is a whole model by itself. One
-            // shard of a split quantization never is: saved alone, it downloads
-            // in full and then fails to load. A directory such as `BF16/` can
-            // sort ahead of a repo's root files, so the first entry often is one.
-            let default = many
-                .iter()
-                .find(|f| !crate::hf::is_split_shard(&f.path))
-                .map_or("", |f| f.path.as_str());
-            loop {
-                let answer = prompt.ask_string(&MODEL_FILE_PICK_FIELD, default).await?;
-                let picks = match answer.trim() {
-                    "" if default.is_empty() => {
-                        eprintln!(
-                            "[outrig] every file listed is one shard of a split \
-                             quantization, so there is no default; pick all the \
-                             shards of the one you want"
-                        );
-                        continue;
-                    }
-                    "" => default,
-                    picks => picks,
-                };
-                match parse_pick_input(picks, many) {
-                    Ok(picked) => return Ok(picked),
-                    Err(bad) => eprintln!(
-                        "[outrig] {bad:?} is not a number 1..={} or a path in the list",
-                        many.len()
-                    ),
-                }
-            }
+    let rows = group_pick_rows(&files);
+    if !rows.iter().any(|r| r.complete) {
+        // Every row is a split set missing shards, so nothing listed can load
+        // and the picker would have no answer to accept.
+        let why = format!(
+            "every split set in {model_id:?} at revision {:?} is missing shards in the \
+             listing, so none can load",
+            revision.unwrap_or("main")
+        );
+        return ask_model_file(prompt, &why).await;
+    }
+    if let [only] = rows.as_slice()
+        && only.complete
+    {
+        eprintln!(
+            "[outrig] found one GGUF in {model_id:?}: {}; using it",
+            only.label
+        );
+        return Ok(only.paths.clone());
+    }
+    eprintln!(
+        "[outrig] {} GGUF files in {model_id:?}, {} to pick from:",
+        files.len(),
+        rows.len()
+    );
+    let idx_w = (rows.len() as f64).log10().floor() as usize + 1;
+    for (i, row) in rows.iter().enumerate() {
+        eprintln!("  {:>idx_w$}: {}", i + 1, row.label);
+    }
+    // Enter takes the first file that is a whole model by itself, else the
+    // first split set the repo lists in full. A directory such as `BF16/` can
+    // sort ahead of a repo's root files, so the first row is often a set; the
+    // single file next to it is the lighter choice.
+    let default = rows
+        .iter()
+        .find(|r| !r.is_set && r.complete)
+        .or_else(|| rows.iter().find(|r| r.complete))
+        .map(|r| r.key.as_str())
+        .expect("a complete row exists");
+    loop {
+        let answer = prompt.ask_string(&MODEL_FILE_PICK_FIELD, default).await?;
+        let picks = match answer.trim() {
+            "" => default,
+            picks => picks,
+        };
+        match parse_pick_input(picks, &rows) {
+            Ok(picked) => return Ok(picked),
+            Err(PickError::Unknown(bad)) => eprintln!(
+                "[outrig] {bad:?} is not a number 1..={} or a path in the list",
+                rows.len()
+            ),
+            Err(PickError::Incomplete(row)) => eprintln!(
+                "[outrig] {} has {} of its {} shards in the repo, so it cannot load; \
+                 pick another row",
+                row.key,
+                row.paths.len(),
+                row.shards
+            ),
         }
     }
+}
+
+/// One choice in the GGUF picker: a file that is a whole model by itself, or
+/// every shard of one split quantization.
+#[derive(Debug)]
+struct PickRow {
+    /// The name a user can type to pick the row: the path of a file, or the
+    /// shard pattern of a set.
+    key: String,
+    /// What the listing shows: the path and size of a file, or the shard
+    /// pattern, shard count, and total size of a set.
+    label: String,
+    /// The paths the row selects, in shard order.
+    paths: Vec<String>,
+    /// Whether this row is a split set.
+    is_set: bool,
+    /// How many shards a split set claims to have; 1 for a file.
+    shards: u32,
+    /// Whether `paths` is the whole model: always for a file, and for a set
+    /// when the repo lists every one of its shards.
+    complete: bool,
+}
+
+/// Group sorted `files` into picker rows, in the order each row first appears.
+fn group_pick_rows(files: &[crate::hf::HfFile]) -> Vec<PickRow> {
+    // A set's shards share a prefix and suffix; `(prefix, suffix)` tells sets apart.
+    struct Set<'a> {
+        prefix: &'a str,
+        suffix: &'a str,
+        members: Vec<(u32, &'a crate::hf::HfFile)>,
+        count: u32,
+    }
+    enum Slot<'a> {
+        File(&'a crate::hf::HfFile),
+        Set(Set<'a>),
+    }
+    let mut slots: Vec<Slot> = Vec::new();
+    for file in files {
+        let Some(shard) = crate::hf::split_shard(&file.path) else {
+            slots.push(Slot::File(file));
+            continue;
+        };
+        let existing = slots.iter_mut().find_map(|slot| match slot {
+            Slot::Set(set) if set.prefix == shard.prefix && set.suffix == shard.suffix => {
+                Some(set)
+            }
+            _ => None,
+        });
+        match existing {
+            Some(set) => set.members.push((shard.index, file)),
+            None => slots.push(Slot::Set(Set {
+                prefix: shard.prefix,
+                suffix: shard.suffix,
+                members: vec![(shard.index, file)],
+                count: shard.count,
+            })),
+        }
+    }
+    slots
+        .into_iter()
+        .map(|slot| match slot {
+            Slot::File(file) => PickRow {
+                key: file.path.clone(),
+                label: format_file_label(&file.path, file.size),
+                paths: vec![file.path.clone()],
+                is_set: false,
+                shards: 1,
+                complete: true,
+            },
+            Slot::Set(mut set) => {
+                set.members.sort_by_key(|(index, _)| *index);
+                let complete = set.members.len() as u32 == set.count
+                    && set
+                        .members
+                        .iter()
+                        .zip(1..)
+                        .all(|((index, _), want)| *index == want);
+                let size = set
+                    .members
+                    .iter()
+                    .map(|(_, f)| f.size)
+                    .sum::<Option<u64>>();
+                let pattern = format!("{}*{}", set.prefix, set.suffix);
+                let named = if complete {
+                    pattern.clone()
+                } else {
+                    format!("{pattern} -- {} of {} shards", set.members.len(), set.count)
+                };
+                PickRow {
+                    label: format_file_label(&named, size),
+                    key: pattern,
+                    paths: set.members.iter().map(|(_, f)| f.path.clone()).collect(),
+                    is_set: true,
+                    shards: set.count,
+                    complete,
+                }
+            }
+        })
+        .collect()
 }
 
 /// The free-form `model-file` prompt, for when the listing offers nothing
@@ -689,46 +805,59 @@ async fn ask_model_file(prompt: &mut impl PromptSource, why: &str) -> Result<Vec
         .map(|s| vec![s])
 }
 
-/// Render one row of the picker: path plus a parenthesized
+/// Render one row of the picker: name plus a parenthesized
 /// human-readable size when known. Centralized so the auto-pick status
 /// line and the multi-line picker share a format.
-fn format_file_label(file: &crate::hf::HfFile) -> String {
-    match file.size {
-        Some(bytes) => format!("{}  ({})", file.path, crate::hf::format_size(bytes)),
-        None => file.path.clone(),
+fn format_file_label(name: &str, size: Option<u64>) -> String {
+    match size {
+        Some(bytes) => format!("{name}  ({})", crate::hf::format_size(bytes)),
+        None => name.to_string(),
     }
 }
 
-/// Parse a comma-separated picker answer against `files`. Each token is
-/// either a 1-based index or a literal path match. Whitespace around
-/// tokens is ignored. Returns the unique paths in the order the user
-/// specified, deduplicated. Returns `Err(bad)` with the first
-/// unrecognized token.
-fn parse_pick_input(
+/// Why a picker answer was refused.
+#[derive(Debug)]
+enum PickError<'a> {
+    /// A token names no row.
+    Unknown(String),
+    /// A token names a split set the repo lists only some shards of.
+    Incomplete(&'a PickRow),
+}
+
+/// Parse a comma-separated picker answer against `rows`. Each token is a
+/// 1-based row number, a row's name (a file's path or a set's shard
+/// pattern), or the path of any one file in a row -- so naming one shard
+/// of a set takes the whole set. Whitespace around tokens is ignored.
+/// Returns the unique paths in the order the user specified. Returns the
+/// first unrecognized token, or the first set that cannot load.
+fn parse_pick_input<'a>(
     input: &str,
-    files: &[crate::hf::HfFile],
-) -> std::result::Result<Vec<String>, String> {
+    rows: &'a [PickRow],
+) -> std::result::Result<Vec<String>, PickError<'a>> {
     let mut out: Vec<String> = Vec::new();
     for tok in input.split(',') {
         let t = tok.trim();
         if t.is_empty() {
             continue;
         }
-        let path = if let Ok(n) = t.parse::<usize>()
-            && (1..=files.len()).contains(&n)
-        {
-            files[n - 1].path.clone()
-        } else if let Some(file) = files.iter().find(|f| f.path == t) {
-            file.path.clone()
-        } else {
-            return Err(t.to_string());
+        let row = match t.parse::<usize>() {
+            Ok(n) if (1..=rows.len()).contains(&n) => &rows[n - 1],
+            _ => rows
+                .iter()
+                .find(|r| r.key == t || r.paths.iter().any(|p| p == t))
+                .ok_or_else(|| PickError::Unknown(t.to_string()))?,
         };
-        if !out.contains(&path) {
-            out.push(path);
+        if !row.complete {
+            return Err(PickError::Incomplete(row));
+        }
+        for path in &row.paths {
+            if !out.contains(path) {
+                out.push(path.clone());
+            }
         }
     }
     if out.is_empty() {
-        return Err(input.trim().to_string());
+        return Err(PickError::Unknown(input.trim().to_string()));
     }
     Ok(out)
 }

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The `config init` GGUF picker selects a split quantization as one row.** It listed every
+  shard of a `*-00001-of-0000N.gguf` set separately, so choosing a set meant naming each one,
+  and a pick that missed a shard validated, downloaded the rest, and failed at load because
+  mistralrs refuses a set whose file count differs from its `split.count`. The listing now has
+  one row per split set, and a number, the row's shard pattern, or any one shard's path takes
+  every shard. A repo whose every quantization is split now has a default, the first set it
+  lists in full; a set the repo lists only some shards of is marked as such and refused at the
+  prompt. (#458)
 - **Lines written while the `>` prompt is up no longer garble it.** The session watcher's
   container-death notice, `tracing` records, a background subagent's tool-call traces and
   failures, retry and failover notices, and the other stderr lines raised from outside the line
