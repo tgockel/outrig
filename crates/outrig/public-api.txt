@@ -1146,6 +1146,29 @@ pub mod outrig::harness::event
 #[non_exhaustive] pub enum outrig::harness::event::Abandoned
 pub outrig::harness::event::Abandoned::Runaway
 pub outrig::harness::event::Abandoned::User
+#[non_exhaustive] pub enum outrig::harness::event::Awaited
+#[non_exhaustive] pub outrig::harness::event::Awaited::Call
+pub outrig::harness::event::Awaited::Call::child: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Awaited::Call::function: alloc::string::String
+pub outrig::harness::event::Awaited::Call::id: core::option::Option<u64>
+pub outrig::harness::event::Awaited::Call::name: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub outrig::harness::event::Awaited::Future
+pub outrig::harness::event::Awaited::Future::type_name: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Awaited::Request
+pub outrig::harness::event::Awaited::Request::channel: alloc::string::String
+pub outrig::harness::event::Awaited::Request::child: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Awaited::Request::id: core::option::Option<u64>
+pub outrig::harness::event::Awaited::Request::name: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub outrig::harness::event::Awaited::Skill
+pub outrig::harness::event::Awaited::Skill::id: u64
+pub outrig::harness::event::Awaited::Skill::skill: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Awaited::Submission
+pub outrig::harness::event::Awaited::Submission::child: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Awaited::Submission::id: core::option::Option<u64>
+pub outrig::harness::event::Awaited::Submission::name: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub outrig::harness::event::Awaited::Task
+pub outrig::harness::event::Awaited::Task::code: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Awaited::Task::name: alloc::string::String
 #[non_exhaustive] pub enum outrig::harness::event::ChildKind
 pub outrig::harness::event::ChildKind::Request
 pub outrig::harness::event::ChildKind::Work
@@ -1335,6 +1358,22 @@ pub outrig::harness::event::Payload::ExecRefused::reason: outrig::harness::event
 #[non_exhaustive] pub outrig::harness::event::Payload::ExecSubmitted
 pub outrig::harness::event::Payload::ExecSubmitted::execid: outrig::harness::event::ExecId
 pub outrig::harness::event::Payload::ExecSubmitted::source: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::ExecWaitEnded
+pub outrig::harness::event::Payload::ExecWaitEnded::channels: alloc::vec::Vec<alloc::string::String>
+pub outrig::harness::event::Payload::ExecWaitEnded::done: alloc::vec::Vec<outrig::harness::event::Awaited>
+pub outrig::harness::event::Payload::ExecWaitEnded::duration: core::time::Duration
+pub outrig::harness::event::Payload::ExecWaitEnded::error: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::ExecWaitEnded::execid: outrig::harness::event::ExecId
+pub outrig::harness::event::Payload::ExecWaitEnded::how: outrig::harness::event::WaitEnd
+pub outrig::harness::event::Payload::ExecWaitEnded::wait: u64
+#[non_exhaustive] pub outrig::harness::event::Payload::ExecWaitStarted
+pub outrig::harness::event::Payload::ExecWaitStarted::elapsed: core::time::Duration
+pub outrig::harness::event::Payload::ExecWaitStarted::execid: outrig::harness::event::ExecId
+pub outrig::harness::event::Payload::ExecWaitStarted::more: u64
+pub outrig::harness::event::Payload::ExecWaitStarted::on: alloc::vec::Vec<outrig::harness::event::Awaited>
+pub outrig::harness::event::Payload::ExecWaitStarted::return_when: outrig::harness::event::ReturnWhen
+pub outrig::harness::event::Payload::ExecWaitStarted::timeout: core::option::Option<core::time::Duration>
+pub outrig::harness::event::Payload::ExecWaitStarted::wait: u64
 #[non_exhaustive] pub outrig::harness::event::Payload::HostedCallback
 pub outrig::harness::event::Payload::HostedCallback::agent: alloc::string::String
 pub outrig::harness::event::Payload::HostedCallback::binding: alloc::string::String
@@ -1540,6 +1579,10 @@ pub outrig::harness::event::RequestEnd::Failed
 pub outrig::harness::event::RequestEnd::Rejected
 pub outrig::harness::event::RequestEnd::Released
 pub outrig::harness::event::RequestEnd::Terminated
+#[non_exhaustive] pub enum outrig::harness::event::ReturnWhen
+pub outrig::harness::event::ReturnWhen::AllCompleted
+pub outrig::harness::event::ReturnWhen::FirstCompleted
+pub outrig::harness::event::ReturnWhen::FirstException
 #[non_exhaustive] pub enum outrig::harness::event::Role
 pub outrig::harness::event::Role::Assistant
 pub outrig::harness::event::Role::User
@@ -1557,6 +1600,11 @@ pub outrig::harness::event::TryRecvError::Empty
 pub outrig::harness::event::UsageRefusal::Replaced
 pub outrig::harness::event::UsageRefusal::Reported
 pub outrig::harness::event::UsageRefusal::Unknown
+#[non_exhaustive] pub enum outrig::harness::event::WaitEnd
+pub outrig::harness::event::WaitEnd::Message
+pub outrig::harness::event::WaitEnd::Raised
+pub outrig::harness::event::WaitEnd::Returned
+pub outrig::harness::event::WaitEnd::Timeout
 #[non_exhaustive] pub enum outrig::harness::event::Why
 pub outrig::harness::event::Why::First
 pub outrig::harness::event::Why::Latest
@@ -1841,6 +1889,15 @@ pub outrig::harness::LogLoss::path: std::path::PathBuf
 pub outrig::harness::LogLoss::records: u64
 impl core::fmt::Display for outrig::harness::LogLoss
 pub fn outrig::harness::LogLoss::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::OpenWait
+pub outrig::harness::OpenWait::agent: outrig::harness::event::Subject
+pub outrig::harness::OpenWait::execid: outrig::harness::event::ExecId
+pub outrig::harness::OpenWait::more: u64
+pub outrig::harness::OpenWait::on: alloc::vec::Vec<outrig::harness::event::Awaited>
+pub outrig::harness::OpenWait::return_when: outrig::harness::event::ReturnWhen
+pub outrig::harness::OpenWait::since: std::time::Instant
+pub outrig::harness::OpenWait::timeout: core::option::Option<core::time::Duration>
+pub outrig::harness::OpenWait::wait: u64
 #[non_exhaustive] pub struct outrig::harness::ProgramExit
 impl outrig::harness::ProgramExit
 pub fn outrig::harness::ProgramExit::code(&self) -> i32
@@ -1875,6 +1932,7 @@ pub async fn outrig::harness::Session::shutdown(self, core::time::Duration) -> o
 pub async fn outrig::harness::Session::start(outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<outrig::harness::Session, outrig::harness::SessionError>
 pub fn outrig::harness::Session::stop_held(&self) -> core::option::Option<alloc::string::String>
 pub fn outrig::harness::Session::user_channel(&self) -> core::option::Option<outrig::harness::UserChannel>
+pub fn outrig::harness::Session::waits(&self) -> outrig::harness::Waits
 pub struct outrig::harness::SessionBuilder
 impl outrig::harness::SessionBuilder
 pub fn outrig::harness::SessionBuilder::approver(self, impl outrig::harness::Approver + 'static) -> Self
@@ -1917,6 +1975,9 @@ pub async fn outrig::harness::UserChannel::receive(&self) -> core::option::Optio
 pub fn outrig::harness::UserChannel::receive_waiting(&self) -> alloc::vec::Vec<alloc::string::String>
 pub fn outrig::harness::UserChannel::send(&self, &str) -> impl core::future::future::Future<Output = core::result::Result<usize, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>> + core::marker::Send + 'static
 pub fn outrig::harness::UserChannel::send_directive(&self, &str, &str) -> impl core::future::future::Future<Output = core::result::Result<usize, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>> + core::marker::Send + 'static
+pub struct outrig::harness::Waits
+impl outrig::harness::Waits
+pub fn outrig::harness::Waits::open(&self) -> alloc::vec::Vec<outrig::harness::OpenWait>
 pub const outrig::harness::DEFAULT_DRAIN: core::time::Duration
 pub trait outrig::harness::Approver: core::marker::Send + core::marker::Sync
 pub fn outrig::harness::Approver::approve(&self, &outrig::harness::ApprovalRequest) -> outrig::harness::Approval

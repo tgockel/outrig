@@ -69,6 +69,7 @@ pub use self::skills::{DirectorySource, SkillFile, SkillSource};
 pub use crate::agent::UserChannel;
 pub use crate::config::{EnvSecrets, Secrets};
 pub use crate::owner::{HostProgram, LeftOpen, ProgramExit, RunningProgram, SessionEnd};
+pub use crate::python::host::{OpenWait, Waits};
 
 #[cfg(test)]
 #[path = "bindings_tests.rs"]

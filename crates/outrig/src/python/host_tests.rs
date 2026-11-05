@@ -11,7 +11,7 @@
 //! replies are read in the order they were written.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -26,7 +26,7 @@ use super::testing::{
     Fake, HUNG_UP, connect, ok, round_trip, spawn, start_on_host, start_on_host_with, within,
 };
 use crate::events::{Events, kinds, of_kind, opened, recorded};
-use crate::harness::event::SessionState;
+use crate::harness::event::{Awaited, ReturnWhen, SessionState};
 use crate::harness::lifecycle::Lifecycle;
 use crate::harness::{ClosedBy, ExecutionStatus};
 
@@ -1244,6 +1244,131 @@ async fn an_exit_seen_before_the_owner_closes_is_still_the_close() {
     assert_eq!(
         of_kind(&records, "interpreter.exited")[0]["expected"],
         false
+    );
+}
+
+/// A wait the interpreter tells of is recorded under its agent and listed as
+/// open, with when it began, until its end, its execution's result, its
+/// kernel's end, or the interpreter's exit says it is over.
+#[tokio::test]
+async fn a_wait_told_of_is_recorded_and_listed_until_it_is_over() {
+    let (dir, events) = recording().await;
+    let (interpreter, mut fake) = Fake::connected_with(events.clone()).await;
+    let waits = interpreter.waits();
+    let (opened, ()) = tokio::join!(within(interpreter.open("c1")), async {
+        fake.expect("open").await;
+        fake.send(json!({"t": "ready", "agent": "c1", "version": "3.13"}))
+            .await;
+    });
+    opened.expect("c1 opened");
+    let mut execution = interpreter
+        .submit("await runtime.wait({t})")
+        .expect("submitted");
+    let id = execution.id();
+    fake.exec(id).await;
+    let on = json!([{"kind": "task", "name": "ci_run", "code": "watch"}]);
+    fake.send(json!({
+        "t": "wait", "agent": PRIMARY, "wait": 1, "exec": id, "on": on, "more": 0,
+        "return_when": "FIRST_COMPLETED", "timeout": 30.0, "elapsed": 1.0,
+    }))
+    .await;
+    fake.send(json!({
+        "t": "wait", "agent": "c1", "wait": 2, "exec": 99,
+        "on": [{"kind": "future", "type": "Future"}], "more": 3,
+        "return_when": "ALL_COMPLETED", "timeout": null, "elapsed": 1.2,
+    }))
+    .await;
+    round_trip(&interpreter, &mut fake).await;
+    let open = waits.open();
+    assert_eq!(open.len(), 2, "{open:?}");
+    assert_eq!(open[0].agent.as_str(), "agent/c1");
+    assert_eq!((open[0].wait, open[0].more, open[0].timeout), (2, 3, None));
+    let primary = &open[1];
+    assert_eq!(primary.agent.as_str(), "agent/primary");
+    assert_eq!(primary.execid, id.public());
+    assert_eq!(primary.wait, 1);
+    assert_eq!(
+        primary.on,
+        [Awaited::Task {
+            name: "ci_run".into(),
+            code: Some("watch".into()),
+        }]
+    );
+    assert_eq!(primary.return_when, ReturnWhen::FirstCompleted);
+    assert_eq!(primary.timeout, Some(Duration::from_secs(30)));
+    let ago = Instant::now().saturating_duration_since(primary.since);
+    assert!(
+        ago >= Duration::from_secs(1) && ago < Duration::from_secs(10),
+        "began {ago:?} ago: `elapsed` backdates it"
+    );
+
+    // Its end.
+    fake.send(json!({
+        "t": "waited", "agent": PRIMARY, "wait": 1, "exec": id, "how": "message",
+        "done": [], "channels": ["user"], "error": null, "elapsed": 4.5,
+    }))
+    .await;
+    round_trip(&interpreter, &mut fake).await;
+    assert_eq!(waits.open().len(), 1);
+    // Its execution's result.
+    fake.send(json!({
+        "t": "wait", "agent": PRIMARY, "wait": 3, "exec": id, "on": on, "more": 0,
+        "return_when": "ALL_COMPLETED", "timeout": null, "elapsed": 1.0,
+    }))
+    .await;
+    fake.ok(id, "").await;
+    within(execution.outcome()).await;
+    let ids: Vec<u64> = waits.open().iter().map(|wait| wait.wait).collect();
+    assert_eq!(ids, [2], "the result ended the primary's wait");
+    // Its kernel's end.
+    fake.send(json!({"t": "ended", "agent": "c1"})).await;
+    round_trip(&interpreter, &mut fake).await;
+    assert!(waits.open().is_empty());
+    // The interpreter's exit.
+    fake.send(json!({
+        "t": "wait", "agent": PRIMARY, "wait": 4, "exec": id, "on": on, "more": 0,
+        "return_when": "ALL_COMPLETED", "timeout": null, "elapsed": 1.0,
+    }))
+    .await;
+    round_trip(&interpreter, &mut fake).await;
+    assert_eq!(waits.open().len(), 1);
+    drop(fake);
+    within(interpreter.gone()).await;
+    assert!(waits.open().is_empty());
+    drop(interpreter);
+    events.close().await.expect("nothing lost");
+
+    let records = recorded(dir.path());
+    let subjects = |kind: &str| -> Vec<String> {
+        records
+            .iter()
+            .filter(|record| record["type"] == format!("org.outrig.{kind}"))
+            .map(|record| record["subject"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    assert_eq!(
+        subjects("exec.wait.started"),
+        [
+            "agent/primary",
+            "agent/c1",
+            "agent/primary",
+            "agent/primary"
+        ]
+    );
+    assert_eq!(subjects("exec.wait.ended"), ["agent/primary"]);
+    assert_eq!(
+        *of_kind(&records, "exec.wait.started")[0],
+        json!({
+            "execid": id, "wait": 1, "on": on, "more": 0,
+            "return_when": "FIRST_COMPLETED", "timeout": 30.0, "elapsed": 1.0,
+        })
+    );
+    assert_eq!(
+        *of_kind(&records, "exec.wait.ended")[0],
+        json!({
+            "execid": id, "wait": 1, "how": "message", "done": [], "channels": ["user"],
+            "error": null, "duration": 4.5,
+        })
     );
 }
 

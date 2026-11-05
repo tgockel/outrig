@@ -478,6 +478,9 @@ struct KernelState {
     late: Vec<Late>,
     /// Where its promotions and demotions go, once something registered.
     on_context: Option<ContextChanged>,
+    /// Each `runtime.wait` its code has been suspended in long enough for the
+    /// interpreter to tell of, by the interpreter's id for it, until it ends.
+    waits: BTreeMap<u64, OpenWait>,
 }
 
 impl KernelState {
@@ -487,6 +490,7 @@ impl KernelState {
             slot: None,
             late: Vec::new(),
             on_context: None,
+            waits: BTreeMap::new(),
         }
     }
 }
@@ -638,6 +642,27 @@ enum Reply {
     /// Every kernel has a stub of each binding the host told of under `id`.
     Bound {
         id: ExecId,
+    },
+    /// A `runtime.wait` the agent's code has been suspended in for a while:
+    /// what it waits on, and for how long so far.
+    Wait {
+        wait: u64,
+        exec: ExecId,
+        on: Vec<event::Awaited>,
+        more: u64,
+        return_when: event::ReturnWhen,
+        timeout: Option<f64>,
+        elapsed: f64,
+    },
+    /// A wait the interpreter told of has ended: how, and after how long.
+    Waited {
+        wait: u64,
+        exec: ExecId,
+        how: event::WaitEnd,
+        done: Vec<event::Awaited>,
+        channels: Vec<String>,
+        error: Option<String>,
+        elapsed: f64,
     },
     /// A kernel the host asked to end has ended: its loop has stopped and its
     /// thread is done.
@@ -1202,6 +1227,14 @@ impl Interpreter {
         }
     }
 
+    /// What lists the waits every kernel's code is suspended in, without a
+    /// way to send.
+    pub(crate) fn waits(&self) -> Waits {
+        Waits {
+            table: Arc::clone(&self.table),
+        }
+    }
+
     /// Call `exited` once the interpreter has exited, before anything waiting
     /// on it hears. Replaces any earlier hook.
     pub(crate) fn on_exit(&self, exited: impl Fn() + Send + Sync + 'static) {
@@ -1573,6 +1606,67 @@ pub(crate) struct Gate {
     table: Arc<Mutex<Table>>,
 }
 
+/// A `runtime.wait` an agent's code is suspended in, as [`Waits::open`] lists
+/// it: the agent, the execution the code belongs to, what it waits on, and
+/// since when.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct OpenWait {
+    /// The agent whose code waits.
+    pub agent: Subject,
+    /// The execution the waiting code belongs to.
+    pub execid: event::ExecId,
+    /// The interpreter's id for the wait, which its events carry.
+    pub wait: u64,
+    /// What it waits on, at most as many as the interpreter lists.
+    pub on: Vec<event::Awaited>,
+    /// How many more than `on` lists.
+    pub more: u64,
+    pub return_when: event::ReturnWhen,
+    /// Its timeout, counted from `since`, if it has one.
+    pub timeout: Option<Duration>,
+    /// When the wait began.
+    pub since: Instant,
+}
+
+/// What lists the waits the session's agents are suspended in, from
+/// [`Session::waits`](crate::harness::Session::waits). Answered from what the
+/// interpreter has said so far, so it never waits on the interpreter; a wait
+/// appears once it has lasted a second, and goes when it ends, when its
+/// execution completes, when its agent's kernel ends, or when the
+/// interpreter exits. Holds no way to send, so keeping one does not keep the
+/// interpreter's input open.
+#[derive(Clone)]
+pub struct Waits {
+    table: Arc<Mutex<Table>>,
+}
+
+impl Waits {
+    /// Every wait open as of the last line the interpreter sent, the
+    /// primary's and each child's, in order of agent and then of wait.
+    pub fn open(&self) -> Vec<OpenWait> {
+        let table = lock(&self.table);
+        let mut open: Vec<OpenWait> = table
+            .kernels
+            .values()
+            .flat_map(|kernel| kernel.waits.values().cloned())
+            .collect();
+        open.sort_by(|a, b| {
+            a.agent
+                .as_str()
+                .cmp(b.agent.as_str())
+                .then(a.wait.cmp(&b.wait))
+        });
+        open
+    }
+}
+
+/// `seconds`, as the interpreter sent it, as a duration; zero for a value
+/// that is not one.
+fn secs(seconds: f64) -> Duration {
+    Duration::try_from_secs_f64(seconds).unwrap_or_default()
+}
+
 impl Gate {
     /// Close admission, `by` what closed it: every submission from now on is
     /// refused.
@@ -1849,6 +1943,10 @@ impl Table {
             );
             return;
         };
+        // A wait its code was in is over with it, told of or not.
+        kernel
+            .waits
+            .retain(|_, wait| wait.execid != slot.id.public());
         let events = kernel.events.clone();
         let (status, error) = match &result.status {
             Status::Ok => (ExecStatus::Ok, None),
@@ -2069,6 +2167,7 @@ where
             .kernels
             .values_mut()
             .filter_map(|kernel| {
+                kernel.waits.clear();
                 let slot = kernel.slot.take()?;
                 Table::record_ended(
                     &kernel.events,
@@ -2323,6 +2422,74 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
                     from: USER_END.to_string(),
                     to: from,
                 });
+        }
+        Reply::Wait {
+            wait,
+            exec,
+            on,
+            more,
+            return_when,
+            timeout,
+            elapsed,
+        } => {
+            let mut table = lock(table);
+            let Some(kernel) = table.kernels.get_mut(agent.as_str()) else {
+                tracing::warn!("ignored a wait from agent {agent:?}, which the host never opened");
+                return;
+            };
+            let timeout = timeout.map(secs);
+            let elapsed = secs(elapsed);
+            kernel.waits.insert(
+                wait,
+                OpenWait {
+                    agent: Subject::agent(&agent),
+                    execid: exec.public(),
+                    wait,
+                    on: on.clone(),
+                    more,
+                    return_when,
+                    timeout,
+                    since: Instant::now()
+                        .checked_sub(elapsed)
+                        .unwrap_or_else(Instant::now),
+                },
+            );
+            kernel.events.emit_with(|| Payload::ExecWaitStarted {
+                execid: exec.public(),
+                wait,
+                on,
+                more,
+                return_when,
+                timeout,
+                elapsed,
+            });
+        }
+        Reply::Waited {
+            wait,
+            exec,
+            how,
+            done,
+            channels,
+            error,
+            elapsed,
+        } => {
+            let mut table = lock(table);
+            let Some(kernel) = table.kernels.get_mut(agent.as_str()) else {
+                tracing::warn!(
+                    "ignored a wait's end from agent {agent:?}, which the host never opened"
+                );
+                return;
+            };
+            kernel.waits.remove(&wait);
+            kernel.events.emit_with(|| Payload::ExecWaitEnded {
+                execid: exec.public(),
+                wait,
+                how,
+                done,
+                channels,
+                error,
+                duration: secs(elapsed),
+            });
         }
         Reply::Ready { .. } | Reply::Ended {} | Reply::Rpc(_) | Reply::Hosted(_) => {}
         Reply::Other => tracing::debug!(

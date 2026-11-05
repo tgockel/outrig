@@ -302,7 +302,11 @@ impl CannedResponse {
 ///
 /// The server answers `script` in order, one response per connection. Past
 /// the end of the script it repeats the last entry rather than hanging, so an
-/// unexpected extra request fails a count assertion instead of a timeout.
+/// unexpected extra request fails a count assertion instead of a timeout. A
+/// `GET` -- the probe for a model's context window, which a session with no
+/// `context-window` makes before its first call -- is answered 404 on its
+/// own, neither recorded nor counted against the script, so the script is the
+/// session's calls alone.
 #[allow(dead_code)]
 pub async fn start_mock_http(
     script: Vec<CannedResponse>,
@@ -332,6 +336,10 @@ async fn serve_mock_http(
         let Some(recorded) = read_http_request(&mut sock).await else {
             continue;
         };
+        if recorded.method == "GET" {
+            answer(sock, CannedResponse::status(404, serde_json::json!({}))).await;
+            continue;
+        }
         if tx.send(recorded).is_err() {
             return;
         }

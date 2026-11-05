@@ -2929,6 +2929,54 @@ async fn on_a_terminal_the_conversation_is_what_was_sent() {
     assert!(screen.contains("[outrig] closing the session"), "{screen}");
 }
 
+/// While the round's code is in a `runtime.wait` long enough for the session to record, the
+/// status line says what it awaits in place of `Python running` -- a task nobody named by its
+/// coroutine, not asyncio's `Task-N` -- and the detail view gets a line as the wait starts and one
+/// as it ends; once the code moves on, the line reads `Python running` again.
+#[tokio::test]
+async fn on_a_terminal_the_status_line_says_what_python_awaits() {
+    let (addr, _requests) = start_mock_http(vec![
+        submit(
+            "toolu_wait",
+            "await runtime.channels['user'].receive()\nimport os\n\
+             async def ci_run():\n    while not os.path.exists('release-1'):\n        \
+             await asyncio.sleep(0.05)\n\
+             t = asyncio.create_task(ci_run())\n\
+             done, pending = await runtime.wait({t})\n\
+             while not os.path.exists('release-2'):\n    await asyncio.sleep(0.05)",
+        ),
+        text_reply("waited it out"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut terminal = OnTerminal::start(repo.path(), sessions.path());
+
+    terminal.shows("Ctrl-O detail").await;
+    terminal.press("go\r");
+    terminal.shows("awaiting ci_run · execution").await;
+    terminal.press("\x0f");
+    terminal.shows(": awaiting ci_run").await;
+    terminal.press("\x1b");
+    terminal.hides(": awaiting ci_run").await;
+
+    std::fs::write(repo.path().join("release-1"), b"").expect("release the wait");
+    terminal.shows("Python running · execution").await;
+    terminal.hides("awaiting ci_run").await;
+    terminal.press("\x0f");
+    terminal.shows("wait over: ci_run done").await;
+    terminal.press("\x1b");
+
+    std::fs::write(repo.path().join("release-2"), b"").expect("release the round");
+    terminal.shows("ready").await;
+
+    terminal.press("\x03");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    terminal.press("\x03");
+    let (status, screen) = terminal.exit().await;
+    assert!(status.success(), "{status}:\n{screen}");
+}
+
 /// A terminal that has stopped reading what is written to it -- Ctrl-S, a terminal program that
 /// hangs -- holds the screen's drawing up, and the agent's messages with it, and nothing else:
 /// Ctrl-C, which raw mode reads as a key, still reaches the conversation, and pressed twice ends

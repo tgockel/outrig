@@ -556,6 +556,50 @@ fn each_event_has_exactly_its_data_fields() {
             &["execid", "names", "total", "more"],
         ),
         (
+            Payload::ExecWaitStarted {
+                execid: id,
+                wait: 1,
+                on: vec![Awaited::Task {
+                    name: text("ci_run"),
+                    code: Some(text("watch")),
+                }],
+                more: 0,
+                return_when: ReturnWhen::FirstCompleted,
+                timeout: Some(Duration::from_millis(1_500)),
+                elapsed: Duration::from_millis(1_000),
+            },
+            "exec.wait.started",
+            &[
+                "execid",
+                "wait",
+                "on",
+                "more",
+                "return_when",
+                "timeout",
+                "elapsed",
+            ],
+        ),
+        (
+            Payload::ExecWaitEnded {
+                execid: id,
+                wait: 1,
+                how: WaitEnd::Message,
+                done: vec![Awaited::Call {
+                    id: Some(7),
+                    function: text("pkg.review_section"),
+                    child: Some(text("c1")),
+                    name: Some(text("reviewer")),
+                }],
+                channels: vec![text("user")],
+                error: None,
+                duration: Duration::from_millis(2_500),
+            },
+            "exec.wait.ended",
+            &[
+                "execid", "wait", "how", "done", "channels", "error", "duration",
+            ],
+        ),
+        (
             Payload::ToolResultTruncated {
                 execid: id,
                 size: 2_000,
@@ -1113,6 +1157,24 @@ fn each_event_has_exactly_its_data_fields() {
     assert_eq!(state, json!({"state": "round_running"}));
     let released = serde_json::to_value(case("agent.instance.released")).expect("encodes");
     assert_eq!(released["how"], json!("async_with"));
+    let started = serde_json::to_value(case("exec.wait.started")).expect("encodes");
+    assert_eq!(
+        started["on"],
+        json!([{"kind": "task", "name": "ci_run", "code": "watch"}])
+    );
+    assert_eq!(started["return_when"], json!("FIRST_COMPLETED"));
+    assert_eq!(started["timeout"], json!(1.5), "seconds, as a number");
+    assert_eq!(started["elapsed"], json!(1.0));
+    let ended = serde_json::to_value(case("exec.wait.ended")).expect("encodes");
+    assert_eq!(ended["how"], json!("message"));
+    assert_eq!(
+        ended["done"][0],
+        json!({
+            "kind": "call", "id": 7, "function": "pkg.review_section",
+            "child": "c1", "name": "reviewer",
+        })
+    );
+    assert_eq!(ended["duration"], json!(2.5));
 }
 
 /// The id a record is given is its place in the file, whichever task emitted

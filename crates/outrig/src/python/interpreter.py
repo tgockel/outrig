@@ -91,6 +91,7 @@ REPR_MAX = 1000  # one echoed value, or one inventory entry
 INVENTORY_MAX = 200  # global names listed in one inventory
 TASKS_MAX = 50  # running tasks named in one listing
 TASK_NAME_MAX = 200  # characters of one task's name
+WAIT_NOTICE_DELAY = 1.0  # seconds a `runtime.wait` is suspended before the host is told of it
 HELP_MAX = 8 * 1024  # characters of one `help()` answer
 DRAIN_TIMEOUT = 5.0  # seconds a result waits for its pipe to reach the end of the body's output
 
@@ -3238,6 +3239,62 @@ _type_qualname = type.__dict__["__qualname__"].__get__
 _type_bases = type.__dict__["__bases__"].__get__
 
 
+def _describe_awaited(fs, handles):
+    """What a wait's futures are, read from types and fields alone so no agent code runs: a task's
+    name and its coroutine's code, a handle's request and child, a skill's invocation, and any
+    other future's type. At most `TASKS_MAX` of them, sorted by label, and how many more. Every
+    string is a plain `str`, so sorting and encoding them runs none either, and `handles` is read
+    by the futures' identities, so none is hashed."""
+    described = []
+    for f in fs:
+        h = handles.get(id(f))
+        if type(h) is _agents.Handle:
+            work = h._work
+            if type(work) is _Call:
+                # Not `declaration.name`, which formats the two raw: a declared function's
+                # `__qualname__` can be a `str` subclass too.
+                declaration = work.declaration
+                function = f"{str.__str__(declaration.module)}.{str.__str__(declaration.qualname)}"
+                d = {"kind": "call", "id": work.id, "function": function}
+            else:
+                d = {"kind": work.kind, "id": work.id, "channel": work.channel}
+            child = work.child
+            d["child"] = None if child is None else child.id
+            d["name"] = None if child is None else child.name
+        elif type(h) is _skills.Invocation:
+            d = {"kind": "skill", "id": h.id, "skill": h.skill}
+        elif issubclass(type(f), asyncio.Task):
+            code = _code_of(f)
+            d = {
+                "kind": "task",
+                # `asyncio.Task`'s own method, not an override a subclass of it may carry.
+                "name": str.__str__(asyncio.Task.get_name(f))[:TASK_NAME_MAX],
+                "code": None if code is None else str.__str__(code.co_qualname),
+            }
+        else:
+            d = {"kind": "future", "type": _plain_qualname(type(f))}
+        described.append(d)
+    described.sort(key=_awaited_order)
+    return described[:TASKS_MAX], max(len(described) - TASKS_MAX, 0)
+
+
+def _awaited_order(d):
+    label = d.get("name") or d.get("function") or d.get("skill") or d.get("type") or ""
+    return (label, d.get("id") or 0)
+
+
+def _plain_qualname(cls):
+    """`cls`'s qualified name as a plain `str`: a subclass of `str` set there would run its own
+    code when tested, sorted, or encoded."""
+    return str.__str__(_type_qualname(cls))
+
+
+def _is_done(f):
+    """Whether `f` is done, through `asyncio.Future`'s own method where `f` is one, not an
+    override a subclass of it may carry."""
+    return asyncio.Future.done(f) if issubclass(type(f), asyncio.Future) else f.done()
+
+
 def _raised(exc):
     """The name of `exc`'s type, as a plain `str`, for the result that reports it.
 
@@ -4078,10 +4135,11 @@ class Runtime:
         if not fs:
             raise ValueError("Set of Tasks/Futures is empty.")
         # A handle, or a skill's invocation, is waited on through its view, and comes back as
-        # itself.
+        # itself. By the view's identity, which the handle keeps alive: reading the map hashes
+        # nothing, so describing the wait runs no future's `__hash__`.
         handles = {}
         for f in [f for f in fs if type(f) is _agents.Handle or type(f) is _skills.Invocation]:
-            handles[f.future] = f
+            handles[id(f.future)] = f
             fs.discard(f)
             fs.add(f.future)
         loop = asyncio.get_running_loop()
@@ -4090,7 +4148,17 @@ class Runtime:
         # futures finishing one at a time cost `N` callbacks, not a look at every future still
         # pending each time one does.
         finished = loop.create_future()
-        timer = None if timeout is None else loop.call_later(timeout, _wake, finished)
+        timed_out = False
+
+        def expire():
+            nonlocal timed_out
+            # Only when the timeout wins: a completion that woke `finished` first is how the wait
+            # ended, however late its waiter runs.
+            if not finished.done():
+                timed_out = True
+                finished.set_result(None)
+
+        timer = None if timeout is None else loop.call_later(timeout, expire)
         remaining = len(fs)
 
         def completed(f):
@@ -4111,6 +4179,33 @@ class Runtime:
 
         for f in fs:
             f.add_done_callback(completed)
+        # Once suspended for `WAIT_NOTICE_DELAY`, the host is told what the wait is on, and how it
+        # ended once it has: what the status line and the session's record show of a long wait.
+        # Described from types and fields alone, so no agent code runs for it. Code outside any
+        # execution has nothing to record a wait under, and is not recorded.
+        execution = _CURRENT.get()
+        started = loop.time()
+        kernel = self._kernel
+        notice = None
+
+        def announce():
+            nonlocal notice
+            try:
+                on, more = _describe_awaited(fs, handles)
+                notice = {"wait": next(_ids), "exec": execution.id}
+                _notify({"t": "wait", "agent": kernel.agent, **notice, "on": on, "more": more,
+                         "return_when": return_when, "timeout": timeout,
+                         "elapsed": loop.time() - started})
+            except BaseException as e:
+                _diag(f"describing a wait failed: {_plain_qualname(type(e))}")
+
+        # Not armed for a wait that cannot last that long: a loop of short timed waits arms nothing.
+        announcing = (
+            None
+            if execution is None or (timeout is not None and timeout < WAIT_NOTICE_DELAY)
+            else loop.call_later(WAIT_NOTICE_DELAY, announce)
+        )
+        how, channels, error = "returned", [], None
         try:
             while True:
                 # Read again on each pass, so a channel added during the wait is watched from the
@@ -4123,21 +4218,41 @@ class Runtime:
                     # spins where the runaway probe detects it.
                     waiting = [name for name, endpoint in endpoints if endpoint._watch(arrived)]
                     if waiting:
+                        how, channels = "message", waiting
                         raise MessageAvailable(waiting)
                     if finished.done():
                         done = {f for f in fs if f.done()}
                         pending = fs - done
-                        return ({handles.get(f, f) for f in done},
-                                {handles.get(f, f) for f in pending})
+                        if timed_out:
+                            how = "timeout"
+                        return ({handles.get(id(f), f) for f in done},
+                                {handles.get(id(f), f) for f in pending})
                     await asyncio.wait({finished, arrived}, return_when=asyncio.FIRST_COMPLETED)
                 finally:
                     for _, endpoint in endpoints:
                         endpoint._unwatch(arrived)
+        except MessageAvailable:
+            raise
+        except BaseException as e:
+            how, error = "raised", _plain_qualname(type(e))
+            raise
         finally:
+            if announcing is not None:
+                announcing.cancel()
             if timer is not None:
                 timer.cancel()
             for f in fs:
                 f.remove_done_callback(completed)
+            if notice is not None:
+                # Best effort, and nothing agent code can override: the wait has ended as it
+                # ended, and a record without the end is the cost of one that cannot be read.
+                try:
+                    done, _ = _describe_awaited([f for f in fs if _is_done(f)], handles)
+                    _notify({"t": "waited", "agent": kernel.agent, **notice, "how": how,
+                             "done": done, "channels": channels, "error": error,
+                             "elapsed": loop.time() - started})
+                except BaseException as e:
+                    _diag(f"describing a wait's end failed: {_plain_qualname(type(e))}")
 
     def __repr__(self):
         return f"<runtime: channels {', '.join(map(repr, self._channels))}>"
@@ -4192,7 +4307,7 @@ class RequestRuntime(Runtime):
 # hears of each step as a notice -- what its record of the session, and its rule for when a child
 # gets a round, are made of -- and never carries the objects.
 
-_ids = itertools.count(1)  # every id the interpreter gives: a request, an ask, a message
+_ids = itertools.count(1)  # every id the interpreter gives: a request, an ask, a message, a wait
 _works = {}  # each request open, or ended and the host not yet told so (`_Work.tell`), by id
 _launching = {}  # each typed call (`outrig.agent`) not yet ended, by its id, the submission's
 _works_lock = threading.Lock()
@@ -6179,8 +6294,9 @@ def _in_agent_task(kernel):
 def _code_of(task):
     """The code of `task`'s coroutine, read only from a coroutine of this process: a task can run
     any awaitable `asyncio.iscoroutine` accepts, a hosted proxy among them, whose attributes are
-    requests -- and this is read inside the SIGINT handler."""
-    coro = task.get_coro()
+    requests -- and this is read inside the SIGINT handler. `asyncio.Task`'s own method, not an
+    override a subclass of it may carry."""
+    coro = asyncio.Task.get_coro(task)
     return coro.cr_code if type(coro) is types.CoroutineType else None
 
 

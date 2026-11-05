@@ -27,7 +27,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::config::RoleAlternation;
@@ -162,6 +162,17 @@ fn seconds<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S
     serializer.serialize_f64(duration.as_secs_f64())
 }
 
+/// Seconds, or `null` where there is no duration.
+fn seconds_opt<S: Serializer>(
+    duration: &Option<Duration>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match duration {
+        Some(duration) => seconds(duration, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// What an event says. Each serializes to the `data` the event log records
 /// for its kind.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -260,6 +271,36 @@ pub enum Payload {
         names: Vec<Held>,
         total: u64,
         more: u64,
+    },
+    /// A `runtime.wait` the agent's code has been suspended in for a second:
+    /// what it waits on, `on`, and `more`, those past what is listed; and
+    /// `elapsed`, how long it had lasted when it was recorded, from which its
+    /// `timeout` counts.
+    #[non_exhaustive]
+    ExecWaitStarted {
+        execid: ExecId,
+        wait: u64,
+        on: Vec<Awaited>,
+        more: u64,
+        return_when: ReturnWhen,
+        #[serde(serialize_with = "seconds_opt")]
+        timeout: Option<Duration>,
+        #[serde(serialize_with = "seconds")]
+        elapsed: Duration,
+    },
+    /// A wait that was recorded starting has ended: `how`; `done`, what was
+    /// done by then; `channels`, those a message arrived on; and `error`, the
+    /// exception that ended it, when one did.
+    #[non_exhaustive]
+    ExecWaitEnded {
+        execid: ExecId,
+        wait: u64,
+        how: WaitEnd,
+        done: Vec<Awaited>,
+        channels: Vec<String>,
+        error: Option<String>,
+        #[serde(serialize_with = "seconds")]
+        duration: Duration,
     },
     #[non_exhaustive]
     ToolResultTruncated {
@@ -734,6 +775,8 @@ impl Payload {
             Payload::ExecProbeFailed { .. } => "exec.probe.failed",
             Payload::ExecAbandoned { .. } => "exec.abandoned",
             Payload::InventoryObserved { .. } => "inventory.observed",
+            Payload::ExecWaitStarted { .. } => "exec.wait.started",
+            Payload::ExecWaitEnded { .. } => "exec.wait.ended",
             Payload::ToolResultTruncated { .. } => "tool.result.truncated",
             Payload::ContextPromoted { .. } => "context.promoted",
             Payload::ContextDemoted { .. } => "context.demoted",
@@ -1155,6 +1198,75 @@ pub struct Held {
     pub name: String,
     #[serde(rename = "type")]
     pub type_name: String,
+}
+
+/// One thing a `runtime.wait` waits on, as the interpreter describes it from
+/// types and fields alone, running none of the agent's code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum Awaited {
+    /// A task: its name, and its coroutine's qualified name when it has one.
+    #[non_exhaustive]
+    Task { name: String, code: Option<String> },
+    /// A submission to a child agent: the request's id, and the child's id
+    /// and spawn name once the child exists.
+    #[non_exhaustive]
+    Submission {
+        id: Option<u64>,
+        child: Option<String>,
+        name: Option<String>,
+    },
+    /// A request on a child's channel.
+    #[non_exhaustive]
+    Request {
+        id: Option<u64>,
+        channel: String,
+        child: Option<String>,
+        name: Option<String>,
+    },
+    /// A typed call of an `@outrig.agent` function, by its qualified name.
+    #[non_exhaustive]
+    Call {
+        id: Option<u64>,
+        function: String,
+        child: Option<String>,
+        name: Option<String>,
+    },
+    /// A skill's invocation.
+    #[non_exhaustive]
+    Skill { id: u64, skill: String },
+    /// Any other future: its type's qualified name.
+    #[non_exhaustive]
+    Future {
+        #[serde(rename = "type")]
+        type_name: String,
+    },
+}
+
+/// When a `runtime.wait` returns, as asyncio names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
+pub enum ReturnWhen {
+    FirstCompleted,
+    FirstException,
+    AllCompleted,
+}
+
+/// How a recorded wait ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum WaitEnd {
+    /// Its futures satisfied `return_when`.
+    Returned,
+    /// Its timeout passed.
+    Timeout,
+    /// A message arrived on a channel, and `MessageAvailable` was raised.
+    Message,
+    /// An exception ended it: a cancel, or an interrupt.
+    Raised,
 }
 
 /// Output an earlier execution wrote after it reported, delivered with a

@@ -7,6 +7,7 @@
 //! could have hidden is marked unknown, or corrected by the next state the
 //! session reports.
 
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use super::facts::{Fact, Phase, cut};
@@ -21,8 +22,8 @@ const SAID_MAX: usize = 200;
 pub(super) struct Status {
     phase: Phase,
     model: Option<String>,
-    /// The submission running, and since when.
-    running: Option<(u64, Instant)>,
+    /// The submission running: since when, and the wait its code is in.
+    running: Option<Running>,
     /// A call that failed, until a request settles, another call starts, or
     /// the round moves on.
     failed: Option<Failed>,
@@ -37,6 +38,27 @@ pub(super) struct Status {
     said: Option<String>,
     /// Whether the agent has sent the user anything since the round started.
     sent: bool,
+}
+
+/// The submission running.
+#[derive(Debug, PartialEq, Eq)]
+struct Running {
+    exec: u64,
+    since: Instant,
+    /// The `runtime.wait`s its code is in, once the session has said so,
+    /// each until it ends, oldest first. Its tasks wait under its id too, so
+    /// there can be several; the line shows the newest.
+    awaiting: Vec<Awaiting>,
+}
+
+/// A wait the running submission's code is in.
+#[derive(Debug, PartialEq, Eq)]
+struct Awaiting {
+    wait: u64,
+    /// What it waits on, as the line says it.
+    on: String,
+    /// When its timeout passes, if it has one.
+    deadline: Option<Instant>,
 }
 
 /// A failed call, as the line says it.
@@ -101,13 +123,46 @@ impl Status {
                 self.said = None;
             }
             Fact::Submitted { exec, .. } => {
-                self.running = Some((*exec, now));
+                self.running = Some(Running {
+                    exec: *exec,
+                    since: now,
+                    awaiting: Vec::new(),
+                });
                 self.failed = None;
             }
             Fact::Completed { exec, .. } => {
-                if self.running.is_some_and(|(running, _)| running == *exec) {
+                if self.running.as_ref().is_some_and(|running| running.exec == *exec) {
                     self.running = None;
                 }
+            }
+            Fact::Awaiting {
+                exec,
+                wait,
+                on,
+                left,
+            } => {
+                // A wait in another execution's code -- a task an earlier one
+                // left running -- is not the running submission's.
+                let Some(running) = self.running.as_mut().filter(|running| running.exec == *exec)
+                else {
+                    return false;
+                };
+                running.awaiting.retain(|open| open.wait != *wait);
+                running.awaiting.push(Awaiting {
+                    wait: *wait,
+                    on: on.clone(),
+                    deadline: left.map(|left| now + left),
+                });
+            }
+            Fact::Awaited { wait, .. } => {
+                let Some(running) = self
+                    .running
+                    .as_mut()
+                    .filter(|running| running.awaiting.iter().any(|open| open.wait == *wait))
+                else {
+                    return false;
+                };
+                running.awaiting.retain(|open| open.wait != *wait);
             }
             Fact::Retry {
                 model,
@@ -166,7 +221,14 @@ impl Status {
                 return false;
             }
             Fact::Said(text) => self.said = Some(text.clone()),
-            Fact::Missed(_) => self.waiting = None,
+            // The gap may have hidden the end of a wait as well as a message;
+            // the loop asks the session what is open and restores it.
+            Fact::Missed(_) => {
+                self.waiting = None;
+                if let Some(running) = &mut self.running {
+                    running.awaiting.clear();
+                }
+            }
             Fact::Exec { .. } | Fact::Note { .. } | Fact::Other { .. } => return false,
         }
         true
@@ -198,11 +260,26 @@ impl Status {
         match self.phase {
             Phase::Starting => parts.push("starting".to_string()),
             Phase::Closing => parts.push("closing".to_string()),
-            Phase::Python => match self.running {
-                Some((exec, since)) => parts.push(format!(
-                    "Python running · execution {exec} · {}",
-                    elapsed(now.saturating_duration_since(since))
-                )),
+            Phase::Python => match &self.running {
+                Some(running) => {
+                    let doing = match running.awaiting.last() {
+                        Some(wait) => {
+                            let mut doing = format!("awaiting {}", wait.on);
+                            if let Some(deadline) = wait.deadline
+                                && deadline > now
+                            {
+                                let _ = write!(doing, " ({} left)", elapsed(deadline - now));
+                            }
+                            doing
+                        }
+                        None => "Python running".to_string(),
+                    };
+                    parts.push(format!(
+                        "{doing} · execution {} · {}",
+                        running.exec,
+                        elapsed(now.saturating_duration_since(running.since))
+                    ));
+                }
                 None => parts.push("Python running".to_string()),
             },
             Phase::Model => {
@@ -542,5 +619,156 @@ mod tests {
         assert_eq!(count(1_250_000), "1.2M");
         assert_eq!(elapsed(Duration::from_millis(999)), "0.9s");
         assert_eq!(elapsed(Duration::from_secs(600)), "10m00s");
+    }
+
+    /// While the running submission's code is in a wait the session has told
+    /// of, the line says what it awaits in place of `Python running`, with the
+    /// time its timeout has left while it has any; the wait's end puts
+    /// `Python running` back, and another wait's end changes nothing.
+    #[test]
+    fn a_wait_shows_what_it_awaits_until_it_ends() {
+        let start = Instant::now();
+        let mut status = after(
+            &[
+                Fact::Submitted {
+                    exec: 4,
+                    source: String::new(),
+                },
+                Fact::Phase(Phase::Python),
+            ],
+            start,
+        );
+        let later = start + Duration::from_secs(5);
+        status.apply(
+            &Fact::Awaiting {
+                exec: 4,
+                wait: 1,
+                on: "the first of ci_run, review".into(),
+                left: Some(Duration::from_secs(65)),
+            },
+            later,
+        );
+        assert_eq!(
+            status.shown(later + Duration::from_secs(5)).text,
+            "awaiting the first of ci_run, review (1m00s left) · execution 4 · 10.0s"
+        );
+        assert_eq!(
+            status.shown(later + Duration::from_secs(70)).text,
+            "awaiting the first of ci_run, review · execution 4 · 1m15s",
+            "a timeout that has passed is not counted down"
+        );
+        status.apply(
+            &Fact::Awaited {
+                exec: 4,
+                wait: 2,
+                what: String::new(),
+            },
+            later,
+        );
+        assert!(status.shown(later).text.starts_with("awaiting"));
+        status.apply(
+            &Fact::Awaited {
+                exec: 4,
+                wait: 1,
+                what: String::new(),
+            },
+            later,
+        );
+        assert_eq!(status.shown(later).text, "Python running · execution 4 · 5.0s");
+    }
+
+    /// A wait goes with its submission's completion and with the state moving
+    /// on, as the submission does; and a gap in the events drops it, since the
+    /// gap may have hidden its end, until the loop's reading of what is open
+    /// now sets it again.
+    #[test]
+    fn a_wait_goes_with_its_submission_and_with_a_gap_in_the_events() {
+        let now = Instant::now();
+        let awaiting = Fact::Awaiting {
+            exec: 4,
+            wait: 1,
+            on: "ci_run".into(),
+            left: None,
+        };
+        let running = [
+            Fact::Submitted {
+                exec: 4,
+                source: String::new(),
+            },
+            Fact::Phase(Phase::Python),
+        ];
+        let mut status = after(&running, now);
+        status.apply(&awaiting, now);
+        status.apply(
+            &Fact::Completed {
+                exec: 4,
+                status: "ok",
+                duration: Duration::ZERO,
+                output: String::new(),
+                dropped: 0,
+                error: None,
+                background: Vec::new(),
+            },
+            now,
+        );
+        assert_eq!(status.shown(now).text, "Python running");
+
+        let mut status = after(&running, now);
+        status.apply(&awaiting, now);
+        status.apply(&Fact::Phase(Phase::Model), now);
+        status.apply(&Fact::Phase(Phase::Python), now);
+        assert_eq!(status.shown(now).text, "Python running");
+
+        let mut status = after(&running, now);
+        status.apply(&awaiting, now);
+        status.apply(&Fact::Missed(3), now);
+        assert_eq!(
+            status.shown(now).text,
+            "Python running · execution 4 · 0.0s · messages waiting unknown"
+        );
+        status.apply(&awaiting, now);
+        assert_eq!(
+            status.shown(now).text,
+            "awaiting ci_run · execution 4 · 0.0s · messages waiting unknown"
+        );
+    }
+
+    /// A submission's tasks wait under its id too, so two waits can be open
+    /// at once: the line shows the newest, and the end of one leaves the
+    /// other showing rather than `Python running`.
+    #[test]
+    fn the_newest_of_several_open_waits_shows_until_each_has_ended() {
+        let now = Instant::now();
+        let mut status = after(
+            &[
+                Fact::Submitted {
+                    exec: 4,
+                    source: String::new(),
+                },
+                Fact::Phase(Phase::Python),
+            ],
+            now,
+        );
+        let wait = |wait: u64, on: &str| Fact::Awaiting {
+            exec: 4,
+            wait,
+            on: on.into(),
+            left: None,
+        };
+        let ended = |wait: u64| Fact::Awaited {
+            exec: 4,
+            wait,
+            what: String::new(),
+        };
+        status.apply(&wait(1, "ci_run"), now);
+        status.apply(&wait(2, "review"), now);
+        assert_eq!(status.shown(now).text, "awaiting review · execution 4 · 0.0s");
+        status.apply(&ended(2), now);
+        assert_eq!(status.shown(now).text, "awaiting ci_run · execution 4 · 0.0s");
+        // Told of again -- restored after a gap -- it is the same wait, not a
+        // second one.
+        status.apply(&wait(1, "ci_run"), now);
+        status.apply(&ended(1), now);
+        assert_eq!(status.shown(now).text, "Python running · execution 4 · 0.0s");
     }
 }

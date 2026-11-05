@@ -11,6 +11,7 @@
 //! Nothing waits on a sleep or a wall-clock threshold. Where a test needs two
 //! things to overlap, a flag file or an `asyncio.Event` gates one on the other.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ExitStatus};
@@ -48,6 +49,11 @@ pub(super) struct Interpreter {
     replies: Receiver<Result<Value, String>>,
     stderr: Arc<Mutex<String>>,
     ready: Value,
+    /// The `wait` and `waited` lines read while looking for something else:
+    /// nothing asks for them, and a wait that crosses a second writes them
+    /// whenever it does, so [`Interpreter::recv`] holds them for
+    /// [`Interpreter::notice`] rather than failing on them.
+    notices: VecDeque<Value>,
 }
 
 impl Interpreter {
@@ -108,6 +114,7 @@ impl Interpreter {
             replies,
             stderr,
             ready: Value::Null,
+            notices: VecDeque::new(),
         };
         // The greeting names no agent, so it is read as `recv` reads nothing else.
         interpreter.ready = interpreter.recv_unnamed();
@@ -133,12 +140,33 @@ impl Interpreter {
         self.send_raw(format!("{message}\n").as_bytes());
     }
 
-    /// The next message, whatever it is. Every message names an agent.
+    /// The next message other than a wait's notice, whatever it is. Every
+    /// message names an agent.
     fn recv(&mut self) -> Value {
+        loop {
+            let message = self.recv_unnamed();
+            assert!(
+                message["agent"].is_string(),
+                "a message without an agent id: {message}"
+            );
+            if is_notice(&message) {
+                self.notices.push_back(message);
+                continue;
+            }
+            return message;
+        }
+    }
+
+    /// The next `wait` or `waited` line: one held back by [`Interpreter::recv`],
+    /// or the next message, which must be one.
+    fn notice(&mut self) -> Value {
+        if let Some(notice) = self.notices.pop_front() {
+            return notice;
+        }
         let message = self.recv_unnamed();
         assert!(
-            message["agent"].is_string(),
-            "a message without an agent id: {message}"
+            is_notice(&message),
+            "expected a wait's notice, got: {message}"
         );
         message
     }
@@ -3284,6 +3312,11 @@ fn a_send_is_machinery_an_interrupt_does_not_land_in() {
 
 // ---------------------------------------------------------------------------- waiting
 
+/// Whether `message` is a wait's notice: a `wait`, or a `waited`.
+fn is_notice(message: &Value) -> bool {
+    message["t"] == "wait" || message["t"] == "waited"
+}
+
 /// Python that writes `PARKED <id>` on stderr once the loop turns again. Put
 /// just before an `await`, it is written once that await has suspended.
 fn parked(id: u64) -> String {
@@ -3674,6 +3707,363 @@ fn a_wait_registers_with_each_future_once() {
         len(done), len(pending), Counted.registered
         "#);
     assert_eq!(k.output(1, &source), "(100, 0, 100)\n");
+}
+
+/// A wait that lasts past a second is told of: what it waits on -- a task by
+/// its name and its coroutine -- with `return_when`, the timeout, and the
+/// execution; and how it ended, with what was done by then.
+#[test]
+fn a_long_wait_is_told_of_and_its_end_says_what_was_done() {
+    let mut k = Interpreter::start();
+    let result = k.exec(
+        1,
+        &py(r#"
+            async def ci_run():
+                await asyncio.sleep(1.5)
+            t = asyncio.create_task(ci_run(), name='ci_run')
+            done, pending = await runtime.wait({t}, timeout=30)
+            print([x.get_name() for x in done], pending)
+            "#),
+    );
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(text(&result["output"]), "['ci_run'] set()\n");
+    let started = k.notice();
+    assert_eq!(started["t"], "wait", "{started}");
+    assert_eq!(started["agent"], PRIMARY);
+    assert_eq!(started["exec"], 1);
+    assert_eq!(
+        started["on"],
+        json!([{"kind": "task", "name": "ci_run", "code": "ci_run"}])
+    );
+    assert_eq!(started["more"], 0);
+    assert_eq!(started["return_when"], "ALL_COMPLETED");
+    assert_eq!(started["timeout"], 30);
+    let elapsed = started["elapsed"].as_f64().expect("elapsed");
+    assert!((1.0..1.5).contains(&elapsed), "{started}");
+    let ended = k.notice();
+    assert_eq!(ended["t"], "waited", "{ended}");
+    assert_eq!(ended["agent"], PRIMARY);
+    assert_eq!(ended["wait"], started["wait"]);
+    assert_eq!(ended["exec"], 1);
+    assert_eq!(ended["how"], "returned");
+    assert_eq!(ended["done"], started["on"]);
+    assert_eq!(ended["channels"], json!([]));
+    assert!(ended["error"].is_null(), "{ended}");
+    let elapsed = ended["elapsed"].as_f64().expect("elapsed");
+    assert!((1.5..3.0).contains(&elapsed), "{ended}");
+}
+
+/// How a told-of wait ended is said: a message arriving names its channel, a
+/// cancel names the exception, and a timeout passing says so.
+#[test]
+fn a_told_of_waits_end_says_how_it_ended() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        "op = asyncio.create_task(asyncio.Event().wait(), name='op')",
+    );
+    k.park(2, &format!("{}\nawait runtime.wait({{op}})", parked(2)));
+    assert_eq!(k.notice()["t"], "wait");
+    let (_, result) = k.post_waking(3, "user", json!("hello"), 2);
+    assert!(error_of(&result).contains("MessageAvailable"));
+    let ended = k.notice();
+    assert_eq!(ended["how"], "message", "{ended}");
+    assert_eq!(ended["channels"], json!(["user"]));
+    assert_eq!(ended["done"], json!([]));
+    k.output(4, "(await runtime.channels['user'].receive()).body");
+
+    k.park(5, &format!("{}\nawait runtime.wait({{op}})", parked(5)));
+    assert_eq!(k.notice()["t"], "wait");
+    k.cancel(5);
+    assert!(error_of(&k.result_of(5)).contains("CancelledError"));
+    let ended = k.notice();
+    assert_eq!(ended["how"], "raised", "{ended}");
+    assert_eq!(ended["error"], "CancelledError");
+
+    assert_eq!(
+        k.output(
+            6,
+            "done, pending = await runtime.wait({op}, timeout=1.5)\nlen(done), len(pending)"
+        ),
+        "(0, 1)\n"
+    );
+    assert_eq!(k.notice()["t"], "wait");
+    let ended = k.notice();
+    assert_eq!(ended["how"], "timeout", "{ended}");
+    assert_eq!(ended["done"], json!([]));
+}
+
+/// A wait that ends within the second -- returning, timing out, or raising
+/// `MessageAvailable` before it suspends -- is not told of, so a loop of short
+/// timed waits writes nothing.
+#[test]
+fn a_short_wait_is_not_told_of() {
+    let mut k = Interpreter::start();
+    assert_eq!(
+        k.output(
+            1,
+            &py(r#"
+            quick = asyncio.create_task(asyncio.sleep(0.1), name='quick')
+            done, pending = await runtime.wait({quick})
+            slow = asyncio.create_task(asyncio.Event().wait(), name='slow')
+            for _ in range(3):
+                done, pending = await runtime.wait({slow}, timeout=0.2)
+            print(len(done), len(pending))
+            "#),
+        ),
+        "0 1\n"
+    );
+    k.post(2, json!("hi"));
+    assert!(error_of(&k.exec(3, "await runtime.wait({slow})")).contains("MessageAvailable"));
+    k.loop_turns(4);
+    assert!(k.notices.is_empty(), "{:?}", k.notices);
+}
+
+/// Describing what a wait is on runs none of the agent's code: a future whose
+/// type defines `__repr__`, `__str__` and a property, and whose qualified
+/// name is a `str` subclass with its own truth, order and encoding, and a
+/// task whose `get_name` is overridden, are read from their types and
+/// fields, and listed in order of their names.
+#[test]
+fn describing_a_wait_runs_no_agent_code() {
+    let mut k = Interpreter::start();
+    let result = k.exec(
+        1,
+        &py(r#"
+            import os
+            def ran(what):
+                os.write(2, f'RAN {what}\n'.encode())
+            class Hooked(str):
+                def __bool__(self):
+                    ran('bool')
+                    return True
+                def __str__(self):
+                    ran('str')
+                    return 'hooked'
+                def __format__(self, spec):
+                    ran('format')
+                    return 'hooked'
+                def __lt__(self, other):
+                    ran('lt')
+                    return False
+                def __eq__(self, other):
+                    ran('eq')
+                    return False
+                __hash__ = str.__hash__
+                def encode(self, *args, **kwargs):
+                    ran('encode')
+                    return b'hooked'
+            class Loud(asyncio.Future):
+                __qualname__ = Hooked('Loud')
+                def __repr__(self):
+                    ran('repr')
+                    return 'loud'
+                def __str__(self):
+                    ran('str')
+                    return 'loud'
+                @property
+                def name(self):
+                    ran('name')
+                    return 'loud'
+            class Renamed(asyncio.Task):
+                def get_name(self):
+                    ran('get_name')
+                    return 'renamed'
+            loop = asyncio.get_running_loop()
+            f = Loud(loop=loop)
+            async def job():
+                await asyncio.sleep(1.5)
+            t = Renamed(job(), loop=loop, name='job')
+            done, pending = await runtime.wait({f, t}, return_when=asyncio.FIRST_COMPLETED)
+            print(len(done), len(pending))
+            "#),
+    );
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(text(&result["output"]), "1 1\n");
+    let started = k.notice();
+    assert_eq!(
+        started["on"],
+        json!([
+            {"kind": "future", "type": "Loud"},
+            {"kind": "task", "name": "job", "code": "job"},
+        ]),
+        "{started}"
+    );
+    assert_eq!(started["return_when"], "FIRST_COMPLETED");
+    let ended = k.notice();
+    assert_eq!(
+        ended["done"],
+        json!([{"kind": "task", "name": "job", "code": "job"}])
+    );
+    assert!(!k.stderr().contains("RAN"), "{}", k.stderr());
+}
+
+/// A typed call in a wait is named by its declaration's module and qualified
+/// name, each read as a plain `str`: a `str` subclass left in the function's
+/// `__qualname__` -- which the declaration keeps as it was, and the call's
+/// own declaring and launching format -- is never formatted once the wait is
+/// suspended, so none of its code runs when the wait is described.
+#[test]
+fn describing_a_waited_call_runs_no_agent_code() {
+    let mut k = Interpreter::start();
+    let (result, _asked) = k.calling(
+        1,
+        &py(r#"
+            import os, outrig
+            from dataclasses import dataclass
+            armed = False
+            def ran(what):
+                if armed:
+                    os.write(2, f'RAN {what}\n'.encode())
+            def arm():
+                global armed
+                armed = True
+            class Hooked(str):
+                def __format__(self, spec):
+                    ran('format')
+                    return 'hooked'
+                def __str__(self):
+                    ran('str')
+                    return 'hooked'
+            @dataclass
+            class Total:
+                total: int
+            async def add(xs: list[int]) -> Total:
+                "ROLE adder: add up `xs`"
+            add.__qualname__ = Hooked('add')
+            add = outrig.agent(add)
+            h = add([1, 2])
+            "#),
+    );
+    assert_eq!(result["status"], "ok", "{result}");
+    k.park(
+        2,
+        &format!(
+            "{}\nasyncio.get_running_loop().call_later(0.5, arm)\nawait runtime.wait({{h}})",
+            parked(2)
+        ),
+    );
+    let started = k.notice();
+    assert_eq!(started["t"], "wait", "{started}");
+    assert_eq!(started["on"][0]["kind"], "call");
+    assert_eq!(
+        started["on"][0]["function"],
+        format!("{PRIMARY_MODULE}.add"),
+        "{started}"
+    );
+    k.cancel(2);
+    assert!(error_of(&k.result_of(2)).contains("CancelledError"));
+    assert_eq!(k.notice()["how"], "raised");
+    assert!(!k.stderr().contains("RAN"), "{}", k.stderr());
+}
+
+/// Describing a wait hashes none of its futures: a handle's view is found by
+/// identity, and the futures done at the end are listed, not gathered in a
+/// set. A future whose `__hash__` and `__eq__` would run code, armed once
+/// the wait is suspended, is never called from either notice.
+#[test]
+fn describing_a_wait_hashes_no_future() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        &py(r#"
+            import os
+            armed = False
+            def ran(what):
+                if armed:
+                    os.write(2, f'RAN {what}\n'.encode())
+            def arm():
+                global armed
+                armed = True
+            class Hashed(asyncio.Future):
+                def __hash__(self):
+                    ran('hash')
+                    return id(self)
+                def __eq__(self, other):
+                    ran('eq')
+                    return self is other
+            f = Hashed(loop=asyncio.get_running_loop())
+            "#),
+    );
+    k.park(
+        2,
+        &format!(
+            "{}\nasyncio.get_running_loop().call_later(0.5, arm)\nawait runtime.wait({{f}})",
+            parked(2)
+        ),
+    );
+    let started = k.notice();
+    assert_eq!(started["on"], json!([{"kind": "future", "type": "Hashed"}]));
+    k.cancel(2);
+    assert!(error_of(&k.result_of(2)).contains("CancelledError"));
+    assert_eq!(k.notice()["how"], "raised");
+    assert!(!k.stderr().contains("RAN"), "{}", k.stderr());
+}
+
+/// A told-of wait ends as it ended whatever its futures do: one whose type
+/// overrides `done` to raise neither replaces the cancel or the message that
+/// ended the wait nor loses the notice of its end, which reads completion
+/// through `asyncio.Future`'s own method.
+#[test]
+fn a_told_of_waits_end_is_not_changed_by_its_futures() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        &py(r#"
+            class Broken(asyncio.Future):
+                def done(self):
+                    raise RuntimeError('broken done')
+            b = Broken(loop=asyncio.get_running_loop())
+            "#),
+    );
+    k.park(2, &format!("{}\nawait runtime.wait({{b}})", parked(2)));
+    assert_eq!(k.notice()["t"], "wait");
+    k.cancel(2);
+    assert!(error_of(&k.result_of(2)).contains("CancelledError"));
+    let ended = k.notice();
+    assert_eq!(ended["how"], "raised", "{ended}");
+    assert_eq!(ended["error"], "CancelledError");
+    assert_eq!(ended["done"], json!([]));
+
+    k.park(3, &format!("{}\nawait runtime.wait({{b}})", parked(3)));
+    assert_eq!(k.notice()["t"], "wait");
+    let (_, result) = k.post_waking(4, "user", json!("hello"), 3);
+    assert!(error_of(&result).contains("MessageAvailable"), "{result}");
+    let ended = k.notice();
+    assert_eq!(ended["how"], "message", "{ended}");
+    assert_eq!(ended["channels"], json!(["user"]));
+    assert!(!k.stderr().contains("broken done"), "{}", k.stderr());
+}
+
+/// A wait whose futures completed before its timeout returned for that
+/// reason, even when its code is resumed only after the deadline passed: the
+/// timeout is how it ended only when the timeout woke it.
+#[test]
+fn a_completion_before_the_deadline_is_not_a_timeout() {
+    let mut k = Interpreter::start();
+    assert_eq!(
+        k.output(
+            1,
+            &py(r#"
+            import time
+            async def job():
+                await asyncio.sleep(1.4)
+                # Done at 1.7 s, the timer at 1.5 s due but not yet run.
+                time.sleep(0.3)
+            t = asyncio.create_task(job(), name='job')
+            done, pending = await runtime.wait({t}, timeout=1.5)
+            print(len(done), len(pending))
+            "#),
+        ),
+        "1 0\n"
+    );
+    assert_eq!(k.notice()["t"], "wait");
+    let ended = k.notice();
+    assert_eq!(ended["how"], "returned", "{ended}");
+    assert_eq!(
+        ended["done"],
+        json!([{"kind": "task", "name": "job", "code": "job"}])
+    );
 }
 
 // ---------------------------------------------------------------------------- history

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The status line says what Python awaits.** While the running submission's code is in a
+  `runtime.wait` the session has recorded, `run-new`'s line reads `awaiting ci_run, review ·
+  execution 4 · 12m03s` in place of `Python running`: `the first of` for `FIRST_COMPLETED`, a
+  task nobody named as its coroutine (`watch_ci`, not `Task-7`), a handle as its child
+  (`c1 'reviewer'`), a typed call as its function (`review_section()`),
+  `and N more` past two names, and the time a timeout has left. The detail view gets a line as a
+  wait starts and one as it ends. After a gap in the events the line drops the wait and reads the
+  session's open waits to restore it. `scripts/render-session.py` notes each execution's waits
+  under it, and a "Waiting now" section names, per agent, the waits open at the end of the record,
+  which a `--host` page reloads as the record grows. (#697)
 - **A model's own `style` in `outrig run`.** A `[models.<name>]` row's `style` overrides its
   provider's, so one provider can serve models over different APIs: see the library's changelog.
   The banner names the style the model is called with.

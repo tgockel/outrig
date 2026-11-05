@@ -51,6 +51,7 @@ import ipaddress
 import json
 import math
 import os
+import re
 import socket
 import socketserver
 import sys
@@ -405,6 +406,67 @@ def tokens(value: object) -> str:
     return "" if n is None else f"{n:,}"
 
 
+AWAITED_MAX = 2  # of what a wait is on, how many are named before "and N more"
+
+
+def awaited_name(a: dict) -> str:
+    """One thing a wait is on, as a summary names it: a task by its name, a handle by its child,
+    or by its request while the child is unknown, a typed call by its function."""
+    kind = text(a.get("kind"))
+    child, name = text(a.get("child")), text(a.get("name"))
+    if kind == "task":
+        # A task nobody named reads as its coroutine, when it has one.
+        code = text(a.get("code"))
+        return code if code and re.fullmatch(r"Task-\d+", name) else name
+    if kind in ("submission", "request"):
+        if child:
+            return f"{child} '{name}'" if name else child
+        return f"{kind} {tokens(a.get('id'))}".rstrip()
+    if kind == "call":
+        return text(a.get("function")).rsplit(".", 1)[-1] + "()"
+    if kind == "skill":
+        return f"skill '{text(a.get('skill'))}'"
+    if kind == "future":
+        return text(a.get("type"))
+    return kind or "something"
+
+
+def awaited_names(on: list[dict], more: int | float) -> str:
+    names = [awaited_name(a) for a in on[:AWAITED_MAX]]
+    rest = max(len(on) - AWAITED_MAX, 0) + more
+    if not names:
+        return f"{tokens(rest)} futures" if rest else ""
+    return ", ".join(names) + (f" and {tokens(rest)} more" if rest else "")
+
+
+def awaited_lines(on: list[dict]) -> list[str]:
+    """Everything the record says of each thing a wait is on, one per line."""
+    lines = []
+    for a in on:
+        kind, name, id_ = text(a.get("kind")), text(a.get("name")), tokens(a.get("id"))
+        if child := text(a.get("child")):
+            to = f"to {child} '{name}'" if name else f"to {child}"
+        else:
+            to = "child not yet known"
+        if kind == "task":
+            code = text(a.get("code"))
+            line = f"task {name}" + (f" running {code}" if code else "")
+        elif kind == "submission":
+            line = f"submission {id_} {to}"
+        elif kind == "request":
+            line = f"request {id_} on channel {text(a.get('channel'))} {to}"
+        elif kind == "call":
+            line = f"call {id_} of {text(a.get('function'))} {to}"
+        elif kind == "skill":
+            line = f"skill invocation {id_} of '{text(a.get('skill'))}'"
+        elif kind == "future":
+            line = f"future {text(a.get('type'))}"
+        else:
+            line = " ".join(f"{k}={text(v)}" for k, v in a.items())
+        lines.append(line)
+    return lines
+
+
 def usage_of(value: object) -> dict[str, int | float]:
     return {name: num(obj(value).get(name)) or 0 for name, _ in USAGE}
 
@@ -459,6 +521,12 @@ class Builder:
         self.agents: set[str] = set()
         # The name each child's `agent.spawned` gave it, by subject.
         self.names: dict[str, str] = {}
+        # Each `runtime.wait` recorded starting and not yet ending, by its agent and the
+        # interpreter's id for it: the execution it belongs to, and the rows that say it began,
+        # on the execution's entry and on the timeline.
+        self.open_waits: dict[tuple[str, int | str], tuple[Exec, list[Item]]] = {}
+        # What each agent's code was still waiting on when the record ended, by the agent's label.
+        self.waiting: dict[str, list[Item]] = {}
         self.kind = ""
         self.time = ""
         self.subject = ""
@@ -1097,8 +1165,17 @@ class Builder:
         )
         self.add(f"exec {x.id}: exec {holder.id} held the interpreter", href=link(x.anchor))
 
+    def retire_waits(self, why: str, of: Exec | None = None) -> None:
+        """The waits still open ended, recorded or not: those of execution `of`, or every one."""
+        for k, (waiting, items) in list(self.open_waits.items()):
+            if of is None or waiting is of:
+                for item in items:
+                    item.summary += f" (no end recorded before {why})"
+                del self.open_waits[k]
+
     def on_exec_completed(self, d: dict) -> None:
         x = self.exec(d.get("execid"))
+        self.retire_waits("the execution ended", x)
         x.status = text(d.get("status"))
         x.duration = seconds(d.get("duration"))
         x.output = text(d.get("output"))
@@ -1143,6 +1220,44 @@ class Builder:
         summary = f"its namespace held {tokens(d.get('total'))} name(s)"
         self.note(d, summary, [Part("names", "\n".join(names))])
 
+    def on_exec_wait_started(self, d: dict) -> None:
+        on, more = objs(d.get("on")), num(d.get("more")) or 0
+        return_when = text(d.get("return_when"))
+        first = "the first of " if return_when == "FIRST_COMPLETED" and len(on) + more > 1 else ""
+        summary = f"awaiting {first}{awaited_names(on, more)}"
+        if return_when not in ("", "ALL_COMPLETED", "FIRST_COMPLETED"):
+            summary += f" ({return_when})"
+        if d.get("timeout") is not None:
+            summary += f", for up to {seconds(d.get('timeout'))}"
+        parts = [Part("awaiting", "\n".join(awaited_lines(on)))] if on else []
+        x = self.exec(d.get("execid"))
+        self.note(d, summary, parts)
+        rows = [x.notes[-1]] + ([self.last] if self.last is not None else [])
+        self.open_waits[(self.subject, key(d.get("wait")))] = (x, rows)
+
+    def on_exec_wait_ended(self, d: dict) -> None:
+        self.open_waits.pop((self.subject, key(d.get("wait"))), None)
+        how, done = text(d.get("how")), objs(d.get("done"))
+        channels = [text(c) for c in seq(d.get("channels"))]
+        error = text(d.get("error"))
+        said = {
+            "returned": "over",
+            "timeout": "timed out",
+            "message": "ended by a message",
+            "raised": "ended by an exception",
+        }.get(how, f"ended ({how})")
+        details = []
+        if done:
+            details.append(f"{awaited_names(done, 0)} done")
+        if channels:
+            details.append("message(s) waiting on " + ", ".join(channels))
+        if error:
+            details.append(error)
+        summary = f"wait {said} after {seconds(d.get('duration'))}"
+        if details:
+            summary += ": " + "; ".join(details)
+        self.note(d, summary, [Part("done", "\n".join(awaited_lines(done)))] if done else [])
+
     def on_tool_result_truncated(self, d: dict) -> None:
         self.note(
             d,
@@ -1171,6 +1286,8 @@ class Builder:
         self.add("", parts=[Part("text", text(d.get("text")), True)])
 
     def on_interpreter_exited(self, d: dict) -> None:
+        # Every agent's code ran in it, so nothing waits any longer, told of or not.
+        self.retire_waits("the interpreter exited")
         # One the session's shutdown stopped is expected; any other is the interpreter dying.
         if d.get("expected") is not True:
             self.health.append(
@@ -1207,6 +1324,14 @@ class Builder:
         all_blocks = [b for sec in self.sections.values() for b in sec.blocks]
         for item in (i for b in all_blocks for i in b.items if i.kind == "output.unattributed"):
             item.parts = [Part("text", "\n".join(p.body for p in item.parts), True)]
+        for x, items in self.open_waits.values():
+            for item in items:
+                item.summary += " (still waiting at the end of the record)"
+            item = items[0]
+            self.waiting.setdefault(x.subject, []).append(
+                Item(item.time, item.kind, f"exec {x.id}: {item.summary}", href=link(x.anchor))
+            )
+        self.open_waits.clear()
         if not records:
             self.health.append("The event log is empty: the agent never started.")
             return
@@ -1453,6 +1578,7 @@ def build(directory: Path) -> dict:
         "session_row": session_row,
         "sections": list(builder.sections.values()),
         "agents": agents,
+        "waiting": builder.waiting,
         "messages": list(builder.messages.values()),
         "requests": list(builder.requests.values()),
         "network": network,
@@ -1839,7 +1965,8 @@ nav a { margin-right: 1rem; }
 {% endmacro %}
 <h1>OutRig session {{ title }}</h1>
 <nav>
-<a href="#health">Record</a><a href="#tokens">Tokens</a><a href="#timeline">Timeline</a>
+<a href="#health">Record</a>{% if waiting %}<a href="#waiting">Waiting</a>{% endif %}
+<a href="#tokens">Tokens</a><a href="#timeline">Timeline</a>
 <a href="#executions">Executions</a><a href="#messages">Messages</a>
 <a href="#requests">Requests</a>
 {% if network is not none %}<a href="#network">Network</a>{% endif %}
@@ -1875,6 +2002,17 @@ nav a { margin-right: 1rem; }
 did not get -- because it fell behind, or could not write it -- shows as a gap, unless it came
 after the last one the log wrote, which leaves none. <code>outrig run-new</code> counts every such
 loss in a warning as the session ends.</p>
+
+{% if waiting %}
+<h2 id="waiting">Waiting now</h2>
+<p>What each agent's code was waiting on in <code>runtime.wait</code> when the record ended: a wait
+recorded starting and not ending. On a page served from a running session, this is what each
+agent is waiting on now.</p>
+{% for agent, items in waiting.items() %}
+<h3>{{ agent }}</h3>
+{% for i in items %}{{ row(i) }}{% endfor %}
+{% endfor %}
+{% endif %}
 
 <h2 id="tokens">Tokens</h2>
 <p>What each round used, as its provider reported it. A round's total adds up every call it made,

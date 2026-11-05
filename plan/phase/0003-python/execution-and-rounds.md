@@ -279,8 +279,11 @@ is `Task-7` everywhere it appears.
   rejection should name the holder's agent as well as its id.
 - What `unknown` does to the round. It is neither a completion nor a failure, and the host has to
   decide something.
-- Whether a very long round wants any operator visibility of its own. Nothing is wrong with a
-  round that lasts an hour, but nothing currently says it is happening either.
+- Whether a very long round wants more operator visibility than its waits give it. A
+  `runtime.wait` suspended for a second is recorded (`exec.wait.started`, `exec.wait.ended` in
+  `doc/reference/events.md`), named on `run-new`'s status line, and listed by `Session::waits`;
+  a bare `await handle` is not, and a round that computes for an hour still says only that
+  Python is running.
 
 ## Unverified
 

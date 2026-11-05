@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A long `runtime.wait` says what it waits on.** Once an agent's code has been suspended in
+  `runtime.wait` for a second, the interpreter tells the host what it waits on -- a task by its
+  name and coroutine, a handle by its request and child, a typed call by its function, a skill's
+  invocation, any other future by its type -- and, when it ends, how: it returned, its timeout
+  passed, a message arrived, or an exception ended it. The session records both under the waiting
+  agent's subject as `exec.wait.started` and `exec.wait.ended` (`Payload::ExecWaitStarted`,
+  `Payload::ExecWaitEnded`, with `Awaited`, `ReturnWhen`, and `WaitEnd`). `Session::waits` gives
+  a `Waits` handle whose `open()` lists every wait still open, the primary's and each child's, as
+  `OpenWait`s, from another task while a round runs; it reads what the interpreter has said and
+  never waits on it. Described from types and fields alone, so none of the agent's code runs for
+  it. A wait that ends within the second records nothing. (#697)
 - **A model's own `style`.** `[models.<name>].style` overrides its provider's `style` for that
   model, so an endpoint that serves some models over Chat Completions and others over Anthropic's
   Messages API or the Responses API is one provider, its `style` the default. The request still

@@ -551,6 +551,36 @@ def every_event() -> list[tuple[str, dict, str | None]]:
         ),
         ("exec.abandoned", {"execid": 2, "why": "user"}, a),
         (
+            "exec.wait.started",
+            {
+                "execid": 2,
+                "wait": 1,
+                "on": [
+                    {"kind": "task", "name": "n", "code": "c"},
+                    {"kind": "call", "id": 7, "function": "f", "child": "c1", "name": "n"},
+                    {"kind": "request", "id": 8, "channel": "ch", "child": None, "name": None},
+                ],
+                "more": 1,
+                "return_when": "FIRST_COMPLETED",
+                "timeout": 1.5,
+                "elapsed": 1.0,
+            },
+            a,
+        ),
+        (
+            "exec.wait.ended",
+            {
+                "execid": 2,
+                "wait": 1,
+                "how": "message",
+                "done": [{"kind": "submission", "id": 7, "child": "c1", "name": "n"}],
+                "channels": ["user"],
+                "error": "e",
+                "duration": 2.5,
+            },
+            a,
+        ),
+        (
             "exec.completed",
             {
                 "execid": 2,
@@ -1680,6 +1710,101 @@ class RenderSession(unittest.TestCase):
         self.assertIn('submitted as exec 4 -- <a href="#exec-4">', round_1)
         self.assertIn('id="exec-4"', html)
         self.assertIn('id="msg-2"', html)
+
+    def test_a_wait_is_noted_under_its_execution_with_how_it_ended(self) -> None:
+        events = ordinary()
+        at = next(i for i, e in enumerate(events) if e[0] == "exec.completed")
+        on = [
+            {"kind": "task", "name": "ci_run", "code": "watch"},
+            {"kind": "task", "name": "Task-7", "code": "watch_ci"},
+            {"kind": "call", "id": 7, "function": "pkg.review", "child": "c1", "name": "reviewer"},
+            {"kind": "future", "type": "Future"},
+        ]
+        events[at:at] = [
+            (
+                "exec.wait.started",
+                {
+                    "execid": 4,
+                    "wait": 1,
+                    "on": on,
+                    "more": 2,
+                    "return_when": "FIRST_COMPLETED",
+                    "timeout": 30,
+                },
+            ),
+            (
+                "exec.wait.ended",
+                {
+                    "execid": 4,
+                    "wait": 1,
+                    "how": "returned",
+                    "done": on[:1],
+                    "channels": [],
+                    "error": None,
+                    "duration": 12.5,
+                },
+            ),
+        ]
+        html = self.page(events)
+        self.assertIn(
+            "awaiting the first of ci_run, watch_ci and 4 more, for up to 30.00 s",
+            html,
+            "a task nobody named reads as its coroutine",
+        )
+        self.assertIn("wait over after 12.50 s: ci_run done", html)
+        self.assertIn("call 7 of pkg.review to c1", html)
+        self.assertNotIn("Waiting now", html)
+        self.assertNotIn("still waiting", html)
+
+    def test_a_wait_still_open_at_the_end_is_listed_under_its_agent(self) -> None:
+        events = ordinary()
+        at = next(i for i, e in enumerate(events) if e[0] == "exec.completed")
+        started = (
+            "exec.wait.started",
+            {
+                "execid": 4,
+                "wait": 1,
+                "on": [{"kind": "task", "name": "ci_run", "code": "watch"}],
+                "more": 0,
+                "return_when": "ALL_COMPLETED",
+                "timeout": None,
+            },
+        )
+        # Ended with its execution: not still waiting.
+        events[at:at] = [started]
+        html = self.page(events)
+        self.assertIn("awaiting ci_run (no end recorded before the execution ended)", html)
+        self.assertNotIn("Waiting now", html)
+        # The record ends inside the execution: still waiting, and listed under its agent.
+        events = ordinary()[:at] + [started]
+        html = self.page(events)
+        self.assertIn("Waiting now", html)
+        self.assertIn('<a href="#waiting">Waiting</a>', html)
+        self.assertIn("exec 4: awaiting ci_run (still waiting at the end of the record)", html)
+
+    def test_a_wait_open_when_the_interpreter_exited_is_not_still_waiting(self) -> None:
+        """A task of a finished execution can start a wait after it; the interpreter's exit,
+        expected or not, ends that wait whether or not its end was recorded."""
+        events = ordinary()
+        at = next(i for i, e in enumerate(events) if e[0] == "exec.completed") + 1
+        started = (
+            "exec.wait.started",
+            {
+                "execid": 4,
+                "wait": 2,
+                "on": [{"kind": "task", "name": "poll", "code": "poll"}],
+                "more": 0,
+                "return_when": "ALL_COMPLETED",
+                "timeout": None,
+                "elapsed": 1.0,
+            },
+        )
+        for expected in (True, False):
+            exited = ("interpreter.exited", {"cause": "end of output", "expected": expected})
+            html = self.page(events[:at] + [started, exited])
+            self.assertIn("awaiting poll (no end recorded before the interpreter exited)", html)
+            self.assertNotIn("Waiting now", html)
+            self.assertNotIn("still waiting", html)
 
     def test_a_late_result_says_where_it_was_submitted(self) -> None:
         events = ordinary()

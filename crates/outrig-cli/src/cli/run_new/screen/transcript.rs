@@ -136,8 +136,11 @@ impl Entry {
                     text,
                 )
             }
-            Fact::Exec { exec, what } => {
+            Fact::Exec { exec, what } | Fact::Awaited { exec, what, .. } => {
                 Self::new(Kind::Detail, format!("execution {exec}: {what}"))
+            }
+            Fact::Awaiting { exec, on, .. } => {
+                Self::new(Kind::Detail, format!("execution {exec}: awaiting {on}"))
             }
             Fact::RoundEnded {
                 round,

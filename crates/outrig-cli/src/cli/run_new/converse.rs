@@ -60,7 +60,9 @@ use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesOrdered, StreamExt};
 use outrig::harness::event::{Payload, Received, Subscription};
-use outrig::harness::{RoundEnd, RoundOutcome, Session, SessionError, StillRunning, Tasks};
+use outrig::harness::{
+    RoundEnd, RoundOutcome, Session, SessionError, StillRunning, Tasks, Waits,
+};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Mutex, mpsc};
 
@@ -143,6 +145,7 @@ pub(super) async fn converse(
     let mut term = Terminal {
         view,
         reading: true,
+        waits: session.waits(),
     };
     let left = drive(
         session, shown, &mut term, typed, interrupts, failures, signals,
@@ -590,8 +593,7 @@ fn tasks(running: &StillRunning) -> Option<(&[String], usize)> {
 fn still_running(running: Option<(&[String], usize)>) -> Option<String> {
     match running {
         Some(([], _)) => None,
-        Some((names, 0)) => Some(names.join(", ")),
-        Some((names, more)) => Some(format!("{} and {more} more", names.join(", "))),
+        Some((names, more)) => Some(screen::joined(names, more as u64)),
         None => Some("could not tell -- Python did not answer".to_string()),
     }
 }
@@ -659,6 +661,9 @@ struct Terminal<'a> {
     /// Whether input is still being read. Once it is not, there is no prompt
     /// to draw.
     reading: bool,
+    /// What lists the waits the session's agents are in, for the screen
+    /// after a gap in the events.
+    waits: Waits,
 }
 
 /// A place for one of the agent's messages, in whichever frontend shows it.
@@ -741,7 +746,15 @@ impl Terminal<'_> {
     fn event(&self, received: Received) {
         let out = match self.view {
             Frontend::Lines(out) => out,
-            Frontend::Screen(screen) => return screen.event(&received),
+            Frontend::Screen(screen) => {
+                screen.event(&received);
+                // The gap may have hidden a wait starting or ending: what is
+                // open now is read back, which only the screen shows.
+                if let Received::Missed(_) = received {
+                    screen.waiting(self.waits.open());
+                }
+                return;
+            }
         };
         if let Some(line) = screen::conversation_line(&received) {
             self.note(&line);

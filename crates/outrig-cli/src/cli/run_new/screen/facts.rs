@@ -15,10 +15,12 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use outrig::harness::OpenWait;
 use outrig::harness::event::{
-    Abandoned, ExecStatus, Payload, ProbeVerdict, Received, Refusal, SessionState, Subject, Usage,
+    Abandoned, Awaited, ExecStatus, Payload, ProbeVerdict, Received, Refusal, ReturnWhen,
+    SessionState, Subject, Usage, WaitEnd,
 };
 
 use serde_json::Value;
@@ -43,6 +45,9 @@ const WHY: &[&str] = &[
 /// The channel the agent and the user talk on, and the user's end of it, as
 /// the session's events name them.
 const USER: &str = "user";
+
+/// How many of what a wait is on the line names before `and N more`.
+const AWAITED_MAX: usize = 2;
 
 /// What the session is doing, as the status line says it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +95,22 @@ pub(super) enum Fact {
     /// Something that happened to a submission, said in a line.
     Exec {
         exec: u64,
+        what: String,
+    },
+    /// Submission `exec`'s code has been in a `runtime.wait` for a second:
+    /// what it waits on, as the line says it, and how long its timeout has
+    /// left, counted from when the wait began rather than from when it was
+    /// told of.
+    Awaiting {
+        exec: u64,
+        wait: u64,
+        on: String,
+        left: Option<Duration>,
+    },
+    /// That wait ended: how, as the line says it.
+    Awaited {
+        exec: u64,
+        wait: u64,
         what: String,
     },
     /// A call failed and is tried again after `delay`. The library logs it
@@ -247,6 +268,34 @@ fn from_payload(payload: &Payload) -> Option<Fact> {
                 .iter()
                 .map(|earlier| (earlier.id.get(), earlier.output.clone(), earlier.dropped))
                 .collect(),
+        },
+        Payload::ExecWaitStarted {
+            execid,
+            wait,
+            on,
+            more,
+            return_when,
+            timeout,
+            elapsed,
+            ..
+        } => Fact::Awaiting {
+            exec: execid.get(),
+            wait: *wait,
+            on: awaiting(on, *more, *return_when),
+            left: timeout.map(|timeout| timeout.saturating_sub(*elapsed)),
+        },
+        Payload::ExecWaitEnded {
+            execid,
+            wait,
+            how,
+            done,
+            channels,
+            error,
+            ..
+        } => Fact::Awaited {
+            exec: execid.get(),
+            wait: *wait,
+            what: awaited(*how, done, channels, error.as_deref()),
         },
         Payload::ExecRefused {
             execid,
@@ -492,6 +541,106 @@ fn tokens(usage: &Usage) -> u64 {
 }
 
 /// `text`, cut to `max` characters.
+/// What a wait is on, as the line says it: `ci_run, review`, `the first of
+/// ci_run, review`, or `ci_run, review and 3 more`.
+fn awaiting(on: &[Awaited], more: u64, return_when: ReturnWhen) -> String {
+    let names = names_of(on, more);
+    if return_when == ReturnWhen::FirstCompleted && (on.len() + more as usize) > 1 {
+        format!("the first of {names}")
+    } else {
+        names
+    }
+}
+
+/// How a wait ended, as the line says it.
+fn awaited(how: WaitEnd, done: &[Awaited], channels: &[String], error: Option<&str>) -> String {
+    let done = names_of(done, 0);
+    match how {
+        WaitEnd::Returned if done.is_empty() => "wait over".to_string(),
+        WaitEnd::Returned => format!("wait over: {done} done"),
+        WaitEnd::Timeout if done.is_empty() => "wait timed out".to_string(),
+        WaitEnd::Timeout => format!("wait timed out; {done} done"),
+        WaitEnd::Message => format!("wait ended: a message arrived on {}", channels.join(", ")),
+        WaitEnd::Raised => format!("wait ended by {}", error.unwrap_or("an exception")),
+        _ => "wait ended".to_string(),
+    }
+}
+
+/// The first [`AWAITED_MAX`] of `on` by name, and how many more: those past
+/// them, and `more`, which the event did not list.
+fn names_of(on: &[Awaited], more: u64) -> String {
+    let names: Vec<String> = on.iter().take(AWAITED_MAX).map(awaited_name).collect();
+    let rest = on.len().saturating_sub(AWAITED_MAX) as u64 + more;
+    match (names.is_empty(), rest) {
+        (true, 0) => String::new(),
+        (true, rest) => format!("{rest} futures"),
+        (false, rest) => joined(&names, rest),
+    }
+}
+
+/// `names`, and how many more there are: `a, b`, or `a, b and 3 more`.
+pub(in crate::cli::run_new) fn joined(names: &[String], more: u64) -> String {
+    match more {
+        0 => names.join(", "),
+        more => format!("{} and {more} more", names.join(", ")),
+    }
+}
+
+/// One thing a wait is on, as the line names it: a task by its name, or by
+/// its coroutine when it was left with asyncio's `Task-N`; a handle by its
+/// child, or by its request while the child is unknown; a typed call by its
+/// function.
+fn awaited_name(awaited: &Awaited) -> String {
+    let (what, id, child, name) = match awaited {
+        Awaited::Task { name, code, .. } => {
+            return match code {
+                Some(code) if is_default_task_name(name) => code.clone(),
+                _ => name.clone(),
+            };
+        }
+        Awaited::Call { function, .. } => {
+            return format!("{}()", function.rsplit('.').next().unwrap_or(function));
+        }
+        Awaited::Skill { skill, .. } => return format!("skill '{skill}'"),
+        Awaited::Future { type_name, .. } => return type_name.clone(),
+        Awaited::Submission {
+            id, child, name, ..
+        } => ("submission", id, child, name),
+        Awaited::Request {
+            id, child, name, ..
+        } => ("request", id, child, name),
+        _ => return "something".to_string(),
+    };
+    match (child, name, id) {
+        (Some(child), Some(name), _) if !name.is_empty() => format!("{child} '{name}'"),
+        (Some(child), _, _) => child.clone(),
+        (None, _, Some(id)) => format!("{what} {id}"),
+        (None, _, None) => what.to_string(),
+    }
+}
+
+/// Whether `name` is one asyncio gave a task nobody named: `Task-7`.
+fn is_default_task_name(name: &str) -> bool {
+    name.strip_prefix("Task-")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The main agent's waits among `open`, as the facts that would have set
+/// them: what restores the status line after a gap in the events hid one.
+pub(super) fn restored(open: &[OpenWait], now: Instant) -> Vec<Fact> {
+    open.iter()
+        .filter(|wait| wait.agent.as_str() == MAIN_AGENT)
+        .map(|wait| Fact::Awaiting {
+            exec: wait.execid.get(),
+            wait: wait.wait,
+            on: awaiting(&wait.on, wait.more, wait.return_when),
+            left: wait
+                .timeout
+                .map(|timeout| (wait.since + timeout).saturating_duration_since(now)),
+        })
+        .collect()
+}
+
 pub(super) fn cut(text: &str, max: usize) -> String {
     match text.char_indices().nth(max) {
         Some((at, _)) => format!("{}...", &text[..at]),
@@ -562,5 +711,66 @@ mod tests {
         assert_eq!(cut("abcdef", 3), "abc...");
         assert_eq!(cut("abc", 3), "abc");
         assert_eq!(cut("日本語の", 2), "日本...");
+    }
+
+    /// One thing a wait is on, read as the library would read it from the
+    /// interpreter's line: the one way this crate can hold one.
+    fn one(json: serde_json::Value) -> Awaited {
+        serde_json::from_value(json).expect("an awaited")
+    }
+
+    /// What a wait is on, as the line names it: a task by its name, a handle
+    /// by its child, or by its request while the child is unknown, a typed
+    /// call by its function; two names and then a count; and `the first of`
+    /// for `FIRST_COMPLETED` when there is more than one.
+    #[test]
+    fn what_a_wait_awaits_is_named_as_the_line_says_it() {
+        let task = one(serde_json::json!({"kind": "task", "name": "ci_run", "code": "watch"}));
+        let unnamed = one(serde_json::json!({"kind": "task", "name": "Task-7", "code": "watch_ci"}));
+        let bare = one(serde_json::json!({"kind": "task", "name": "Task-8", "code": null}));
+        let child = one(serde_json::json!(
+            {"kind": "submission", "id": 7, "child": "c1", "name": "reviewer"}
+        ));
+        let unknown = one(serde_json::json!(
+            {"kind": "request", "id": 8, "channel": "fizz", "child": null, "name": null}
+        ));
+        let call = one(serde_json::json!(
+            {"kind": "call", "id": 9, "function": "pkg.mod.review_section", "child": null, "name": null}
+        ));
+        let skill = one(serde_json::json!({"kind": "skill", "id": 3, "skill": "lint"}));
+        let future = one(serde_json::json!({"kind": "future", "type": "Future"}));
+        assert_eq!(awaiting(std::slice::from_ref(&task), 0, ReturnWhen::AllCompleted), "ci_run");
+        assert_eq!(
+            awaiting(&[unnamed, bare], 0, ReturnWhen::AllCompleted),
+            "watch_ci, Task-8",
+            "a task nobody named reads as its coroutine, when it has one"
+        );
+        assert_eq!(
+            awaiting(&[task.clone(), child], 0, ReturnWhen::FirstCompleted),
+            "the first of ci_run, c1 'reviewer'"
+        );
+        assert_eq!(
+            awaiting(std::slice::from_ref(&task), 0, ReturnWhen::FirstCompleted),
+            "ci_run",
+            "one thing has no first"
+        );
+        assert_eq!(
+            awaiting(&[unknown, call, skill, future], 2, ReturnWhen::AllCompleted),
+            "request 8, review_section() and 4 more"
+        );
+        assert_eq!(awaited(WaitEnd::Returned, std::slice::from_ref(&task), &[], None), "wait over: ci_run done");
+        assert_eq!(awaited(WaitEnd::Timeout, &[], &[], None), "wait timed out");
+        assert_eq!(
+            awaited(WaitEnd::Timeout, &[task], &[], None),
+            "wait timed out; ci_run done"
+        );
+        assert_eq!(
+            awaited(WaitEnd::Message, &[], &["user".to_string()], None),
+            "wait ended: a message arrived on user"
+        );
+        assert_eq!(
+            awaited(WaitEnd::Raised, &[], &[], Some("CancelledError")),
+            "wait ended by CancelledError"
+        );
     }
 }

@@ -344,6 +344,30 @@ three times for one call before the rejection ends it.
 - `inventory.observed` -- what the agent's namespace held when a liveness check was answered,
   which is only while an execution has run 30 seconds or more: `execid`; `names`, each
   `{name, type}`; `total`; and `more`, those past the 200 listed.
+- `exec.wait.started` -- a `runtime.wait` the agent's code has been suspended in for a second,
+  which a shorter wait never records. Described from types and fields alone: none of the agent's
+  code runs for it.
+  - `execid`, and `wait`, the interpreter's id for the wait, which its end carries too.
+  - `on`: what it waits on, at most 50 entries, and `more`, those past them. Each entry is one of
+    `{kind: "task", name, code}`, a task by its name and its coroutine's qualified name, or
+    `null` when it has none; `{kind: "submission", id, child, name}` or
+    `{kind: "request", id, channel, child, name}`, a handle's submission to, or request on a
+    channel of, the child `child`, whose spawn name is `name`, both `null` until the child
+    exists; `{kind: "call", id, function, child, name}`, a typed call of the `@outrig.agent`
+    function `function`, by its qualified name, with its child once it exists;
+    `{kind: "skill", id, skill}`, a skill's invocation; or `{kind: "future", type}`, any other
+    future, by its type's qualified name.
+  - `return_when`: asyncio's `FIRST_COMPLETED`, `FIRST_EXCEPTION`, or `ALL_COMPLETED`.
+  - `timeout`: seconds, or `null`; and `elapsed`, how many seconds the wait had lasted when it
+    was recorded, from which the timeout counts.
+- `exec.wait.ended` -- that wait ended.
+  - `execid` and `wait`.
+  - `how`: `returned` once its futures satisfied `return_when`; `timeout` once its timeout
+    passed; `message` once one arrived and `MessageAvailable` was raised; or `raised` when
+    another exception ended it, a cancel or an interrupt.
+  - `done`: what was done by then, as `on` lists them; `channels`, those a message waited on;
+    and `error`, the exception's name for `raised`, else `null`.
+  - `duration`: seconds since the wait began.
 - `tool.result.truncated` -- a result cut to `tool-result-max`: `execid`; `size`, the bytes
   before the cut; `max`; and `kept`.
 - `context.promoted`, `context.demoted` -- `turns`, the ids the agent's code named.

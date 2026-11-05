@@ -21,7 +21,7 @@ use crate::agent::orientation::Holdings;
 use crate::agent::window::Windows;
 use crate::agent::{Agent, AgentError, ResolvedAgent};
 use crate::config::{Config, Secrets};
-use crate::python::host::{Interpreter, PRIMARY, bindings_message};
+use crate::python::host::{Interpreter, PRIMARY, Waits, bindings_message};
 use crate::python::hosted::Relay;
 use crate::python::supervisor::STOP_GRACE;
 
@@ -310,6 +310,15 @@ impl Session {
     /// runs, as [`Session::interrupter`] interrupts one.
     pub fn closer(&self) -> Closer {
         Closer(Arc::clone(&self.lifecycle))
+    }
+
+    /// What lists the `runtime.wait`s the session's agents' code is suspended
+    /// in -- the primary's and each child's, what each waits on and since
+    /// when -- from another task while [`Session::round`] runs. It is read
+    /// from what the interpreter has said, so it never waits on the
+    /// interpreter, and it lists no wait until it has lasted a second.
+    pub fn waits(&self) -> Waits {
+        self.interpreter.waits()
     }
 
     /// Bind the live object `brief` describes, which the program on the host

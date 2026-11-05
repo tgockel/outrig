@@ -37,6 +37,8 @@ mod transcript;
 mod tty;
 mod viewport;
 
+pub(super) use self::facts::joined;
+
 use std::collections::VecDeque;
 use std::fs::File;
 use std::future::Future;
@@ -48,6 +50,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use outrig::harness::OpenWait;
 use outrig::harness::event::Received;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -295,6 +298,15 @@ impl Screen {
     /// The channel took a typed line, with `waiting` messages on it.
     pub(super) fn queued(&self, waiting: usize) {
         self.say(ToScreen::Queued(waiting));
+    }
+
+    /// The waits open across the session's agents, read after a gap in the
+    /// events may have hidden one starting or ending: the main agent's are
+    /// taken as the facts that would have set them.
+    pub(super) fn waiting(&self, open: Vec<OpenWait>) {
+        for fact in facts::restored(&open, Instant::now()) {
+            self.say(ToScreen::Fact(fact));
+        }
     }
 
     /// A place for one more of the agent's messages, waiting until one of
