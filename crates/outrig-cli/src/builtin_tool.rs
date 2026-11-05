@@ -22,6 +22,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::llm::{ANTHROPIC_FALLBACK_MAX_TOKENS, EffectiveCeiling, TurnUndo};
+use crate::notice::notice;
 use crate::rig_tool::truncate_for_llm;
 use crate::subagent::state::{GaveUp, Outcome, SubagentShared};
 use crate::subagent::{Read, SubagentRegistry};
@@ -199,7 +200,7 @@ impl ToolDyn for SubagentTool {
                     let suffix = launched_as.map_or(String::new(), |label| {
                         format!(" (model: {})", label.display_name())
                     });
-                    eprintln!(
+                    notice!(
                         "[outrig] subagent {} started{suffix}",
                         self.registry.path_of(&args.name)
                     );
@@ -760,7 +761,7 @@ impl SetResultTool {
             self.agent_name.as_deref(),
             self.ceilings.get().map_or(&[], Vec::as_slice),
         );
-        eprintln!(
+        notice!(
             "[outrig]   [{}] set_result was cut off before `body`: the model's \
              output-token ceiling is too low for this report. {remedy}.",
             self.label

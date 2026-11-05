@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Lines written while the `>` prompt is up no longer garble it.** The session watcher's
+  container-death notice, `tracing` records, a background subagent's tool-call traces and
+  failures, retry and failover notices, and the other stderr lines raised from outside the line
+  editor landed on the row the editor believed it owned, so the next refresh painted from the
+  wrong screen and the displayed prompt stopped matching the text about to be sent. They now go
+  through one channel that writes at once when no prompt is up -- so ordering against a streamed
+  reply is unchanged -- and holds them while one is, writing them when the read ends. A
+  test pins that the modules which can run during a prompt write through it. (#439)
 - **The repo-config walk no longer treats a config it cannot `stat` as absent.** A
   `.agents/outrig/config.toml` under a directory without search permission for the invoking
   user made `is_file()` false, the same as a missing file, so the walk went on past it: `run`

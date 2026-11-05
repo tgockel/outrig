@@ -72,6 +72,7 @@ use rig::http_client::{
 use rig::streaming::StreamingCompletionResponse;
 use rig::wasm_compat::WasmCompatSend;
 
+use crate::notice::notice;
 use super::is_blank;
 
 /// First backoff delay; doubles each attempt, capped at [`RetryPolicy::max_delay`].
@@ -559,7 +560,7 @@ impl<M: CompletionModel> RetryingModel<M> {
                 return Err(CompletionError::ResponseError(message));
             };
 
-            eprintln!(
+            notice!(
                 "{}",
                 super::labeled_line(format!(
                     "model returned an unusable response ({message}); retry in {:.1}s \
@@ -597,7 +598,7 @@ fn report_textless_completion<R: serde::Serialize>(
     }
 
     let finish_reason = provider_finish_reason(&response.raw_response);
-    eprintln!("{}", textless_line(finish_reason.as_deref(), max_tokens));
+    notice!("{}", textless_line(finish_reason.as_deref(), max_tokens));
 }
 
 /// Whether a completion showed the user anything: non-blank text, or a tool
@@ -769,7 +770,7 @@ where
         // wait does not wrap in a terminal the user is watching. The budget
         // shown is the one actually being spent against, so a connect failure
         // does not count down against a ten-minute bound it will never reach.
-        eprintln!(
+        notice!(
             "{}",
             super::labeled_line(format!(
                 "LLM call failed ({}); retry in {:.1}s ({}; {}s/{}s spent)",

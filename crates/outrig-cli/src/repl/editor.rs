@@ -421,6 +421,10 @@ impl Drop for TerminalModeGuard {
         let _ = termios::tcsetattr(&self.tty, SetArg::TCSANOW, &self.saved);
         let _ = (&self.tty).write_all(BRACKETED_PASTE_OFF);
         let _ = install_sigint_action(&self.saved_sigint);
+
+        // Last, with the terminal back: a notice held for a read that never
+        // returned is written now instead of dying with the process.
+        crate::notice::release();
     }
 }
 
@@ -498,7 +502,10 @@ impl EditorSource {
         // unprocessed until the next byte arrives. Measured on a pty: `slow\r`
         // echoed `s` and accepted the line only when a byte arrived two
         // seconds later; without the printer the same bytes are handled at
-        // once. Prompt-safe notices are #439.
+        // once. Out-of-band lines are held for the span of a read instead, and
+        // written when it ends: `crate::notice` (#439). Once a rustyline
+        // release drains its buffer before selecting, the printer can replace
+        // the holding.
         let (requests, inbox) = mpsc::channel();
         let reader_lease = Arc::clone(&lease);
         let tid = Arc::new(AtomicI32::new(0));
@@ -541,6 +548,11 @@ fn reader_loop(mut editor: DefaultEditor, inbox: &mpsc::Receiver<Request>, lease
             let Some(_reading) = lease.acquire() else {
                 return;
             };
+            // Lines other tasks raise while the prompt is up wait for it to
+            // end, then come out ahead of the reply below -- see `notice`.
+            // Dropped at the end of this block, after rustyline has restored
+            // the terminal and before the line is handed on.
+            let _held = crate::notice::reading();
             editor.readline(&request.prompt)
         };
         if request.reply.send(line).is_err() {
@@ -832,17 +844,10 @@ mod tests {
     /// the file it reports progress to.
     const PTY_CHILD_REPORT: &str = "OUTRIG_TEST_EDITOR_PTY_REPORT";
 
-    /// #437 end to end, against real rustyline on a terminal that is the
-    /// child's controlling one: a prompt is up, the REPL future is dropped
-    /// (as the session watcher does when the primary container dies), and a
-    /// line typed during teardown must still be there for whoever reads the
-    /// terminal next -- not taken by the reader thread left behind.
-    #[test]
-    fn a_read_cancelled_mid_prompt_leaves_teardown_keystrokes_queued() {
-        if let Some(report) = std::env::var_os(PTY_CHILD_REPORT) {
-            pty_child(std::path::Path::new(&report));
-            return;
-        }
+    /// Run this test binary again as `test`, with a fresh pty as its controlling
+    /// terminal, reporting progress to a file. Returns the child, the pty's master
+    /// end, and the report's path.
+    fn spawn_on_pty(test: &str) -> (std::process::Child, File, std::path::PathBuf) {
         use std::os::unix::process::CommandExt as _;
         use std::process::{Command, Stdio};
 
@@ -856,12 +861,7 @@ mod tests {
         let slave = File::from(pty.slave);
         let mut command = Command::new(std::env::current_exe().expect("test binary"));
         command
-            .args([
-                "repl::editor::tests::a_read_cancelled_mid_prompt_leaves_teardown_keystrokes_queued",
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
             .env(PTY_CHILD_REPORT, &report)
             .env("TERM", "xterm-256color")
             .stdin(Stdio::from(slave.try_clone().expect("dup")))
@@ -870,7 +870,7 @@ mod tests {
         // SAFETY: the hook runs in the forked child, and calls only `setsid`
         // and `ioctl`, both async-signal-safe: a new session, with the pty --
         // already on stdin -- as its controlling terminal.
-        let mut child = unsafe {
+        let child = unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
@@ -878,27 +878,45 @@ mod tests {
                 Ok(())
             })
         }
-            .spawn()
-            .expect("spawn the child on the pty");
+        .spawn()
+        .expect("spawn the child on the pty");
+        (child, File::from(pty.master), report)
+    }
+
+    /// Poll `report` until a line starts with `what`, or 20 seconds pass; the text so far.
+    fn wait_for_report(report: &std::path::Path, what: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let text = std::fs::read_to_string(report).unwrap_or_default();
+            if text.lines().any(|l| l.starts_with(what)) || Instant::now() >= deadline {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// #437 end to end, against real rustyline on a terminal that is the
+    /// child's controlling one: a prompt is up, the REPL future is dropped
+    /// (as the session watcher does when the primary container dies), and a
+    /// line typed during teardown must still be there for whoever reads the
+    /// terminal next -- not taken by the reader thread left behind.
+    #[test]
+    fn a_read_cancelled_mid_prompt_leaves_teardown_keystrokes_queued() {
+        if let Some(report) = std::env::var_os(PTY_CHILD_REPORT) {
+            pty_child(std::path::Path::new(&report));
+            return;
+        }
+        let (mut child, mut master, report) = spawn_on_pty(
+            "repl::editor::tests::a_read_cancelled_mid_prompt_leaves_teardown_keystrokes_queued",
+        );
 
         // Drain what the child draws, so it never blocks on a full pty.
-        let mut master = File::from(pty.master);
         let mut drain = master.try_clone().expect("dup master");
         std::thread::spawn(move || {
             let mut sink = [0u8; 4096];
             while matches!(std::io::Read::read(&mut drain, &mut sink), Ok(n) if n > 0) {}
         });
-
-        let wait_for = |what: &str| {
-            let deadline = Instant::now() + Duration::from_secs(20);
-            loop {
-                let text = std::fs::read_to_string(&report).unwrap_or_default();
-                if text.lines().any(|l| l.starts_with(what)) || Instant::now() >= deadline {
-                    return text;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        };
+        let wait_for = |what: &str| wait_for_report(&report, what);
 
         let text = wait_for("cancelled");
         assert!(text.contains("cancelled"), "child never cancelled its read: {text:?}");
@@ -940,5 +958,99 @@ mod tests {
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).expect("read stdin");
         log(&format!("read {line:?}"));
+    }
+
+    /// #439 end to end: a line raised while the prompt is up stays off the terminal until
+    /// the read ends, then comes out after the line typed -- and the line typed, written as
+    /// one chunk, is accepted at once rather than stalling on a later byte, which is what
+    /// rustyline's `ExternalPrinter` would have done.
+    #[test]
+    fn a_notice_raised_mid_prompt_waits_for_the_read_to_end() {
+        if let Some(report) = std::env::var_os(PTY_CHILD_REPORT) {
+            notice_pty_child(std::path::Path::new(&report));
+            return;
+        }
+        let (mut child, mut master, report) =
+            spawn_on_pty("repl::editor::tests::a_notice_raised_mid_prompt_waits_for_the_read_to_end");
+
+        let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut drain = master.try_clone().expect("dup master");
+        let collected = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = std::io::Read::read(&mut drain, &mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                collected.lock().unwrap().extend_from_slice(&chunk[..n]);
+            }
+        });
+        let output = || String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+
+        let text = wait_for_report(&report, "noticed");
+        assert!(text.contains("noticed"), "child never raised its notice: {text:?}");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !output().contains(NOTICE_TEXT),
+            "the notice reached the terminal under a live prompt: {:?}",
+            output(),
+        );
+
+        master.write_all(b"hello\r").expect("type");
+        let text = wait_for_report(&report, "line ");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !output().contains(NOTICE_TEXT) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let screen = output();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&report);
+
+        assert!(
+            text.contains("line \"hello\""),
+            "the line typed in one chunk was not accepted: {text:?}",
+        );
+        let typed = screen.find("hello").expect("the typed line is echoed");
+        let held = screen.find(NOTICE_TEXT).expect("the held notice is written once the read ends");
+        assert!(typed < held, "the notice must follow the line typed: {screen:?}");
+    }
+
+    const NOTICE_TEXT: &str = "a notice raised under the prompt";
+
+    /// The child's half: a prompt is up, another thread raises a notice, then the line comes.
+    fn notice_pty_child(report: &std::path::Path) {
+        let log = |line: &str| {
+            let mut f = File::options()
+                .create(true)
+                .append(true)
+                .open(report)
+                .expect("report");
+            writeln!(f, "{line}").expect("report");
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut source = EditorSource::try_new().expect("a line editor on the pty");
+            let mut out = tokio::io::sink();
+            // Like the watcher: another thread, while the prompt is up.
+            let raiser = std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                crate::notice::notice!("{NOTICE_TEXT}");
+            });
+            let waiting = source.read_line("> ", &mut out, std::future::pending());
+            let line = tokio::join!(waiting, async {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                log("noticed");
+            })
+            .0;
+            raiser.join().expect("raiser");
+            match line.expect("read") {
+                LineEvent::Line(line) => log(&format!("line {line:?}")),
+                _ => log("line other"),
+            }
+        });
     }
 }

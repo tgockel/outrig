@@ -33,6 +33,7 @@ internal_modules! {
 pub(crate) mod builtin_image;
 pub(crate) mod builtin_tool;
 pub(crate) mod mcp_self;
+pub(crate) mod notice;
 pub(crate) mod self_tool;
 pub(crate) mod subagent;
 pub(crate) mod term;

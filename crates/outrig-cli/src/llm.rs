@@ -19,6 +19,7 @@ use thiserror::Error;
 #[cfg(feature = "local-llm")]
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+use crate::notice::notice;
 use crate::error::{CliError, Result};
 use crate::session_tool::{self, SessionTool, SharedTools};
 use outrig::config::{Config, DEFAULT_TOOL_CALL_MAX, LlmProvider, MistralrsDeviceSpec};
@@ -1456,7 +1457,7 @@ impl failover::Candidate for LazyLocalCandidate {
             // on -- which reads as "and the next one is answering now". The
             // wording is the subagent path's, because it is the same wait.
             if !self.registry.is_loaded(&self.candidate.model_name) {
-                eprintln!(
+                notice!(
                     "{}",
                     labeled_line(format!(
                         "loading in-process model {} (first use; this may take \
@@ -1873,7 +1874,7 @@ fn warn_local_llm_deprecated(candidate: &ResolvedCandidate) {
     {
         return;
     }
-    eprintln!("{}", local_llm_deprecation_notice(&candidate.model_name));
+    notice!("{}", local_llm_deprecation_notice(&candidate.model_name));
 }
 
 /// Say, once per model, that outrig picked an output-token ceiling nobody asked
@@ -1903,7 +1904,7 @@ fn warn_fallback_ceiling(candidate: &ResolvedCandidate) {
     {
         return;
     }
-    eprintln!(
+    notice!(
         "[outrig] {} has no published output-token ceiling in this build, so turns \
          are capped at {ANTHROPIC_FALLBACK_MAX_TOKENS}. Set [models.{}].max-tokens \
          (or the agent's) to choose your own.",
@@ -2653,7 +2654,7 @@ fn endpoint_failed(
     } else {
         HISTORY_UNCHANGED
     };
-    eprintln!("{}", hook.turn_end_notice(&reason, tried, advice));
+    notice!("{}", hook.turn_end_notice(&reason, tried, advice));
     Ok(TurnEnd {
         // Nothing belongs on stdout: the model never spoke, or spoke only in
         // tool calls, which the history now holds. `repl.rs`'s
@@ -2772,7 +2773,7 @@ fn handle_prompt_error(
         ),
         other => return Err(other.into()),
     };
-    eprintln!(
+    notice!(
         "{}",
         hook.turn_end_notice(&reason, None, PARTIAL_HISTORY_RETAINED)
     );
@@ -3199,7 +3200,7 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
                         self.max
                     ));
                 }
-                eprintln!(
+                notice!(
                     "[outrig] {}tool call: {tool_name}({args})",
                     self.trace_prefix()
                 );

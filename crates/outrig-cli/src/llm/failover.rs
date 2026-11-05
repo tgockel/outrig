@@ -56,6 +56,7 @@ use rig::completion::{
 };
 use rig::streaming::StreamingCompletionResponse;
 
+use crate::notice::notice;
 use super::retry::RetryPolicy;
 
 /// One candidate of a chain, behind an object-safe interface.
@@ -388,7 +389,7 @@ impl CompletionModel for FailoverModel {
                     // can be half one model's work, which is the stronger
                     // version of the same hazard and wants the same mitigation.
                     if let Some(next) = self.candidates.get(index + 1) {
-                        eprintln!(
+                        notice!(
                             "{}",
                             move_announcement(candidate.model_name(), &error, next.model_name())
                         );

@@ -43,6 +43,7 @@ use outrig::config::Config;
 use tokio::task::JoinHandle;
 
 use crate::llm::{ResolvedAgent, ResolvedCandidate, TurnStop};
+use crate::notice::notice;
 use crate::session_tool::{SessionTool, SharedTools};
 use state::{GaveUp, Outcome, SubagentShared};
 
@@ -284,7 +285,7 @@ impl SubagentRegistry {
             && resolved.model_weights().is_some()
             && !self.ctx.registry.is_loaded(resolved.model_name())
         {
-            eprintln!(
+            notice!(
                 "[outrig] subagent {}: loading in-process model {} (first use; this may take \
                  several minutes)",
                 self.path_of(name),
@@ -989,7 +990,7 @@ async fn run_rounds(
     // Before anything that could itself panic, since a parent may be waiting.
     shared.end_task();
     let note = "its task ended unexpectedly, so it can no longer run";
-    eprintln!("[outrig]   [{path}] {note}");
+    notice!("[outrig]   [{path}] {note}");
     log.record_outcome("task ended", note);
 }
 
@@ -1111,7 +1112,7 @@ async fn drive_rounds(
             // a failure after reporting does.
             let note = "a later report was cut off at the output-token limit; the earlier one \
                         was kept";
-            eprintln!("[outrig]   [{path}] {note}");
+            notice!("[outrig]   [{path}] {note}");
             log.record_outcome("report cut off after reporting", note);
         }
         if let Some(reason) = &failure {
@@ -1123,7 +1124,7 @@ async fn drive_rounds(
                 // Not when the parent steered the round after the report,
                 // though: the report cannot answer that, and a parent waiting
                 // for the answer would wait forever.
-                eprintln!("[outrig]   [{path}] round failed after reporting: {reason}");
+                notice!("[outrig]   [{path}] round failed after reporting: {reason}");
                 log.record_outcome("round failed after reporting", reason);
             } else {
                 publish_round_failure(shared, path, reason);
@@ -1152,7 +1153,7 @@ async fn drive_rounds(
 /// record it twice.
 fn publish_round_failure(shared: &SubagentShared, path: &str, reason: &str) {
     let message = format!("round failed: {reason}");
-    eprintln!("[outrig]   [{path}] {message}");
+    notice!("[outrig]   [{path}] {message}");
     shared.publish(Outcome::Error(message));
 }
 

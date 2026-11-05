@@ -448,6 +448,13 @@ is what keeps scripted use (`echo "..." | outrig run`) working unchanged. `outri
 `config init`, and `image add` treat those three `TERM` values the same way, asking plain line
 questions instead of opening arrow-key pickers.
 
+Lines outrig writes to stderr on its own account -- a subagent finishing or failing, a retry
+notice, a `warn`-level log record, the session watcher reporting a dead container -- never land
+on the prompt you are typing at. While the prompt is up they are held, and they are written when
+you press `Enter` (or the session ends), after the line you typed and before the next prompt. A
+notice raised while you sit at the prompt is therefore late, not garbled; with stdin piped there
+is no editor and lines are written as they happen.
+
 Input is read as UTF-8. A line from a pipe or a file with bytes that are not UTF-8 -- a Latin-1
 `é` in a prompts file -- is still sent, with U+FFFD (`�`) in place of each bad sequence. The line
 editor does not do this yet: at the first such byte, from an `Alt` key that sets the eighth bit or

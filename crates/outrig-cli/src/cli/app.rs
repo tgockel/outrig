@@ -423,7 +423,7 @@ fn init_tracing(verbose: u8) {
     }
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+        .with_writer(crate::notice::TracingWriter)
         .init();
     if verbose >= 2 {
         tracing::trace!(target: "outrig", "verbose tracing enabled");

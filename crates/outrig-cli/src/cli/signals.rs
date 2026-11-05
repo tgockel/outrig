@@ -21,13 +21,12 @@
 //!   session -- or a Ctrl-C typed at the REPL -- is not mistaken for a second
 //!   one asking cleanup to hurry.
 //!
-//! Notices go through `writeln!` with the error dropped, never `eprintln!`:
-//! after SIGHUP the terminal may be gone, and `eprintln!` panics when the
-//! write fails.
+//! Notices go through [`crate::notice`], which drops a failed write, never
+//! `eprintln!`: after SIGHUP the terminal may be gone, and `eprintln!` panics
+//! when the write fails.
 
 use std::fmt;
 use std::future::Future;
-use std::io::Write as _;
 
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
@@ -210,5 +209,5 @@ pub async fn unless_signaled(cleanup: impl Future<Output = ()>) -> Option<EndSig
 }
 
 fn notice(line: &str) {
-    let _ = writeln!(std::io::stderr(), "{line}");
+    crate::notice::notice!("{line}");
 }

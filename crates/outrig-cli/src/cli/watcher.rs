@@ -22,6 +22,7 @@ use tokio::io::AsyncBufReadExt;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::notice::notice;
 use crate::cli::engine;
 use crate::error::CliError;
 use outrig::container::LABEL_SESSION;
@@ -164,7 +165,7 @@ async fn on_primary_died(
     // Said before the reaping: the count is known as soon as the death is, and
     // announcing afterwards left the terminal silent for the whole window and
     // then reported finished work in the future tense.
-    eprintln!(
+    notice!(
         "[outrig] primary container {primary} exited unexpectedly; \
          reaping {} sidecar container(s)",
         doomed.len()
@@ -199,7 +200,7 @@ const REAP_BUDGET: Duration = Duration::from_secs(10);
 async fn reap(sidecar: &SidecarRef, engine_program: &'static str) {
     if let Err(e) = engine::remove_by_label(engine_program, &sidecar.selector(), REAP_BUDGET).await
     {
-        eprintln!("[outrig] could not remove container {}: {e}", sidecar.name);
+        notice!("[outrig] could not remove container {}: {e}", sidecar.name);
     }
 }
 
@@ -311,7 +312,7 @@ async fn watch_events(
                         .iter()
                         .any(|sidecar| sidecar.name == name);
                     if known {
-                        eprintln!(
+                        notice!(
                             "[outrig] sidecar container {name} exited; \
                              its MCP tools will return errors until the session ends"
                         );

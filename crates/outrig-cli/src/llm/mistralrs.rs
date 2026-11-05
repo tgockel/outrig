@@ -31,6 +31,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use crate::notice::notice;
 use crate::error::Result;
 use crate::llm::{LlmResolveError, is_blank, retry};
 use outrig::config::MistralrsDeviceSpec;
@@ -496,7 +497,7 @@ impl CompletionModel for MistralrsModel {
         // chain erases `raw_response` past here, so this is the last place that
         // can name the finish reason and the ceiling that ended the turn.
         if !retry::showed_something(&completion.choice) {
-            eprintln!(
+            notice!(
                 "{}",
                 retry::textless_line(finish_reason.as_deref(), max_tokens)
             );
@@ -552,7 +553,7 @@ fn response_stream(
         // failed one, even when nothing arrived: end it as a finished reply
         // ends, with no usage, and warn that text may be missing.
         if !state.saw_final_response {
-            eprintln!(
+            notice!(
                 "{}",
                 crate::llm::labeled_line(
                     "warning: the local model's reply ended without a finish reason, \
@@ -571,7 +572,7 @@ fn response_stream(
         // turn's finish reason. Rig reads this stream to its end, so this runs
         // before the turn does.
         if let Some(line) = state.textless_report(max_tokens) {
-            eprintln!("{line}");
+            notice!("{line}");
         }
     })
 }
