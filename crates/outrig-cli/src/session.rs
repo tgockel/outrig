@@ -275,7 +275,10 @@ impl SessionStore {
     /// An explicit directory is created if absent and refused unless empty, so
     /// that nothing in it predates the session. Writing the record claims the
     /// directory: of two launches given one at once, the second to write is
-    /// refused.
+    /// refused. Linking it under the root is what registers that claim; a
+    /// launch whose root the link fails under undoes the write first, so an
+    /// unregistered record is not left for `ls`, `clean`, and `discard <id>`
+    /// to miss and a retry into the same directory to be refused over (#431).
     ///
     /// Without one, creating `<root>/<sid>` is the claim: when anything at all
     /// is already there under that name, the result is
@@ -293,10 +296,14 @@ impl SessionStore {
         explicit_dir: Option<&Path>,
         session: &mut Session,
     ) -> Result<(PathBuf, Option<SessionLock>)> {
-        // Before the root is created, so a root nested inside the explicit
-        // directory is not taken for something already there. These checks are
-        // the policy and the messages for a directory that is plainly taken;
-        // the claim below holds when two launches pass them together.
+        // The longest resolved prefix of the explicit directory that was
+        // already on disk before this call touched anything, so a failure
+        // partway through can undo exactly what it added and nothing older:
+        // a directory this call created is nothing left behind once undone,
+        // one that predates it -- or a `missing/../existing` path whose
+        // target does, which `dir.exists()` cannot confirm (caught in review
+        // of #431, see `canonicalize_prefix`) -- is left as found.
+        let mut created_from: Option<PathBuf> = None;
         if let Some(dir) = explicit_dir {
             if dir.exists() && !dir.is_dir() {
                 return Err(OutrigError::Configuration(format!(
@@ -312,15 +319,19 @@ impl SessionStore {
             // `canonicalize_prefix` resolves the longest existing ancestor of
             // each side, so this runs before `dir` or `self.root` necessarily
             // exist yet.
-            let dir_prefix = canonicalize_prefix(dir).path_ctx("resolve", dir)?;
-            let root_prefix = canonicalize_prefix(&self.root).path_ctx("resolve", &self.root)?;
-            if dir_prefix == root_prefix || dir_prefix.starts_with(&root_prefix) {
+            let (dir_logical, dir_existing_prefix) =
+                canonicalize_prefix(dir).path_ctx("resolve", dir)?;
+            let (root_logical, _) = canonicalize_prefix(&self.root).path_ctx("resolve", &self.root)?;
+            if dir_logical == root_logical || dir_logical.starts_with(&root_logical) {
                 return Err(OutrigError::Configuration(format!(
                     "--session-dir {} is inside the session root {}; omit --session-dir, \
                      or name a directory outside it",
                     dir.display(),
                     self.root.display(),
                 )).into());
+            }
+            if dir_existing_prefix != dir_logical {
+                created_from = Some(dir_existing_prefix);
             }
             fs::create_dir_all(dir).path_ctx("create directory", dir)?;
             if dir.join(SESSION_JSON).exists() {
@@ -346,7 +357,32 @@ impl SessionStore {
                 session.session_dir = canon.clone();
                 claim_session_json(&canon, session)?;
                 let link = self.root.join(&sid.0);
-                std::os::unix::fs::symlink(&canon, &link).path_ctx("symlink", &link)?;
+                let symlinked = std::os::unix::fs::symlink(&canon, &link);
+                if symlinked.is_err() {
+                    // The write above claimed the directory; a launch that
+                    // cannot register under the root undoes it rather than
+                    // leave a record `ls`, `clean`, and `discard <id>` cannot
+                    // find -- one that then refuses a retry into the same
+                    // directory because of it (#431). Only what `created_from`
+                    // marks as new is removed, walking up from `canon` one
+                    // directory at a time and stopping the moment that prefix
+                    // is reached, so nothing that predates this call goes
+                    // with it.
+                    let _ = fs::remove_file(canon.join(SESSION_JSON));
+                    if let Some(boundary) = &created_from {
+                        let mut cur = canon.as_path();
+                        while cur != boundary.as_path() {
+                            if fs::remove_dir(cur).is_err() {
+                                break;
+                            }
+                            cur = match cur.parent() {
+                                Some(parent) => parent,
+                                None => break,
+                            };
+                        }
+                    }
+                }
+                symlinked.path_ctx("symlink", &link)?;
                 canon
             }
             None => {
@@ -385,7 +421,8 @@ impl SessionStore {
     ///
     /// An explicit directory is never redrawn: its record is in the directory by
     /// the time the link under the root finds the id taken, so it fails there
-    /// instead, and `create` reports no taken id for it (#431). A launch draws
+    /// instead of reporting a taken id -- `create` undoes the write first, so
+    /// the failure leaves the directory as it found it (#431). A launch draws
     /// with [`SessionId::new`]; a test can draw ids it has already taken.
     pub fn create_fresh(
         &self,
@@ -666,9 +703,19 @@ fn dir_names(dir: &Path) -> Result<Vec<String>> {
 
 /// Canonicalize `path`, which may not exist yet: resolve the longest existing
 /// prefix, symlinks included, and apply whatever comes after it lexically.
-/// Lets [`SessionStore::create`] compare an explicit `--session-dir` against
-/// the session root for containment before either one is necessarily on disk
-/// (#429).
+/// Returns `(logical, existing_prefix)`: `logical` is the full path -- the
+/// resolved prefix plus whatever of `path` is not there yet, applied as
+/// written -- and is what [`SessionStore::create`] compares against the
+/// session root for containment before either one is necessarily on disk
+/// (#429). `existing_prefix` is just the part of that confirmed against the
+/// real filesystem, equal to `logical` exactly when `path` names something
+/// already there -- including a `path` that only gets there by canceling a
+/// missing name with a later `..`, which a plain `path.exists()` cannot
+/// confirm, since the kernel refuses to resolve `..` past a name that is not
+/// there to begin with. `create` reads prior existence this way rather than
+/// with `path.exists()` so that undoing a directory it made itself, on a
+/// link that then fails, never takes a same-named directory that predates
+/// the call with it (#431).
 ///
 /// A relative `path` is anchored to the current directory first, the same
 /// base `fs::create_dir_all` and friends resolve it against: without this, a
@@ -693,8 +740,10 @@ fn dir_names(dir: &Path) -> Result<Vec<String>> {
 /// was (caught in review of #429, alongside a path with more than one
 /// trailing `..` landing outside the session root entirely, which an earlier
 /// version of this walk -- shrinking the whole suffix backward instead of
-/// growing `resolved` forward -- misjudged as inside it).
-fn canonicalize_prefix(path: &Path) -> std::io::Result<PathBuf> {
+/// growing `resolved` forward -- misjudged as inside it). `resolved` at the
+/// end of the walk, before `missing` -- empty or not -- is appended onto it
+/// for `logical`, is `existing_prefix`.
+fn canonicalize_prefix(path: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     let anchored;
     let start: &Path = if path.is_absolute() {
         path
@@ -737,10 +786,11 @@ fn canonicalize_prefix(path: &Path) -> std::io::Result<PathBuf> {
         }
     }
 
+    let existing_prefix = resolved.clone();
     for part in missing {
         resolved.push(part);
     }
-    Ok(resolved)
+    Ok((resolved, existing_prefix))
 }
 
 /// Resolve a path under the session root. `Ok(None)` when the entry is

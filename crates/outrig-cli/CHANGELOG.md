@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   act on it. That read is now ended as the prompt is dropped, without taking a byte, and the
   input stays queued for the shell you return to. (#437)
 
+- **`--session-dir` no longer leaves an orphaned record when it can't be
+  registered.** `outrig run --session-dir <dir>` wrote `<dir>/session.json` and then
+  linked `<session-root>/<sid>` to it; a root that could not be linked into -- not
+  writable, or an id already taken there -- left the write in place anyway. The record
+  stayed where `ls`, `clean`, and `discard <id>` could not find it, unfinalized, and a
+  retry into the same directory was refused because of it, with nothing saying
+  `discard --session-dir <dir>` was the way out. `create` now undoes the write when the
+  link fails, so the directory is left as it was found and a retry succeeds once
+  whatever blocked the link is fixed. (#431)
+
 - **`--config` reports a file it cannot examine as what it is.** A `--config` path whose
   `stat` failed for any reason -- a directory without search permission, say -- was called
   "not an existing file", which sends the user looking for a file that is there. That message

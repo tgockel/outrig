@@ -1475,3 +1475,127 @@ fn explicit_dir_through_a_missing_directory_then_a_real_symlink_resolves_through
     assert_eq!(dir, canon_elsewhere.join("run"));
     assert!(dir.join("session.json").exists());
 }
+
+/// #431: `create`'s explicit-directory branch writes `session.json` before it
+/// links `<root>/<sid>` to the directory. A link that fails -- here, because
+/// the root already holds something under that id -- used to leave the
+/// directory holding an unregistered record that `ls`/`clean`/`discard <id>`
+/// could not reach, and that then refused a retry into the same directory.
+/// `create` now undoes the write when the link fails, so the directory is
+/// left as it was found and a retry succeeds once the blocker is gone.
+///
+/// The root is occupied rather than made unwritable: a permission check is
+/// what the real bug reports as one trigger, but chmod alone is not a
+/// reliable way to force a failure in a test -- a process with
+/// `CAP_DAC_OVERRIDE`, root included, ignores it, and the symlink would
+/// succeed regardless (caught in review of #431).
+#[test]
+fn explicit_dir_undoes_its_write_when_the_root_link_fails() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261005T205327-160f".into());
+    let mut session = sample_session(&sid);
+
+    let blocker = root.path().join(sid.as_str());
+    std::fs::write(&blocker, b"").expect("occupy the id under root");
+
+    let err = store
+        .create(&sid, Some(explicit.path()), &mut session)
+        .expect_err("symlink over an occupied name should fail");
+    match err {
+        CliError::Outrig(OutrigError::Path { op, source, .. }) => {
+            assert_eq!(op, "symlink");
+            assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
+        }
+        other => panic!("expected a symlink Path error, got: {other:?}"),
+    }
+
+    assert!(
+        !explicit.path().join("session.json").exists(),
+        "the write the failed link could not register should be undone"
+    );
+    let names: Vec<_> = std::fs::read_dir(explicit.path())
+        .expect("read explicit")
+        .collect();
+    assert!(
+        names.is_empty(),
+        "the explicit directory, which predates the call, should be left as found"
+    );
+
+    // Retrying into the same directory, once whatever blocked the link is
+    // gone, is no longer refused by the record the first attempt left.
+    std::fs::remove_file(&blocker).expect("clear the blocker");
+    let mut retry_session = sample_session(&sid);
+    store
+        .create(&sid, Some(explicit.path()), &mut retry_session)
+        .expect("retry into the same directory should now succeed");
+    assert!(explicit.path().join("session.json").exists());
+}
+
+/// Same failure, but the explicit directory does not exist until `create`
+/// makes it: undoing the write removes the directory too, so a launch that
+/// cannot register leaves nothing on disk at all.
+#[test]
+fn explicit_dir_created_by_create_is_removed_when_the_root_link_fails() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let explicit = parent.path().join("run");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261005T205327-9a01".into());
+    let mut session = sample_session(&sid);
+
+    let blocker = root.path().join(sid.as_str());
+    std::fs::write(&blocker, b"").expect("occupy the id under root");
+
+    store
+        .create(&sid, Some(&explicit), &mut session)
+        .expect_err("symlink over an occupied name should fail");
+    assert!(
+        !explicit.exists(),
+        "a directory create made for this call should not outlive its failure"
+    );
+}
+
+/// A directory reached only by canceling a missing name with a later `..`
+/// (`<parent>/missing/../existing`, `missing` absent, `existing` real and
+/// already there) is not told from one `create` made itself by
+/// `dir.exists()`: the kernel refuses to resolve `..` past a name that is
+/// not there, so that call reports `false` for a target that plainly
+/// exists. A failed link used to take that `false` at face value and
+/// `rmdir` what it names, destroying a directory that predates the call
+/// entirely (caught in review of #431). `create` now reads prior existence
+/// off `canonicalize_prefix`, which resolves `missing/..` the same way the
+/// kernel resolves the rest of the path, and keeps `existing` either way.
+#[test]
+fn explicit_dir_reached_through_a_cancelled_missing_segment_survives_a_failed_link() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let base = tempfile::tempdir().expect("tempdir base");
+    let existing = base.path().join("existing");
+    std::fs::create_dir(&existing).expect("mkdir existing");
+    let dotted = base.path().join("missing").join("..").join("existing");
+    assert!(
+        !dotted.exists(),
+        "a literal stat of the dotted path should not resolve, which is the bug"
+    );
+
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261005T205327-c0d1".into());
+    let mut session = sample_session(&sid);
+
+    let blocker = root.path().join(sid.as_str());
+    std::fs::write(&blocker, b"").expect("occupy the id under root");
+
+    store
+        .create(&sid, Some(&dotted), &mut session)
+        .expect_err("symlink over an occupied name should fail");
+
+    assert!(
+        existing.is_dir(),
+        "a directory that predates the call must survive its failure"
+    );
+    assert!(
+        !existing.join("session.json").exists(),
+        "the write the failed link could not register should still be undone"
+    );
+}
