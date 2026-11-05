@@ -74,6 +74,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`find_repo_root_with`/`load_project` no longer treat a config they cannot `stat` as
+  absent.** A `.agents/outrig/config.toml` under a directory without search permission for the
+  invoking user made `is_file()` false, the same as a missing file, so the walk went on past it
+  and found a config further up, or none. It now stops and returns `OutrigError::Path` naming the
+  config and the cause; a directory or other non-file entry at that path still does not end the
+  walk. outrig-cli's own copy of the walk has the same fix. (#829)
+
 - **The network audit writer no longer panics when the runtime is shutting down mid-append.**
   A failed append is rolled back by truncating the file to where the record began; `tokio::fs::File`
   cannot be trusted to do that once a blocking spawn it attempted has been refused, which happens

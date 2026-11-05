@@ -58,27 +58,25 @@ pub async fn ensure(
 /// `name` is the image `image add` was given, if any. One it can't build
 /// is refused before anything is asked or written; otherwise the
 /// bootstrap hands it to `image add` as `default-image` rather than asking for one.
-/// Returns the resolved repo root paired with `name`, or, when that is
-/// `None` and the bootstrap ran, the name it asked for.
-/// `global_override` is `--global-config`, which only the bootstrap reads: one
-/// that names nothing is refused before the bootstrap asks anything. With no
-/// flag and no default location, the bootstrap reads no global config, as it
-/// does when the default file is missing. The bootstrap prompt names the
-/// directory it would make the workspace and defaults to no outside a git repo.
+/// Returns the resolved repo root paired with `name` (or, when that is
+/// `None` and the bootstrap ran, the name it asked for), and whether this
+/// call is the one that wrote the config: the caller's own signal for
+/// whether to set `default-image`, rather than a separate walk of its own
+/// that a `stat` between the two could answer differently from this one.
 pub async fn resolve_or_bootstrap(
     cwd: &Path,
     global_override: Option<&Path>,
     name: Option<String>,
     prompt: &mut impl PromptSource,
     hf: &mut impl HfTreeFetcher,
-) -> Result<(PathBuf, Option<String>)> {
+) -> Result<(PathBuf, Option<String>, bool)> {
     // Ahead of the bootstrap, which would walk a fresh repo through its
     // prompts and write the name as its `default-image`.
     if let Some(name) = &name {
         image_add::check_name(name).map_err(OutrigError::from)?;
     }
     match find_repo_root_from(cwd) {
-        Ok(root) => Ok((root, name)),
+        Ok(root) => Ok((root, name, false)),
         Err(OutrigError::NoRepoConfig) => {
             let global_path = resolve_global_config(global_override)?;
             eprintln!(
@@ -106,7 +104,7 @@ pub async fn resolve_or_bootstrap(
                 return Err(OutrigError::NoRepoConfig.into());
             }
             let name = write_repo_config(cwd, global_path.as_deref(), name, prompt, hf).await?;
-            Ok((cwd.to_path_buf(), Some(name)))
+            Ok((cwd.to_path_buf(), Some(name), true))
         }
         Err(other) => Err(other.into()),
     }

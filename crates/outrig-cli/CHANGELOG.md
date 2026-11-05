@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The repo-config walk no longer treats a config it cannot `stat` as absent.** A
+  `.agents/outrig/config.toml` under a directory without search permission for the invoking
+  user made `is_file()` false, the same as a missing file, so the walk went on past it: `run`
+  and `mcp` took a config further up the tree (or none, with the current directory as the
+  workspace), and `build` reported that no config exists. The walk now stops and names the
+  config it could not examine and why, as `--config` has since #496; a directory or other
+  non-file entry at that path still does not end the walk. (#829)
+- **`image add` no longer risks overwriting `default-image` on a race in that same walk.** It
+  decided whether to set `default-image` from a preliminary walk of its own, separate from the
+  one `resolve_or_bootstrap` made moments later to actually resolve the root; a `stat` outcome
+  that changed between the two could leave them disagreeing, so an existing repo's config was
+  overwritten as though it had just been bootstrapped. `resolve_or_bootstrap` now reports
+  whether its own call is the one that wrote the config, and that is what `image add` acts on,
+  so there is only one walk to disagree with itself. (#829)
 - **`outrig run` no longer prints rig's `INFO` lines between the prompt and the reply.** The
   default log filter was `info` for every target, so each turn printed rig-core's
   `Current conversation Turns`, `execute_tool`, and `Agent run finished` lines on stderr. The

@@ -237,11 +237,8 @@ async fn add_from(
     let (mut prompt, _stderr) = scripted_prompt(script).await;
     let mut hf = common::StubHfTreeFetcher::with_files(Vec::<&str>::new());
     let name = name.map(str::to_string);
-    let bootstraps = !cwd
-        .ancestors()
-        .any(|dir| dir.join(".agents/outrig/config.toml").exists());
     timeout(TEST_TIMEOUT, async {
-        let (repo_root, name) =
+        let (repo_root, name, bootstraps) =
             resolve_or_bootstrap(cwd, Some(global), name, &mut prompt, &mut hf).await?;
         if bootstraps {
             run_bootstrapped(&repo_root, name, false, &mut prompt).await
@@ -289,6 +286,54 @@ async fn fallback_yes_bootstraps_repo_config() {
     assert_eq!(cfg.default_agent.as_deref(), Some("coder"));
     assert!(cfg.images.contains_key("myproj-standard"));
     assert!(cfg.agents.contains_key("coder"));
+}
+
+/// The caller's signal for whether to set `default-image` comes from
+/// `resolve_or_bootstrap`'s own return, not a second walk of `cwd` run
+/// separately: an existing repo answers `false` and a bootstrapped one
+/// answers `true`, from the same call that resolved the root.
+#[tokio::test]
+async fn resolve_or_bootstrap_reports_whether_it_bootstrapped() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_repo(tmp.path(), STANDARD_SEED);
+    let cwd = tmp.path().join("src");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("global.toml");
+
+    let (mut prompt, _stderr) = scripted_prompt(b"").await;
+    let mut hf = common::StubHfTreeFetcher::with_files(Vec::<&str>::new());
+    let (root, name, bootstraps) = timeout(
+        TEST_TIMEOUT,
+        resolve_or_bootstrap(&cwd, Some(&global), None, &mut prompt, &mut hf),
+    )
+    .await
+    .expect("must not hang")
+    .expect("an existing repo config must resolve without prompting");
+    assert_eq!(root, tmp.path());
+    assert_eq!(name, None);
+    assert!(!bootstraps, "an existing repo config was not just written");
+
+    let tmp2 = tempfile::tempdir().unwrap();
+    let cwd2 = tmp2.path().join("myproj");
+    std::fs::create_dir_all(cwd2.join(".git")).unwrap();
+    let (mut prompt2, _stderr2) = scripted_prompt(b"\n\n\n\n\n\n").await;
+    let mut hf2 = common::StubHfTreeFetcher::with_files(Vec::<&str>::new());
+    let (root2, name2, bootstraps2) = timeout(
+        TEST_TIMEOUT,
+        resolve_or_bootstrap(
+            &cwd2,
+            Some(Path::new("/dev/null")),
+            None,
+            &mut prompt2,
+            &mut hf2,
+        ),
+    )
+    .await
+    .expect("must not hang")
+    .expect("a declined-then-accepted bootstrap must still succeed");
+    assert_eq!(root2, cwd2);
+    assert!(name2.is_some());
+    assert!(bootstraps2, "a config just written by this call");
 }
 
 /// #195: given a name, the bootstrap writes it as `default-image` instead of

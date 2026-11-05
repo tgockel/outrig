@@ -42,9 +42,24 @@ pub(crate) fn find_repo_root_from(cwd: &Path) -> Result<PathBuf> {
 fn find_repo_root_with(cwd: &Path, uid: u32) -> Result<PathBuf> {
     let mut cur = cwd;
     loop {
-        if cur.join(REPO_CONFIG_REL).is_file() {
-            refuse_foreign_repo_config(cur, uid)?;
-            return Ok(cur.to_path_buf());
+        let config = cur.join(REPO_CONFIG_REL);
+        match fs::metadata(&config) {
+            Ok(meta) if meta.is_file() => {
+                refuse_foreign_repo_config(cur, uid)?;
+                return Ok(cur.to_path_buf());
+            }
+            // A `.agents/` or `.agents/outrig/` that is a file rather than a
+            // directory, or a `config.toml` that is a directory: not the
+            // config this is looking for, so the walk goes on, same as a
+            // missing entry.
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {}
+            // Anything else -- a directory in the path the user cannot
+            // search, say -- says nothing about whether the config is there,
+            // so it is not treated as absent: `is_file()` collapsed it to
+            // `false` and let the walk continue past a config it could not
+            // examine, landing on one further up or none at all (#829).
+            Err(e) => return Err(e).path_ctx("stat", config),
         }
         match cur.parent() {
             Some(parent) => cur = parent,
@@ -1101,6 +1116,57 @@ mod tests {
 
         let bare = tmp.path().join("a");
         fs::create_dir_all(bare.join(".agents")).unwrap();
+        let nested = bare.join("b/c");
+        fs::create_dir_all(&nested).unwrap();
+
+        let root = find_repo_root_from(&nested).unwrap();
+        assert_eq!(root, tmp.path());
+    }
+
+    /// #829: `.agents/outrig/` the user cannot search must stop the walk
+    /// rather than be read as absent -- a config further up, or none, picked
+    /// silently in place of one the walk never examined.
+    #[test]
+    fn find_repo_root_reports_a_config_it_cannot_examine() {
+        let tmp = tempdir().unwrap();
+        write_repo_config(tmp.path()); // a config further up, of the caller's own
+        let proj = tmp.path().join("proj");
+        let agents = proj.join(".agents").join("outrig");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("config.toml"), b"# fixture
+").unwrap();
+        let nested = proj.join("sub");
+        fs::create_dir_all(&nested).unwrap();
+        fs::set_permissions(&agents, Permissions::from_mode(0o000)).unwrap();
+        // A superuser searches any directory, so there is nothing to see.
+        let searchable = fs::metadata(agents.join("config.toml")).is_ok();
+
+        let result = find_repo_root_from(&nested);
+
+        fs::set_permissions(&agents, Permissions::from_mode(0o755)).unwrap();
+        if searchable {
+            return;
+        }
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, OutrigError::Path { op: "stat", path, .. } if *path == agents.join("config.toml")),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("Permission denied"), "{err}");
+    }
+
+    /// A regular file named `.agents` is not the directory the config lives
+    /// in, but it is not absence either: the walk goes on past it rather
+    /// than erroring or stopping short.
+    #[test]
+    fn find_repo_root_skips_a_agents_entry_that_is_a_regular_file() {
+        let tmp = tempdir().unwrap();
+        write_repo_config(tmp.path());
+
+        let bare = tmp.path().join("a");
+        fs::create_dir_all(&bare).unwrap();
+        fs::write(bare.join(".agents"), b"not a directory
+").unwrap();
         let nested = bare.join("b/c");
         fs::create_dir_all(&nested).unwrap();
 

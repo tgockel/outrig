@@ -20,9 +20,7 @@ use crate::error::{OutrigError, Result};
 use crate::image_setup::render::{self, BaseImage, McpServer, Toolchain};
 use crate::init::prompt::{self, Field, PromptSource};
 use crate::init::repo as init_repo;
-use crate::paths::{
-    find_repo_root_from, image_dir, image_dir_rel, repo_config_path, write_atomic_all,
-};
+use crate::paths::{image_dir, image_dir_rel, repo_config_path, write_atomic_all};
 use outrig::config::{ConfigValidationError, check_build_image_name};
 use outrig::error::IoPathExt;
 
@@ -33,7 +31,10 @@ use outrig::error::IoPathExt;
 /// single conversation. `global_override` plumbs `--global-config` into
 /// the bootstrap path so the model-section can list models from the
 /// right global config. A bootstrap writes `name` as `default-image`, so
-/// a fresh repo defaults to the image added here.
+/// a fresh repo defaults to the image added here -- `resolve_or_bootstrap`
+/// says whether this call is the one that bootstrapped, rather than a
+/// second, separate walk of `cwd` whose answer a `stat` landing between the
+/// two could leave disagreeing with the one it actually resolved against.
 pub async fn run(
     cwd: &Path,
     global_override: Option<&Path>,
@@ -42,8 +43,7 @@ pub async fn run(
 ) -> Result<()> {
     let mut prompt = prompt::auto();
     let mut hf = crate::hf::auto();
-    let bootstraps = find_repo_root_from(cwd).is_err();
-    let (repo_root, name) =
+    let (repo_root, name, bootstraps) =
         init_repo::resolve_or_bootstrap(cwd, global_override, name, &mut prompt, &mut hf).await?;
     run_inner(&repo_root, name, force, bootstraps, &mut prompt).await
 }
