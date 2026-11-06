@@ -114,6 +114,31 @@ pub async fn remove_batch(
     Ok(())
 }
 
+/// Like [`remove_batch`], for a removal whose outcome the caller reads back
+/// rather than infers from the exit status.
+///
+/// A non-zero exit is not an error here. `podman rm` without `-f` removes
+/// what it can and exits non-zero for each name it refused, so a batch with
+/// one running container in it "fails" after doing everything it should.
+/// Only failing to run the engine at all is an error. The engine's trimmed
+/// stderr comes back, for a caller that wants to say why a name stayed.
+pub async fn try_remove_batch(
+    program: &'static str,
+    verb: &[&str],
+    targets: Vec<String>,
+) -> Result<String> {
+    let output = tokio::process::Command::new(program)
+        .args(verb)
+        .args(&targets)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|source| {
+            OutrigError::Configuration(format!("running {program} {}: {source}", verb.join(" ")))
+        })?;
+    Ok(String::from_utf8_lossy(&output.stderr).trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

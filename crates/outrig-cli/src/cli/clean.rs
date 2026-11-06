@@ -7,8 +7,10 @@
 //! container, which a label-filtered listing would miss. The label sweep
 //! catches *stray* containers -- ones carrying `org.outrig.session` whose
 //! session record is gone (lost record, SIGKILLed outrig, failed `--rm`) --
-//! and `podman rm -f`s the stopped ones older than the cutoff in one
-//! invocation. Running containers are never removed, labeled or not, and
+//! and `podman rm`s the stopped ones older than the cutoff in one
+//! invocation. Running containers are never removed, labeled or not -- the
+//! removal is not forced, so one that started after the listing is refused by
+//! podman at the moment of removal and reported as kept -- and
 //! neither is one whose creation time cannot be read: with no age to measure
 //! against the cutoff, it is reported instead.
 //!
@@ -19,7 +21,7 @@
 //! they have no way to reason about. See [`crate::cli::build_containers`]
 //! for why it is opt-in.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -87,12 +89,29 @@ pub struct LabeledContainer {
     pub name: String,
     pub session_label: String,
     pub sidecar_label: Option<String>,
+    /// Running **or paused**: either is a live container that `podman rm`
+    /// refuses and `clean` must not remove.
     pub running: bool,
     /// `None` when the row's `Created` is not a readable time: absent, neither
     /// an integer nor an RFC 3339 string, or at or before the epoch. Such a
     /// container is reported and left alone: an unknown age cannot clear a
     /// cutoff, and the container may be seconds old.
     pub created: Option<SystemTime>,
+}
+
+/// A stray the removal hook left in place, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    pub name: String,
+    /// Podman refused it because it is running or paused, as against a removal
+    /// that failed. The listing that selected it called it stopped, so this is
+    /// a container someone started after `clean` looked.
+    pub running: bool,
+    /// What podman said when it was asked for this name on its own and
+    /// declined -- a dependent container holding a user namespace, say -- so a
+    /// failure is reported with its reason. `None` for a running container,
+    /// whose refusal is expected, and for a removal that exited zero.
+    pub detail: Option<String>,
 }
 
 pub async fn execute(
@@ -125,7 +144,7 @@ pub async fn execute(
         running,
         labeled,
         build,
-        podman_remove_force_batch,
+        podman_remove_batch,
         buildah_remove_batch,
     )
     .await;
@@ -158,7 +177,7 @@ where
     // Returns the subset of `names` still in the store afterwards -- see the
     // call site for why the batch's exit status cannot answer that.
     D: FnMut(Vec<String>) -> DFut,
-    DFut: Future<Output = Result<Vec<String>>>,
+    DFut: Future<Output = Result<Vec<Kept>>>,
     B: FnMut(Vec<String>) -> BFut,
     BFut: Future<Output = Result<()>>,
 {
@@ -385,7 +404,7 @@ where
         }
     }
 
-    // One `podman rm -f` for every stray. Guard the empty case -- `podman rm
+    // One `podman rm` for every stray. Guard the empty case -- `podman rm
     // -f` with no names is an error.
     //
     // The per-container outcome comes from a re-read, not from the batch's
@@ -395,21 +414,36 @@ where
     // self-perpetuating: the container this claimed to remove joins the next
     // sweep's batch and is skipped again. A line saying a container was
     // removed is now a claim about that container.
-    let kept: BTreeSet<String> = if stray_targets.is_empty() {
-        BTreeSet::new()
+    //
+    // Not forced, because the listing that selected these is older than this
+    // moment -- by the length of the prompt -- and a container started since
+    // is running. `podman rm` refuses a running container when it acts, which
+    // is the only time that can be checked; `-f` would stop and delete it.
+    let kept: BTreeMap<String, Kept> = if stray_targets.is_empty() {
+        BTreeMap::new()
     } else {
         remove_containers(stray_targets.iter().map(|s| s.name.clone()).collect())
             .await?
             .into_iter()
+            .map(|k| (k.name.clone(), k))
             .collect()
     };
     for stray in &stray_targets {
-        let verb = if kept.contains(&stray.name) {
-            "could not remove"
-        } else {
-            "removed"
+        let msg = match kept.get(&stray.name) {
+            Some(k) if k.running => format!(
+                "[outrig] kept container {}: it is running or paused\n",
+                stray.name
+            ),
+            Some(Kept {
+                detail: Some(detail),
+                ..
+            }) => format!(
+                "[outrig] could not remove container {}: {detail}\n",
+                stray.name
+            ),
+            Some(_) => format!("[outrig] could not remove container {}\n", stray.name),
+            None => format!("[outrig] removed container {}\n", stray.name),
         };
-        let msg = format!("[outrig] {verb} container {}\n", stray.name);
         stderr.write_all(msg.as_bytes()).await?;
     }
     // `kept` is what the removal hook reports still present, so it is a subset
@@ -437,7 +471,14 @@ where
     stderr.write_all(summary.as_bytes()).await?;
     // Reporting the failure is not enough on its own: a script that checks the
     // exit code would otherwise read a partial sweep as a complete one.
-    Ok(if kept.is_empty() { 0 } else { 1 })
+    //
+    // A running container that was refused is not a failure: the sweep did
+    // what it promised, which is to leave running containers alone.
+    Ok(if kept.values().any(|k| !k.running) {
+        1
+    } else {
+        0
+    })
 }
 
 pub fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
@@ -897,51 +938,74 @@ fn format_retention(duration: Duration) -> String {
     }
 }
 
-/// `podman rm -f <name>...` for every stray in one invocation, returning the
-/// names that are **still there** afterwards -- clean should report a
+/// `podman rm <name>...` for every stray in one invocation, returning the
+/// ones that are **still there** afterwards -- clean should report a
 /// container it could not remove rather than claiming success, and the
 /// invocation's own exit status cannot tell it which those are. Callers guard
-/// the empty case (`podman rm -f` with no names is an error).
+/// the empty case (`podman rm` with no names is an error).
 ///
-/// A failing batch is still an error: that is a removal that did not run, as
-/// against one that ran and did not take.
-async fn podman_remove_force_batch(names: Vec<String>) -> Result<Vec<String>> {
-    engine::remove_batch("podman", &["rm", "-f"], names.clone()).await?;
+/// Not `-f`: this runs on a listing taken before the user answered the
+/// prompt, so a stray may be running by now, and podman refuses a running
+/// container without `-f` at the moment of removal. That refusal makes the
+/// batch exit non-zero after removing the rest, so the exit status is not
+/// consulted at all -- the re-read is the outcome. A failure to run podman
+/// still propagates.
+async fn podman_remove_batch(names: Vec<String>) -> Result<Vec<Kept>> {
+    engine::try_remove_batch("podman", &["rm"], names.clone()).await?;
     let mut left = still_present(&names).await?;
     // A name the batch skipped is not a name podman refuses: asked for it on
     // its own, it removes it at once. So the batch stays the common path and
     // the survivors are retried one at a time, which is also the shape that
     // can attribute a failure -- a batch reports one exit status for every
     // name in it, which is how skipping went unnoticed in the first place.
+    // A running survivor is not retried: it was refused, and would be again.
     //
     // Best-effort: a name that will not go away is reported by the caller
     // rather than failing the whole sweep, because the rest of it did work.
-    if !left.is_empty() {
-        for name in &left {
-            let _ = engine::remove_batch("podman", &["rm", "-f"], vec![name.clone()]).await;
+    let retry: Vec<String> = left
+        .iter()
+        .filter(|k| !k.running)
+        .map(|k| k.name.clone())
+        .collect();
+    if !retry.is_empty() {
+        // Asked on its own, podman's stderr is about this name alone, so it
+        // can be attached to it.
+        let mut reasons = BTreeMap::new();
+        for name in &retry {
+            let said = engine::try_remove_batch("podman", &["rm"], vec![name.clone()]).await?;
+            if !said.is_empty() {
+                reasons.insert(name.clone(), said);
+            }
         }
-        left = still_present(&left).await?;
+        left = still_present(&names).await?;
+        for k in left.iter_mut().filter(|k| !k.running) {
+            k.detail = reasons.remove(&k.name);
+        }
     }
     Ok(left)
 }
 
-/// Which of `names` podman still has. Reuses the sweep's own listing call
-/// rather than adding a second way to read the store -- it is one more `podman
-/// ps` and no new parsing *code*, though it does re-parse every row on the
-/// host to answer a membership test over `names`. Only the labeled half is
-/// consulted: a stray is a container carrying `org.outrig.session`, so a name
-/// absent from that list is gone as far as this sweep can ever act on it.
+/// Which of `names` podman still has, and whether each is running or paused. Reuses the
+/// sweep's own listing call rather than adding a second way to read the store
+/// -- it is one more `podman ps` and no new parsing *code*, though it does
+/// re-parse every row on the host to answer a membership test over `names`.
+/// Only the labeled half is consulted: a stray is a container carrying
+/// `org.outrig.session`, so a name absent from that list is gone as far as
+/// this sweep can ever act on it.
 ///
 /// `plan/next/clean-verify-above-the-seam.md` has the cheaper shape -- podman's
 /// own `rm` output already names what it removed -- and why it is not taken
 /// here.
-async fn still_present(names: &[String]) -> Result<Vec<String>> {
+async fn still_present(names: &[String]) -> Result<Vec<Kept>> {
     let (labeled, _running) = list_all_containers().await?;
-    let present: BTreeSet<&str> = labeled.iter().map(|c| c.name.as_str()).collect();
-    Ok(names
+    Ok(labeled
         .iter()
-        .filter(|name| present.contains(name.as_str()))
-        .cloned()
+        .filter(|c| names.contains(&c.name))
+        .map(|c| Kept {
+            name: c.name.clone(),
+            running: c.running,
+            detail: None,
+        })
         .collect())
 }
 
@@ -975,7 +1039,9 @@ fn parse_all_containers(stdout: &[u8]) -> Result<(Vec<LabeledContainer>, BTreeSe
         let is_running = row
             .get("State")
             .and_then(|state| state.as_str())
-            .is_some_and(|state| state.eq_ignore_ascii_case("running"));
+            .is_some_and(|state| {
+                state.eq_ignore_ascii_case("running") || state.eq_ignore_ascii_case("paused")
+            });
         if is_running {
             running.insert(name.to_string());
         }
@@ -1035,6 +1101,25 @@ mod tests {
 
     fn names(containers: &[LabeledContainer]) -> Vec<&str> {
         containers.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    /// A paused container is live: `podman rm` refuses it as it does a running
+    /// one, and `rm -f` would have deleted it. It counts as running everywhere.
+    #[test]
+    fn parse_all_containers_reads_a_paused_container_as_running() {
+        let stdout = br#"[
+          {
+            "Names": ["outrig-paused"],
+            "Labels": {"org.outrig.session": "paused"},
+            "State": "paused",
+            "Created": 1700000000
+          }
+        ]"#;
+
+        let (labeled, running) = parse_all_containers(stdout).expect("parse");
+
+        assert!(labeled[0].running, "paused is live");
+        assert!(running.contains("outrig-paused"));
     }
 
     #[test]

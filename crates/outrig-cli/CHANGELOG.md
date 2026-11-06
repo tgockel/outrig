@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig clean` no longer stops and deletes a stray container that started while its prompt
+  was open.** It chose strays from a `podman ps -a` taken before the prompt and then removed them
+  with `podman rm -f`, which kills a running container, so one revived in that window was lost and
+  reported as an ordinary removal. The removal is no longer forced: podman refuses a running
+  container when it acts, and `clean` reports `kept container <name>: it is running or paused`
+  and still exits `0`; a paused container counts as live. A removal that fails for another reason
+  now prints podman's explanation. (#482)
 - **`outrig clean`, `outrig ls`, `outrig logs`, and `outrig discard` no longer exit 0 having
   silently dropped their last line.** Each writes through tokio's `stdout`/`stderr`, which hands
   every write to a blocking-pool thread and returns before it lands; the command's own runtime

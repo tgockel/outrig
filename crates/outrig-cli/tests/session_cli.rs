@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use clap::Parser;
 use outrig_cli::cli::build_containers::BuildContainer;
+use outrig_cli::cli::clean::Kept;
 use outrig_cli::cli::{clean, discard, logs, ls};
 use outrig_cli::session::{Session, SessionId, SessionStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
@@ -1193,7 +1194,7 @@ fn clean_args_for(older_than: Duration, yes: bool, session: &str) -> clean::Clea
 /// `buildah_remove_batch` are fn items too.
 /// The stray-removal hook. Returns the names still present afterwards, so
 /// `Ok(vec![])` means every container in the batch went away.
-async fn no_removals(names: Vec<String>) -> outrig_cli::error::Result<Vec<String>> {
+async fn no_removals(names: Vec<String>) -> outrig_cli::error::Result<Vec<Kept>> {
     panic!("nothing should have been removed, but {names:?} was");
 }
 
@@ -1863,7 +1864,13 @@ async fn clean_reports_a_stray_the_engine_still_has() {
         strays,
         Vec::new(),
         // The batch succeeds, and one of the two is still in the store.
-        |_names: Vec<String>| async move { Ok(vec!["outrig-still-here".to_string()]) },
+        |_names: Vec<String>| async move {
+            Ok(vec![Kept {
+                name: "outrig-still-here".to_string(),
+                running: false,
+                detail: Some("cannot remove container: it has dependent containers".to_string()),
+            }])
+        },
         no_build_removals,
     )
     .await
@@ -1880,12 +1887,78 @@ async fn clean_reports_a_stray_the_engine_still_has() {
         "the one that went away is still reported as removed: {err}"
     );
     assert!(
-        err.contains("[outrig] could not remove container outrig-still-here"),
-        "the one still in the store must be reported as not removed: {err}"
+        err.contains(
+            "[outrig] could not remove container outrig-still-here: \
+             cannot remove container: it has dependent containers"
+        ),
+        "the one still in the store is reported as not removed, with podman's reason: {err}"
     );
     assert!(
         !err.contains("[outrig] removed container outrig-still-here"),
         "and must not also be claimed as removed: {err}"
+    );
+}
+
+/// A stray that started (or was started and paused) between `clean`'s listing
+/// and its removal is refused
+/// by podman (the removal is not forced) and comes back as kept-and-running.
+/// That is the "running containers are never removed" promise holding, so it
+/// is reported as kept, the rest of the sweep still counts as removed, and the
+/// exit status stays zero.
+#[tokio::test]
+async fn clean_keeps_a_stray_that_started_after_the_listing() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+
+    let strays = vec![
+        labeled("outrig-went-away", "went-away", None, false, days(40), now),
+        labeled("outrig-revived", "revived", None, false, days(40), now),
+    ];
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    let rc = clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        BTreeSet::new(),
+        strays,
+        Vec::new(),
+        |_names: Vec<String>| async move {
+            Ok(vec![Kept {
+                name: "outrig-revived".to_string(),
+                running: true,
+                detail: None,
+            }])
+        },
+        no_build_removals,
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+
+    assert_eq!(rc, 0, "leaving a running container alone is not a failure");
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains("[outrig] removed container outrig-went-away"),
+        "the stopped one is still removed: {err}"
+    );
+    assert!(
+        err.contains("[outrig] kept container outrig-revived: it is running or paused"),
+        "the running (or paused) one is reported as kept, and why: {err}"
+    );
+    assert!(
+        !err.contains("removed container outrig-revived")
+            && !err.contains("could not remove container outrig-revived"),
+        "and is neither claimed as removed nor called a failure: {err}"
+    );
+    assert!(
+        err.contains("[outrig] cleaned 1 stray container"),
+        "only the removed one is counted: {err}"
     );
 }
 

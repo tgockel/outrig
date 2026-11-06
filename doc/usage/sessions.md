@@ -370,7 +370,7 @@ that one.
 Alongside the record walk, `outrig clean` sweeps for *stray containers*: podman containers
 carrying the `org.outrig.session` label whose session record no longer exists (a lost record,
 a SIGKILLed outrig, a failed `--rm`). Stopped strays older than the cutoff are removed with
-`podman rm -f` and appear in the same preview/confirmation; running labeled containers are
+`podman rm` and appear in the same preview/confirmation; running labeled containers are
 never removed, only reported:
 
 ```sh
@@ -386,10 +386,17 @@ A stray whose creation time cannot be read has no age to compare with the cutoff
 reports it under `skipped labeled containers with no creation time` and leaves it alone.
 
 Each `[outrig] removed container <name>` line is a claim about that container, checked by
-re-reading the container list rather than inferred from the batched `podman rm -f`'s exit
+re-reading the container list rather than inferred from the batched `podman rm`'s exit
 status -- one status for every name in the batch cannot say which of them went away. A name the
 batch skipped is retried on its own; one that is still there afterwards is reported as
-`could not remove container <name>`, and a sweep that ends with any of those exits `1`.
+`could not remove container <name>: <reason>`, with podman's own explanation, and a sweep that
+ends with any of those exits `1`.
+
+The removal is not forced, because the listing that chose the strays is older than the moment of
+removal by as long as the prompt stays open. A stray someone started in that window is live
+(running or paused) when `clean` acts, and podman refuses to remove a live container without
+`-f`; `clean` keeps it and reports `kept container <name>: it is running or paused`. That is the
+guarantee holding, not a failure, so it does not change the exit status.
 
 A third sweep, `--build-containers`, is available for the buildah *working containers* an
 interrupted build can leave behind. It is off by default and is the one sweep outrig cannot
