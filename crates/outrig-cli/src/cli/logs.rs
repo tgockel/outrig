@@ -54,14 +54,23 @@ pub async fn execute(
     let logs_dir = resolve_logs_dir(args, session_root_flag, global_override)?;
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
-    execute_with(
+    let result = execute_with(
         &mut stdout,
         &mut stderr,
         &logs_dir,
         args.server.as_deref(),
         args.follow,
     )
-    .await
+    .await;
+    // `list_logs`'s header and "(none)" line go to stderr with no flush of
+    // their own, and the dumping paths below it already flush stdout as they
+    // go -- but the runtime drops right after this future resolves either
+    // way, and a write still in the blocking pool's queue at that point is
+    // dropped, not run (#759). Flushed on both paths, so the lines written
+    // before an error still arrive.
+    let _ = stdout.flush().await;
+    let _ = stderr.flush().await;
+    result
 }
 
 pub async fn execute_with<W, E>(

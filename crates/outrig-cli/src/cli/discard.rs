@@ -52,7 +52,14 @@ pub async fn execute(
     let store = SessionStore::new(root);
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut stderr = tokio::io::stderr();
-    execute_with(&mut stderr, stdin, &store, args, podman_is_running).await
+    let result = execute_with(&mut stderr, stdin, &store, args, podman_is_running).await;
+    // tokio's stderr hands each write to a blocking-pool thread and returns
+    // before it lands; only `flush` waits for it. The runtime drops right
+    // after this future resolves, and shutdown drops whatever the pool
+    // hasn't picked up yet -- the removal report, say (#759). Flushed on
+    // both paths, so the lines written before an error still arrive.
+    let _ = stderr.flush().await;
+    result
 }
 
 /// Inner form: every effect is injected so the test suite can drive both

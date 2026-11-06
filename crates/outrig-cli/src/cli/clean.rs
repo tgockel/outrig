@@ -116,7 +116,7 @@ pub async fn execute(
     };
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut stderr = tokio::io::stderr();
-    execute_with(
+    let result = execute_with(
         &mut stderr,
         stdin,
         &store,
@@ -128,7 +128,15 @@ pub async fn execute(
         podman_remove_force_batch,
         buildah_remove_batch,
     )
-    .await
+    .await;
+    // tokio's stderr hands each write to a blocking-pool thread and returns
+    // before it lands; only `flush` waits for it. `dispatch` shuts this
+    // command's runtime down right after this future resolves, and shutdown
+    // runs only the blocking pool's *mandatory* tasks, dropping the rest --
+    // a write no worker thread has picked up yet is lost (#759). Flushed on
+    // both paths, so the lines written before an error still arrive.
+    let _ = stderr.flush().await;
+    result
 }
 
 #[allow(clippy::too_many_arguments)]

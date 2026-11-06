@@ -36,7 +36,17 @@ pub async fn execute(
     let store = SessionStore::new(root);
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
-    execute_with(&mut stdout, &mut stderr, &store).await
+    let result = execute_with(&mut stdout, &mut stderr, &store).await;
+    // Both tokio::io::stdout() and stderr() hand writes to a blocking-pool
+    // thread and return before they land; only `flush` waits for one. The
+    // runtime that pool belongs to shuts down right after this future
+    // resolves, and shutdown drops whatever the pool hasn't picked up yet --
+    // the listing's own last line, or a pipe reader slower than its writer,
+    // lost silently (#759). Flushed on both paths, so lines already written
+    // before an error still arrive.
+    let _ = stdout.flush().await;
+    let _ = stderr.flush().await;
+    result
 }
 
 pub async fn execute_with<W, E>(stdout: &mut W, stderr: &mut E, store: &SessionStore) -> Result<i32>

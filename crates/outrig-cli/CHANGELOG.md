@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig clean`, `outrig ls`, `outrig logs`, and `outrig discard` no longer exit 0 having
+  silently dropped their last line.** Each writes through tokio's `stdout`/`stderr`, which hands
+  every write to a blocking-pool thread and returns before it lands; the command's own runtime
+  shuts down right after its future resolves, and shutdown runs only the blocking pool's
+  *mandatory* tasks, dropping a write no worker thread has picked up yet. On a loaded host that
+  write could be the "no stopped sessions..." notice, a stray-container report, or the last row
+  of a listing piped elsewhere. Each command now flushes its stdout and stderr before returning,
+  on both the success and the error path. (#759)
 - **The `config init` GGUF picker selects a split quantization as one row.** It listed every
   shard of a `*-00001-of-0000N.gguf` set separately, so choosing a set meant naming each one,
   and a pick that missed a shard validated, downloaded the rest, and failed at load because
