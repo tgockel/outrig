@@ -186,9 +186,10 @@ pay that up front rather than inside your first session, see
 
 Two caveats. `outrig-default`, `outrig-default-fs`, and `outrig-default-shell` are reserved
 names -- declare any of them yourself and outrig steps aside entirely, with a note saying so.
-And if outrig was built without the `<arch>-unknown-linux-musl` target, the `outrig-enter`
-launcher is missing: `fs` then falls back to a read-write bind mount of the workspace (same
-tools) and `shell` is unavailable. Full details in
+And if outrig was built without the `outrig-enter` launcher -- no `<arch>-unknown-linux-musl`
+target, and no static C library for the fallback build (see
+[Building without the musl target](no-musl.md)) -- `fs` falls back to a read-write bind mount
+of the workspace (same tools) and `shell` is unavailable. Full details in
 [Reference -> Config](../reference/config.md#the-built-in-default-image-config).
 
 ## What happens, in order

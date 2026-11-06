@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A build without the musl target still embeds the `outrig-enter` launcher.** `build.rs` used
+  to embed an empty one when `<arch>-unknown-linux-musl` was not installed or its build failed,
+  and every `view = "primary"` sidecar was then refused with
+  `OutrigError::FilesystemHelperUnavailable`. It now compiles the same launcher statically for
+  the build machine's own target instead (`-C target-feature=+crt-static`, which links glibc in
+  on a gnu host), so like the musl build it needs nothing from the sidecar image. That build
+  needs the host's static C library -- `libc6-dev` on Debian and Ubuntu, `glibc-static` on
+  Fedora -- and is only tried for a native build. When it fails too the launcher is missing as
+  before, and `FilesystemHelperUnavailable` names both failures and links
+  https://tgockel.github.io/outrig/usage/no-musl.html. `OUTRIG_REQUIRE_ENTER` still requires the
+  musl build and never tries the fallback. (#868)
+
 - **`NetworkInterceptor::retire_attachment` frees one container's name without ending its
   interception.** Where `drop_attachment` aborts the loops and hands the undo to a background
   reaper, this keeps the loops, the nft table and the resolver redirect in place, and tears the
@@ -80,6 +92,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that contains `:`. See the fix below for why it is now refused. (#365)
 
 ### Fixed
+
+- **A build without the musl target no longer recompiles `outrig` on every `cargo` invocation.**
+  `build.rs` watched the musl target's library directory, so that installing the target would
+  rebuild the crate. Cargo counts a watched path that does not exist as changed on every build,
+  and a rerun build script makes everything built on the crate stale, so `outrig` and all of its
+  dependents were recompiled each time. It now watches the toolchain's `lib/rustlib` directory
+  until the target's own directory exists, and `rustup target add` still triggers the rebuild.
+  (#868)
 
 - **A dropped `Outrig::add_sidecar` no longer leaves its network-interceptor attachment holding
   the sidecar's name.** Under `audit` or `filter` mode, a future dropped while connecting the

@@ -7,10 +7,11 @@
 //! A Rust port of the prototype's `sidecar-enter.c`
 //! (<https://github.com/tgockel/prototype-podman-shared-fs>). It is the sidecar
 //! image's ENTRYPOINT, so it runs before any graft exists, against an image
-//! OutRig does not control -- hence it is compiled statically for
-//! `*-unknown-linux-musl` and depends on nothing but the kernel: it declares
-//! the handful of libc symbols and syscall numbers it needs itself, so the
-//! embedding `build.rs` can compile it with a single `rustc` invocation.
+//! OutRig does not control -- hence it is compiled statically, for
+//! `*-unknown-linux-musl` or, without that target, for the build machine's own
+//! target with `+crt-static`, and depends on nothing but the kernel: it
+//! declares the handful of libc symbols and syscall numbers it needs itself, so
+//! the embedding `build.rs` can compile it with a single `rustc` invocation.
 //!
 //! Expected launch (0002-13 arranges it): `--userns=container:<target>` (so we are
 //! already in the user namespace that owns the target's mount namespace),
@@ -105,9 +106,9 @@
 //! that paragraph with it.
 //!
 //! This file is compiled only by the `outrig` crate's `build.rs`, always for a
-//! Linux musl target; it is not part of the normal `cargo build`. The logic it
-//! relies on lives in `elf.rs`, `path_search.rs` and `canon.rs`, pulled in
-//! below and unit-tested on the host.
+//! Linux target and always statically linked; it is not part of the normal
+//! `cargo build`. The logic it relies on lives in `elf.rs`, `path_search.rs`
+//! and `canon.rs`, pulled in below and unit-tested on the host.
 
 use std::ffi::{CString, OsString, c_char, c_int, c_long, c_ulong, c_void};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};

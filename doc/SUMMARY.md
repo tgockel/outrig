@@ -26,6 +26,7 @@
   - [outrig build](usage/build.md)
   - [Sessions](usage/sessions.md)
   - [Recipes](usage/recipes.md)
+  - [Building without the musl target](usage/no-musl.md)
 
 # Reference
 
