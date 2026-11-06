@@ -35,7 +35,7 @@ phase.
   |             retry, failover  (private)     |
   | agent/tool  the tool surface   (private)   |
   | python/     interpreter, console, payload  |
-  |   interpreter.rs -- NDJSON, podman exec ---+------> interpreter.py
+  |   interpreter.rs -- NDJSON, podman exec ---+------> _interpreter.py
   |                                            |         +------------------------+
   | container/  lifecycle, exec, mounts        |         | interpreter process    |
   | mcp/        clients, proxy                 |         |  reader thread         |
@@ -139,7 +139,7 @@ leaves open.
 The prototype's files are named for the older vocabulary -- `kernel.py` and `kernel.rs` implement
 what these documents now call the interpreter -- and the port renames them, since "kernel" is
 taken by the per-agent environment they host. The program is
-`crates/outrig/src/python/interpreter.py`.
+`crates/outrig/src/python/outrig/_interpreter.py`.
 
 Ported from the prototype rather than redesigned, with one change of shape. There is one interpreter
 process per session, started through `podman exec -i` and spoken to in NDJSON -- and it hosts one

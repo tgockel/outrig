@@ -690,6 +690,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The interpreter program is a file of the `outrig` package.** A session's `python3` ran it
+  from a `-c` argument, which Linux caps at 128 KiB and which it had grown to within 5% of. It is
+  now `outrig/_interpreter.py` in the package every session mounts at `/outrig/lib`, run by its
+  path, and the package's digest covers it, so a kernel runs the program its build carries.
+  `/outrig/lib` stays where it was on `sys.path`, and the program's own directory is not on it. A
+  traceback through the program's code names that file and quotes its lines, where it named
+  `<interpreter>`. `import outrig._interpreter` raises `ImportError`, since the program is not a
+  module, and a `multiprocessing` child started by `spawn` or `forkserver` runs none of it, as
+  before.
 - **Every public item of `harness` has rustdoc**, the payload fields of `harness::event` and
   what `harness` re-exports included, and `missing_docs` warns on one added without. The crate's
   front page shows a session started with `SessionBuilder::no_primary`.

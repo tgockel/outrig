@@ -20,28 +20,24 @@ mount the owner manages by hand, or anything the model installs.
 
 ## What the mounted package carries
 
-Every session mounts OutRig's own Python package read-only at `/outrig/lib`
-(`crates/outrig/src/python/payload.rs:59`), written once into a cache directory named for a
-digest of its files (`package_dir`, `:162-174`; `package_name`, `:178-187`; `write_package`,
-`:192-209`) and listed in `PACKAGE` (`:63-70`). The interpreter program itself does not travel
-that way today: `build.rs` compresses `interpreter.py`, base64-encodes it and stages it as a
-one-line `-c` argument (`crates/outrig/build.rs:321-356`), and `Interpreter::start` runs
-`python3 -I -c <program> /outrig/lib [/outrig/rpyc]` (`crates/outrig/src/python/host.rs:124`,
-`:133`, `:680-697`). Linux caps one argument at 128 KiB (`ARG_STRLEN_MAX`, `build.rs:331`), the
-build fails past it, and the program stood at about 118 KB after `0003-34` (its `## Decisions`;
-the `plan/next/` entry on the argument cap, folded into `0003-39`). Every task of this phase adds
+Every session mounts OutRig's own Python package read-only at `/outrig/lib` (`PACKAGE_MOUNT`,
+`crates/outrig/src/python/payload.rs`), written once into a cache directory named for a digest of
+its files (`package_dir`, `package_name`, `write_package`) and listed in `PACKAGE`. The
+interpreter program travels the same way since `0003-39`, as `outrig/_interpreter.py`, and
+`Interpreter::start` runs it by path:
+`python3 -I /outrig/lib/outrig/_interpreter.py /outrig/lib [/outrig/rpyc]`. It had been a
+one-line `-c` argument, compressed and base64-encoded by `build.rs`, and Linux caps one argument
+at 128 KiB: the bootstrap stood at 124,986 bytes when it moved, and every task of this phase adds
 interpreter code -- the metaclass, facility references, `self`, the construct line, external
-endpoints, the MCP presenter, preparation and designation -- so the cap would be reached within
-the first tasks.
+endpoints, the MCP presenter, preparation and designation.
 
-`0003-39` ships the program in the mounted package, as `outrig/_interpreter.py`, and starts it by
-path: `python3 -I /outrig/lib/outrig/_interpreter.py /outrig/lib [/outrig/rpyc]`. `-I` implies
-`-P`, so the program's directory is not put on `sys.path`, and `/outrig/lib` joins it where
-`_load_outrig` puts it today (`crates/outrig/src/python/interpreter.py:2426-2447`, `:6725-6744`).
-The module refuses import under its package name, since it is a program and not a module. The
-digest of the package then covers the program, so a kernel always runs the interpreter its build
-was made with. `binding.py` and `program.py`, the other two `-c` programs, run on the host where
-the package directory is a plain path; whether they move too is `0003-39`'s fork.
+`-I` implies `-P`, so the program's directory is not on `sys.path`, and `/outrig/lib` joins it
+where `_load_outrig` puts it. The program refuses import under any name but `__main__`, since it
+is a program and not a module, and drops its `__file__` as it starts, so that `multiprocessing`
+does not run it again in a child its `spawn` or `forkserver` method starts. The package's digest
+covers the program, so a kernel always runs the interpreter its build was made with. `binding.py`
+and `program.py`, the other two `-c` programs, stay `-c` bootstraps: they run on the host, where
+the package directory is a plain path, and are far from the cap (`0003-39`'s `## Decisions`).
 
 ## Supplying it
 
@@ -76,7 +72,7 @@ since the mount and `sys.path` are the interpreter's and not a kernel's.
 
 The snapshot is mounted read-only at `/outrig/app/<digest>`, beside `/outrig/bindings/<hash>`
 (`payload.rs:49`), and the interpreter is told of it in an `application` line before any kernel
-opens, as it is told the bindings and the skills (`_bindings`, `interpreter.py:6176-6204`;
+opens, as it is told the bindings and the skills (`_bindings`, `_interpreter.py:6176-6204`;
 `declare_skills`, `host.rs:950-953`). The line names the mount, the digest, the dependency
 directories and the modules to import at start.
 
@@ -84,7 +80,7 @@ Where it goes on `sys.path` is `0003-43`'s fork. Recommended: after `/outrig/lib
 `/outrig/rpyc` and before the workspace, so the owner's code cannot be shadowed by a file in the
 agent-writable workspace, and its declared dependencies go with it. The alternative places it as
 a binding's packages are placed, after the workspace and before the agent's own installs
-(`_bindings`, `interpreter.py:6198-6202`), keeping one rule for every path OutRig adds; a
+(`_bindings`, `_interpreter.py:6198-6202`), keeping one rule for every path OutRig adds; a
 workspace module named like the application's package would then win, which is the ordinary
 `sys.path` hazard `discovery.md` chose to avoid for the standard library.
 
@@ -135,7 +131,7 @@ under the mount.
 Nothing of an application fails for the first time in a model round. The specification names the
 modules to import at start -- the package that holds the task-bound class, typically -- and the
 interpreter imports each as the session starts, on a thread of its own: not the reader thread,
-which never runs agent code or waits (`_open`, `interpreter.py:6249-6254`), and not a kernel,
+which never runs agent code or waits (`_open`, `_interpreter.py:6249-6254`), and not a kernel,
 since a session with no primary has none until a root is constructed. The import runs outside
 every execution, so `outrig.runtime` raises in it as it raises anywhere outside one
 (`_kernel.py:17-23`), which a module should not touch at import, and its output goes to the
@@ -147,7 +143,7 @@ carrying the traceback; no kernel was opened and no model called.
 
 The codes are the skills' (`skills.md`, "Dependencies are checked, never installed"):
 `import-failed` for a module that raised, with its traceback; `native-extension-unavailable` when
-`0003-10`'s diagnostic verifies compiled code (`_compiled_cause`, `interpreter.py:1447`);
+`0003-10`'s diagnostic verifies compiled code (`_compiled_cause`, `_interpreter.py:1447`);
 `module-missing` for a name the artifact does not hold. A module the specification does not name
 imports when something first imports it -- the construct of a class in it (`0003-46`), or agent
 code -- and a failure then is that import's, before any round the construction would have had.

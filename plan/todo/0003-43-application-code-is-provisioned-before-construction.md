@@ -9,8 +9,8 @@ installed once into a cache keyed by the requirement set, wheels only and each w
 (`crates/outrig/src/harness/bindings.rs:200-225`, `container_path` `:452-454`), declared to the
 interpreter in a `bindings` line (`declare`, `:392-404`; `bindings_message`,
 `crates/outrig/src/python/host.rs:661-671`), and put on `sys.path` after the workspace and before
-the agent's own installs (`_bindings`, `crates/outrig/src/python/interpreter.py:6176-6204`). A
-skill's files come from a host-side `SkillSource` (`crates/outrig/src/harness/skills.rs:64-75`),
+the agent's own installs (`_bindings`, `crates/outrig/src/python/outrig/_interpreter.py:6176-6204`).
+A skill's files come from a host-side `SkillSource` (`crates/outrig/src/harness/skills.rs:64-75`),
 bounded by a `DirectorySource` that follows no link (`:120-133`), served over the pipe on demand
 (`serve`, `:1241-1280`) to a `meta_path` finder that serves `outrig_skills` and nothing else
 (`crates/outrig/src/python/outrig/skills.py:423-431`, `:830-859`), with dependencies checked and
@@ -19,7 +19,7 @@ never installed (`_check`, `:483-528`) and import failures coded `import-failed`
 into a digest-named directory and mounted at `/outrig/lib`
 (`crates/outrig/src/python/payload.rs:59-70`, `:162-209`). The interpreter runs `-I`, and `main`
 and `_open_imports` set the `sys.path` order
-(`interpreter.py:6725-6744`, `:1350-1377`); `_compiled_cause` is `0003-10`'s import diagnostic
+(`_interpreter.py:6725-6744`, `:1350-1377`); `_compiled_cause` is `0003-10`'s import diagnostic
 (`:1447`). A class's digest is a SHA-256 of its module's file (`_digest`,
 `crates/outrig/src/python/outrig/_agents.py:432-453`).
 
@@ -193,6 +193,6 @@ Each is a mock-driven test unless it says otherwise; the mock model is not calle
 - `plan/next/skill-dependency-installation.md`,
   `plan/next/pep723-dependencies-for-host-programs.md`, `plan/next/use-the-images-python.md`,
   `plan/next/hosted-reference-and-payload-bounds.md`.
-- `crates/outrig/src/python/install.rs`, `payload.rs`, `interpreter.py` (`_bindings`,
+- `crates/outrig/src/python/install.rs`, `payload.rs`, `outrig/_interpreter.py` (`_bindings`,
   `_open_imports`, `main`), `crates/outrig/src/harness/bindings.rs`, `skills.rs`,
   `crates/outrig/src/owner/session.rs`, `connection.rs`, `crates/outrig/src/python/outrig/_host.py`.

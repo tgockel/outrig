@@ -15,7 +15,7 @@ operation that reaches an agent (`public-api.txt:1817-1830`). A root node at dep
 admission, the depth and `children-max` and mints an id (`:391-501`); `make` resolves the model
 on the session's `Config`, drops the profile's preamble, opens the kernel, builds the preamble
 and the agent and starts the runner (`:506-662`, `:518-532`). `_open` opens a child's kernel only
-for a spawn waiting in `_spawning` (`crates/outrig/src/python/interpreter.py:6267-6275`);
+for a spawn waiting in `_spawning` (`crates/outrig/src/python/outrig/_interpreter.py:6267-6275`);
 `Agent.__init__` refuses a class with no `@outrig.agent` channel
 (`crates/outrig/src/python/outrig/_agents.py:533-535`). `0003-41` runs construction before
 attachment, `0003-42` makes a facility a reference an owner can name, `0003-45` binds a
@@ -113,7 +113,7 @@ the reads later tasks add -- never the Python object; the instance's own runner 
   open through the instance's runner on the orienting round and on arrivals, and the orienting
   round requires no request or delivery to exist (OR-A1-5).
 - **Release while launching** waits for the construction's answer, then releases, as
-  `_Instance._release` waits for the launch task (`interpreter.py:5216-5218`); `ready()` then
+  `_Instance._release` waits for the launch task (`_interpreter.py:5216-5218`); `ready()` then
   raises `AgentReleased`.
 - **Owner requests** (OR-A2-5). The kernel-side half -- a host-originated request into a root's
   channel, the reply crossing to the host as JSON after the kernel checked it against the declared
@@ -246,5 +246,5 @@ Each is a Rust test with a mock model unless it says otherwise; no Python host p
   owner"; `plan/phase/0003-python/lifecycle.md` -- the **Root agents** rows.
 - `plan/todo/0003-35-a-host-program-drives-an-agent-class.md` -- the plumbing reused or built.
 - `crates/outrig/src/harness/builder.rs`, `session.rs`, `crates/outrig/src/agent/children.rs`,
-  `crates/outrig/src/python/interpreter.py` (`_open`, `_Instance`),
+  `crates/outrig/src/python/outrig/_interpreter.py` (`_open`, `_Instance`),
   `crates/outrig/src/python/outrig/_agents.py`.

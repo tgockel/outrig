@@ -8,14 +8,14 @@ The conversation store is Rust's and rig-typed. `History` (`crates/outrig/src/ag
 and pushes a mirror into the interpreter (`push_turn`, `crates/outrig/src/python/host.rs:
 1492-1500`). The mirror is a projection: `mirror` (`history.rs:1043-1092`) keeps the prompt, the
 reply text, each call's source and result text and the incomplete flag, and drops reasoning,
-tool-call ids and every other part, so `runtime.history.turns` (`crates/outrig/src/python/
-interpreter.py:3306-3360`) cannot stand in for the store. Each model call's view is chosen from
+tool-call ids and every other part, so `runtime.history.turns` (`crates/outrig/src/python/outrig/
+_interpreter.py:3306-3360`) cannot stand in for the store. Each model call's view is chosen from
 the store (`history.rs:854-870`, `view`) and recorded as a manifest (`:143-172`), whose
 `left_out` (`:177-181`, `:186-228`) names each reasoning part the call's provider cannot take, by
 the per-wire rule `Wire::takes` applies (`crates/outrig/src/agent/budget.rs:187-217`): unsigned
 reasoning is left out of a call to an Anthropic model, and an OpenAI-compatible model takes
 everything. Promotions reach the store from `Context.promote` and `demote`
-(`interpreter.py:3393-3410`) through `on_context` (`host.rs:1506-1510`) and `Store::change`
+(`_interpreter.py:3393-3410`) through `on_context` (`host.rs:1506-1510`) and `Store::change`
 (`history.rs:719-742`). Nothing exports a store and nothing imports one: the only export is the
 `turn.committed` event, and the store ends with its session (the code map, section 4).
 `History::new` is made in `Agent::assemble` (`crates/outrig/src/agent/mod.rs:286`), before any
@@ -234,4 +234,4 @@ Each is a mock-driven test unless it says otherwise.
 - `plan/phase/0003-python/potential/cost-aware-commentary-preamble.md` -- the per-wire rule as it
   stands.
 - `crates/outrig/src/agent/history.rs`, `budget.rs`, `mod.rs`; `crates/outrig/src/python/host.rs`,
-  `interpreter.py`, `outrig/_host.py`; `crates/outrig/src/owner/mod.rs`.
+  `outrig/_interpreter.py`, `outrig/_host.py`; `crates/outrig/src/owner/mod.rs`.

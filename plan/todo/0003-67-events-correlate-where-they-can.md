@@ -26,9 +26,9 @@ joins a reader wants are not carried:
   (`crates/outrig/src/agent/runner.rs:100-134`) and the registry marks each open request with the
   round (`children.rs:1130-1148`), which is what `agent.request.received.round` and
   `agent.request.settled.rounds` carry.
-- The interpreter's `took` line names a message's channel and id (`interpreter.py:3654`;
+- The interpreter's `took` line names a message's channel and id (`_interpreter.py:3654`;
   `host.rs:2269-2278`), not the execution whose code took it, though the kernel keeps the current
-  execution in a context variable (`interpreter.py:186`).
+  execution in a context variable (`_interpreter.py:186`).
 - `hosted.received.execid` and `.invocation` are "as the interpreter said: diagnostic context,
   which the agent's own code can change" (`events.md`; `hosted.rs:633-634`, `:696-712`), and
   nothing in `events.md` says, field by field, which ids the host minted and which it took on a
@@ -165,4 +165,5 @@ Mock-driven unless it says otherwise.
 - `plan/phase/0003-python/boundary-policy.md` -- "Events", previews built from by-value data.
 - `plan/phase/0003-python/continuation.md` -- a resume is a new session for the same task.
 - `crates/outrig/src/agent/round.rs`, `tool.rs`, `runner.rs`, `children.rs`;
-  `crates/outrig/src/python/host.rs`, `hosted.rs`, `interpreter.py`; `doc/reference/events.md`.
+  `crates/outrig/src/python/host.rs`, `hosted.rs`, `outrig/_interpreter.py`;
+  `doc/reference/events.md`.

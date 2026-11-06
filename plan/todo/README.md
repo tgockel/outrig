@@ -106,7 +106,6 @@ phase.
 
 | Task      | What it settles                                     |
 | --------- | ----------------------------------------------------|
-| `0003-39` | The interpreter program is a file                   |
 | `0003-40` | The container facade stays beside the harness       |
 
 **Application agents**

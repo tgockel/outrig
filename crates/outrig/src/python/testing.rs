@@ -192,12 +192,16 @@ async fn spawn_in(arguments: &[&Path], dir: Option<&Path>) -> Child {
     let python = payload::host_python()
         .await
         .expect("the payload this build embedded");
+    let package = payload::package_dir()
+        .await
+        .expect("the package this build carries");
     let mut command = tokio::process::Command::new(python);
     if let Some(dir) = dir {
         command.current_dir(dir);
     }
     command
         .args(ARGS)
+        .arg(package.join(payload::PROGRAM))
         .args(arguments)
         .env("HOME", host_home())
         .env_remove("PYTHONUSERBASE")
@@ -280,7 +284,10 @@ pub(crate) fn python_command(home: Option<&Path>) -> Command {
 /// The interpreter as `Interpreter::start` starts it, on the host, per `start`.
 pub(crate) fn interpreter_command(start: &Start) -> Command {
     let mut command = python_command(start.home);
-    command.args(ARGS).arg(package());
+    command
+        .args(ARGS)
+        .arg(package().join(payload::PROGRAM))
+        .arg(package());
     if let Some(dir) = start.dir {
         command.current_dir(dir);
     }

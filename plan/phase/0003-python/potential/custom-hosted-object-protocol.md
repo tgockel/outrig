@@ -40,7 +40,7 @@ A hosted-object protocol of OutRig's own, asyncio-native on both sides, with RPy
 - **Servable from Rust.** The same messages can be answered by a Rust service directly, which is
   `../services.md` (`0003-44`) without a hosted Python client, and which `mcp-wrappers.md` asks for.
 
-What it costs: `binding.py`, the hosted half of `interpreter.py`, the hosted-object tests, and
+What it costs: `binding.py`, the hosted half of `_interpreter.py`, the hosted-object tests, and
 the hosted-objects, boundary-policy and security pages are rewritten; and RPyC's conveniences are
 re-created -- proxy classes built from the host's `inspect` so `isinstance` holds, exception
 types rebuilt by name with their public attributes, the by-value type set and the copy shim,

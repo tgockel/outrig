@@ -3,23 +3,23 @@
 ## Context
 
 A request between agents is built. A request child's end of a channel is `RequestEndpoint`
-(`crates/outrig/src/python/interpreter.py:5310-5362`), whose `receive()` gives a `RequestDelivery`
-answered with `reply` or `fail` (`:3518-3538`); the parent's end is `ChildChannel.request`, which
-returns a `Handle` (`:4744-4771`, `:4641-4723`); each request is a `_Work` both kernels share,
-ended exactly once under its lock (`_Work.end`, `:4492-4517`), with a late answer refused
-(`refused`, `:4551-4561`) and a cancel that withdraws an unread request first (`:4631-4638`). The
-host records every request of a child's in the children registry, by id, as `Unread`, `Received`
-or `Ended` (`crates/outrig/src/agent/children.rs:147-167`), builds the `Summary` the runner
-compares from those records (`:181-184`; `summary`, `:1012-1035`), renders the nudge from
-`unread_text` and `taken` (`:1076-1093`; `crates/outrig/src/agent/orientation.rs:405-418`), ends a
-request the host decides on with a `settle` line (`:1196-1200`; `_HOST_ENDS`,
-`interpreter.py:6437-6442`), lists the requests open at the close in the report (`:269-287`;
-`crates/outrig/src/harness/report.rs:35`), and emits the `agent.request.*` family
-(`crates/outrig/src/harness/event.rs:382-444`; `RequestEnd`, `:1238-1256`). `0003-37` adds the
-warning round and the host's cancel to the runner's rule, with `cancelled` in `_HOST_ENDS` and the
-cause on `agent.request.cancelled`. `0003-51` gives an agent external channels of the plain kind:
-a definition naming a Rust backend behind a trait, the owner's push through a channel handle, a
-host end, a holder, and the four send outcomes as the agent sees them.
+(`crates/outrig/src/python/outrig/_interpreter.py:5310-5362`), whose `receive()` gives a
+`RequestDelivery` answered with `reply` or `fail` (`:3518-3538`); the parent's end is
+`ChildChannel.request`, which returns a `Handle` (`:4744-4771`, `:4641-4723`); each request is a
+`_Work` both kernels share, ended exactly once under its lock (`_Work.end`, `:4492-4517`), with a
+late answer refused (`refused`, `:4551-4561`) and a cancel that withdraws an unread request first
+(`:4631-4638`). The host records every request of a child's in the children registry, by id, as
+`Unread`, `Received` or `Ended` (`crates/outrig/src/agent/children.rs:147-167`), builds the
+`Summary` the runner compares from those records (`:181-184`; `summary`, `:1012-1035`), renders the
+nudge from `unread_text` and `taken` (`:1076-1093`;
+`crates/outrig/src/agent/orientation.rs:405-418`), ends a request the host decides on with a
+`settle` line (`:1196-1200`; `_HOST_ENDS`, `_interpreter.py:6437-6442`), lists the requests open at
+the close in the report (`:269-287`; `crates/outrig/src/harness/report.rs:35`), and emits the
+`agent.request.*` family (`crates/outrig/src/harness/event.rs:382-444`; `RequestEnd`, `:1238-1256`).
+`0003-37` adds the warning round and the host's cancel to the runner's rule, with `cancelled` in
+`_HOST_ENDS` and the cause on `agent.request.cancelled`. `0003-51` gives an agent external channels
+of the plain kind: a definition naming a Rust backend behind a trait, the owner's push through a
+channel handle, a host end, a holder, and the four send outcomes as the agent sees them.
 
 OR-CH2 asks to distinguish plain messages and notifications from reply-owed requests; to give a
 request correlation and a waitable terminal outcome -- reply, failure, cancellation, or closure
@@ -259,6 +259,6 @@ Each is a mock-driven test unless it says otherwise.
 - `requirements/outrig/A-07-owner-side-channel-backend.md` -- OR-A7-5;
   `A-02-rust-owner-construction.md` -- OR-A2-2.
 - `crates/outrig/src/agent/children.rs` (`Record`, `Summary`, `summary`, `settle`, `report`),
-  `runner.rs`, `orientation.rs`; `crates/outrig/src/python/interpreter.py` (`RequestEndpoint`,
-  `_Work`, `Handle`, `ChildChannel`, `_HOST_ENDS`); `crates/outrig/src/harness/event.rs`
-  (`AgentRequest*`, `RequestEnd`).
+  `runner.rs`, `orientation.rs`; `crates/outrig/src/python/outrig/_interpreter.py`
+  (`RequestEndpoint`, `_Work`, `Handle`, `ChildChannel`, `_HOST_ENDS`);
+  `crates/outrig/src/harness/event.rs` (`AgentRequest*`, `RequestEnd`).

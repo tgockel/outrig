@@ -107,3 +107,63 @@ path, so the `-c` argument cap no longer bounds the interpreter's code.
 - `plan/phase/0003-python/agent-placement.md` -- the interpreter process and its kernels.
 - `plan/phase/0003-python/discovery.md` -- the `sys.path` order the program keeps.
 - `crates/outrig/build.rs`, `crates/outrig/src/python/host.rs`, `payload.rs`, `testing.rs`.
+
+## Decisions
+
+- **Fork 1 -- inside the package, as `outrig/_interpreter.py`.** As recommended: one mount, one
+  digest, and `the_package_lists_every_file_in_its_directory` holds with the file listed.
+  `payload::PROGRAM` names its path under the package directory; `Interpreter::start` joins it to
+  `PACKAGE_MOUNT`, and `testing.rs` to the host's `package_dir()`.
+- **Fork 2 -- `binding.py` and `program.py` stay `-c` bootstraps.** At the move their bootstraps
+  were 6,170 and 2,098 bytes against the 131,072 the cap allows, where the interpreter's was
+  124,986. `ARG_STRLEN_MAX`'s assert stays over both.
+- **Fork 3 -- run by path, with `__file__` dropped.** Run by path, `__main__.__file__` names the
+  program, and Python 3.13's `multiprocessing` runs a `__main__` that names its file again, as
+  `__mp_main__`, in every child its `spawn` and `forkserver` methods start
+  (`multiprocessing/spawn.py`: `get_preparation_data`, `_fixup_main_from_path`). The program's
+  body moves fds 0 and 1 and patches `sys.stdout`, `threading` and `os.system` as it runs; under
+  the import guard the child dies instead. `pip_installs_a_pure_package_that_imports_at_once`
+  starts a `spawn` child, and without the fix that child exits 1. So the program deletes
+  `__file__` straight after its guard, and a child leaves `__main__` alone, as it did under `-c`;
+  `a_spawn_or_forkserver_child_runs_none_of_the_program` starts one of each and fails without it.
+  Of fork 3's reasons this gives up "`__main__.__file__` is set", which nothing read. Tracebacks
+  still name the path, since they read the code objects' filename, and nothing is decompressed at
+  start.
+- **The guard refuses every name but `__main__`**, not only `outrig._interpreter`: `runpy` under
+  any other name would make the second copy of the program's classes the guard exists to
+  prevent. With `__file__` gone, `multiprocessing` never runs the program as `__mp_main__`. Its
+  message names the name it was run under, and the program's last line calls `main()` with no
+  `if __name__ == "__main__"` around it, since the guard has made that test already.
+- **The traceback acceptance runs through a line the reader routes.** `_handle` reports a line it
+  cannot route in one diagnostic, `ignored a message: <error>`, with no traceback, so no line it
+  rejects names a file, under `-c` or now. The test corrupts the answer to a spawn instead: the
+  reader hands a `spawned` that names no child to the spawn waiting on it, `_spawn` raises
+  `KeyError` in the program's own code, and the execution's traceback names
+  `<package>/outrig/_interpreter.py` (`a_failure_in_the_programs_own_code_names_its_file`). The
+  e2e test `the_program_runs_from_the_mounted_package` checks the literal
+  `/outrig/lib/outrig/_interpreter.py` through `runtime.nothing`, which `Runtime.__getattr__`
+  refuses in the program's own code. `_handle`'s diagnostic is unchanged.
+- **"`outrig`'s other modules import as before" has no test of its own.** Every start imports
+  `outrig._agents`, `outrig._kernel`, `outrig.schema` and `outrig.skills` from the package
+  directory before it greets, so every interpreter test covers it; importing them again in a
+  test would be answered from `sys.modules` and could not fail.
+- **The program's frames quote their source.** A frame of the program below the agent's own in
+  an execution's traceback -- inside `runtime.spawn`, say -- now shows its line, as frames of the
+  package's other modules already did. `_format_error` still drops the frames above the
+  submission's.
+- **`package_name` and `write_package` take the file list**, which `package_dir` passes as
+  `PACKAGE`, so `a_program_one_byte_different_is_written_under_another_name` can write a package
+  whose program differs by one byte.
+- **`main()`'s usage line** names `sys.argv[0]`, the program's path, in place of `-c <program>`;
+  the argument count it checks is unchanged.
+- **Nothing to remove from `plan/next/`.** `interpreter-program-nears-the-argument-cap.md` was
+  deleted by the planning round that folded it into this task (`5238383`).
+- **No event and no close row.** `doc/reference/events.md` gains nothing: the start's
+  `interpreter.*` events are unchanged. `lifecycle.md`'s close table gains no row: the program is
+  a file of a mount every session already had, not a new resource.
+- **Plan references follow the file.** In `plan/todo/` and `plan/phase/`, a reference to
+  `crates/outrig/src/python/interpreter.py` names `crates/outrig/src/python/outrig/_interpreter.py`,
+  and a bare `interpreter.py` names `_interpreter.py`, or `outrig/_interpreter.py` in a list of
+  paths under `crates/outrig/src/python/`. Line numbers are as they were written. Left alone:
+  `plan/done/`; this file's Context and forks, which describe the program before the move; and
+  `0003-67`'s fork 5, which reasons from the argument cap this task removes.

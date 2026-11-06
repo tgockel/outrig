@@ -3,7 +3,7 @@
 ## Context
 
 A child's kernel is built by `_open` with its globals `__builtins__`, `asyncio` and `runtime`
-(`Kernel.__init__`, `crates/outrig/src/python/interpreter.py:5378-5403`), a stub per binding
+(`Kernel.__init__`, `crates/outrig/src/python/outrig/_interpreter.py:5378-5403`), a stub per binding
 (`:5439-5445`), and -- for a spawn waiting on it -- the parent's inputs and the classes under their
 names (`:6276-6282`); no `self` is bound. `_Instance` is "what the runtime keeps of an agent class
 instance, apart from the instance, which nothing here holds: its being collected is what releases
@@ -166,5 +166,5 @@ Each is a mock-driven test.
 - `plan/phase/0003-python/messages.md` -- "Contracts", whose rule stands for channels.
 - `plan/done/phase/0003-python/tasks/0003-34-an-agent-class-answers-requests.md` -- its
   `## Decisions` on `_Instance` and the finalizer.
-- `crates/outrig/src/python/interpreter.py` (`_Instance`, `_collected`, `_open`, `Kernel`),
+- `crates/outrig/src/python/outrig/_interpreter.py` (`_Instance`, `_collected`, `_open`, `Kernel`),
   `crates/outrig/src/python/outrig/_agents.py`.

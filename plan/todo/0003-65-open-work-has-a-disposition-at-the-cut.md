@@ -6,9 +6,9 @@ A request a child holds ends one of eight ways: `RequestEnd` is `Accepted`, `Rej
 `Cancelled`, `Released`, `Budget`, `Closed` or `Terminated` (`crates/outrig/src/harness/event.rs:
 1238-1256`), mapped from the interpreter's name (`crates/outrig/src/agent/children.rs:1401-1411`,
 `outcome`), and the host ends one itself only through `_HOST_ENDS` (`crates/outrig/src/python/
-interpreter.py:6437-6452`), which `0003-37` extends with `cancelled`. At the close, the registry
-notes every request open (`children.rs:1375-1397`, `close`; `:81-97`, `at_close`) and the
-interpreter's `_close` ends each with `SessionClosing` (`interpreter.py:6207-6238`); the report
+outrig/_interpreter.py:6437-6452`), which `0003-37` extends with `cancelled`. At the close, the
+registry notes every request open (`children.rs:1375-1397`, `close`; `:81-97`, `at_close`) and the
+interpreter's `_close` ends each with `SessionClosing` (`_interpreter.py:6207-6238`); the report
 lists them `closed`, or `terminated` when the interpreter died first (`children.rs:269-287`,
 `report`; `crates/outrig/src/harness/report.rs:119-126`). A message between co-hosted agents
 never reaches the host (`messages.md`, lead), so the host holds a bounded preview of a request's
@@ -222,4 +222,5 @@ Each is a mock-driven test unless it says otherwise.
 - `plan/phase/0003-python/work.md` -- "A request settles once".
 - `plan/phase/0003-python/messages.md` -- why a local request's body never reaches the host.
 - `crates/outrig/src/agent/children.rs`; `crates/outrig/src/harness/event.rs`, `report.rs`;
-  `crates/outrig/src/python/interpreter.py`, `host.rs`; `crates/outrig/src/agent/channel.rs`.
+  `crates/outrig/src/python/outrig/_interpreter.py`, `host.rs`;
+  `crates/outrig/src/agent/channel.rs`.

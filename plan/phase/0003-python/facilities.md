@@ -29,9 +29,9 @@ as an argument, its values facility bindings named by their bound names (`rust-o
 
 A key is a Python identifier, not a keyword, not a dunder, not `runtime`, `asyncio`, `outrig` or
 `self`, and not the name of an input or of a class bound in the child, by the rules inputs
-already follow (`_inputs`, `crates/outrig/src/python/interpreter.py:4334-4342`; `one_name_each`,
-`crates/outrig/src/python/outrig/_agents.py:260-279`). A key is presentation: `{"files": files}`
-may name a binding the session calls `repo`, and the events name the binding.
+already follow (`_inputs`, `crates/outrig/src/python/outrig/_interpreter.py:4334-4342`;
+`one_name_each`, `crates/outrig/src/python/outrig/_agents.py:260-279`). A key is presentation:
+`{"files": files}` may name a binding the session calls `repo`, and the events name the binding.
 
 The mapping is mutable and is a working interface, not a boundary (OR-AG4). What mutation does is
 "The view is the agent's"; what it never does is widen or narrow authority, which is the
@@ -42,7 +42,7 @@ session's (`security.md`, "The binding is the grant").
 `outrig.bindings[name]` is already the authoritative lookup of a binding: "the calling kernel's
 proxy of the binding, whatever the kernel's globals hold" (`hosted-objects.md`, "Presentation"),
 resolved through the execution's context variable to that kernel's stub (`_Bindings.__getitem__`,
-`crates/outrig/src/python/outrig/_kernel.py:66-67`; `Kernel.stub`, `interpreter.py:5447-5450`). A
+`crates/outrig/src/python/outrig/_kernel.py:66-67`; `Kernel.stub`, `_interpreter.py:5447-5450`). A
 facility reference is that lookup made into a value: an object with a `kind` and a `name` that
 resolves at each use -- an attribute read, a call, an item access, iteration -- to what the calling
 kernel holds for that facility, and that can sit in a dict, be handed to a constructor, be stored
@@ -102,7 +102,7 @@ each entry of the canonical mapping, in place:
 | any other Python object                        | an `object` facility: the object itself      |
 
 The stub converts because `{"files": files}` is the code a parent writes, and the stub names its
-binding (`interpreter.py:5447-5450`). A sub-object proxy -- `repo.index`, a `Commit` -- is refused
+binding (`_interpreter.py:5447-5450`). A sub-object proxy -- `repo.index`, a `Commit` -- is refused
 because it belongs to one kernel's connection and names no facility the child could reach on its
 own; the message says to give the binding, or a narrower facility the owner binds. That is
 OR-AG4's rule that "Selecting an entry does not narrow its methods; supply a narrower facade", and
@@ -112,7 +112,7 @@ which is OR-A1-2's "non-data, non-facility value"; a socket or a file object is 
 the shared heap and stays one, documented as such. At the owner's boundary the question does not
 arise: an argument is data or a facility binding by name, and anything else is refused there
 (`rust-owner.md`, "Construction from Rust"). The one check that refuses a hosted object as a data
-*input* stands (`_hosted_name`, `interpreter.py:4314-4322`); `0003-42` points its message at the
+*input* stands (`_hosted_name`, `_interpreter.py:4314-4322`); `0003-42` points its message at the
 facilities dict.
 
 A mapping's entries after attachment are read live: `runtime.bindings` and `outrig.bindings`
@@ -141,12 +141,12 @@ refused facilities as inputs, for agents constructed with a dict:
   mapping's entries and no other binding, service or channel; `runtime.bindings` lists them, each
   with its `kind`, the description its kind allows and its type; a convenience global is
   installed per key where the name is free, as `bind_stubs` installs every binding's today
-  (`interpreter.py:5439-5445`); and `outrig.bindings[key]` resolves the mapping's entry, raising
+  (`_interpreter.py:5439-5445`); and `outrig.bindings[key]` resolves the mapping's entry, raising
   `KeyError` for a session binding the mapping does not name, as it raises today for a name the
   session has not bound.
 - **A kernel built without a dict inherits its maker's view.** Under the CLI's primary that is
   today's session-wide view -- every binding's stub under its name, `runtime.bindings` from the
-  session's manifest (`_BINDINGS`, `interpreter.py:6173`, `:4016-4025`), the orientation's
+  session's manifest (`_BINDINGS`, `_interpreter.py:6173`, `:4016-4025`), the orientation's
   `hosted()` list (`crates/outrig/src/agent/orientation.rs:267-295`), and every service
   (`mcp-presenter.md`, "The Python surface") -- so the primary, its `runtime.spawn` children, a
   decorated call's child and an `outrig.Agent` it constructs without `facilities=` keep exactly what
@@ -216,7 +216,7 @@ session's life and a live object in its program (`hosted-objects.md`, "Lifetime"
 a service is the embedder's and is bound for the session's life (`services.md`); an MCP placement
 is the Session's (`mcp-presenter.md`); an external channel is defined when the Session is built
 (`external-channels.md`). Releasing a child closes that kernel's connections to every binding
-(`Kernel.close_hosted`, `interpreter.py:5478-5484`) and drops its mapping with its namespace;
+(`Kernel.close_hosted`, `_interpreter.py:5478-5484`) and drops its mapping with its namespace;
 "A release kills no binding, since the bindings process serves every kernel in the session"
 (`lifecycle.md`, "Releasing a child"), so a parent using the same facility is untouched, and a
 child's release leaves a service serving its parent (OR-A3-2). An `object` facility has an
@@ -296,7 +296,7 @@ OR-A3-5 asks for.
 ## Unverified
 
 - That a `HostedRoot` stub identifies its binding by name through its pool is read from
-  `Kernel.stub` and `_Pool`'s construction (`interpreter.py:5447-5450`, `:5463-5476`); the
+  `Kernel.stub` and `_Pool`'s construction (`_interpreter.py:5447-5450`, `:5463-5476`); the
   attribute the classification reads is `0003-42`'s to add.
 - The attribution claim rests on the relay accepting `agent` only for an opened kernel
   (`hosted.rs:343-353`) and on each kernel's pool being its own; both are `0003-22`'s and

@@ -5,28 +5,28 @@
 Every channel an agent holds today has one of two far ends. The primary's `user` channel ends on
 the host, in `UserChannel` (`crates/outrig/src/agent/channel.rs:173-292`): the owner's `send`
 posts a `msg` line the interpreter queues (`Interpreter::posting`,
-`crates/outrig/src/python/host.rs:1100-1140`; `_msg`, `crates/outrig/src/python/interpreter.py:
-6309-6336`), the agent's `send` arrives as a `send` line the host routes to the one outbox it has,
-and every other channel's send is refused as "nothing on the host reads this channel"
-(`host.rs:2232-2262`). A child's channels end in its parent's kernel and never reach the host
-(`messages.md`; `agent-placement.md`). The interpreter's own comment names the generalization
-point: "Today the other end of every channel is the host: an agent's `user` channel"
-(`interpreter.py:3453-3455`). What exists and is kept: `Endpoint` with its bounded queue, its
-delivered count, `pending()`, `receive()` and `send()` (`:3582-3783`; `QUEUE_MAX`, `MESSAGE_MAX`
-and `SEND_WINDOW` at `:3466-3468`); `Delivery` with `id`, `body`, `sender`, `received_at` and
-`skill` (`:3500-3515`); `runtime.wait` watching every endpoint and taking handles through their
-futures (`:4036-4130`); the `Announcer` that tells the model what waits by name and count
-(`channel.rs:42-134`); the `pending` and `received` lines (`:6489-6493`, `:6339-6349`); and the
-`took` line, sent only once the host has asked to observe (`:3651-3654`, `:6478-6486`). Channel
-sets are fixed when a kernel is built (`Kernel.__init__`, `:5384-5397`). The owner's inputs are
-fixed on `SessionBuilder` before the start (`crates/outrig/src/harness/builder.rs:75-117`), and
-`SkillSource` is the template for one the owner implements: synchronous methods on a thread where
-blocking is fine, within a bound and a concurrency cap (`crates/outrig/src/harness/skills.rs:
-64-76`, `:98-102`). `Session::user_channel` hands the owner a cheap, cloneable end of a channel
-(`crates/outrig/src/harness/session.rs:246-248`). A host program's owner protocol carries requests
-from the program and pushes from the engine, and no request from the engine
-(`crates/outrig/src/owner/mod.rs:16-28`; `owner/connection.rs:141-242`), reading lines of at most
-64 KiB (`:35`).
+`crates/outrig/src/python/host.rs:1100-1140`; `_msg`,
+`crates/outrig/src/python/outrig/_interpreter.py: 6309-6336`), the agent's `send` arrives as a
+`send` line the host routes to the one outbox it has, and every other channel's send is refused as
+"nothing on the host reads this channel" (`host.rs:2232-2262`). A child's channels end in its
+parent's kernel and never reach the host (`messages.md`; `agent-placement.md`). The interpreter's
+own comment names the generalization point: "Today the other end of every channel is the host: an
+agent's `user` channel" (`_interpreter.py:3453-3455`). What exists and is kept: `Endpoint` with its
+bounded queue, its delivered count, `pending()`, `receive()` and `send()` (`:3582-3783`;
+`QUEUE_MAX`, `MESSAGE_MAX` and `SEND_WINDOW` at `:3466-3468`); `Delivery` with `id`, `body`,
+`sender`, `received_at` and `skill` (`:3500-3515`); `runtime.wait` watching every endpoint and
+taking handles through their futures (`:4036-4130`); the `Announcer` that tells the model what waits
+by name and count (`channel.rs:42-134`); the `pending` and `received` lines (`:6489-6493`,
+`:6339-6349`); and the `took` line, sent only once the host has asked to observe (`:3651-3654`,
+`:6478-6486`). Channel sets are fixed when a kernel is built (`Kernel.__init__`, `:5384-5397`). The
+owner's inputs are fixed on `SessionBuilder` before the start
+(`crates/outrig/src/harness/builder.rs:75-117`), and `SkillSource` is the template for one the owner
+implements: synchronous methods on a thread where blocking is fine, within a bound and a concurrency
+cap (`crates/outrig/src/harness/skills.rs: 64-76`, `:98-102`). `Session::user_channel` hands the
+owner a cheap, cloneable end of a channel (`crates/outrig/src/harness/session.rs:246-248`). A host
+program's owner protocol carries requests from the program and pushes from the engine, and no
+request from the engine (`crates/outrig/src/owner/mod.rs:16-28`; `owner/connection.rs:141-242`),
+reading lines of at most 64 KiB (`:35`).
 
 OR-CH1 asks for an external-channel abstraction with an application-supplied definition and
 backend: OutRig owns local queues, arrivals and announcements, sending, receiving, wake and wait
@@ -111,7 +111,7 @@ to the backend per item, and the primary's initial and later input arrive on one
 - **The endpoint in the kernel.** An external endpoint built at kernel build for the holder, with
   `receive()`, `send()` and `pending()` as `Endpoint` has them. `send` writes its line under an
   id and awaits the host's answer on the kernel's loop, as `Kernel.asks` waits for answers
-  (`interpreter.py:5375`): accepted returns; refused, not accepted and uncertain each raise a
+  (`_interpreter.py:5375`): accepted returns; refused, not accepted and uncertain each raise a
   typed exception, the last carrying the item id (spellings this task's; `0003-53` adds the query
   before the raise and `resolve`). `receive()` sends the consumed notice unconditionally -- the
   `took` line made unconditional for external endpoints, or a line of its own (fork 6) -- and the
@@ -173,7 +173,7 @@ to the backend per item, and the primary's initial and later input arrive on one
   gains the entries.
 - **A Python host program's backend is not built** (fork 9). The constraint found for it is
   recorded here so whoever builds it meets it: the engine reads lines of at most 64 KiB from the
-  program (`owner/connection.rs:35`) while a channel item may be 1 MiB (`interpreter.py:3467`), so
+  program (`owner/connection.rs:35`) while a channel item may be 1 MiB (`_interpreter.py:3467`), so
   a host program's push would need that bound raised for channel lines or the body carried in
   parts; the Rust push crosses no line and has no such bound.
 - `crates/outrig/CHANGELOG.md`'s `[Unreleased]` says what an external channel is; every new
@@ -291,7 +291,7 @@ Each is a mock-driven test unless it says otherwise.
    pushed before constructing, or fail the start, which refuses a session whose channels are meant
    for a child.
 5. **Where a typed body is decoded -- Recommended: the structural check on arrival, construction
-   at `receive()` on the agent's loop**, for the reason `_deliver` gives (`interpreter.py:
+   at `receive()` on the agent's loop**, for the reason `_deliver` gives (`_interpreter.py:
    3759-3762`). The alternative constructs on arrival, which runs the class's code on the reader
    thread.
 6. **The consumed notice -- Open; recommended: a line of its own, part of delivery**, leaving the
@@ -338,7 +338,7 @@ Each is a mock-driven test unless it says otherwise.
 - `plan/phase/0003-python/facilities.md` -- the facility reference a channel reaches an
   agent through.
 - `requirements/outrig/A-07-owner-side-channel-backend.md` -- OR-A7-1 through OR-A7-4.
-- `crates/outrig/src/python/interpreter.py` (`Endpoint`, `_deliver`, `runtime.wait`, `_msg`,
+- `crates/outrig/src/python/outrig/_interpreter.py` (`Endpoint`, `_deliver`, `runtime.wait`, `_msg`,
   `_pending`), `crates/outrig/src/python/host.rs` (`posting`, `acknowledge`, `Reply::Sent`),
   `crates/outrig/src/agent/channel.rs`, `runner.rs`, `orientation.rs`,
   `crates/outrig/src/harness/builder.rs`, `session.rs`, `skills.rs`.

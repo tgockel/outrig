@@ -141,7 +141,7 @@ bar = BarAgent(repo_path="/workspace", model="fast")    # two inputs, a configur
 **`FooAgent(**inputs, model=...)` returns at once, and the child launches in the background.**
 `outrig.Agent.__init__` does two things. Synchronously, it checks each input against the
 serializable subset with the check channel contracts use (`_check_subset`,
-`interpreter.py:1442`), so a hosted reference or an open file is refused in the constructor with
+`_interpreter.py:1442`), so a hosted reference or an open file is refused in the constructor with
 nothing launched. Then it schedules `runtime.spawn(name, prompt=<the class docstring>,
 model=model, inputs=inputs, requests=<the channels>)` as a task on the constructing kernel's event
 loop and returns the instance. The spawn is `0003-30`'s, with the channels derived from the
@@ -252,7 +252,7 @@ has settled -- answered already, cancelled, released -- is refused and evented, 
 and `fail` are methods of request deliveries,
 `0003-30`'s `RequestDelivery` subclass of `Delivery`; `id` is on every delivery, the user channel's
 included, since the interpreter already posts each message under an id (`_deliver`,
-`interpreter.py:1725`).
+`_interpreter.py:1725`).
 
 **A request child has no `runtime.complete`**, and the parent has no `submit` on it. The two child
 kinds never mix: a work child has inputs bound as variables, one active submission, `complete`,
@@ -284,7 +284,7 @@ the round opened on (below). The model reads the requests by writing code that d
 `messages.md` says of every channel: notification without disclosure.
 
 **`runtime.wait` in the child is ended by an arriving request.** A request is input on a channel,
-and `runtime.wait` (`interpreter.py:1815`) watches every channel, so a child waiting on a
+and `runtime.wait` (`_interpreter.py:1815`) watches every channel, so a child waiting on a
 subprocess or a timer with `runtime.wait` has the wait ended by `MessageAvailable` naming the
 channel, with the operation still running. Input wins, as it does for the primary
 (`execution-and-rounds.md`). A bare `await` is not watched, so a child in one is unreachable

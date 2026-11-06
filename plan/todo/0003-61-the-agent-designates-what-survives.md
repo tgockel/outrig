@@ -10,8 +10,8 @@ is where the container's `/workspace` is. A host-opened round with a fixed openi
 `Agent::opened` (`crates/outrig/src/agent/runner.rs:166-170`), the orienting round's `ORIENTING`
 (`crates/outrig/src/agent/orientation.rs:358-362`), `0003-37`'s warning round -- and `0003-60`
 makes such a round exempt from `0003-37`'s count. `runtime` is the object agent code acts through
-(`crates/outrig/src/python/interpreter.py:3840`, `Runtime`), and the serializable subset is what
-a channel contract may carry, checked by `outrig.schema` (`messages.md`, "Contracts").
+(`crates/outrig/src/python/outrig/_interpreter.py:3840`, `Runtime`), and the serializable subset is
+what a channel contract may carry, checked by `outrig.schema` (`messages.md`, "Contracts").
 
 OR-SUS2 asks that, for a sleep, the model is told the interpreter will restart and given a
 bounded opportunity "to identify/designate and prepare important files or supported state,
@@ -159,4 +159,4 @@ Each is a mock-driven test unless it says otherwise.
 - `plan/phase/0003-python/agent-classes.md` -- "The child's rounds".
 - `plan/todo/0003-37-a-request-is-worked-on-or-cancelled.md` -- the warning round's shape.
 - `crates/outrig/src/agent/orientation.rs`, `runner.rs`; `crates/outrig/src/harness/builder.rs`
-  (`same_paths`); `crates/outrig/src/python/interpreter.py` (`Runtime`).
+  (`same_paths`); `crates/outrig/src/python/outrig/_interpreter.py` (`Runtime`).

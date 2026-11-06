@@ -1,6 +1,6 @@
 //! The relay between agent code's hosted calls and a process serving the session's bindings -- the
 //! bindings process, or a host program serving the live objects it injected, each with a relay of
-//! its own: it carries `interpreter.py`'s RPyC frames to `outrig._serve` and back, decides at the
+//! its own: it carries `_interpreter.py`'s RPyC frames to `outrig._serve` and back, decides at the
 //! session's close which requests never reach the process, and records each request -- its
 //! receipt, its dispatch and its outcome -- under a [`RequestId`] the session's relays give out.
 //!

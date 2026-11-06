@@ -31,15 +31,15 @@ Four limits bound a `run-new` session's agents, read once as the session starts 
 level or `[agents.<name>]` (`crates/outrig/src/config/mod.rs:78-87`, `Limits`; `:1439-1457`,
 `Config::limits`). `subagent-depth-max`, `children-max` and `requests-max` refuse at the call with
 `AgentLimitReached` (`crates/outrig/src/agent/children.rs:432-451`;
-`crates/outrig/src/python/interpreter.py:4419-4426`); `model-concurrency-max` holds a place per
-request in flight (`crates/outrig/src/agent/ledger.rs:187-193`). `tool-call-max` stops a round at
-its cap (`crates/outrig/src/agent/round.rs:622-624`). `token-budget` is a session-wide latch on
+`crates/outrig/src/python/outrig/_interpreter.py:4419-4426`); `model-concurrency-max` holds a place
+per request in flight (`crates/outrig/src/agent/ledger.rs:187-193`). `tool-call-max` stops a round
+at its cap (`crates/outrig/src/agent/round.rs:622-624`). `token-budget` is a session-wide latch on
 reported spend: the ledger marks it spent as the attempts recorded reach it
 (`ledger.rs:222-232`); the round's hook stops the loop before the next call once it is
 (`round.rs:616-620`); each retry loop refuses a request once it holds its place
 (`crates/outrig/src/agent/retry.rs:911-916`, `:626-628`); a child's runner settles every open
 request `budget` and marks the child idle (`crates/outrig/src/agent/runner.rs:77-98`); the
-sender's `await` raises `BudgetExhausted` (`interpreter.py:6437-6452`, `_HOST_ENDS` and
+sender's `await` raises `BudgetExhausted` (`_interpreter.py:6437-6452`, `_HOST_ENDS` and
 `_settle_work`); an instance's `ready()` raises it (`crates/outrig/src/python/outrig/
 _agents.py:544-553`). None of these counts model requests per agent, and none ends in a stop the
 owner can lift: a spent budget is final for the session.
@@ -145,7 +145,7 @@ a child below, and its control handle carries the reads and the reset.
 **A child.** The runner checks the limit where it checks the spent budget, before it compares
 summaries (`runner.rs:77-98`, then `:100-124`). A child at its limit settles every request it holds
 -- unread or taken -- with the end `limit`, through the `settle` line the budget uses
-(`children.rs:1196-1200`; `interpreter.py:6444-6452`), and a request that arrives while it stays
+(`children.rs:1196-1200`; `_interpreter.py:6444-6452`), and a request that arrives while it stays
 at the limit is settled `limit` as it arrives, before any round opens and with no model call. The
 sender's `await` raises `AgentLimitReached`, whose message names the child, its limit and its
 count; `h.status` reads `failed: limit`, and its `child` reads `limit-reached`
@@ -156,14 +156,14 @@ the parent through the `child` line, `:1175-1192`). `RequestEnd` gains `Limit`
 orienting round the limit stops part way has ended, so `ready()` settles and the child is at its
 limit from then on. `ready()` raises `AgentLimitReached` only when the orienting round cannot
 open at all -- the runner's check fires first, and `oriented`'s error arm gains `limit` beside
-`budget` and `failed` (`children.rs:1205-1221`; `interpreter.py:6455-6461`) -- which a limit of at
+`budget` and `failed` (`children.rs:1205-1221`; `_interpreter.py:6455-6461`) -- which a limit of at
 least 1 and a count from zero rule out at a first start, and which a resume with a carried count
 at its limit reaches (`0003-64`); `agent.instance.ready.error` names the limit then. The child
 stays resident and addressable; it keeps its kernel, its namespace, its facilities and its
 history; and after a reset the next request opens a round on that history, which is A-04-3's
 "answered from the retained context".
 
-`AgentLimitReached` is the existing `limit` reason (`_agents.py:125-127`; `interpreter.py:4180`,
+`AgentLimitReached` is the existing `limit` reason (`_agents.py:125-127`; `_interpreter.py:4180`,
 `_REFUSED`; `Status.reason`, `:169-170`): "A limit the session holds every agent to refused at
 once, rather than waiting". The model-request limit is such a limit, and its message says which.
 `Status.child` tells a caller a limit-reached child from one that refused for `requests-max`. A

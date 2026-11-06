@@ -20,7 +20,8 @@
 //! than fetched: its sources are compiled in, and [`package_dir`] writes them
 //! once into a directory named for their digest. Every session mounts it
 //! read-only at [`PACKAGE_MOUNT`], where each kernel imports it, and a program
-//! on the host imports the same files.
+//! on the host imports the same files. The interpreter program is one of them,
+//! [`PROGRAM`], which a session runs from the mount by its path.
 
 use std::ffi::OsString;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -58,12 +59,19 @@ pub(crate) const RPYC_MOUNT: &str = "/outrig/rpyc";
 /// puts on `sys.path` straight after the standard library.
 pub(crate) const PACKAGE_MOUNT: &str = "/outrig/lib";
 
+/// The interpreter program, by its path under the directory holding `outrig/`:
+/// a file of the package, run by that path as `__main__` and never imported.
+/// The digest that names the package covers it, so a kernel always runs the
+/// program its build was made with.
+pub(super) const PROGRAM: &str = "outrig/_interpreter.py";
+
 /// The `outrig` package, each file by its path under [`package_dir`]. One
 /// source for a kernel and for a program on the host.
 const PACKAGE: &[(&str, &str)] = &[
     ("outrig/__init__.py", include_str!("outrig/__init__.py")),
     ("outrig/_agents.py", include_str!("outrig/_agents.py")),
     ("outrig/_host.py", include_str!("outrig/_host.py")),
+    (PROGRAM, include_str!("outrig/_interpreter.py")),
     ("outrig/_kernel.py", include_str!("outrig/_kernel.py")),
     ("outrig/_serve.py", include_str!("outrig/_serve.py")),
     ("outrig/schema.py", include_str!("outrig/schema.py")),
@@ -163,22 +171,22 @@ pub(crate) async fn rpyc_dir() -> Result<PathBuf> {
 pub(crate) async fn package_dir() -> Result<PathBuf> {
     let dir = cache_dir("outrig package")?
         .join("outrig/package")
-        .join(package_name());
+        .join(package_name(PACKAGE));
     if dir.is_dir() {
         return Ok(dir);
     }
     let target = dir.clone();
-    supervise::blocking(move |_| locked_once(&target, || write_package(&target)))
+    supervise::blocking(move |_| locked_once(&target, || write_package(&target, PACKAGE)))
         .await
         .map_err(|e| OutrigError::Io(std::io::Error::other(e)))??;
     Ok(dir)
 }
 
-/// `outrig-` and the first 16 hex digits of a digest of [`PACKAGE`]'s paths
-/// and contents.
-fn package_name() -> String {
+/// `outrig-` and the first 16 hex digits of a digest of `files`' paths and
+/// contents: [`package_dir`] writes [`PACKAGE`] under its name.
+fn package_name(files: &[(&str, &str)]) -> String {
     let mut hasher = blake3::Hasher::new();
-    for (path, source) in PACKAGE {
+    for (path, source) in files {
         hasher.update(path.as_bytes());
         hasher.update(&[0]);
         hasher.update(source.as_bytes());
@@ -187,16 +195,16 @@ fn package_name() -> String {
     format!("outrig-{}", &hasher.finalize().to_hex()[..16])
 }
 
-/// Write [`PACKAGE`] to `dir`, staged beside it and renamed into place as
+/// Write `files` to `dir`, staged beside it and renamed into place as
 /// [`unpack`] does, so `dir` holds the whole package or does not exist. Run
 /// under [`locked_once`], which has made `dir`'s parent.
-fn write_package(dir: &Path) -> Result<()> {
+fn write_package(dir: &Path, files: &[(&str, &str)]) -> Result<()> {
     let parent = dir.parent().expect("the package directory has a parent");
     let stage = tempfile::Builder::new()
         .prefix(".write-")
         .tempdir_in(parent)
         .path_ctx("create a directory in", parent)?;
-    for (path, source) in PACKAGE {
+    for (path, source) in files {
         let file = stage.path().join(path);
         let at = file.parent().expect("a package file is in a directory");
         std::fs::create_dir_all(at).path_ctx("create", at)?;
@@ -655,8 +663,9 @@ mod tests {
     #[test]
     fn the_package_is_written_whole_under_its_digest() {
         let cache = tempfile::tempdir().unwrap();
-        let dir = cache.path().join("package").join(package_name());
-        locked_once(&dir, || write_package(&dir)).unwrap();
+        let name = package_name(PACKAGE);
+        let dir = cache.path().join("package").join(&name);
+        locked_once(&dir, || write_package(&dir, PACKAGE)).unwrap();
         for (path, source) in PACKAGE {
             assert_eq!(std::fs::read_to_string(dir.join(path)).unwrap(), *source);
         }
@@ -665,8 +674,28 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| !name.ends_with(".lock"))
             .collect();
-        assert_eq!(beside, [package_name()], "the stage was left behind");
-        assert!(package_name().starts_with("outrig-") && package_name().len() == 23);
+        assert_eq!(beside, [name.as_str()], "the stage was left behind");
+        assert!(name.starts_with("outrig-") && name.len() == 23);
+    }
+
+    /// The program is a file of the package, so the digest that names the
+    /// package covers it: a package whose program differs by one byte is
+    /// written under another name.
+    #[test]
+    fn a_program_one_byte_different_is_written_under_another_name() {
+        let mut files = PACKAGE.to_vec();
+        let program = files
+            .iter()
+            .position(|(path, _)| *path == PROGRAM)
+            .expect("the program is in the package");
+        // Its first byte, the docstring's opening quote, made a `#`.
+        let altered = format!("#{}", &files[program].1[1..]);
+        files[program].1 = &altered;
+        let cache = tempfile::tempdir().unwrap();
+        let dir = cache.path().join(package_name(&files));
+        locked_once(&dir, || write_package(&dir, &files)).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join(PROGRAM)).unwrap(), altered);
+        assert_ne!(package_name(&files), package_name(PACKAGE));
     }
 
     #[test]

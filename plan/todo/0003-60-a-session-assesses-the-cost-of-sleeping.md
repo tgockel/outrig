@@ -14,7 +14,7 @@ has not seen end, which is what the shutdown's drain waits on
 (`crates/outrig/src/python/hosted.rs:509-511`). The liveness probe
 asks two questions, one answered on the loop and one on the reader thread, so a loop that is not
 turning is told from one that is blocked (`runtime-protection.md`, "What the port does";
-`crates/outrig/src/python/interpreter.py:5887-5899`, `cpu`). Host-opened rounds exist: the
+`crates/outrig/src/python/outrig/_interpreter.py:5887-5899`, `cpu`). Host-opened rounds exist: the
 runner opens one with a fixed opening through `Agent::opened` (`crates/outrig/src/agent/
 runner.rs:166-170`), for the orienting round (`crates/outrig/src/agent/orientation.rs:358-362`,
 `ORIENTING`) and, after `0003-37`, for the warning round. `outrig.Agent` has no hook an
@@ -178,4 +178,4 @@ Each is a mock-driven test unless it says otherwise.
 - `plan/next/a-round-names-the-hosted-calls-it-left-running.md` -- the relay's record of calls in
   flight, which the facts read.
 - `crates/outrig/src/agent/runner.rs`, `children.rs`, `orientation.rs`; `crates/outrig/src/python/
-  host.rs`, `hosted.rs`, `interpreter.py`, `outrig/_agents.py`, `outrig/_host.py`.
+  host.rs`, `hosted.rs`, `outrig/_interpreter.py`, `outrig/_agents.py`, `outrig/_host.py`.

@@ -18,9 +18,9 @@ four open questions; this task absorbs it, and its questions are the forks below
 
 What exists to build on. The skills package already asks the host synchronously and is answered
 by Rust: `_ask` (`crates/outrig/src/python/outrig/skills.py:393`), `_ask_host`
-(`crates/outrig/src/python/interpreter.py:4219`) blocking the calling thread on a queue the reader
-thread fills (`:4212`, `:6670`), `_from_agent` naming the calling agent (`skills.py:461`), the
-`skill.` prefix routed to an attached hook and answered from a task of its own
+(`crates/outrig/src/python/outrig/_interpreter.py:4219`) blocking the calling thread on a queue the
+reader thread fills (`:4212`, `:6670`), `_from_agent` naming the calling agent (`skills.py:461`),
+the `skill.` prefix routed to an attached hook and answered from a task of its own
 (`crates/outrig/src/python/host.rs:2109`, `:944`; `crates/outrig/src/harness/skills.rs:1241`).
 The relay is the admission and event pattern: `first()` refuses once the session closed
 (`crates/outrig/src/python/hosted.rs:592`), `refuse` and `receipt` publish `hosted.received` and
@@ -31,7 +31,7 @@ The relay is the admission and event pattern: `first()` refuses once the session
 (`crates/outrig/src/harness/bindings.rs:32`) and the
 `Brief` the orientation lists (`bindings.rs:316`; `crates/outrig/src/agent/orientation.rs:267`) are
 what a service sits beside. Each kernel gets a stub per binding at its build (`bind_stubs`,
-`interpreter.py:5439`), `runtime.bindings` lists `Binding` records (`:4017`, `:6160`), and
+`_interpreter.py:5439`), `runtime.bindings` lists `Binding` records (`:4017`, `:6160`), and
 `outrig.bindings[name]` resolves through the calling execution's kernel
 (`crates/outrig/src/python/outrig/_kernel.py:55`). `outrig.schema` declares Python types and
 renders their schema (`crates/outrig/src/python/outrig/schema.py:818`); nothing renders a JSON
@@ -255,6 +255,6 @@ the Python side driven as the interpreter's tests drive agent code.
 - `plan/phase/0003-python/boundary-policy.md` -- the grant, the events and the reader's rule.
 - `plan/phase/0003-python/potential/ticket-based-service-waits.md` -- the ticket pattern.
 - `plan/next/rust-object-as-python-object.md` -- absorbed here.
-- `crates/outrig/src/python/hosted.rs`, `host.rs`, `interpreter.py`, `outrig/skills.py`,
+- `crates/outrig/src/python/hosted.rs`, `host.rs`, `outrig/_interpreter.py`, `outrig/skills.py`,
   `outrig/_kernel.py`, `outrig/schema.py`; `crates/outrig/src/harness/builder.rs`, `bindings.rs`,
   `report.rs`, `lifecycle.rs`; `crates/outrig/src/agent/orientation.rs`.

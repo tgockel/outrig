@@ -6,10 +6,10 @@
 `__init_subclass__` checks the declaration (`:527-529`, `_declare_class` `:581-631`), and its
 `__init__` checks the class has a channel and `model` is a `str`, then runs `self._outrig =
 _launch(self, inputs, model)` (`:531-542`). `_launch` is `_Instance`, bound as the interpreter
-loads the package (`crates/outrig/src/python/interpreter.py:2439`), whose `__init__` validates
-and copies the inputs, builds the child's record and schedules the launch on the constructing
-kernel's loop with `call_soon_threadsafe` before it returns (`:5061-5095`). On the host, the
-runner is spawned inside `make`, before the spawn is answered
+loads the package (`crates/outrig/src/python/outrig/_interpreter.py:2439`), whose `__init__`
+validates and copies the inputs, builds the child's record and schedules the launch on the
+constructing kernel's loop with `call_soon_threadsafe` before it returns (`:5061-5095`). On the
+host, the runner is spawned inside `make`, before the spawn is answered
 (`crates/outrig/src/agent/children.rs:642`, `:374-384`), and the runner opens the orienting round
 at once, since `orienting` bypasses the
 summary rule (`crates/outrig/src/agent/runner.rs:69`, `:101`, `:130`). A subclass whose
@@ -145,5 +145,5 @@ Each is a mock-driven test.
 - `plan/phase/0003-python/agent-classes.md` -- "The declaration", "Construction and readiness".
 - `plan/done/phase/0003-python/tasks/0003-34-an-agent-class-answers-requests.md` -- its
   `## Decisions` on the skipped `super().__init__` and on `_Instance`.
-- `crates/outrig/src/python/outrig/_agents.py`, `crates/outrig/src/python/interpreter.py`
+- `crates/outrig/src/python/outrig/_agents.py`, `crates/outrig/src/python/outrig/_interpreter.py`
   (`_Instance`), `crates/outrig/src/agent/children.rs` (`make`), `runner.rs`.

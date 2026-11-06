@@ -194,4 +194,4 @@ service, and a tool whose schema does not compile is dispatched unchecked.
 - `plan/next/one-bad-tool-schema-aborts-the-tool-list.md` -- absorbed here;
   `plan/next/tool-descriptor-is-shaped-twice.md`, `plan/next/rmcp-list-result-spec-gaps.md`.
 - `crates/outrig/src/mcp_content.rs`; `crates/outrig/src/agent/orientation.rs`;
-  `crates/outrig/src/python/interpreter.py`.
+  `crates/outrig/src/python/outrig/_interpreter.py`.

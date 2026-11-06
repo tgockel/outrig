@@ -1,14 +1,14 @@
 //! The agent's Python: the static interpreter every session mounts, the
 //! program it runs, and the host's half of the protocol between them.
 //!
-//! `interpreter.py` is that program: one process per session, hosting one
-//! kernel per agent and answering over NDJSON by agent id. `host` starts it
-//! in a session's container, submits executions, and correlates the replies.
-//! `recovery` waits for an execution's outcome, and cancels or interrupts one
-//! that will not end on its own -- because the user asked, or because it is
-//! spinning. `supervisor` starts the process holding a session's bindings on
-//! the host, and `program` an operator's Python program there, under
-//! `outrig run-new <script.py>`.
+//! `outrig/_interpreter.py`, a file of OutRig's own package, is that program:
+//! one process per session, hosting one kernel per agent and answering over
+//! NDJSON by agent id. `host` starts it in a session's container, submits
+//! executions, and correlates the replies. `recovery` waits for an execution's
+//! outcome, and cancels or interrupts one that will not end on its own --
+//! because the user asked, or because it is spinning. `supervisor` starts the
+//! process holding a session's bindings on the host, and `program` an
+//! operator's Python program there, under `outrig run-new <script.py>`.
 //!
 //! Crate-private throughout. `outrig-cli` reaches none of it directly: the
 //! agent loop in `crate::agent` drives it, and `crate::harness` is how the

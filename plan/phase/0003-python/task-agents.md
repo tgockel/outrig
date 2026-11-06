@@ -89,7 +89,7 @@ sequence beside it and checks nothing of the declaration.
 
 Why: today `Agent.__init__` calls `_launch` directly
 (`crates/outrig/src/python/outrig/_agents.py:542`), `_Instance.__init__` schedules the spawn
-before returning (`crates/outrig/src/python/interpreter.py:5095`), and the host spawns the
+before returning (`crates/outrig/src/python/outrig/_interpreter.py:5095`), and the host spawns the
 child's runner inside `make`, before it answers `spawned`
 (`crates/outrig/src/agent/children.rs:642`, `:374-384`); the runner opens the orienting round at
 once (`crates/outrig/src/agent/runner.rs:69`, `:101`, `:130`). So a subclass `__init__` that
@@ -118,7 +118,7 @@ them; so does an unmarked `async def`. The child's namespace holds the inputs th
 given and the message and reply types, nothing of the instance. This is `messages.md`'s rule that
 object identity does not cross, applied to the instance itself." `0003-34` built exactly that:
 `_open` binds the inputs and the classes into the child's globals and nothing else
-(`interpreter.py:6279-6282`), and `_Instance` "keeps no reference to the instance" (its
+(`_interpreter.py:6279-6282`), and `_Instance` "keeps no reference to the instance" (its
 `## Decisions`). `0003-45` reverses the sentence about the child's namespace: **the instance the
 parent constructed is bound as `self` in the child's kernel**, the same object, and ordinary
 methods, properties and annotated state are reachable from both kernels.
@@ -128,7 +128,7 @@ heap (`agent-placement.md`, "The shape"), and `security.md` already says "Agents
 from each other, and it does not matter": the grant is the session's, and co-hosting is
 interference, not disclosure. `messages.md`'s rule holds unchanged for what crosses a channel; the
 instance is not a message, and OutRig installs it in the child's namespace as it installs the
-inputs, through `_spawning` (`interpreter.py:3947-3949`) into `_open`. What the requirement wants
+inputs, through `_spawning` (`_interpreter.py:3947-3949`) into `_open`. What the requirement wants
 from this (OR-AG1) is one object: the task the subclass's `__init__` stored on `self._task`, read
 in the child as the same object, with no hidden second instance and no attribute serialization.
 

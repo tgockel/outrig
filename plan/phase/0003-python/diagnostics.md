@@ -195,9 +195,9 @@ causality". The ids exist; four joins are not carried.
    orienting round, which opens on no request (`agent-classes.md`, "The orienting round"), and
    `null` for the primary, whose rounds open on messages the announcer counts and does not name.
 3. **A message the agent's code took to the execution that took it.** The interpreter's `took`
-   line names the channel and the message (`interpreter.py:3654`; `host.rs:2269-2278`) and not the
+   line names the channel and the message (`_interpreter.py:3654`; `host.rs:2269-2278`) and not the
    execution, though the kernel keeps the current execution in a context variable
-   (`interpreter.py:186`). `message.received` gains `execid`, a claim like `hosted.received`'s,
+   (`_interpreter.py:186`). `message.received` gains `execid`, a claim like `hosted.received`'s,
    `null` when the receive ran outside every execution.
 4. **A hosted or MCP call to its execution and invocation.** `hosted.received` carries both, as
    claims, and `parent` for a callback's call (`events.md`). An MCP call is new (`mcp-presenter.md`,

@@ -967,6 +967,46 @@ mod e2e {
             .expect("the container stops");
     }
 
+    /// The program runs from the mounted package by its path: `/outrig/lib` is on
+    /// `sys.path` and the program's own directory is not, the program will not
+    /// be imported as a module, and a failure in its own code names its file
+    /// where the container sees it.
+    #[tokio::test]
+    async fn the_program_runs_from_the_mounted_package() {
+        let container = session(ALPINE, true).await;
+        let interpreter = within(Interpreter::start(&container, Events::off(), None, None))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        within(interpreter.open(PRIMARY))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let paths =
+            "import sys\nprint('/outrig/lib' in sys.path, '/outrig/lib/outrig' in sys.path)";
+        assert_eq!(run(&interpreter, paths).await, ok("True False\n"));
+        let Outcome::Error { traceback, .. } =
+            run(&interpreter, "import outrig._interpreter").await
+        else {
+            panic!("the program was imported");
+        };
+        assert!(
+            traceback.contains("ImportError: outrig._interpreter is OutRig's interpreter program"),
+            "{traceback}"
+        );
+        // `Runtime.__getattr__`, in the program's own code, refuses the name.
+        let Outcome::Error { traceback, .. } = run(&interpreter, "runtime.nothing").await else {
+            panic!("runtime.nothing did not raise");
+        };
+        assert!(
+            traceback.contains("File \"/outrig/lib/outrig/_interpreter.py\", line"),
+            "{traceback}"
+        );
+        drop(interpreter);
+        container
+            .stop(Duration::from_secs(2))
+            .await
+            .expect("the container stops");
+    }
+
     /// The payload is read-only in a session, and a plain `pip install` puts a
     /// package in the interpreter's environment under the container user's
     /// home -- which the interpreter reads, so it imports at once, with no

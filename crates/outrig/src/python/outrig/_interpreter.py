@@ -1,5 +1,10 @@
 """The interpreter: one process per session, hosting one kernel per agent.
 
+This file is the interpreter program, not a module of the package it travels in. Every session
+mounts OutRig's package read-only at `/outrig/lib`, and the program runs from it as `__main__`, by
+its path: `python3 -I /outrig/lib/outrig/_interpreter.py`. Imported under any other name it raises
+`ImportError`, so no second copy of its classes is ever made.
+
 Started by `podman exec -i` inside the session container, with OutRig's package directory as its
 argument -- and RPyC's after it, for a session with bindings -- and spoken to in NDJSON: requests
 on stdin, replies on stdout, every message about an agent naming the agent it concerns. It starts
@@ -41,6 +46,16 @@ Five things here are load-bearing rather than incidental:
   while agent code runs leaves room to report it with. It is not isolation, for the reasons the
   memory section below gives.
 """
+
+if __name__ != "__main__":
+    # Imported, it would make a second copy of every class the running program defines.
+    raise ImportError(f"{__name__} is OutRig's interpreter program, run by path, not a module")
+
+# `multiprocessing` runs a `__main__` that names its file again, as `__mp_main__`, in each child its
+# `spawn` and `forkserver` methods start, where the guard above would end the child. Without
+# `__file__` a child leaves `__main__` alone, as it did when the program was a `-c` argument. A
+# traceback still names the file, which it reads from the code.
+del __file__
 
 import ast
 import asyncio
@@ -3189,7 +3204,7 @@ def _without_hosted_frames(exc):
 def _format_error(exc):
     """The traceback from the submitted code's first frame on.
 
-    The frames above it are this program's, and Python 3.13 quotes source for `-c` code, so
+    The frames above it are this program's, and Python quotes the source of its file, so
     keeping them would put the interpreter's own lines in front of every error. A compile error
     has no frame of the submission's at all, and is reported as the exception alone. Nor is the
     SIGINT handler's frame kept, where an interrupt ends the list: the interrupt is the result,
@@ -7011,7 +7026,7 @@ def _read():
 
 def main():
     if len(sys.argv) not in (2, 3):
-        _diag(f"usage: python3 -I -c <program> <outrig-dir> [<rpyc-dir>]; got {sys.argv[1:]!r}")
+        _diag(f"usage: python3 -I {sys.argv[0]} <outrig-dir> [<rpyc-dir>]; got {sys.argv[1:]!r}")
         os._exit(2)
     global _reader_thread
     # Before any agent exists, and every process it starts inherits it.
@@ -7041,5 +7056,4 @@ def main():
     _onto_main.get().serve()
 
 
-if __name__ == "__main__":
-    main()
+main()

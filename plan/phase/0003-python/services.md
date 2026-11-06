@@ -118,7 +118,7 @@ Python or Rust objects.
 
 - **The host tells the interpreter the services** once, before any kernel opens, in a line beside
   `bindings` and `skills` (`crates/outrig/src/python/host.rs:1220`, `:950`;
-  `crates/outrig/src/python/interpreter.py:6176`): each service's name, its description, its
+  `crates/outrig/src/python/outrig/_interpreter.py:6176`): each service's name, its description, its
   methods and its `generation`, 1 at start. A description that changes is a `service.described`
   line of its own with the next generation.
 - **A call is a `service.call` line** from the interpreter: the ask id the answer is matched by,
@@ -132,12 +132,12 @@ Python or Rust objects.
   (`next_line`, `host.rs:2379-2408`), so such a line would never be dispatched and no deadline
   would ever be armed for it. A line over the bound raises `ValueError` in the caller naming the
   bound and the size, sends nothing and registers no wait, as a spawn whose arguments take more
-  than 1 MiB to describe does (`interpreter.py:4844`).
+  than 1 MiB to describe does (`_interpreter.py:4844`).
 - **The answer is a `service` line** with the ask id and `ok` holding the result, or `error`
   holding the call id, the outcome, the category, the message and, for an argument the schema
   refused, the JSON path. The host answers every line it accepts, at the close included, so no
   thread waits for good, as `skills.rs:1241` guarantees for a skill request.
-- **The wait blocks the calling thread**, as `_ask_host` blocks (`interpreter.py:4219`): on a
+- **The wait blocks the calling thread**, as `_ask_host` blocks (`_interpreter.py:4219`): on a
   queue the reader thread fills (`:4212`, the `skill` arm at `:6670`), interruptible for agent
   code by the same mechanism, with no timeout of its own -- the host's deadline governs, and the
   size check above is what guarantees a deadline is armed for every line that is sent. The
@@ -219,7 +219,7 @@ dispatch states onto these (`mcp-presenter.md`, "Calls").
 **A class per description, an instance per kernel.** From each service's description the
 `outrig` package generates a class once per interpreter -- the class of the service's `presenter`
 kind, `outrig.Service` for the generic one -- and each kernel gets an instance at its build, as
-`bind_stubs` gives it a stub per binding (`interpreter.py:5439`). The instance knows its kernel,
+`bind_stubs` gives it a stub per binding (`_interpreter.py:5439`). The instance knows its kernel,
 so a call made from a thread without an execution context is still attributed to that kernel's
 agent; the execution is read from the context when there is one.
 
@@ -242,7 +242,7 @@ agent; the execution is read from the context when there is one.
   that attribute raise an ambiguity error naming the exact names and `.method(name)`. Nothing
   picks.
 - **Listed as a binding is.** `runtime.bindings` lists the service with `kind: "service"`, its
-  description and the generated class's qualified name (`interpreter.py:4017`; the `Binding` record
+  description and the generated class's qualified name (`_interpreter.py:4017`; the `Binding` record
   gaining `kind` is `0003-42`'s); `outrig.bindings[name]` is the authoritative lookup, resolving to
   the calling kernel's instance as it resolves a binding's stub
   (`crates/outrig/src/python/outrig/_kernel.py:55`); a convenience global of the service's name is

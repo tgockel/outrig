@@ -101,8 +101,8 @@ The handle is what a Rust owner holds for an instance it constructed (brief voca
 - **Release.** `release()` ends the instance and settles its open requests `AgentReleased`, as
   `agent-classes.md`, "Release", has it; a release while the instance is still launching waits
   for the construction's answer and then releases, as `_Instance._release` waits for the launch
-  task today (`crates/outrig/src/python/interpreter.py:5216-5218`), and `ready()` then raises
-  `AgentReleased`. The session's exit releases a live instance through the close rows
+  task today (`crates/outrig/src/python/outrig/_interpreter.py:5216-5218`), and `ready()` then
+  raises `AgentReleased`. The session's exit releases a live instance through the close rows
   (`lifecycle.md`, "The close table", **Root agents**).
 - **Requests**, when the class declares channels (OR-A2-5): `channels()` lists each channel with
   its request and reply schema text; `request(channel, json)` sends and returns a request handle

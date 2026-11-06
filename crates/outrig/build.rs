@@ -321,13 +321,13 @@ fn wheels(out_dir: &Path) {
 /// The Python programs passed to the payload's interpreter as its `-c`
 /// argument, by the name of the bootstrap `OUT_DIR` gets for each.
 const PROGRAMS: &[(&str, &str)] = &[
-    ("interpreter", "src/python/interpreter.py"),
     ("binding", "src/python/binding.py"),
     ("program", "src/python/program.py"),
 ];
 
-/// Linux caps one argument string at 32 pages, and the interpreter's source
-/// is past that.
+/// Linux caps one argument string at 32 pages. The interpreter program is past
+/// that, so it travels as a file of the `outrig` package instead
+/// (`src/python/payload.rs`).
 const ARG_STRLEN_MAX: usize = 128 * 1024;
 
 /// Stage each program as the one-line `-c` argument that runs it: its source

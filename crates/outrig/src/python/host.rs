@@ -1,4 +1,4 @@
-//! The host's half of the protocol `interpreter.py` speaks.
+//! The host's half of the protocol `outrig/_interpreter.py` speaks.
 //!
 //! [`Interpreter::start`] execs the program inside a session's primary
 //! container and waits for its `ready` greeting, so an interpreter that cannot
@@ -115,22 +115,19 @@ use crate::harness::event::{self, ExecStatus, Payload, Refusal, Subject};
 use crate::harness::{Closed, ClosedBy, ExecutionStatus};
 
 use super::hosted::{Notice, Relay, Rpc};
-use super::payload::{PACKAGE_MOUNT, PAYLOAD_MOUNT};
+use super::payload::{PACKAGE_MOUNT, PAYLOAD_MOUNT, PROGRAM};
 use super::recovery::{self, Found, Timings, Verdict, Watched};
 
-/// The program the interpreter runs, passed on its command line: `build.rs`
-/// stages `interpreter.py` compressed behind a one-line bootstrap, since Linux
-/// caps one argument at 128 KiB and the source is past that.
-const PROGRAM: &str = include_str!(concat!(env!("OUT_DIR"), "/interpreter.bootstrap"));
-
-/// What the payload's `python3` is started with, ahead of where OutRig's own
-/// package is, and the vendored RPyC when the session has bindings. `-I`
-/// isolates it: no `PYTHON*` variable or other configuration the image carries
-/// reaches it, and neither the working directory nor the environment pip
-/// installs into is on `sys.path` until the program puts them there, after the
-/// standard library (`_open_imports`). That environment is made under `HOME`,
-/// which the program still reads.
-pub(super) const ARGS: [&str; 3] = ["-I", "-c", PROGRAM];
+/// What the payload's `python3` is started with, ahead of the program's path in
+/// OutRig's own package ([`PROGRAM`]), where that package is, and the vendored
+/// RPyC when the session has bindings. `-I` isolates it: no `PYTHON*` variable
+/// or other configuration the image carries reaches it, and neither the working
+/// directory nor the environment pip installs into is on `sys.path` until the
+/// program puts them there, after the standard library (`_open_imports`). That
+/// environment is made under `HOME`, which the program still reads. `-I` also
+/// implies `-P`, so the program's own directory is never on `sys.path`: the
+/// package's modules import as `outrig`'s, never as top-level modules.
+pub(super) const ARGS: [&str; 1] = ["-I"];
 
 /// The primary agent's id: the kernel opened on the interpreter's main thread,
 /// where an interrupt reaches it, and the agent every request here addresses.
@@ -173,7 +170,7 @@ pub(crate) const USER: &str = "user";
 /// The host's end of that channel, as the event log names it.
 const USER_END: &str = "user";
 
-/// The longest message posted to a channel, in bytes. `interpreter.py` bounds
+/// The longest message posted to a channel, in bytes. `_interpreter.py` bounds
 /// what the agent sends by the same `MESSAGE_MAX`, measured on the protocol line
 /// a send becomes.
 pub(crate) const MESSAGE_MAX: usize = 1 << 20;
@@ -722,10 +719,11 @@ impl Interpreter {
         workdir: Option<&Path>,
     ) -> Result<Self, InterpreterError> {
         let python = format!("{PAYLOAD_MOUNT}/bin/python3");
+        let program = format!("{PACKAGE_MOUNT}/{PROGRAM}");
         let argv: Vec<String> = [python.as_str()]
             .into_iter()
             .chain(ARGS)
-            .chain([PACKAGE_MOUNT])
+            .chain([program.as_str(), PACKAGE_MOUNT])
             .chain(rpyc)
             .map(String::from)
             .collect();

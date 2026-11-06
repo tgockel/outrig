@@ -27,7 +27,9 @@ use serde_json::{Value, json};
 
 use super::host::PRIMARY;
 use super::payload;
-use super::testing::{Flag, PIP_PROBE, Start, capture, eventually, interpreter_command, py};
+use super::testing::{
+    Flag, PIP_PROBE, Start, capture, eventually, interpreter_command, package, py,
+};
 
 /// How long any one reply may take. Generous for a loaded CI runner; nothing
 /// here comes close.
@@ -579,6 +581,65 @@ fn messages_the_interpreter_cannot_route_are_ignored() {
     ] {
         k.await_stderr(needle);
     }
+}
+
+/// The program runs from OutRig's package, by its path: the package's directory
+/// is on `sys.path`, ahead of the workspace, and the program's own directory is
+/// not on it at all. Imported as a module of the package, the program refuses.
+#[test]
+fn the_program_runs_from_the_package_and_will_not_be_imported() {
+    let mut k = Interpreter::start();
+    let paths = format!(
+        "import os, sys\nlib = {:?}\n\
+         print(sys.path.index(lib) < sys.path.index(os.getcwd()), lib + '/outrig' in sys.path)",
+        package().to_str().expect("a UTF-8 package path"),
+    );
+    assert_eq!(k.output(1, &paths), "True False\n");
+    let refused = error_of(&k.exec(2, "import outrig._interpreter"));
+    assert!(
+        refused.ends_with(
+            "ImportError: outrig._interpreter is OutRig's interpreter program, run by path, not \
+             a module\n"
+        ),
+        "{refused}"
+    );
+}
+
+/// A failure in the program's own code names the program's file, where the
+/// package holds it. The answer to this spawn names no child, as no host's
+/// does: the reader hands it to the spawn waiting on it, which fails reading
+/// it.
+#[test]
+fn a_failure_in_the_programs_own_code_names_its_file() {
+    let mut k = Interpreter::start();
+    k.submit(1, "await runtime.spawn('x', prompt='p')");
+    let asked = k.recv();
+    assert_eq!(asked["t"], "agent.spawn", "{asked}");
+    k.send(json!({"t": "spawned", "agent": PRIMARY, "id": asked["id"]}));
+    let error = error_of(&k.result_of(1));
+    let program = package().join(payload::PROGRAM);
+    assert!(
+        error.contains(&format!("File \"{}\", line", program.display()))
+            && error.ends_with("KeyError: 'child'\n"),
+        "{error}"
+    );
+}
+
+/// A child `multiprocessing` starts by `spawn` or `forkserver` runs none of the
+/// program: with no `__file__` in `__main__`, it does not run the program again
+/// as `__mp_main__`, where the program's guard would end it.
+#[test]
+fn a_spawn_or_forkserver_child_runs_none_of_the_program() {
+    let mut k = Interpreter::start();
+    let source = py(r#"
+        import multiprocessing, os
+        for method in ('spawn', 'forkserver'):
+            child = multiprocessing.get_context(method).Process(target=os.getpid)
+            child.start()
+            child.join()
+            print(method, child.exitcode)
+        "#);
+    assert_eq!(k.output(1, &source), "spawn 0\nforkserver 0\n");
 }
 
 /// An `open` the interpreter cannot carry out is answered with why, so a host

@@ -80,8 +80,8 @@ use super::host::{STDERR_LINE_MAX, STDERR_TAIL_LINES, next_line};
 use crate::error::{OutrigError, Result};
 use crate::supervise::{Debt, Owed, owe};
 
-/// The binding program as the payload's `-c` argument, staged by `build.rs` as `host.rs`'s
-/// `PROGRAM` is.
+/// The binding program as the payload's `-c` argument: `build.rs` stages its source compressed
+/// behind a one-line bootstrap that runs it.
 pub(crate) const PROGRAM: &str = include_str!(concat!(env!("OUT_DIR"), "/binding.bootstrap"));
 /// The grace a session's shutdown gives the bindings' group between `SIGTERM` and `SIGKILL`: the
 /// time `host.rs` gives the interpreter's exec client to exit. `lifecycle.md` counts it after

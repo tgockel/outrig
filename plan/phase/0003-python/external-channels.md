@@ -37,7 +37,7 @@ where it decides something, and nothing of theirs is restated here as a decision
 first milestone. The rest is designed now so that adding a second relationship later does not
 change the shape of the first", and "the rest of the layer stays design". The interpreter says the
 same of its code: "Today the other end of every channel is the host: an agent's `user` channel"
-(`crates/outrig/src/python/interpreter.py:3453-3455`). An external channel is that second
+(`crates/outrig/src/python/outrig/_interpreter.py:3453-3455`). An external channel is that second
 relationship, and this page changes nothing about the first: an endpoint keeps its three
 operations, a `Delivery` keeps its shape, `runtime.wait` keeps its rule, and the serializable
 subset is still the contract. Plain external channels are therefore a deferral the layer
@@ -87,7 +87,7 @@ from the owner's own code, pushed through a **channel handle** OutRig hands out 
 246-248`). OutRig's **host end** holds the channel's record and talks to the interpreter through
 the protocol lines the `user` channel already uses -- `msg` in, `send` out, `pending` and
 `received` beside them (`observability.md`, "Most of this is already on a wire"). The
-**endpoint** in the holder's kernel is `interpreter.py`'s `Endpoint` (`:3582`), with its bounded
+**endpoint** in the holder's kernel is `_interpreter.py`'s `Endpoint` (`:3582`), with its bounded
 queue, its delivered count, its `pending()`, `receive()` and `send()`, and the watchers
 `runtime.wait` registers (`_watch`, `:3682`). Nothing of the backend runs in the container, and
 nothing of the agent's runs in the owner's process.
@@ -132,7 +132,7 @@ A **definition** names a channel and fixes, for its lifetime:
   types or empty ("Bodies");
 - its **bound**: how many items the local queue holds unread, and for an inbound request channel
   how many requests may be unsettled -- unread, or received and unanswered -- at once; the default
-  and the ceiling are the interpreter's own, 256 (`interpreter.py:3466`);
+  and the ceiling are the interpreter's own, 256 (`_interpreter.py:3466`);
 - its **wake policy**: `wake`, `announce` or `silent` ("Wake policy");
 - its **description**, which the agent's instructions carry ("What the agent is told");
 - its **backend**, the embedder's object behind the trait, which is the channel's far end
@@ -169,7 +169,7 @@ is OutRig's, and the body is one of two things.**
 
 - **A body the backend owns** crosses as `str`, or as untyped JSON -- any JSON value, which the
   agent's code reads as the `dict`, `list` or scalar it decodes to. OutRig checks that it is JSON
-  and that it fits `MESSAGE_MAX` (`interpreter.py:3467`), and nothing else. An application whose
+  and that it fits `MESSAGE_MAX` (`_interpreter.py:3467`), and nothing else. An application whose
   job records have a schema keeps that schema on its own side, in the backend, and the agent's
   code reads what arrives.
 - **A body the definition types** is declared in the serializable subset, checked by
@@ -185,7 +185,7 @@ is OutRig's, and the body is one of two things.**
 
 Where a typed body is decoded follows from a rule the interpreter already has. `_deliver` runs on
 the reader thread and refuses to build a dataclass there, "since building one runs the agent's
-code, and this is the reader thread" (`interpreter.py:3759-3762`). So an arriving typed body is
+code, and this is the reader thread" (`_interpreter.py:3759-3762`). So an arriving typed body is
 checked against the schema as JSON on arrival, with no code of the agent's run -- a body that does
 not fit is refused to the owner with the problems, and nothing is queued -- and is constructed
 into the declared class at `receive()`, on the agent's own loop. `0003-51` builds this; its fork
@@ -193,13 +193,13 @@ is whether anything but the structural check runs on arrival.
 
 Sender identity comes from the owner's push, never from the body: an inbound item carries a
 `sender` the backend set, which `Delivery.sender` carries into the agent's code, as `"user"` is
-carried today (`interpreter.py:3500-3515`). `messages.md`, "Routing and attribution": "A body
+carried today (`_interpreter.py:3500-3515`). `messages.md`, "Routing and attribution": "A body
 that claims to be from another agent is a body with a field in it." An outbound item has no
 addressee field; the channel is the addressee, and the backend routes it.
 
 ## The local queue is a window
 
-An endpoint's queue is bounded, `QUEUE_MAX` of 256 unread (`interpreter.py:3466`), and a delivery
+An endpoint's queue is bounded, `QUEUE_MAX` of 256 unread (`_interpreter.py:3466`), and a delivery
 past the bound is refused rather than waited for: `_deliver` raises `_Refused` "already holds 256
 unread messages", having queued nothing (`:3773-3774`), and the host's `post` answers with that
 refusal (`crates/outrig/src/python/host.rs:1100-1140`). The bound is kept, and it is what makes
@@ -237,7 +237,7 @@ primary's user channel and stands there; a holder of an external channel is reac
 Three positions, which OR-CH3 asks to keep apart, and which the layer already keeps apart:
 
 1. **Queued locally.** The host posted the item on the holder's channel and the interpreter
-   queued it, answering with the count then waiting (`_msg`, `interpreter.py:6309-6336`). The
+   queued it, answering with the count then waiting (`_msg`, `_interpreter.py:6309-6336`). The
    push returns here. The item is in the window and nothing has read it. `messages.md`:
    "Receiving removes a message. Notification does not." Nothing is reported to the backend at
    this position: queued is not consumed.
@@ -274,7 +274,7 @@ calls it, and what the save carries of the registry is `continuation.md`'s.
 ## Wake policy
 
 `runtime.wait` watches every endpoint of the calling agent and raises `MessageAvailable` while any
-holds unread input (`interpreter.py:4036-4130`; `messages.md`, "Waiting": "Input wins"). The
+holds unread input (`_interpreter.py:4036-4130`; `messages.md`, "Waiting": "Input wins"). The
 announcer tells the model what waits, by channel and count, at a round's opening and on the next
 tool result (`crates/outrig/src/agent/channel.rs:42-134`; `agent/tool.rs:147-160`). For the
 `user` channel both are unconditional. A definition chooses, per channel, what an arrival does
@@ -317,7 +317,7 @@ is about requests, and "Requests" says how far it reaches here.
 
 **`runtime.wait` over a child's handle and an external channel is one wait** (OR-A7-4). A handle
 is watched through its `future` and every channel through `_watch`, in the one loop
-`runtime.wait` already runs (`interpreter.py:4036-4130`), so a wait over a child's handle and a
+`runtime.wait` already runs (`_interpreter.py:4036-4130`), so a wait over a child's handle and a
 channel returns on whichever comes first: the handle settling, as `(done, pending)`, or the
 arrival, as `MessageAvailable`. Nothing is added for it; `0003-51` states it as acceptance, since
 an embedder offers one wait over local children and remote peers on it.
@@ -330,7 +330,7 @@ says `announce`, and one for a feed the agent polls says `silent`.
 
 A channel connects two endpoints (`messages.md`, "Channels and endpoints"). The backend is one;
 the other is one agent's, and this page calls that agent the channel's **holder**. Channel sets
-are fixed when a kernel is built (`interpreter.py:5384-5397`), so a channel is attached to its
+are fixed when a kernel is built (`_interpreter.py:5384-5397`), so a channel is attached to its
 holder as the holder's kernel is built, and never later.
 
 An external channel reaches an agent as a **facility** (`README.md`, "Vocabulary"; `facilities.md`;
@@ -376,13 +376,13 @@ and `messages.md`'s rule holds: identity does not cross.
 `await endpoint.send(message)` on a plain channel, and `endpoint.request(body)` on an outbound
 request channel, hand an item to the backend. Today a `send` on the `user` channel writes one
 protocol line and returns, and the host frees the send window of 16 when the user receives
-(`interpreter.py:3698-3748`; `host.rs:1597-1628`, `:1903-1907`). On an external channel the item
+(`_interpreter.py:3698-3748`; `host.rs:1597-1628`, `:1903-1907`). On an external channel the item
 goes to the backend through the trait, with the item's metadata -- direction, kind, type, the
 sender as the backend sets it, the correlation id, a stable item id OutRig mints, and any backend
 reference already known (OR-A7-1) -- and **`send` returns once the backend has taken it durably**:
 the `accepted` of OR-CH3, which `messages.md` already says is what success means, "accepted for
 delivery, not processed by the recipient". `SEND_WINDOW` keeps bounding what one endpoint has sent
-and not yet heard about (`interpreter.py:3468`), so an agent that sends faster than its backend
+and not yet heard about (`_interpreter.py:3468`), so an agent that sends faster than its backend
 accepts waits in its own `send`, in its own memory, as it does today.
 
 The backend answers one of three things (OR-A7-1): **accepted**, with its opaque durable
@@ -443,7 +443,7 @@ in agreement: **a request on an external channel settles under the backend** (OR
 The owner pushes a request as it pushes a message, with kind `request`; the push answers once the
 request is queued, with its delivery id. The agent's end is a request child's end (`messages.md`,
 "Request channels"): `receive()` gives a `RequestDelivery` with `id`, `body` and `sender`, and
-`await d.reply(value)` or `await d.fail(message)` answers it (`interpreter.py:3518-3538`;
+`await d.reply(value)` or `await d.fail(message)` answers it (`_interpreter.py:3518-3538`;
 `RequestEndpoint`, `:5310-5362`). `reply` checks the value against the channel's reply contract
 strictly, and raises the problems in the agent's code when it does not fit, as a child's does --
 for a `str` or untyped-JSON contract there is nothing to fail. The request's terminal outcome is
@@ -689,7 +689,7 @@ the owner connection. That path is an open choice, not a requirement (`A-00-inde
 built: the owner protocol carries requests from the program and pushes from the engine, and no
 request from the engine (`crates/outrig/src/owner/mod.rs:16-28`; `owner/connection.rs:141-242`),
 so it would need engine-initiated requests; and the engine reads lines of at most 64 KiB from the
-program (`owner/connection.rs:35`) while a channel item may be 1 MiB (`interpreter.py:3467`), so a
+program (`owner/connection.rs:35`) while a channel item may be 1 MiB (`_interpreter.py:3467`), so a
 host program's push of a large item would need that bound raised or the body carried in parts.
 The Rust push crosses no line and has no such bound.
 
@@ -785,7 +785,7 @@ the item id, and promises nothing a backend did not (`embedding.md`, "What stays
 embedder's"); redelivery is the backend's, by item id, against the positions the cut handed it.
 
 **Rejected: a channel added after the kernel is built.** Channel sets are fixed at kernel build
-(`interpreter.py:5384-5397`), and a definition is given to the builder. Adding one mid-session
+(`_interpreter.py:5384-5397`), and a definition is given to the builder. Adding one mid-session
 would need the kernel's channel dict to grow, the registry to learn of it, and the orientation --
 composed once -- to be told; nothing this phase needs asks for that.
 
@@ -817,7 +817,7 @@ is given a facility of the application's making.
 
 ## Unverified
 
-- Nothing on this page is built. `interpreter.py`'s endpoint, `pending()`, the announcer, the
+- Nothing on this page is built. `_interpreter.py`'s endpoint, `pending()`, the announcer, the
   delivery ids and `runtime.wait`'s watching exist and are tested for the `user` channel and for
   request channels between agents; that they generalize to a host end other than the user is
   reasoned from `host.rs:2232-2262`, where the only host end today is the primary's outbox and
@@ -827,10 +827,10 @@ is given a facility of the application's making.
   `record.child`; whether an id space shared between the host's `MessageId` and the interpreter's
   request ids is needed, or two registries are unioned, is `0003-52`'s fork.
 - That `runtime.wait` over a child's handle and an external channel is one wait is reasoned from
-  `interpreter.py:4036-4130`, where handles are watched through their futures and channels through
+  `_interpreter.py:4036-4130`, where handles are watched through their futures and channels through
   `_watch` in one loop; `0003-51`'s acceptance runs it.
 - The owner connection's 64 KiB line bound (`owner/connection.rs:35`) against a 1 MiB item
-  (`interpreter.py:3467`) binds only a Python host program's push, which no task here builds; the
+  (`_interpreter.py:3467`) binds only a Python host program's push, which no task here builds; the
   Rust push crosses no line. Recorded so that whoever builds that path meets it knowingly.
 - The interpreter program's size after `0003-39` is what makes room for the external endpoint
   classes; the cap it would otherwise hit is recorded in `0003-34`'s `## Decisions`.

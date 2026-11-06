@@ -6,7 +6,7 @@ Every message the host posts or the agent sends already has an id. `Interpreter:
 records `message.sent` under a `MessageId` before the `msg` line goes out
 (`crates/outrig/src/python/host.rs:1100-1140`), and a `send` line from the agent is given one as
 it arrives (`:2232-2242`); `Delivery.id` carries it into the agent's code
-(`crates/outrig/src/python/interpreter.py:3500-3515`), and `Endpoint.send` returns nothing
+(`crates/outrig/src/python/outrig/_interpreter.py:3500-3515`), and `Endpoint.send` returns nothing
 (`:3698-3735`). The host knows, per child channel, every request ever delivered and which are
 unread (`children.rs:114-125`, `counts`, `:1041-1070`), and per request its state and the rounds
 it spanned (`:147-156`); the interpreter answers `pending` with each channel's unread and delivered
@@ -220,4 +220,4 @@ Each is a mock-driven test unless it says otherwise.
   `A-06-owner-readable-outcomes-and-roster.md` -- OR-A6-2.
 - `crates/outrig/src/python/host.rs` (`posting`, `Reply::Sent`), `crates/outrig/src/agent/
   children.rs` (`counts`, `report`), `crates/outrig/src/harness/report.rs`,
-  `crates/outrig/src/python/interpreter.py` (`Endpoint.send`, `Delivery`, `_pending`).
+  `crates/outrig/src/python/outrig/_interpreter.py` (`Endpoint.send`, `Delivery`, `_pending`).

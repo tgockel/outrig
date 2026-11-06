@@ -16,9 +16,10 @@ it: docstrings, schema text and input previews (`_agents.py:186-195`), no `repr`
 `__dict__`. The repository's instructions are capped at 32 KiB
 (`crates/outrig/src/agent/instructions.rs:20`) and the skills list at 50 entries or 12 KiB
 (`orientation.rs:298-301`). A spawn line is bounded
-at `MESSAGE_MAX`, 1 MiB (`_refuse_long`, `crates/outrig/src/python/interpreter.py:4259-4266`).
-`0003-42` gives the orientation a facility manifest in place of the bindings list, `0003-45` a
-sentence about `self`, and `0003-46` a root whose construction answers on a line of its own.
+at `MESSAGE_MAX`, 1 MiB (`_refuse_long`,
+`crates/outrig/src/python/outrig/_interpreter.py:4259-4266`). `0003-42` gives the orientation a
+facility manifest in place of the bindings list, `0003-45` a sentence about `self`, and `0003-46` a
+root whose construction answers on a line of its own.
 
 OR-AG7 asks that, after full initialization, OutRig compose execution and channel rules, the
 class's and the application's task contributions, and the actual facility and channel manifest;
@@ -155,4 +156,4 @@ once, and `task-agents.md` records the per-round alternative as rejected.
 - `plan/phase/0003-python/typed-agents.md` -- "Inputs are values".
 - `plan/phase/0003-python/discovery.md` -- "What goes in the preamble".
 - `crates/outrig/src/agent/orientation.rs`, `children.rs` (`make`), `instructions.rs`,
-  `crates/outrig/src/python/interpreter.py` (`_Instance.launch`, `_spawn`).
+  `crates/outrig/src/python/outrig/_interpreter.py` (`_Instance.launch`, `_spawn`).

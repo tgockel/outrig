@@ -3,7 +3,7 @@
 ## Context
 
 A child is given data: `_inputs` checks each input against the serializable subset, previews
-it and deep-copies it (`crates/outrig/src/python/interpreter.py:4325-4348`), `_hosted_name`
+it and deep-copies it (`crates/outrig/src/python/outrig/_interpreter.py:4325-4348`), `_hosted_name`
 refuses an object a binding holds with "a child reaches the session's bindings itself, by name"
 (`:4314-4322`), `_spawn` sends the manifest to the host and keeps the copies in `_spawning`
 (`:3907`, `:3941-3949`), and `_open` binds them into the child's globals (`:6279-6282`). A child
@@ -206,6 +206,6 @@ Each is a mock-driven test.
 - `plan/phase/0003-python/security.md` -- "Agents are not isolated from each other, and it does
   not matter"; `plan/phase/0003-python/agent-placement.md` -- "What agents share regardless".
 - `plan/phase/0003-python/boundary-policy.md` -- "Narrow bindings for consequential actions".
-- `crates/outrig/src/python/interpreter.py` (`_inputs`, `_hosted_name`, `_Instance`, `Kernel`,
-  `_bindings`, `_open`), `crates/outrig/src/python/outrig/_kernel.py`,
+- `crates/outrig/src/python/outrig/_interpreter.py` (`_inputs`, `_hosted_name`, `_Instance`,
+  `Kernel`, `_bindings`, `_open`), `crates/outrig/src/python/outrig/_kernel.py`,
   `crates/outrig/src/agent/orientation.rs` (`child_preamble`, `hosted`).

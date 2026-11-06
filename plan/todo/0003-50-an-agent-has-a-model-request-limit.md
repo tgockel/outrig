@@ -11,13 +11,13 @@ retry loop refuses a request once it holds its place (`crates/outrig/src/agent/r
 `:626-628`, `BudgetSpent`); a child's runner, seeing `spent_budget()`, settles every open request
 `budget` and marks the child idle (`crates/outrig/src/agent/runner.rs:77-98`;
 `crates/outrig/src/agent/children.rs:1196-1200`, `settle`; `:1228-1230`); the sender's `await`
-raises `BudgetExhausted` (`crates/outrig/src/python/interpreter.py:6437-6452`, `_HOST_ENDS` and
-`_settle_work`), and an instance's `ready()` raises it through `oriented`
-(`children.rs:1205-1221`; `interpreter.py:6455-6461`;
+raises `BudgetExhausted` (`crates/outrig/src/python/outrig/_interpreter.py:6437-6452`, `_HOST_ENDS`
+and `_settle_work`), and an instance's `ready()` raises it through `oriented`
+(`children.rs:1205-1221`; `_interpreter.py:6455-6461`;
 `crates/outrig/src/python/outrig/_agents.py:544-553`). A spent budget is final for the session.
 `subagent-depth-max`, `children-max` and `requests-max` refuse at the call with
 `AgentLimitReached`, whose `Status.reason` is `limit` (`children.rs:432-451`;
-`interpreter.py:4419-4426`, `:4180`; `_agents.py:125-127`, `:164-182`). A logical model request
+`_interpreter.py:4419-4426`, `:4180`; `_agents.py:125-127`, `:164-182`). A logical model request
 is a `call_id`, minted once by `CallSlot::begin_call` as the chain's `completion()` begins
 (`ledger.rs:529-540`; `crates/outrig/src/agent/failover.rs:589`); each request sent for it is an
 `attempt_id` (`ledger.rs:579-596`). The slot is per agent (`:363-389`). A round's stop is one text
@@ -103,12 +103,12 @@ a child's requests settled `limit`, with nothing released, failed or rolled back
   child holds with the end `limit` through `settle`, and a request arriving while the child stays
   at the limit is settled `limit` as it arrives, with no round and no model call. `RequestEnd`
   gains `Limit` (`event.rs:1238-1258`; `children.rs:1401-1412`); `_HOST_ENDS` gains `"limit"`
-  mapped to `AgentLimitReached` (`interpreter.py:6437-6441`), whose message names the child, its
+  mapped to `AgentLimitReached` (`_interpreter.py:6437-6441`), whose message names the child, its
   limit and its count; `Status.reason` reads `limit` and `Status.child` reads `limit-reached`
   (`_agents.py:164-182`), from a new `Life` state the host tells the parent (`children.rs:128-145`,
   `:1175-1192`). An orienting round the limit stops part way has ended, so `ready()` settles and
   the child is at its limit; `oriented`'s error arm gains `limit` beside `budget` and `failed`
-  (`children.rs:1205-1221`; `interpreter.py:6455-6461`) for an orienting round that cannot open,
+  (`children.rs:1205-1221`; `_interpreter.py:6455-6461`) for an orienting round that cannot open,
   which a carried count at a resume reaches (`0003-64`), and `ready()` raises `AgentLimitReached`
   then. The child stays resident, counted by `children-max`, with its kernel, namespace,
   facilities and history.
@@ -287,5 +287,5 @@ Each is a mock-driven test unless it says otherwise.
 - `plan/todo/0003-37-a-request-is-worked-on-or-cancelled.md` -- the rule this task composes with.
 - `crates/outrig/src/agent/ledger.rs`, `round.rs`, `runner.rs`, `children.rs`, `tool.rs`,
   `orientation.rs`; `crates/outrig/src/harness/session.rs`, `event.rs`;
-  `crates/outrig/src/config/mod.rs`, `validate.rs`; `crates/outrig/src/python/interpreter.py`,
-  `outrig/_agents.py`.
+  `crates/outrig/src/config/mod.rs`, `validate.rs`;
+  `crates/outrig/src/python/outrig/_interpreter.py`, `outrig/_agents.py`.

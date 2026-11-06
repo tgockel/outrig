@@ -242,8 +242,8 @@ The stamp is the stream sequence at which the facts were read (`crates/outrig/sr
 happened since. A fact that could not be read in time -- a kernel whose loop is not turning, a
 probe unanswered -- is reported as unavailable or timed out, never as a guess: the probe pattern
 of `runtime-protection.md`, "What the port does" ("The probe asks two questions"), is the
-precedent, and `kernel.cpu` (`crates/outrig/src/python/interpreter.py:5887-5899`) answers on the
-reader thread while a loop does not. The facts are the same facts a latest-state snapshot would
+precedent, and `kernel.cpu` (`crates/outrig/src/python/outrig/_interpreter.py:5887-5899`) answers on
+the reader thread while a loop does not. The facts are the same facts a latest-state snapshot would
 carry; `potential/live-state-snapshot.md` is the stream-sequenced version for a monitor, and the
 assessment adds the continuation fields and the stamp without adopting that entry.
 
@@ -535,14 +535,14 @@ shows the notice as the first round's opening. The flag joins `RunNewArgs`
 **Reversed here, in part.** `lifecycle.md`, "Closing a session", says closing cancels "child work
 and unanswered requests cancelled, and every waiter on them settled with a documented error", and
 the interpreter's `_close` settles them `SessionClosing`
-(`crates/outrig/src/python/interpreter.py:6207-6238`). A sleep that ended in today's close would
-cancel every request the agent holds and tell the owner `SessionClosing`, which is the opposite of
-recording their positions. What is added: a **terminal request end for suspension**, recorded
-before the close settles anything, so the close finds each request already ended and settles
-nothing it should have recorded; the `terminated` end the close uses for an interpreter death
-(`crates/outrig/src/harness/event.rs:1238-1256`, `RequestEnd`; `children.rs:269-287`, `report`)
-is the precedent. And `lifecycle.md`, "The interpreter's death ends the session", says "A fresh
-interpreter inherits no pending handles and no proxies, only the notice". What is narrowed: a
+(`crates/outrig/src/python/outrig/_interpreter.py:6207-6238`). A sleep that ended in today's close
+would cancel every request the agent holds and tell the owner `SessionClosing`, which is the
+opposite of recording their positions. What is added: a **terminal request end for suspension**,
+recorded before the close settles anything, so the close finds each request already ended and
+settles nothing it should have recorded; the `terminated` end the close uses for an interpreter
+death (`crates/outrig/src/harness/event.rs:1238-1256`, `RequestEnd`; `children.rs:269-287`,
+`report`) is the precedent. And `lifecycle.md`, "The interpreter's death ends the session", says "A
+fresh interpreter inherits no pending handles and no proxies, only the notice". What is narrowed: a
 handle to a **durable external** request is reattached by its logical id through
 `external-channels.md`'s registry, because the backend holds the request and its identity outlives
 the session; every other handle is ended. No proxy is reattached, which OR-AG5 and OR-SUS6 reject
