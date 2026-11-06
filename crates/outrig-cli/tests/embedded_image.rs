@@ -113,6 +113,7 @@ async fn mcp_show_merged_prints_effective_toml() {
     let repo_dir = tempfile::tempdir().expect("tempdir repo");
     let sessions = tempfile::tempdir().expect("tempdir sessions");
     let image_ctx = tempfile::tempdir().expect("tempdir image context");
+    let global = common::EmptyGlobalConfig::new();
     let agents_dir = repo_dir.path().join(".agents/outrig");
     std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
 
@@ -149,6 +150,8 @@ context = "{context}"
         TEST_TIMEOUT,
         Command::new(bin)
             .args([
+                "--global-config",
+                common::utf8(global.path()),
                 "--session-root",
                 sessions.path().to_str().expect("sessions path utf-8"),
                 "mcp",
@@ -194,6 +197,7 @@ async fn mcp_show_merged_accepts_raw_local_image_ref() {
     let repo_dir = tempfile::tempdir().expect("tempdir repo");
     let sessions = tempfile::tempdir().expect("tempdir sessions");
     let image_ctx = tempfile::tempdir().expect("tempdir image context");
+    let global = common::EmptyGlobalConfig::new();
     let agents_dir = repo_dir.path().join(".agents/outrig");
     std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
     std::fs::write(agents_dir.join("config.toml"), "").expect("write config");
@@ -213,6 +217,8 @@ async fn mcp_show_merged_accepts_raw_local_image_ref() {
         TEST_TIMEOUT,
         Command::new(bin)
             .args([
+                "--global-config",
+                common::utf8(global.path()),
                 "--session-root",
                 sessions.path().to_str().expect("sessions path utf-8"),
                 "mcp",
@@ -567,6 +573,7 @@ async fn mcp_show_merged_without_repo_config() {
     let repo_dir = tempfile::tempdir().expect("tempdir repo");
     let sessions = tempfile::tempdir().expect("tempdir sessions");
     let image_ctx = tempfile::tempdir().expect("tempdir image context");
+    let global = common::EmptyGlobalConfig::new();
 
     let image_ref = unique_image_tag("config-less-mcp");
     let dockerfile = format!(
@@ -583,6 +590,8 @@ async fn mcp_show_merged_without_repo_config() {
         TEST_TIMEOUT,
         Command::new(bin)
             .args([
+                "--global-config",
+                common::utf8(global.path()),
                 "--session-root",
                 sessions.path().to_str().expect("sessions path utf-8"),
                 "mcp",
@@ -727,9 +736,10 @@ context = "{context}"
     );
     std::fs::write(agents_dir.join("config.toml"), config_toml).expect("write config");
 
+    let global = common::EmptyGlobalConfig::new();
     let bin = env!("CARGO_BIN_EXE_outrig");
     let mut child = Command::new(bin)
-        .args(["mcp"])
+        .args(["--global-config", common::utf8(global.path()), "mcp"])
         .current_dir(repo_dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
