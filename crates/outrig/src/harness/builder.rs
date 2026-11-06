@@ -42,7 +42,10 @@ pub enum Step {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Progress {
+    /// The step began.
     Started(Step),
+    /// The step completed. A step that fails is not reported finished: the
+    /// start returns its error instead.
     Finished(Step),
 }
 
@@ -805,6 +808,7 @@ fn same_paths(
 /// A container for a session, and the MCP servers it leaves out.
 #[non_exhaustive]
 pub struct ContainerSpec {
+    /// The container's description, to give [`SessionBuilder::container`].
     pub spec: LaunchSpec,
     /// The configured MCP servers the container does not start.
     pub left_out: Vec<String>,

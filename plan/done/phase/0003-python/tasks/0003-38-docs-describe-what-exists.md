@@ -177,3 +177,90 @@ MCP now sits, and what a binding lets an agent do on the host.
 
 - `plan/phase/0003-python/README.md` -- the linked subsystems and why the MCP pages matter most.
 - `crates/outrig-cli/src/mcp_self/docs.rs` -- the `include_str!` sites and the symlink test.
+
+## Decisions
+
+- **Fork 1: one runtime page.** `doc/concepts/python-runtime.md` carries executions, rounds,
+  names, channels and waiting, child agents, `@outrig.agent`, `outrig.Agent` and skills, at 355
+  lines; `doc/concepts/hosted-objects.md` beside it carries bindings. Neither needed splitting.
+- **Fork 2: `subagents.md` gains the pointer.** It says the page is `run`'s, that `run-new`'s
+  children are a different system, and that the width cap is `run`'s alone, bounded in `run-new`
+  by `children-max` and `model-concurrency-max` instead.
+- **The trust-model page is retitled "Trust Model"; its file and page key are not.** It now
+  describes the boundary for everything in the container, MCP servers and the agent's Python
+  alike, with "The agent cannot grow its own environment" as a section of its own. Keeping
+  `mcp-trust-model.md` keeps every inbound link and the `concepts/mcp-trust-model` key `outrig
+  mcp self` serves, which `list_includes_trust_model` asserts. `tests/mcp_self.rs`, which checks
+  that `get_doc` returns the page by its heading, now looks for `# Trust Model`.
+- **The new pages are not added to `outrig mcp self`'s bundle.** The bundle serves image-config
+  design, and `[bindings.<name>]` is already in its config reference. Bundled pages link to the
+  new ones by absolute `https://tgockel.github.io/outrig/` URL, as they already do for `run.md`
+  and `llm-providers.md`, since `every_internal_link_resolves_to_a_registered_page` requires a
+  relative link from one to reach another bundled page.
+- **The host-program section moves from `run.md` to `doc/usage/host-programs.md`.** `run.md` is
+  `run`'s page and keeps a pointer; `run_program_e2e.rs` reads its example from the new page. The
+  moved text kept its wording but one fix: a read from piped input is `outrig run-new`'s, where it
+  said `outrig run`.
+- **The task's settings list for a host program's session (R7) says `[workspace]` applies; the
+  code does not mount it.** `0003-29`'s `prepare` in `owner/session.rs` replaces the configured
+  workspace with the program's `mounts=`, and `outrig.config()` shows the configured one. The new
+  config section, "What a host program's session reads", says what the code does, and adds what
+  the list left out, each read from the code: `[network]` (`LaunchSpec::from_config`), the
+  top-level limits and tool limits (`Config::limits(None)`, `resolve_agent` with no agent), and
+  that no MCP server, sidecar or skill starts.
+- **Vocabulary is defined once, in `python-runtime.md#vocabulary`.** Pages about both loops --
+  `config.md`, `llm-providers.md`, `events.md`, `cli.md` -- use `run-new`'s words and say so; pages
+  about `run` alone -- `run.md`, `subagents.md`, `mcp-servers.md`, `recipes.md`, the quickstart --
+  say that a turn there is a prompt and its work. A "turn" that quotes the program's own output,
+  `turns are capped at 32768` in `config.md`, is left as the program prints it.
+- **The Python owner API reference is generated, at the maintainer's choice.**
+  `scripts/python-api-reference.py` reads the package with `ast`, imports nothing, and checks by
+  default and writes with `--write`, as `check-public-api.py` does; CI's `doc-style` job runs the
+  check. Every name in `__all__`, `_HOST_ONLY` and `_KERNEL_ONLY` must be placed on the page or
+  listed as kernel-only, so a newly exported name fails rather than going unlisted. The types a
+  program reads from other names' values -- `Model`, `ShutdownReport`'s parts, and `Handle`, which
+  is not exported -- are listed under their bare names. `Schema` and `Handle` are shown without
+  their `__init__`, which takes the engine's internals.
+- **`events.md` keeps its categories.** `event.rs`'s section comments group the `agent.*` events
+  under execution diagnostics and `binding.injected` under integration audit, the other way from
+  the page. The page's placement decides what each event may hold, and the tasks that added them
+  placed them there on purpose, so it stands; this task changes no event and no comment.
+- **Three event entries had drifted from the code**, each since `0003-37` or before:
+  `agent.request.cancelled` gains `reason`; `agent.request.settled`'s `cause` belongs to a
+  submission the engine cancelled, carried by `RequestCancelled.__cause__`, not to a rejected
+  one; and `message.sent`'s `from` can be a child's subject, which a `message.refused` follows.
+- **`SECURITY.md` gains what the phase changed and it lacked**, checked against
+  `plan/phase/0003-python/security.md` point by point. In scope: code in the container reaching
+  the bindings process or a host program other than through the relay, a request to a binding
+  running unpublished, or one admitted after the close; agent code starting a container, sidecar,
+  MCP server or binding; and, under `run-new`, a credential from an MCP or sidecar block reaching
+  the container. Known boundaries: the host program as trusted host code and the authority of a
+  live object it injects; that the events are a record only under `[events] mode = "record"`;
+  that a binding's grant covers OutRig's own files and is not limited by a read-only mount; and
+  that agents in one session are not isolated from each other. Left out: the design's bounds on
+  what the container sends and its note that what the host queues is not yet bounded, which are
+  robustness rather than the boundary, and the supported-versions table stays at `0.2.x`, since
+  0.3 is not released.
+- **Every remaining `TODO: Incomplete` marker is still honest.** All seven describe work not
+  done: `llm-providers.md` (other Rig styles, and prompt caching in `run-new`), `mcp-servers.md`
+  (auto-restart and health checks), `usage/image.md` (the known MCP servers), `usage/config.md`
+  and `usage/init.md` (non-interactive modes), `recipes.md` (sharing configs) and `run.md` (typed
+  multi-line input for `run`). None was dropped.
+- **Stale text found on the way, and fixed:** `cli.md` said podman forwards the host's proxy
+  variables into `run-new`'s container, which 0.2.2's `--http-proxy=false` stopped; its exit-code
+  paragraph left out a host program's `3`; `crates/outrig-cli/README.md` said the library avoids
+  the LLM dependency graph; `_host.py`'s module docstring named `outrig run <script.py>`;
+  `concepts/README.md` counted four concepts and said a subagent cannot launch subagents; and
+  `0003-70`'s note said every `concepts/` and `reference/` page is a symlink.
+- **Review corrections, each checked against the code.** Only `Outrig::launch` mounts the
+  payload and reserves `/outrig`, so `containers.md` scopes both to `run-new`'s primary, a host
+  program's and an embedder's; `run`, `run-legacy`, `outrig mcp` and sidecars get none of it. A
+  standalone `@outrig.agent` declaration is called only in a kernel (`_call` stays `None` on the
+  host), which its docstring now says. A handle raises an `outrig.AgentError` for what the child's
+  work or the session ended; a typed call's raising `validate=`, a model not configured and work
+  too long to send end it on the caller's side with other exceptions, which `python-runtime.md`,
+  the `Handle` and `AgentError` docstrings and the reference's Errors introduction now say. And
+  `bindings::approve` reads the approval store before it looks for an approver, so a host
+  program's session starts a repository's binding approved before; the pages that said it
+  refuses every one now say so, `an_approval_is_remembered_and_an_edit_asks_again` asserts it,
+  and `plan/next/host-program-approves-repo-bindings.md` keeps only the approver a program lacks.

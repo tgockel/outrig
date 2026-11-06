@@ -127,6 +127,30 @@ assert_eq!(report.verdict(), Verdict::Clean);
 # }
 ```
 
+A session started with `no_primary` has no agent of its own: it is what each `outrig.Session` a
+Python program run by `outrig run-new <script.py>` enters, the program driving the agents in it.
+It resolves no model and asks its `Secrets` for nothing as it starts, and has no rounds and no
+`user` channel; its container, interpreter and bindings, its admission, its events and its
+shutdown report are the same as a session's with a primary agent:
+
+```rust,no_run
+# async fn example(config: outrig::config::Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+use outrig::harness::{DEFAULT_DRAIN, SessionBuilder, SessionError};
+
+let mut builder = SessionBuilder::new(config, None, None).no_primary();
+let mut events = builder.subscribe();
+let mut session = builder.start().await?;
+assert!(session.user_channel().is_none());
+assert!(matches!(session.round().await, Err(SessionError::NoPrimary)));
+
+session.close_admission();
+let report = session.shutdown(DEFAULT_DRAIN).await;
+println!("{:?}", report.verdict());
+# let _ = events.try_recv();
+# Ok(())
+# }
+```
+
 ## Documentation
 
 Full docs render as an mdbook at <https://tgockel.github.io/outrig/>. Source lives in the

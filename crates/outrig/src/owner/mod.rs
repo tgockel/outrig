@@ -47,6 +47,8 @@
 //!   and `agent.closed` (`terminated`), the session's close, and again, `terminated`, once its
 //!   interpreter has exited. Every push about a session precedes the answer that ends it.
 
+#![warn(missing_docs)]
+
 mod connection;
 mod program;
 mod session;
@@ -316,6 +318,7 @@ impl ProgramExit {
 pub struct LeftOpen {
     /// The session's id.
     pub id: String,
+    /// How the engine ended it.
     pub end: SessionEnd,
 }
 

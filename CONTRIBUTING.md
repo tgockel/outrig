@@ -52,6 +52,20 @@ The check does not forbid changing the API. After an intentional surface change,
 with `python3 scripts/check-public-api.py --write` and let the regenerated snapshot travel in
 the same commit: that diff is the review material.
 
+## The Python API reference
+
+`doc/reference/python.md` is rendered from the docstrings of the `outrig` package in
+`crates/outrig/src/python/outrig/`, and CI fails when the page and the docstrings differ:
+
+```sh
+python3 scripts/python-api-reference.py           # check
+python3 scripts/python-api-reference.py --write   # render the page again
+```
+
+Run it with `--write` after changing a docstring the page carries. A name newly exported from
+`outrig/__init__.py` fails the check until the script's `SECTIONS` or `KERNEL_ONLY` gives it a
+place on the page.
+
 ## The session renderer
 
 `scripts/render-session.py` turns a session's event log into a page a browser opens, and the log

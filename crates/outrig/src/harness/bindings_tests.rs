@@ -437,6 +437,11 @@ async fn an_approval_is_remembered_and_an_edit_asks_again() {
     assert_eq!(listed(&session).await, "['rec']\n");
     stop(session).await;
 
+    // Remembered, so a session with nobody to ask -- a host program's -- starts it too.
+    let session = start(bed.builder(bed.load())).await;
+    assert_eq!(listed(&session).await, "['rec']\n");
+    stop(session).await;
+
     bed.write("", &bed.recorder("rec", 1, "edited"));
     let session = start(bed.builder(bed.load()).approver(approve())).await;
     assert_eq!(asked.load(Ordering::SeqCst), 2, "an edit asks again");

@@ -33,6 +33,7 @@ pub struct ShutdownReport {
     /// Each request an agent had made of a child and not seen answered when
     /// admission closed, and how it ended.
     pub requests: Vec<RequestOutcome>,
+    /// How the session's events reached its subscriptions and its log.
     pub events: EventDelivery,
 }
 
@@ -72,7 +73,10 @@ pub enum Stopped {
     /// Something could not be confirmed stopped, for `reason`: something the
     /// session started may still be acting.
     #[non_exhaustive]
-    NotProven { reason: String },
+    NotProven {
+        /// What could not be confirmed stopped, and why.
+        reason: String,
+    },
 }
 
 /// How the process holding a session's bindings stopped at shutdown: `SIGTERM` to its process
@@ -103,10 +107,15 @@ pub struct BindingStop {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct HostedCall {
+    /// The request, as its `hosted.received` numbered it.
     pub request: RequestId,
+    /// The agent whose code made it, as the interpreter's protocol names it.
     pub agent: String,
+    /// The binding whose object it was made of.
     pub binding: String,
+    /// How it ended.
     pub outcome: HostedOutcome,
+    /// Why, for an outcome that has a reason; otherwise `None`.
     pub reason: Option<HostedReason>,
 }
 
@@ -117,11 +126,13 @@ pub struct HostedCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct RequestOutcome {
+    /// The request, as its `agent.request.sent` numbered it.
     pub request: AgentRequestId,
     /// The child it was made of, as the interpreter's protocol names it.
     pub child: String,
     /// The channel it was sent on, or `None` for a submission.
     pub channel: Option<String>,
+    /// How it ended.
     pub outcome: RequestEnd,
 }
 
@@ -129,8 +140,10 @@ pub struct RequestOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct ExecutionOutcome {
+    /// The execution, as its `exec.submitted` numbered it.
     #[serde(rename = "execid")]
     pub id: ExecId,
+    /// How it ended.
     pub status: ExecutionStatus,
 }
 
@@ -180,8 +193,10 @@ pub struct EventDelivery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct LogLoss {
+    /// The `events.jsonl` the session recorded to.
     #[serde(serialize_with = "lossy")]
     pub path: PathBuf,
+    /// How many events it did not get.
     pub records: u64,
     /// Why the first was lost.
     pub first: String,

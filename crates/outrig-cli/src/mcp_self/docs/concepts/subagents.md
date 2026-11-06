@@ -12,6 +12,14 @@ alongside MCP tools like `fs__read_file` and `shell__exec` and are called the sa
 Subagents are enabled by default. Set `subagents = false` on an `[agents.<name>]` block to leave
 the tools out entirely; see [Reference -> Config](../reference/config.md).
 
+This page describes `outrig run`'s subagents, and in it a *turn* is one prompt and the agent's
+work on it. `outrig run-new`'s child agents are a different system: an agent's Python launches
+them with `runtime.spawn`, `@outrig.agent` or `outrig.Agent`, and each is a kernel of its own in
+the session's interpreter that acts by writing Python, as its parent does (see Python Runtime's
+[Child agents](https://tgockel.github.io/outrig/concepts/python-runtime.html#child-agents)).
+The width cap below is `run`'s alone: `run-new`'s children are not under it, and are bounded by
+`children-max` and `model-concurrency-max` instead.
+
 ## What a subagent is
 
 A subagent is a headless REPL. `outrig run` drives one agent loop from lines you type; a subagent
@@ -309,8 +317,10 @@ want non-overlapping scopes.
 ## See also
 
 - [MCP Servers](mcp-servers.md) -- where a subagent's tools come from.
-- [MCP Trust Model](mcp-trust-model.md) -- why sharing the container keeps the boundary intact.
+- [Trust Model](mcp-trust-model.md) -- why sharing the container keeps the boundary intact.
 - [Providers, Models, and Agents](https://tgockel.github.io/outrig/concepts/llm-providers.html) --
   the `[agents.<name>]` block.
 - [Usage -> outrig run](https://tgockel.github.io/outrig/usage/run.html) --
   the REPL these run underneath.
+- [Python Runtime](https://tgockel.github.io/outrig/concepts/python-runtime.html) --
+  `outrig run-new`'s child agents.

@@ -11,9 +11,13 @@ like in practice, what comes back when something goes wrong.
   `image add` (scaffolds a Dockerfile under `.agents/outrig/images/<name>/`).
 - **[AI-assisted design](ai-assisted-design.md)** -- use `outrig mcp self` when the
   built-in image templates do not fit.
-- **[outrig run](run.md)** -- start an interactive agent session. The main subcommand.
+- **[outrig run](run.md)** -- start an interactive agent session whose agent calls MCP tools.
+  The main subcommand; `outrig run-legacy` is the same command.
 - **[outrig run-new](../reference/cli.md#outrig-run-new)** -- preview a session whose agent
-  acts by writing Python rather than by calling MCP tools.
+  acts by writing Python rather than by calling MCP tools; see
+  [Python Runtime](../concepts/python-runtime.md).
+- **[Host programs](host-programs.md)** -- `outrig run-new <script.py>`, a preview: a Python
+  program of yours on the host that owns sessions and drives their agents.
 - **[outrig mcp](mcp.md)** -- expose an image-config's MCP tools to an external client.
 - **[outrig build](build.md)** -- pre-warm the image cache so the next `outrig run` is instant.
 - **[Sessions](sessions.md)** -- `outrig ls`, `outrig logs`, `outrig discard`,

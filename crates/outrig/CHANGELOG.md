@@ -690,6 +690,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Every public item of `harness` has rustdoc**, the payload fields of `harness::event` and
+  what `harness` re-exports included, and `missing_docs` warns on one added without. The crate's
+  front page shows a session started with `SessionBuilder::no_primary`.
+
 - **A decorated call's child is briefed as that call.** Its instructions name the call
   (`city_fact(country: str) -> Fact`), hold the docstring and the result type's schema, and speak
   of one submission; its opening names the submission and inputs only. No child is told it has no

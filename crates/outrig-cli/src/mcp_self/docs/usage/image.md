@@ -1,6 +1,6 @@
 # `outrig image`
 
-`outrig image` groups commands for the container images that host an agent's tools.
+`outrig image` groups commands for the container images an agent works in.
 `outrig image add` scaffolds a repo-local image-config (a named Dockerfile + MCP-server
 bundle); `outrig image init` scaffolds a standalone image project whose build output is a
 reusable image, `outrig image build` builds and validates that project, and

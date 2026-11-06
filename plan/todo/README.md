@@ -102,12 +102,6 @@ was built from the phase's exit criteria instead and silently omitted discovery,
 observability -- the exit criteria describe the first milestone, the deliverables describe the
 phase.
 
-**Documentation of the first 37**
-
-| Task      | What it settles                                                    |
-| --------- | ------------------------------------------------------------------ |
-| `0003-38` | The docs describe the system that now exists                       |
-
 **Enabling**
 
 | Task      | What it settles                                     |

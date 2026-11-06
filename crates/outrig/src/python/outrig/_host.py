@@ -1,7 +1,7 @@
 """The host's half of `outrig`: a program's connection to the engine that runs it,
-`outrig.config()`, and the sessions the program owns, `outrig.Session`. The bootstrap `outrig run
-<script.py>` starts installs it before the program runs; nothing else imports it, and no kernel
-ever does.
+`outrig.config()`, and the sessions the program owns, `outrig.Session`. The bootstrap `outrig
+run-new <script.py>` starts installs it before the program runs; nothing else imports it, and no
+kernel ever does.
 
 The connection is two pipes the engine passed down, one each way, each line one JSON object. They
 are the program's alone: close-on-exec from here on, so no program this one starts inherits them,
@@ -743,12 +743,13 @@ class Session:
     exist, is not a directory, or is `/`, and a `cwd` that is not a directory, fail entry.
 
     `async with` starts it in the image `default-image` names, with the configured factory
-    bindings -- a repository's own are refused, there being nobody to approve them -- and records
-    its events in its session directory under `[events] mode = "record"`. Inside the block it is
-    `current_session()`, in the tasks created there too. A session is entered once. A start that
-    fails raises `RuntimeError` with the engine's reason, once what it had started is stopped,
-    and the block does not run; one asking for more mounts than the engine reads in a request
-    raises `ValueError` before anything starts.
+    bindings -- a repository's own only where its exact declaration was approved in that
+    repository before, as a session asks nobody -- and records its events in its session
+    directory under `[events] mode = "record"`. Inside the block it is `current_session()`, in
+    the tasks created there too. A session is entered once. A start that fails raises
+    `RuntimeError` with the engine's reason, once what it had started is stopped, and the block
+    does not run; one asking for more mounts than the engine reads in a request raises
+    `ValueError` before anything starts.
 
     An `outrig.Agent` constructed inside the block is a child of the session (see
     `help(outrig.Agent)`): enter its `async with` inside this one, since leaving this block

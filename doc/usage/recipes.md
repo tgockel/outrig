@@ -1,7 +1,8 @@
 # Recipes
 
 A handful of common patterns. None of them require anything outside the documented commands and
-config -- they're just compositions worth knowing.
+config -- they're just compositions worth knowing. They use `outrig run`, in which a turn is one
+prompt and the agent's work on it.
 
 ## Recipe: scripted single-prompt runs
 
@@ -110,6 +111,10 @@ $ git log --oneline main..HEAD     # what the agent committed (if anything)
 ```
 
 Combined: `--verbose` for *what the agent decided*, git for *what landed on disk*.
+
+`outrig run-new` records what its agent did in the session's event log instead, under
+`[events] mode = "record"`, and `scripts/render-session.py` renders it as a page; see
+[Sessions -> The event log](sessions.md#the-event-log).
 
 ## Recipe: testing a config from outside the repo
 

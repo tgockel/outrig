@@ -2,8 +2,9 @@
 
 ![CI](https://github.com/tgockel/outrig/actions/workflows/ci.yml/badge.svg)
 
-`outrig` runs an LLM agent on the host and connects it to MCP servers inside a podman-managed
-container, so tools like filesystem and shell access stay inside the sandbox you've set up.
+`outrig` runs an LLM agent on the host and keeps what the agent does inside a podman-managed
+container: the MCP servers whose tools it calls, or -- with `outrig run-new`, a preview -- the
+Python it writes. Tools like filesystem and shell access stay inside the sandbox you've set up.
 
 Crate names matter: depend on `outrig` when embedding the library, and install
 `outrig-cli` when you want the command-line tool that provides the `outrig` binary. Both
@@ -15,7 +16,10 @@ talks to. Then you run `outrig run` from your shell, and outrig drops you into a
 where you talk to the agent.
 
 The agent layer is the [Rig](https://github.com/0xPlaygrounds/rig) crate -- outrig's job is to run
-Rig in the host process and give it a container-isolated MCP tool set.
+Rig in the host process and give it a container-isolated tool set: MCP servers for `outrig run`,
+and for `outrig run-new` a Python interpreter whose variables persist from one message to the
+next. See
+[Python Runtime](doc/concepts/python-runtime.md) for the second.
 
 ## Install
 

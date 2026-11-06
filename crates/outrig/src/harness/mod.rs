@@ -43,6 +43,9 @@
 //! No type of the model-provider library this is built on appears here, so a
 //! release of it cannot break this surface.
 
+// Here rather than crate-wide: the frozen 0.2 surface is undocumented.
+#![warn(missing_docs)]
+
 mod approval;
 pub(crate) mod bindings;
 mod builder;

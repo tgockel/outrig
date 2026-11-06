@@ -44,6 +44,9 @@ pub enum ApiKeyError {
 /// once, at start, and held for the session's life: a rotated key takes a new
 /// session.
 pub trait Secrets: Send + Sync {
+    /// The value of `var`, the name inside a `${VAR}` reference, or why there
+    /// is none. A model whose key has none is left out of an alias's
+    /// candidates, and the start fails when no model is left, saying why.
     fn resolve(&self, var: &str) -> std::result::Result<String, ApiKeyError>;
 }
 

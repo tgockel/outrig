@@ -1611,6 +1611,7 @@ pub(crate) struct Gate {
 /// since when.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
+#[warn(missing_docs)]
 pub struct OpenWait {
     /// The agent whose code waits.
     pub agent: Subject,
@@ -1622,6 +1623,7 @@ pub struct OpenWait {
     pub on: Vec<event::Awaited>,
     /// How many more than `on` lists.
     pub more: u64,
+    /// When it returns, as asyncio names it.
     pub return_when: event::ReturnWhen,
     /// Its timeout, counted from `since`, if it has one.
     pub timeout: Option<Duration>,
@@ -1637,10 +1639,12 @@ pub struct OpenWait {
 /// interpreter exits. Holds no way to send, so keeping one does not keep the
 /// interpreter's input open.
 #[derive(Clone)]
+#[warn(missing_docs)]
 pub struct Waits {
     table: Arc<Mutex<Table>>,
 }
 
+#[warn(missing_docs)]
 impl Waits {
     /// Every wait open as of the last line the interpreter sent, the
     /// primary's and each child's, in order of agent and then of wait.

@@ -85,7 +85,8 @@ class AgentError(Exception):
 
     `except outrig.AgentError` around `await handle` catches the child's failure -- rejected,
     failed, cancelled, released, out of budget, the session closing, a limit -- and lets the
-    caller's own bugs, a `TypeError` say, through.
+    caller's own errors through: what a typed call's `validate=` raised, say, or the `ValueError`
+    of a model that is not configured.
     """
 
 
@@ -196,10 +197,14 @@ class Status:
 
 class Handle:
     """One submission or request an agent made of a child: what `child.submit(...)` and
-    `child.channels[name].request(...)` return, at once, the work already sent.
+    `child.channels[name].request(...)` return, at once, the work already sent, and what a typed
+    call or an agent class's request returns.
 
     `await handle` gives the accepted answer, an instance of the declared type, or raises how the
-    request ended -- an `outrig.AgentError` -- and awaiting again gives the same. Cancelling the
+    request ended -- an `outrig.AgentError` when the child's work or the session ended it -- and
+    awaiting again gives the same. A typed call or an agent class's request can also end on the
+    caller's side, raising what is not an `outrig.AgentError`: what the call's `validate=` raised,
+    or `ValueError` for a model that is not configured or work too long to send. Cancelling the
     code awaiting it cancels that wait and never the request; `handle.cancel()` cancels the
     request: one the child has not received never reaches it, and one it has ends so that its
     answer raises `outrig.RequestCancelled`. `done()` and `result()` answer without waiting, as a
@@ -564,15 +569,19 @@ def agent(fn=None, *, validate=None, model=None):
     Calling the declaration checks each argument against its parameter's type and copies it,
     sends the work to a new child agent, and returns the handle at once: `await` it for the
     result, checked against the return type. The child is released once the call settles,
-    awaited or not.
+    awaited or not. Only agent code, in an agent's kernel, can call a declaration: called
+    anywhere else, a host program included, it raises `RuntimeError`. A host program gives a
+    child work through an `outrig.Agent` subclass instead.
 
     `validate(result, **arguments)` runs on each answer the child gives, with the arguments as
     they were at the call, and returns a list of problems, empty to accept; the child corrects
     what it lists, within the attempt limit, reading the first 20, each cut to 1,024 characters.
     It must be pure -- no hosted calls, writes or model calls -- since it runs again on every
-    attempt. `model` names a configured model or alias for the child; without it, the caller's.
-    What a declaration cannot take -- a missing docstring, an unannotated parameter, a type
-    outside the subset -- raises `TypeError` at decoration, naming the function.
+    attempt. One that raises ends the call, counting no attempt, and the handle raises what it
+    raised. `model` names a configured model or alias for the child; without it, the caller's.
+    A name that is not configured ends the call, and the handle raises `ValueError` naming the
+    configured ones. What a declaration cannot take -- a missing docstring, an unannotated
+    parameter, a type outside the subset -- raises `TypeError` at decoration, naming the function.
 
     On a method of an `outrig.Agent` subclass it marks a request channel instead, and takes
     neither keyword: see `help(outrig.Agent)`.

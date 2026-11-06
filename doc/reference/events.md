@@ -18,8 +18,16 @@ startup. To read a recording as a page rather than as JSON, see
 
 The file is one reader of the session's events. A program that runs a session itself, through the
 `outrig` library's `harness` module, receives the same events as values, in the same order, through
-subscriptions of its own; the key decides only whether `outrig run-new` writes the file. Each
-event's `data` below is the payload such a subscriber reads, field for field.
+subscriptions of its own, and a [host program](../usage/host-programs.md) reads them from
+`session.events()`; the key decides only whether `outrig run-new` writes the file. Each event's
+`data` below is the payload such a subscriber reads, field for field. A subscription never slows
+the session: one that falls behind loses the oldest events it holds, past 4,096 by default, and is
+told how many -- a `Received::Missed(n)` in Rust, an `outrig.Missed` in a host program -- where
+they would have come, so the next event's `id` is that many past the last one received.
+
+The events use `outrig run-new`'s words: a **round** is the agent's work on what was waiting when
+it began, and a **turn** is one model call and the Python it submitted; see
+[Vocabulary](../concepts/python-runtime.md#vocabulary).
 
 The file is created readable and writable by its owner only (mode `0600`), and an empty file
 already there is narrowed to that. It holds message bodies the model may never have printed, which
@@ -335,15 +343,16 @@ three times for one call before the rejection ends it.
 - `exec.cancel.sent` -- `execid`. A cancel sent, which Ctrl-C does: the first on code a call waits
   on, and one at the prompt on code left holding the interpreter.
 - `exec.interrupt.sent` -- `execid` and `runaway`. An interrupt sent: by a Ctrl-C on code blocked
-  in a call, or at the prompt on code left holding the interpreter, or by OutRig on code keeping a
-  CPU busy (`runaway`).
+  in a call, or at the prompt on code left holding the interpreter, or on code keeping a CPU busy,
+  which OutRig found on its own or a Ctrl-C's check found. `runaway` is true for the last, whose
+  interrupt reaches whatever agent code holds the event loop.
 - `exec.probe.failed` -- a liveness check the event loop did not answer: `execid`, and `verdict`,
   which is `blocked`, `spinning`, or `starved`.
 - `exec.abandoned` -- OutRig stopped waiting for an execution, which keeps the interpreter until
   it ends: `execid`, and `why`, which is `user` or `runaway`.
-- `inventory.observed` -- what the agent's namespace held when a liveness check was answered,
-  which is only while an execution has run 30 seconds or more: `execid`; `names`, each
-  `{name, type}`; `total`; and `more`, those past the 200 listed.
+- `inventory.observed` -- what the agent's namespace held when a liveness check was answered: the
+  check OutRig makes of an execution each 30 seconds it runs, or the one a first Ctrl-C makes of
+  it. `execid`; `names`, each `{name, type}`; `total`; and `more`, those past the 200 listed.
 - `exec.wait.started` -- a `runtime.wait` the agent's code has been suspended in for a second,
   which a shorter wait never records. Described from types and fields alone: none of the agent's
   code runs for it.
@@ -479,13 +488,16 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
   `body`, its text, cut to 1,024 characters. Progress settles nothing.
 - `agent.request.failed` -- `request`, and `message`, why, cut to 1,024 characters: the child's
   code failed it, or its model failed in a way that does not recover.
-- `agent.request.cancelled` -- its sender cancelled it: `request`, and `received`, whether the
-  child had taken it.
+- `agent.request.cancelled` -- it was cancelled, by its sender or by the engine: `request`;
+  `received`, whether the child had taken it; and `reason`, `null` for its sender's cancel, or,
+  when the engine cancelled it because the child ended its rounds without answering it after a
+  warning, the text its sender's `RequestCancelled` carries.
 - `agent.request.settled` -- how it ended: `request`; `outcome`, which is `accepted`, `rejected`,
   `failed`, `cancelled`, `released`, `budget`, `closed`, or `terminated`; `attempts`, the answers
-  it took; `rounds`, the child's rounds it was open during; and `cause`, `null`, or for a request
-  rejected after a round of the child failed on a model call once its code had run, the text of
-  that failure, which the sender's `CompletionRejected` carries as its `__cause__`.
+  it took; `rounds`, the child's rounds it was open during; and `cause`, `null`, or, for a
+  submission the engine cancelled after a round of the child failed on a model call once its code
+  had run, the text of that failure: the sender's `RequestCancelled` carries it as its
+  `__cause__`, an `AgentRequestFailed`.
 - `agent.request.refused` -- an answer to a request that had already ended, refused: `request`,
   and `ended`, how it had ended.
 - `agent.call.started` -- a call of a function declared with `@outrig.agent` launched the
@@ -532,7 +544,9 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
   before the request ended: `instance`, and `request`. The request runs on, and nothing reads its
   answer.
 - `message.sent` -- a message put on a channel: `message`, an id OutRig gives it; `channel`;
-  `from` and `to`, each `user` or `agent/primary`; and `body`.
+  `from` and `to`, `user` and the subject of the agent at the other end -- `agent/primary`, or
+  another agent's, whose send nothing on the host reads, so a `message.refused` follows it; and
+  `body`.
 - `message.refused` -- a message the other end did not take: `message`, `channel`, `from`, `to`,
   and `reason`.
 - `message.received` -- the other end took a message: `message`, the id its `message.sent` gave,

@@ -1,8 +1,9 @@
 # Containers
 
-The container is the agent's whole world. It's where MCP servers run, where shell commands
-execute, where files get read and written. You define it with a `Dockerfile` you commit to your
-repo, and outrig builds it with `buildah` and runs it with `podman`.
+The container is the agent's whole world. It's where `outrig run`'s MCP servers run and
+`outrig run-new`'s Python runs, where shell commands execute, where files get read and written.
+You define it with a `Dockerfile` you commit to your repo, and outrig builds it with `buildah` and
+runs it with `podman`.
 
 ## Default location
 
@@ -31,8 +32,9 @@ outrig expects a few things from your Dockerfile.
 ### Don't set an `ENTRYPOINT`
 
 The container's job is to stay running while the agent works. Every real process -- MCP servers,
-shell commands the agent runs -- is launched via `podman exec` from outrig on the host, so the
-container's own process only has to stay alive.
+the Python interpreter `outrig run-new`'s agent writes code for, shell commands the agent runs --
+is launched via `podman exec` from outrig on the host, so the container's own process only has to
+stay alive.
 
 outrig arranges that itself: it appends `sleep infinity` after the image reference on the
 `podman run`, and trailing arguments there *are* the container's command. **Your `CMD` is
@@ -106,6 +108,23 @@ RUN npm install -g @modelcontextprotocol/server-filesystem
 
 If multiple MCP servers need different language toolchains (one needs Node, one needs Python),
 install both in the same image. The agent's whole MCP set runs in one container per session.
+
+### The image needs no Python for `outrig run-new`
+
+The primary container of an `outrig run-new` session gets OutRig's own static CPython, mounted
+read-only at `/outrig/python`, and OutRig's `outrig` Python package at `/outrig/lib`, as does the
+primary of a host program's session, or of any session the library's `Outrig::launch` starts. A
+session with [bindings](https://tgockel.github.io/outrig/concepts/hosted-objects.html) also mounts
+their packages under `/outrig/bindings` and the RPyC library at `/outrig/rpyc`. The agent's Python
+runs in that interpreter, so the image needs no Python for it. An image's own Python, if it has
+one, stays what `python3` runs, and the agent's code can call it with `subprocess` for a package
+with compiled parts, which the static interpreter cannot load.
+
+`outrig run`, `outrig run-legacy` and `outrig mcp` mount none of this, and no sidecar gets it: an
+MCP server written in Python needs Python, and its packages, in the image it runs in.
+
+Where these mounts are made, `/outrig` is outrig's: the launch refuses a workspace or mount placed
+at it or under it, and an image should keep nothing it needs there.
 
 ### Create the directory a `VOLUME` names
 
@@ -526,7 +545,9 @@ sidecar the same way it attaches to the primary, before any MCP server connects.
 ## What outrig sets in the run
 
 outrig adds `--userns=keep-id`, the primary workspace bind-mount, any configured extra
-workspace mounts, and the runtime user-mapping bootstrap (see [Workspace](workspace.md)). It
+workspace mounts, for an `outrig run-new` primary its own read-only mounts under `/outrig` (see
+[The image needs no Python for `outrig run-new`](#the-image-needs-no-python-for-outrig-run-new)),
+and the runtime user-mapping bootstrap (see [Workspace](workspace.md)). It
 also supplies the container's command: `sleep infinity`, appended after the image reference,
 which overrides the image's `CMD` (see [Don't set an `ENTRYPOINT`](#dont-set-an-entrypoint)).
 The bootstrap runs from the host: a forked child joins the container's user namespace, becomes
@@ -657,7 +678,9 @@ baked into the image, so keep credentials out of it.
   scaffold a new image-config.
 - [MCP Servers](mcp-servers.md) -- declaring and invoking the tools that run inside the
   container.
-- [MCP Trust Model](mcp-trust-model.md) -- why MCP tools can be configured liberally inside the
+- [Python Runtime](https://tgockel.github.io/outrig/concepts/python-runtime.html) -- the agent
+  that acts by writing Python inside it.
+- [Trust Model](mcp-trust-model.md) -- why tools can be configured liberally inside the
   container boundary.
 - [AI-assisted design](../usage/ai-assisted-design.md) -- use `outrig mcp self` when the
   templates do not fit.

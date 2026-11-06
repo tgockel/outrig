@@ -307,6 +307,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 scripts/audit-doc-style.py
+      # `doc/reference/python.md` copies the `outrig` package's docstrings; this fails when a
+      # docstring changed and the page was not rendered again with `--write`.
+      - run: python3 scripts/python-api-reference.py
 
   # `scripts/render-session.py` turns a session's event log into a page a browser opens, and
   # everything on that page -- source, tracebacks, output, message bodies -- was written by a

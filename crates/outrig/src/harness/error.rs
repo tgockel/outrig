@@ -58,6 +58,7 @@ pub struct Closed {
 }
 
 impl Closed {
+    /// What closed the session's admission.
     pub fn by(&self) -> &ClosedBy {
         &self.by
     }
@@ -79,7 +80,11 @@ pub enum ClosedBy {
     Owner,
     /// The interpreter exited, which ends a session.
     #[non_exhaustive]
-    InterpreterExited { cause: String },
+    InterpreterExited {
+        /// How it ended, as its `interpreter.exited` event records it, or
+        /// `its output closed` while that is not yet known.
+        cause: String,
+    },
 }
 
 impl fmt::Display for ClosedBy {

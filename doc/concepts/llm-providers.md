@@ -38,6 +38,11 @@ flowchart LR
     a1 -. "image" .-> cont
 ```
 
+The configuration serves both agent loops, `outrig run` and `outrig run-new`, and this page says
+which one it means where they behave differently. It uses `run-new`'s words: a **round** is one
+prompt and the agent's work on it, which `outrig run` calls a turn, and a **turn** is one model
+call and the tool calls it asked for (see [Vocabulary](python-runtime.md#vocabulary)).
+
 ## `[providers.<name>]`
 
 A provider is an endpoint + API key + the wire format its models speak by default.
@@ -187,19 +192,21 @@ When every candidate has failed, what happens next depends on *why*. The message
 candidate with its own reason either way:
 
 * **At least one failed recoverably** -- a rate limit, an unreachable host, a response that could
-  not be used -- and the **turn** ends. If that was the turn's first model call nothing was
-  appended to the history, and sending the prompt again retries it; a later call keeps the tool
-  calls the turn already ran, and `continue` picks up from them (see
+  not be used -- and the **round** ends. In `outrig run`, if that was the round's first model call
+  nothing was appended to the history, and sending the prompt again retries it; a later call keeps
+  the tool calls the round already ran, and `continue` picks up from them (see
   [`outrig run`](../usage/run.md)). One vendor rate-limiting while another's key is revoked lands
   here too: the rate limit is the reason that can lift on its own, so it is worth waiting out.
-* **Every one was terminal** -- a revoked key answering `401` at all three vendors, say -- and the
-  **session** ends, exactly as that failure ends it for a single model. No resend can satisfy a
-  prompt whose credentials are refused everywhere, and advising one would loop forever.
+* **Every one was terminal** -- a revoked key answering `401` at all three vendors, say -- and in
+  `outrig run` the **session** ends, exactly as that failure ends it for a single model. No resend
+  can satisfy a prompt whose credentials are refused everywhere, and advising one would loop
+  forever. `outrig run-new` ends the round in both cases and keeps the session, its error saying
+  whether another message could help.
 
 Two properties worth knowing:
 
 * **The whole chain is bounded by one `retry-budget-secs`, not one per candidate.** Three
-  candidates at the ten-minute default is a half-hour turn against a total outage, most of it spent
+  candidates at the ten-minute default is a half-hour wait against a total outage, most of it spent
   on endpoints already known to be down, so the budget is shared rather than repeated. The value
   is the one on the **first selectable candidate's** provider; `retry-budget-secs` on any
   later candidate's provider is not consulted. A chain spanning providers that disagree has no
@@ -208,9 +215,9 @@ Two properties worth knowing:
 * **Every model call starts again at the head of the list.** The order is a preference, so one
   rate-limit window does not demote candidate one for the rest of the session.
 
-A move happens *between* model calls, never around a whole turn, so tool calls the turn already
-ran are not re-executed -- a turn that fails on its fifth model call has already run the tool calls
-from the first four, and those stay done.
+A move happens *between* model calls, never around a whole round, so tool calls the round already
+ran are not re-executed -- a round that fails on its fifth model call has already run the tool
+calls from the first four, and those stay done.
 
 The cost is that one reply can be half one model's work. That is why a move prints, why the banner
 lists the fallbacks a session may reach before it starts, and why a
@@ -268,8 +275,8 @@ serves: it tells `outrig run-new` how much of a conversation one call can carry.
 [Remote-provider models](../reference/config.md#remote-provider-models).
 
 `tool-call-max` also lives on the agent when a role needs longer tool loops. If unset, the agent
-uses the top-level `tool-call-max`, then the compiled-in default of `50`. The max is per user
-turn, so typing a follow-up prompt starts a fresh count while keeping conversation history.
+uses the top-level `tool-call-max`, then the compiled-in default of `50`. The max is per round,
+so a follow-up prompt starts a fresh count while keeping conversation history.
 `tool-result-max` works the same way for oversized MCP output: an agent can inherit the
 top-level max or set its own byte max when a role regularly reads larger files or logs.
 
@@ -327,7 +334,7 @@ Reasoning an endpoint returns beside its reply -- in `reasoning_content`, or Ope
 produced nothing but reasoning, which the model ended on its own, stays in the conversation but
 is left out of later requests, since a chat message needs text or a call; the prompts on either
 side of it go as one user message, so the conversation keeps alternating between user and
-assistant. One cut off at the output-token ceiling while reasoning fails the turn instead, with
+assistant. One cut off at the output-token ceiling while reasoning fails the round instead, with
 an error that names `max-tokens` as the remedy.
 
 A gateway that requires the user's and the model's turns to alternate -- a Bedrock-backed Claude
@@ -503,7 +510,7 @@ header, and every later call to it goes without, with a warning on stderr.
 
 Everything else is shared with the other remote styles: `request-timeout-secs`,
 `retry-budget-secs`, `role-alternation`, tool-call limits, tool-result truncation, conversation
-history, and subagents all behave identically. Turns are non-streaming, as for
+history, and subagents all behave identically. Model calls are non-streaming, as for
 `chat-completions`.
 
 ## Transient failures
@@ -535,7 +542,7 @@ that leash real. A host that answers a connection attempt with silence rather th
 `request-timeout-secs` and reach the short bound only afterwards. Note what this does *not*
 bound: once connected, waiting for the response is `request-timeout-secs`' business and
 nothing else's, because a non-streaming completion answers only when the model has finished,
-so a long wait for the first byte is what a long reasoning turn looks like from outside.
+so a long wait for the first byte is what a long reasoning reply looks like from outside.
 
 Both budgets bound the *retrying* and not an attempt already in flight, which is the same
 rule `retry-budget-secs` has always followed. An attempt is never cancelled by the clock
@@ -544,11 +551,11 @@ settled in about 30 seconds and at worst 40 -- the bound, plus one last connecti
 that had already begun. A `retry-budget-secs` shorter than ten seconds does not shorten the
 connection cap either; it just buys no retries.
 
-The distinction is per request, not per turn, and it latches: once a call has produced a
+The distinction is per request, not per round, and it latches: once a call has produced a
 response, the full budget applies for the rest of that request. A call that connects, gets
 a `503`, and then cannot reconnect for its retry is a provider having a bad minute -- not an
 address that was never right -- and it keeps the full budget. The practical effect of the
-split is that a typo in `base-url`'s host ends the turn in seconds, naming the connection
+split is that a typo in `base-url`'s host ends the round in seconds, naming the connection
 failure, rather than after ten minutes of retry lines. A `base-url` that is not an `http://`
 or `https://` URL does not get that far: the config is refused when it loads, naming the key.
 
@@ -591,13 +598,13 @@ every later call is sent the note in their place too; otherwise nothing is left 
 fails naming the finish reason. Without this, every later call would carry the refused result and
 be refused the same way.
 
-Both retries happen beneath a single model call, which is what keeps them safe. A turn is a
-model -> tool -> model loop, and retrying the *turn* would re-run container tool calls that
+Both retries happen beneath a single model call, which is what keeps them safe. A round is a
+model -> tool -> model loop, and retrying the *round* would re-run container tool calls that
 already happened. Tools run between model calls, never inside one, so replaying either an
 HTTP request or a model call replays exactly that and nothing observable.
 
-If the budget or the attempts do run out, the turn ends and the REPL prompts again. The
-conversation keeps the tool calls the turn had already run, with their results, and is
+If the budget or the attempts do run out, the round ends and the REPL prompts again. The
+conversation keeps the tool calls the round had already run, with their results, and is
 otherwise untouched -- see [`outrig run`](../usage/run.md). The session, and its containers,
 stay up.
 

@@ -23,6 +23,9 @@ use crate::python::payload::xdg_root;
 ///
 /// Any `Fn(&ApprovalRequest) -> Approval` is one.
 pub trait Approver: Send + Sync {
+    /// The answer for the declaration `request` describes: [`Approval::Approve`] starts the
+    /// binding and remembers the approval; any other answer starts nothing and remembers
+    /// nothing.
     fn approve(&self, request: &ApprovalRequest) -> Approval;
 }
 

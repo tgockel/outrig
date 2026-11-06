@@ -24,9 +24,12 @@ concepts page, whose account of agent classes `0003-41`, `0003-42` and `0003-45`
 (construction before attachment, facilities, the instance as `self`); and the host-programs
 usage page, beside which a Rust embedder now needs its own.
 
-Note that `doc/concepts/*.md` and `doc/reference/*.md` are symlinks into
-`crates/outrig-cli/src/mcp_self/docs/`, so editing them edits shipped tool output, as `0003-38`
-records.
+Note that eight `doc/` pages are symlinks into `crates/outrig-cli/src/mcp_self/docs/`: five under
+`concepts/` (`containers`, `mcp-servers`, `mcp-trust-model`, `subagents`, `workspace`),
+`reference/config.md`, `usage/ai-assisted-design.md` and `usage/image.md`. Editing them edits
+shipped tool output, and a link from one of them to a page outside that set is an absolute
+`https://tgockel.github.io/outrig/` URL (`every_internal_link_resolves_to_a_registered_page`), as
+`0003-38` records.
 
 ## Goal
 

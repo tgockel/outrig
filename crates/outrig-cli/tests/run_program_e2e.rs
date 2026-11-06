@@ -132,12 +132,13 @@ async fn finish(child: Child) -> (std::process::ExitStatus, String, String) {
     )
 }
 
-/// The example the run page gives for a program that leaves its session when interrupted.
+/// The example the host-programs page gives for a program that leaves its session when
+/// interrupted.
 fn documented_example() -> String {
-    let page = include_str!("../../../doc/usage/run.md");
+    let page = include_str!("../../../doc/usage/host-programs.md");
     let after = page
         .split_once("A program that leaves its session when interrupted, and prints the report")
-        .expect("the run page gives the example")
+        .expect("the host-programs page gives the example")
         .1;
     let code = after.split_once("```python\n").expect("a python block").1;
     code.split_once("```")
@@ -146,9 +147,9 @@ fn documented_example() -> String {
         .to_string()
 }
 
-/// The run page's example: Ctrl-C makes the program leave its session and print the report
-/// itself, and `outrig` exits 0 with nothing left in podman. With `[events] mode = "record"` the
-/// session's events are in its directory under the session root, readable by its owner alone,
+/// The host-programs page's example: Ctrl-C makes the program leave its session and print the
+/// report itself, and `outrig` exits 0 with nothing left in podman. With `[events] mode = "record"`
+/// the session's events are in its directory under the session root, readable by its owner alone,
 /// from `starting` to `reported`.
 #[tokio::test]
 async fn the_documented_example_exits_0_after_ctrl_c() {

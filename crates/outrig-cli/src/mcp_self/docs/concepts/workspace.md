@@ -1,6 +1,6 @@
 # Workspace
 
-The workspace is what the agent's tools get to read and write. By default, your repository is
+The workspace is what the agent gets to read and write. By default, your repository is
 mounted live into the container at `/workspace`. You can also mount extra resource directories,
 read-only by default, when the agent needs supporting material outside the repo. Read this page
 before you run outrig on anything you can't easily roll back.
@@ -36,8 +36,8 @@ For an autonomous-agent workflow, the better safety net is **git**, not a stagin
 - If the agent really destroyed something, that's what `git reflog` is for.
 
 If you find yourself wanting a "review before apply" step, that's a signal you don't yet trust the
-agent's environment -- usually the right fix is to tighten the Dockerfile or the MCP server
-choices, not to layer a staging mechanism over the top.
+agent's environment -- usually the right fix is to tighten the Dockerfile, the MCP servers, or
+the bindings it is given, not to layer a staging mechanism over the top.
 
 ## UID/GID: runtime user mapping
 
@@ -154,6 +154,13 @@ See [path resolution](../reference/config.md#path-resolution). Their container p
 absolute, cannot be `/`, and must not duplicate the primary workspace or another extra mount.
 Exact duplicates fail during config validation instead of relying on podman mount ordering.
 
+In a session with a [binding](https://tgockel.github.io/outrig/concepts/hosted-objects.html) --
+an `outrig run-new` session whose config declares one -- the workspace and every extra mount
+appear in the container at their host paths instead, so a path the agent's code writes and a path
+the binding's library reads on the host name the same file. A declared `container-path` must then
+be that host path, or the config is refused. In any session, an extra mount's `container-path`
+may be left unset, and is then its host path.
+
 Extra mounts default to `access = "read-only"`. Use `access = "read-write"` only when the agent
 really should mutate that host directory, such as a scratch cache under `/var/tmp`.
 
@@ -165,7 +172,9 @@ circumstances:
 - `/etc/passwd` on the host -- not mounted; the container has its own.
 
 The container has its own `/etc`, `/home`, `/tmp`, etc. coming from the image. The only windows
-onto the host filesystem are the primary workspace and the extra mounts you declare.
+onto the host filesystem are the primary workspace and the extra mounts you declare. A binding is
+not a window of this kind: it runs on the host, as you, and reaches whatever its library can
+there, mounted or not -- including a directory the container has only read-only.
 
 ### Sidecar containers see nothing by default
 
@@ -259,6 +268,7 @@ interceptor, startup fails before MCP servers launch.
 ## See also
 
 - [Containers](containers.md) -- Dockerfile conventions, including the UID/GID setup.
-- [MCP Servers](mcp-servers.md) -- the layer that bounds what the agent can actually *do* with the
-  workspace.
+- [MCP Servers](mcp-servers.md) -- the tools `outrig run`'s agent acts on the workspace with.
+- [Hosted Objects](https://tgockel.github.io/outrig/concepts/hosted-objects.html) -- objects on
+  the host an `outrig run-new` agent uses, which reach past the workspace.
 - [Reference -> Config](../reference/config.md) -- full schema for the `[workspace]` block.

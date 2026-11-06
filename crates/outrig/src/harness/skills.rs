@@ -80,11 +80,15 @@ pub trait SkillSource: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SkillFile {
+    /// The file's path, relative to the skill's directory, its components separated by `/`.
     pub path: String,
+    /// What changes whenever the file does, so the session can tell that a skill changed
+    /// without reading its files.
     pub version: String,
 }
 
 impl SkillFile {
+    /// The file at `path` in its skill's directory, whose version is `version`.
     pub fn new(path: impl Into<String>, version: impl Into<String>) -> Self {
         Self {
             path: path.into(),

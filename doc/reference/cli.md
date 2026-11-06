@@ -213,6 +213,28 @@ outrig image inspect [--remote] <ref>
 
 See [Usage -> outrig image](../usage/image.md#outrig-image-inspect).
 
+### Which `run` to type
+
+Three commands start an agent session. They differ in how the agent acts and in what drives it:
+
+| Command                      | What it starts                                                    |
+|------------------------------|-------------------------------------------------------------------|
+| `outrig run`                 | A session whose agent acts by calling MCP tools, with you.        |
+| `outrig run-legacy`          | The same as `outrig run`, under a name that keeps meaning it.     |
+| `outrig run-new`             | Preview: a session whose agent acts by writing Python, with you.  |
+| `outrig run-new <script.py>` | Preview: a Python program of yours on the host, owning sessions.  |
+
+A later release makes `outrig run` start what `outrig run-new` starts today, the script form
+included, and no release is set for it. A script that means one of the two systems should name
+it: `run-legacy` for the agent that calls MCP tools, `run-new` for the one that writes Python.
+`outrig run` and `outrig run-legacy` refuse a script, with an error that names `run-new`.
+[Usage -> outrig run](../usage/run.md), [Python Runtime](../concepts/python-runtime.md), and
+[Host programs](../usage/host-programs.md) describe each.
+
+The two systems use one word differently. In `run`, a **turn** is one prompt and the agent's work
+on it. In `run-new`, that is a **round**, and a turn is one model call and the Python it
+submitted; see [Vocabulary](../concepts/python-runtime.md#vocabulary).
+
 ### `outrig run`
 
 Start an interactive agent session. `outrig run-legacy` takes the same flags and starts the same
@@ -249,8 +271,8 @@ outrig run [--agent <name>]
   not held to the global config's [`[repo]` `env-allow`](config.md#repo) list, which governs
   the references in a repo config and in an image's label. Within a scope, last wins on
   duplicate keys. Precedence per key: config-file env < global `--env` < per-server `--env`.
-- `--max-tool-calls <n>` (default: resolved `tool-call-max`, else `50`): per-turn tool-call
-  max.
+- `--max-tool-calls <n>` (default: resolved `tool-call-max`, else `50`): the most tool calls
+  in one turn, one prompt and the agent's work on it.
 - `--max-tool-result-bytes <n>` (default: resolved `tool-result-max`, else `262144`):
   per-tool-result byte max.
 - `--model <name>` (default: agent's `model`, else `default-model`): configured
@@ -386,7 +408,8 @@ once, and awaiting it gives a value of the declared type or raises an `outrig.Ag
 why there is none; `help(runtime.spawn)` has the rest. `children-max`, `model-concurrency-max`,
 `requests-max`, and `token-budget` bound them (see [Top level](config.md#top-level)). A child's
 code and model calls are in the event log, under the child's own subject, and are not printed
-here.
+here. [Python Runtime -> Child agents](../concepts/python-runtime.md#child-agents) describes
+them, with `@outrig.agent` and `outrig.Agent`, which declare the same work as typed Python.
 
 **A `/name` asks the agent to run a skill.** The session's skills are the repository's
 `.agents/skills` and then `~/.agents/skills`, each a directory holding a `SKILL.md` and, optionally,
@@ -396,10 +419,13 @@ code sees naming the skill: the line as typed, or, for a skill with no `skill.py
 instructions followed by the line. For a skill with a `skill.py`, the agent runs it with
 `outrig.skills.invoke(name, text)`: a child agent reads `text` into the parameters of the skill's
 entry function, or asks a question instead, which the agent puts to you, and the entry is then
-called in the agent's Python, with each binding the skill names. Nothing of the skill runs until the
-agent's code calls it. No line typed after a directive reaches the agent before it does. `/help` and
+called in the agent's Python, with each binding the skill names. The REPL parses nothing of the
+line: an agent that understood the text itself calls `outrig.skills.invoke(name, params=...)`
+instead, which makes no model call, and `skill.invocation.started` records which way the
+parameters came, `by` the `parser` or the `caller`. Nothing of the skill runs until the agent's
+code calls it. No line typed after a directive reaches the agent before it does. `/help` and
 `/quit` are `run-new`'s own whatever the skills are named, and a skill named for one of them is said
-as the session starts.
+as the session starts. See [Python Runtime -> Skills](../concepts/python-runtime.md#skills).
 
 **The model is sent part of the conversation; the agent's Python holds all of it.** A round is
 the agent's work on the messages waiting when it starts. Each model call is chosen the session's
@@ -535,11 +561,11 @@ them, and a server placed in the primary container would run beside the interpre
 user, with whatever its `env` resolved readable from Python where `/proc` allows. So no credential
 from an MCP or sidecar block reaches the session's containers.
 
-That is the whole of the guarantee. Python can read anything else in the container, and that
-includes what podman passes in on its own: by default it forwards the host's proxy variables
-(`HTTP_PROXY`, `HTTPS_PROXY`, and their lowercase forms), and a proxy URL can carry a user and
-password. The image's own environment, the workspace, and any configured mounts are outside it
-too.
+That is the whole of the guarantee. Python can read anything else in the container: the image's
+own environment, the workspace, and any configured mounts. What podman passes in on its own is
+closed: it would copy the host's proxy variables into the container, and a proxy URL can carry a
+user and password, so OutRig starts every container with `--http-proxy=false` (see
+[Containers -> The container's environment](../concepts/containers.md#the-containers-environment)).
 
 Startup checks the model before anything is pulled or started, pulls or builds the image,
 starts the container and the interpreter, and prints the image, the model, and the Python
@@ -630,6 +656,7 @@ description, and its Python uses each under that name as its library documents:
 event loop until it comes. Every call it makes is checked on the host and, with
 `[events] mode = "record"`, recorded. If the bindings process dies, the session goes on without
 its bindings, and a call to one raises an error saying how the process ended.
+[Hosted Objects](../concepts/hosted-objects.md) says what a binding grants and what crosses.
 
 With `[events] mode = "record"`, the session records what its agent did in
 `logs/events.jsonl`: each model call and what it was sent, each submission and how it ended, each
@@ -684,12 +711,11 @@ outrig [--config <path>] [--global-config <path>] [--session-root <path>] [--ver
 
 In a session it enters, the program can construct agent classes, subclasses of `outrig.Agent`,
 each an agent of the session whose replies are decoded into the program's own classes (see
-[Usage -> Agent classes](../usage/run.md#agent-classes)).
+[Host programs -> Agent classes](../usage/host-programs.md#agent-classes)).
 
 A later release makes `outrig run` the command of the sessions whose agents write Python, and the
-script form comes with it. See
-[Usage -> outrig run](../usage/run.md#running-a-python-program-on-the-host) for what the program
-sees.
+script form comes with it. See [Host programs](../usage/host-programs.md) for what the program
+sees, and [Python API](python.md) for every name the `outrig` package gives it.
 
 ### `outrig mcp`
 
@@ -958,7 +984,8 @@ container, and stops that container before it exits.
 there; the run is reported in full, and the container is named on stderr.
 
 `outrig run-new <script.py>` exits with its program's status, whatever it is, or with 128 plus the
-number of the signal that ended the program.
+number of the signal that ended the program -- or with `3` when a session the program left open
+could not be proven stopped, whatever the program's status was.
 
 ## Environment variables
 

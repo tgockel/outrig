@@ -26,10 +26,13 @@ unless you ask to remain anonymous.
 
 ## Security model
 
-OutRig's security property is the **container boundary**. MCP servers and the tools the agent
-runs execute inside a podman-managed container; the host stays outside that boundary except
-for the workspace mount(s) and the runtime services OutRig explicitly connects. See
-[`doc/concepts/mcp-trust-model.md`](doc/concepts/mcp-trust-model.md) and
+OutRig's security property is the **container boundary**. What the agent runs executes inside a
+podman-managed container: under `outrig run`, the MCP servers and the tools they run; under
+`outrig run-new` (0.3), the agent's own Python and every program it starts. The host stays outside
+that boundary except for the workspace mount(s), the runtime services OutRig explicitly connects,
+and the bindings an operator declares, which act on the host (see below). See
+[`doc/concepts/mcp-trust-model.md`](doc/concepts/mcp-trust-model.md),
+[`doc/concepts/hosted-objects.md`](doc/concepts/hosted-objects.md) and
 [`doc/concepts/containers.md`](doc/concepts/containers.md) for the full model.
 
 Issues that bear on **host integrity** are in scope, for example:
@@ -38,7 +41,11 @@ Issues that bear on **host integrity** are in scope, for example:
   processes outside the configured workspace mount(s).
 - OutRig leaking host secrets, credentials, or environment into the container when not
   configured to, including through a podman default OutRig leaves in place, such as
-  `--http-proxy`.
+  `--http-proxy`, or, under `outrig run-new`, through an MCP server's or a sidecar's environment:
+  `run-new` starts neither, so no credential from those blocks reaches its container.
+- Agent code starting a container, a sidecar, an MCP server, or a binding. Those come from the
+  configuration, the operator, an embedder, or a host program's `inject`, never from the agent:
+  the agent cannot grow its own environment.
 - The network interceptor failing to enforce a configured host:port allow/deny policy.
 - The network interceptor attaching to a container that holds `CAP_NET_ADMIN` -- `cap-add` of
   `NET_ADMIN`, or of `ALL` without `NET_ADMIN` in `cap-drop` -- since whatever it runs as root
@@ -72,6 +79,11 @@ Issues that bear on **host integrity** are in scope, for example:
 - A binding a repository's config declares (`[bindings.<name>]`) starting without the
   operator's approval of that exact declaration in that repository. A binding's factory is code
   the host runs as the user, and a repository's config is content the agent can write.
+- Code in the container reaching the process that holds a session's bindings, or a host program,
+  other than through the requests OutRig relays to it; a request to a binding or a live object
+  running without being published as events; or one admitted after the session's owner closed
+  admission. These checks are on the host so that nothing the container sends -- raw RPyC frames
+  included -- gets past them.
 
 ## Known boundaries (by design, not vulnerabilities)
 
@@ -92,7 +104,7 @@ Issues that bear on **host integrity** are in scope, for example:
   rootless user namespace, not host root) and can read the primary's entire filesystem -- so its
   image is as trusted as the primary image. It is opt-in, defaults to `"none"`, and remains a
   container (cgroups, seccomp, network policy, and `no-new-privileges` still apply; only the
-  mount namespace is joined). See [MCP Trust Model](doc/concepts/mcp-trust-model.md).
+  mount namespace is joined). See [Trust Model](doc/concepts/mcp-trust-model.md).
 - A proxy handed to an MCP server through its `env` is the agent's to read, credentials
   included, and a filter policy that allows it allows whatever it will reach. See
   [Containers](doc/concepts/containers.md#the-containers-environment).
@@ -109,9 +121,22 @@ Issues that bear on **host integrity** are in scope, for example:
   `${VAR}`. One process holds every binding of a session, so every binding's library runs with that
   one environment. Whatever the library does on the host is part of what the binding grants --
   GitPython runs `git`, which runs the hooks and `core.fsmonitor` a repository names, and the agent
-  can write `.git/` through the workspace mount. Every request the agent's code makes of a
-  binding runs, and is published as events: having the object is permission to use it. Binding a
-  library is a deliberate grant by whoever wrote the config, not a vulnerability.
+  can write `.git/` through the workspace mount. The user's authority covers OutRig's own files too
+  -- the global config and the record of approved bindings -- so a binding through which the agent
+  can run host programs can change what later sessions are granted. A binding acts on the host, so a
+  mount's `read-only` access does not limit it. Every request the agent's code makes of a binding
+  runs, and is published as events: having the object is permission to use it. The events are a
+  record only where something keeps them -- `outrig run-new` writes them to `events.jsonl` only
+  under `[events] mode = "record"`. Binding a library is a deliberate grant by whoever wrote the
+  config, not a vulnerability.
+- A **host program** (`outrig run-new <script.py>`, 0.3) is trusted code you run on the host, with
+  your authority and your environment. It is not a sandbox, and OutRig neither confines nor
+  audits it. A live object it injects into its sessions (`session.inject`) acts with the
+  program's authority, and every request an agent makes of it is published as a binding's is.
+  Keep the program's imports, and the credentials it reads, outside paths an agent can write.
+- **Agents in one `outrig run-new` session are not isolated from each other.** They share one
+  interpreter process, a thread each, so any agent's code can reach another's names, and every
+  agent is given every binding. The grant is the session's, not one agent's.
 - Hostname **deny** rules are best-effort against a hostile client. A container that resolves a
   name through the interceptor is bound to it and cannot shed that binding, but one that
   connects by address and asserts no name at all offers nothing to match against. Hostname deny

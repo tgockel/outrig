@@ -192,6 +192,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The docs describe both agent loops.** MCP is one way an agent acts, beside writing Python:
+  the trust-model page, retitled "Trust Model", covers the container boundary for both, with the
+  rule that an agent cannot grow its own environment; `outrig mcp self` lists it under that title,
+  at the same `concepts/mcp-trust-model` key. New pages:
+  [Python Runtime](../../doc/concepts/python-runtime.md),
+  [Hosted Objects](../../doc/concepts/hosted-objects.md),
+  [Host programs](../../doc/usage/host-programs.md), moved out of the `outrig run` page, and
+  [Python API](../../doc/reference/python.md), every name the `outrig` package gives a host
+  program with its `help()` text. [Reference -> CLI](../../doc/reference/cli.md) says which of
+  `run`, `run-legacy` and `run-new` to type.
+
 - **`style = "openai"` is `style = "chat-completions"`** in `outrig config init`, the configs
   `outrig init` writes, the startup banner and the docs. The old spelling still loads, as the new
   one, with a warning that names it; `outrig mcp`'s `validate_config` reports it as

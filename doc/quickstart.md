@@ -2,7 +2,9 @@
 
 This walks you from a fresh repo to your first running agent in five minutes, mostly via
 `outrig init` (which orchestrates `outrig config init` and `outrig image add` under the
-hood).
+hood). The agent it runs is `outrig run`'s, which acts by calling MCP tools in the container;
+`outrig run-new` previews one that acts by writing Python instead (see
+[Python Runtime](concepts/python-runtime.md)).
 
 Crate names matter: depend on `outrig` when embedding the library, and install
 `outrig-cli` when you want the command-line tool that provides the `outrig` binary. Both
@@ -261,7 +263,7 @@ Diagnostics arrive on stderr:
 > 
 ```
 
-Anything you type at `> ` is the user turn. Replies (only the assistant text) come back on
+Anything you type at `> ` is a prompt to the agent. Replies (only the assistant text) come back on
 stdout:
 
 ```
@@ -345,6 +347,8 @@ work back from you.
   LLM config and how to add more models or agents.
 - [Concepts -> Containers](concepts/containers.md) -- the Dockerfile conventions in detail.
 - [Concepts -> MCP Servers](concepts/mcp-servers.md) -- how to add more tools.
+- [Concepts -> Python Runtime](concepts/python-runtime.md) -- `outrig run-new`, the agent that
+  acts by writing Python.
 - [Usage -> AI-assisted design](usage/ai-assisted-design.md) -- AI-guided image-config
   design after `outrig init`.
 - [Usage -> outrig run](usage/run.md) -- REPL behavior, slash commands, multiple

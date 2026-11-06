@@ -103,7 +103,7 @@ async fn mcp_self_serves_docs_schema_suggestions_and_validators() {
             trust["markdown"]
                 .as_str()
                 .expect("markdown string")
-                .contains("# MCP Trust Model"),
+                .contains("# Trust Model"),
             "get_doc returned unexpected content: {trust}",
         );
 

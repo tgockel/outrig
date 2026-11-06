@@ -1,10 +1,17 @@
 # MCP Servers
 
-[MCP](https://modelcontextprotocol.io/) -- Model Context Protocol -- is the wire format outrig
-uses to talk to tools. Each MCP server is a child process that runs inside a session container
-and speaks JSON-RPC over its stdio. outrig connects to each one by `podman exec -i`'ing into the
-container, hands the resulting stdio pair to the [rmcp](https://crates.io/crates/rmcp) client, and
-treats every tool the server advertises as a Rig dynamic tool.
+[MCP](https://modelcontextprotocol.io/) -- Model Context Protocol -- is one of the ways an agent
+reaches tools. `outrig run`'s agent acts by calling the tools of the MCP servers an image-config
+declares, and `outrig mcp` serves the same tools to an external client. `outrig run-new`'s agent
+acts by writing Python instead (see
+[Python Runtime](https://tgockel.github.io/outrig/concepts/python-runtime.html)), and starts none
+of these servers; its startup names the configured ones it left out. On this page, "the agent" is
+`outrig run`'s, and a turn is one prompt and the agent's work on it.
+
+Each MCP server is a child process that runs inside a session container and speaks JSON-RPC over
+its stdio. outrig connects to each one by `podman exec -i`'ing into the container, hands the
+resulting stdio pair to the [rmcp](https://crates.io/crates/rmcp) client, and treats every tool
+the server advertises as a Rig dynamic tool.
 
 By default a server runs in the session's primary workspace container. An entry can instead opt
 into a **sidecar** -- an extra container owned by the session -- so the server's runtime
@@ -13,8 +20,8 @@ granted. See [Sidecar placement](#sidecar-placement) below and
 [Containers](containers.md#sidecar-containers) for the container-side details.
 
 The same `[images.<name>.mcp]` table is consumed by both `outrig run` and
-`outrig mcp`. `outrig run` registers those tools with its built-in agent; `outrig mcp`
-republishes them as one stdio MCP server for an external client. See
+`outrig mcp`, and set aside by `outrig run-new`. `outrig run` registers those tools with its
+built-in agent; `outrig mcp` republishes them as one stdio MCP server for an external client. See
 [Usage -> outrig mcp](https://tgockel.github.io/outrig/usage/mcp.html) for client setup and
 transport rules.
 When `outrig mcp --attach` points at an existing container, it still starts its own
@@ -262,7 +269,7 @@ matches, startup fails with a message naming the program and the `PATH` that was
 
 `view = "primary"` is a real posture change: the container starts with `CAP_SYS_ADMIN` and
 `CAP_SYS_PTRACE` in the primary's user namespace, and the server can read the primary's whole
-filesystem. See [MCP Trust Model](mcp-trust-model.md) and `SECURITY.md`. It needs the
+filesystem. See [Trust Model](mcp-trust-model.md) and `SECURITY.md`. It needs the
 `outrig-enter` helper. The helper is supported on Linux x86-64 and AArch64 and is compiled
 when the matching `<arch>-unknown-linux-musl` Rust target is installed; without it a
 `view = "primary"` session fails at start with a message naming the missing artifact and the
@@ -396,7 +403,7 @@ is:
 3. **Discover tools** -- outrig calls `tools/list` and receives the list of advertised tools, each
    with a name, description, and JSON Schema for its inputs.
 4. **Register with Rig** -- each discovered tool becomes a `McpToolAdapter` that implements Rig's
-   dynamic-tool trait. The agent now has access to it.
+   dynamic-tool trait. `outrig run`'s agent now has access to it.
 
 All servers come up before the REPL accepts any input. If any server fails to initialize --
 including one that [stops answering](#what-if-a-server-hangs) -- `outrig run` reports the error
@@ -430,7 +437,7 @@ coupling a config-declared entrypoint host has.
 
 The REPL surface is narrower by design: `/sidecar add <name>` starts a sidecar the image config
 declared with `start = "manual"`, and nothing else -- unknown names and already-running sidecars
-are errors, and there is no `/sidecar stop`. New tools become available to the agent on the next
+are errors, and there is no `/sidecar stop`. New tools become available to the agent on its next
 turn. `/sidecar list` shows every declared sidecar with its status (`running`, `not started`,
 `exited`) and the servers it hosts.
 
@@ -441,7 +448,9 @@ This is deliberately different from the session-start `on-failure` policy, which
 a *launch-time* sidecar failure aborts the session.
 
 There is intentionally no agent-invocable tool for adding sidecars: the agent must not grow its
-own environment. Only the human at the REPL or the embedding program can.
+own environment (see
+[Trust Model](mcp-trust-model.md#the-agent-cannot-grow-its-own-environment)). Only the human at
+the REPL or the embedding program can.
 
 ## Tool name prefixing
 
@@ -622,8 +631,10 @@ Two practical guidelines:
 ## See also
 
 - [Containers](containers.md) -- the Dockerfile that has to install the server binaries.
-- [MCP Trust Model](mcp-trust-model.md) -- the container boundary that makes broad MCP tools
+- [Trust Model](mcp-trust-model.md) -- the container boundary that makes broad MCP tools
   practical.
+- [Python Runtime](https://tgockel.github.io/outrig/concepts/python-runtime.html) -- the agent
+  that acts by writing Python, which starts no MCP server.
 - [AI-assisted design](../usage/ai-assisted-design.md) -- use `outrig mcp self` to design custom
   MCP-enabled image-configs.
 - [Sessions](https://tgockel.github.io/outrig/usage/sessions.html) --

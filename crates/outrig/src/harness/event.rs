@@ -47,6 +47,7 @@ pub struct Event {
     /// The agent it belongs to, or `None` for one about the session or the
     /// interpreter every agent shares.
     pub subject: Option<Subject>,
+    /// What it says: the fields `events.jsonl` records as its `data`.
     pub payload: Payload,
 }
 
@@ -77,6 +78,8 @@ impl Subject {
         }
     }
 
+    /// The subject as the event log writes it: `agent/primary`, `agent/c1`, or
+    /// `owner`.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -100,6 +103,7 @@ macro_rules! id_type {
                 Self(id)
             }
 
+            /// The number, as the event log writes it.
             pub fn get(self) -> u64 {
                 self.0
             }
@@ -183,93 +187,194 @@ pub enum Payload {
     /// What every model call carries besides the conversation.
     #[non_exhaustive]
     ModelInstructions {
+        /// The `[models.<name>]` row every call is tried against first: for an
+        /// alias, the first of its models this build can reach.
         model: String,
+        /// The system prompt: OutRig's orientation, the agent's configured
+        /// preamble, then the repository's instructions for agents when the
+        /// agent loaded any.
         preamble: String,
+        /// The tools every call offers the model.
         tools: Vec<ToolDefinition>,
+        /// That model's reply ceiling, after its published ceiling filled it in
+        /// or lowered it, or `None` when none is sent.
         max_tokens: Option<u32>,
     },
     /// A turn of the conversation, as it was committed. `messages` are rig's
     /// message JSON, whose form can change with a rig upgrade.
     #[non_exhaustive]
     TurnCommitted {
+        /// Its id, from 0, in commit order.
         turn: u64,
+        /// The round it belongs to.
         round: u32,
+        /// Whether the round ended while its calls ran, so OutRig's note saying
+        /// so stands in for each missing result.
         incomplete: bool,
+        /// The turn's messages: a round's first turn begins with the round's
+        /// opening.
         messages: Vec<Value>,
     },
     /// The text of a model's reply, as the call that made it returned. A
     /// reply with no text says nothing here.
     #[non_exhaustive]
-    ModelText { text: String },
+    ModelText {
+        /// Its text parts, joined.
+        text: String,
+    },
     /// What a model call was sent of the conversation, and why.
     ModelCall(ModelCall),
+    /// Python the model submitted, as it goes to run.
     #[non_exhaustive]
-    ExecSubmitted { execid: ExecId, source: String },
+    ExecSubmitted {
+        /// The id its execution's other events carry.
+        execid: ExecId,
+        /// The Python, as submitted.
+        source: String,
+    },
 
     // Execution diagnostics: the runtime's own state.
+    /// What the session is doing, as it changes: `starting` first, and
+    /// `reported` last.
     #[non_exhaustive]
-    SessionState { state: SessionState },
+    SessionState {
+        /// What it is doing from now on.
+        state: SessionState,
+    },
     /// What the session's shutdown found: its report, less how its events
     /// were delivered, which is final only once this has been published.
     #[non_exhaustive]
     SessionReport {
+        /// What closed the session to new work.
         closed_by: super::ClosedBy,
+        /// Whether what the session started is proven stopped.
         stopped: super::Stopped,
+        /// Each execution running at the close, and how it ended.
         executions: Vec<super::ExecutionOutcome>,
+        /// Each request to a binding that ended after the close, in the order
+        /// they ended.
         hosted: Vec<super::HostedCall>,
+        /// How the process holding the session's bindings stopped, or `None`
+        /// when the session had none.
         bindings: Option<super::BindingStop>,
+        /// Each request made of a child agent that was open at the close, and
+        /// how it ended.
         requests: Vec<super::RequestOutcome>,
+        /// What the report adds up to.
         verdict: super::Verdict,
     },
+    /// An agent started: a child's is recorded as it is launched.
     #[non_exhaustive]
     AgentStarted {
+        /// The `[models.<name>]` row every call of the agent is tried against
+        /// first.
         model: String,
+        /// The interpreter's Python version.
         python: String,
+        /// The name of the container the interpreter runs in.
         container: String,
+        /// The most tool calls one of its rounds may make: its `tool-call-max`.
         tool_call_max: u64,
+        /// The most bytes one tool result may hold before it is cut: its
+        /// `tool-result-max`.
         tool_result_max: u64,
     },
+    /// The agent stopped: as the session's shutdown stops the container, or for
+    /// a child as its kernel ends after its release.
     #[non_exhaustive]
     AgentStopped {},
+    /// A round of the event's subject began.
     #[non_exhaustive]
-    RoundStarted { round: u32 },
+    RoundStarted {
+        /// The round's number. A round that commits no turn leaves its number
+        /// to the next, and each agent counts its own.
+        round: u32,
+    },
     /// A submission that was not run: `holder` held the interpreter, or the
     /// session was closed to new work.
     #[non_exhaustive]
     ExecRefused {
+        /// The id the submission was given.
         execid: ExecId,
+        /// The execution that held the interpreter, or `None` when the session
+        /// was closed to new work.
         holder: Option<ExecId>,
+        /// Why it was not run.
         reason: Refusal,
     },
+    /// How an execution ended, when its result arrived.
     #[non_exhaustive]
     ExecCompleted {
+        /// The execution, as `exec.submitted` numbered it.
         execid: ExecId,
+        /// How it ended.
         status: ExecStatus,
+        /// How long it took, from its submission.
         #[serde(serialize_with = "seconds")]
         duration: Duration,
+        /// What it printed, bounded.
         output: String,
+        /// The bytes of output past the bound.
         dropped: u64,
+        /// Its traceback, or `None`.
         error: Option<String>,
+        /// Output earlier executions wrote after they reported, delivered with
+        /// this result.
         background: Vec<Background>,
     },
+    /// An execution raised `MemoryError`, beside its `exec.completed`, whose
+    /// `error` holds the traceback.
     #[non_exhaustive]
-    MemoryExhausted { execid: ExecId },
+    MemoryExhausted {
+        /// The execution that raised it.
+        execid: ExecId,
+    },
+    /// A cancel was sent to an execution, which raises `CancelledError` at the
+    /// await it is suspended on.
     #[non_exhaustive]
-    ExecCancelSent { execid: ExecId },
+    ExecCancelSent {
+        /// The execution it was sent to.
+        execid: ExecId,
+    },
+    /// An interrupt was sent to an execution, which raises `KeyboardInterrupt`
+    /// in agent code that has stopped yielding or is blocked in a call.
     #[non_exhaustive]
-    ExecInterruptSent { execid: ExecId, runaway: bool },
+    ExecInterruptSent {
+        /// The execution it was sent for.
+        execid: ExecId,
+        /// Whether it was sent for code found keeping a CPU busy, which it
+        /// reaches in whatever agent code holds the event loop, not only in
+        /// this execution's.
+        runaway: bool,
+    },
+    /// A liveness check of an execution's event loop went unanswered.
     #[non_exhaustive]
     ExecProbeFailed {
+        /// The execution that was running.
         execid: ExecId,
+        /// What the check found the loop doing.
         verdict: ProbeVerdict,
     },
+    /// OutRig stopped waiting for an execution, which keeps the interpreter
+    /// until it ends.
     #[non_exhaustive]
-    ExecAbandoned { execid: ExecId, why: Abandoned },
+    ExecAbandoned {
+        /// The execution it stopped waiting for.
+        execid: ExecId,
+        /// Why it stopped waiting.
+        why: Abandoned,
+    },
+    /// What the agent's namespace held when a liveness check of a running
+    /// execution was answered: names and types, never values.
     #[non_exhaustive]
     InventoryObserved {
+        /// The execution that was running.
         execid: ExecId,
+        /// The names it held, each with its value's type, at most 200.
         names: Vec<Held>,
+        /// How many names it held in all.
         total: u64,
+        /// How many it held past those listed.
         more: u64,
     },
     /// A `runtime.wait` the agent's code has been suspended in for a second:
@@ -278,13 +383,22 @@ pub enum Payload {
     /// `timeout` counts.
     #[non_exhaustive]
     ExecWaitStarted {
+        /// The execution whose code waits.
         execid: ExecId,
+        /// The interpreter's id for the wait, which its `exec.wait.ended`
+        /// carries too.
         wait: u64,
+        /// What it waits on, at most 50 entries.
         on: Vec<Awaited>,
+        /// How many it waits on past those in `on`.
         more: u64,
+        /// When it returns, as asyncio names it.
         return_when: ReturnWhen,
+        /// Its timeout, or `None` when it has none.
         #[serde(serialize_with = "seconds_opt")]
         timeout: Option<Duration>,
+        /// How long it had lasted when it was recorded, from which `timeout`
+        /// counts.
         #[serde(serialize_with = "seconds")]
         elapsed: Duration,
     },
@@ -293,42 +407,90 @@ pub enum Payload {
     /// exception that ended it, when one did.
     #[non_exhaustive]
     ExecWaitEnded {
+        /// The execution whose code waited.
         execid: ExecId,
+        /// The interpreter's id for the wait, as its `exec.wait.started` gave
+        /// it.
         wait: u64,
+        /// How it ended.
         how: WaitEnd,
+        /// What was done by then, described as `exec.wait.started` describes
+        /// what it waits on.
         done: Vec<Awaited>,
+        /// The channels a message was waiting on when it ended, for `message`;
+        /// otherwise empty.
         channels: Vec<String>,
+        /// The name of the exception that ended it, for `raised`; otherwise
+        /// `None`.
         error: Option<String>,
+        /// How long it lasted, from when it began.
         #[serde(serialize_with = "seconds")]
         duration: Duration,
     },
+    /// A tool result was cut to fit `tool-result-max`, with a marker saying
+    /// what was cut.
     #[non_exhaustive]
     ToolResultTruncated {
+        /// The execution whose result it is.
         execid: ExecId,
+        /// The bytes of the text that was cut, before the cut.
         size: u64,
+        /// The bytes that text had room for: `tool-result-max`, less what the
+        /// result holds whole ahead of it.
         max: u64,
+        /// The bytes of that text kept, ahead of the marker.
         kept: u64,
     },
+    /// The agent's code promoted turns, with `runtime.context.promote`: each is
+    /// chosen for later model calls until it is demoted.
     #[non_exhaustive]
-    ContextPromoted { turns: Vec<u64> },
+    ContextPromoted {
+        /// The turns' ids, as the agent's code named them.
+        turns: Vec<u64>,
+    },
+    /// The agent's code demoted turns, with `runtime.context.demote`, ending
+    /// their promotion.
     #[non_exhaustive]
-    ContextDemoted { turns: Vec<u64> },
+    ContextDemoted {
+        /// The turns' ids, as the agent's code named them.
+        turns: Vec<u64>,
+    },
+    /// A line no execution can be billed for: what `os.write(1, ...)` wrote,
+    /// say, or a child process started outside every execution.
     #[non_exhaustive]
-    OutputUnattributed { text: String },
+    OutputUnattributed {
+        /// The line, cut past 4 KiB.
+        text: String,
+    },
+    /// A line the interpreter wrote about itself.
     #[non_exhaustive]
-    InterpreterDiagnostic { text: String },
+    InterpreterDiagnostic {
+        /// The line, without its `outrig-interpreter:` prefix.
+        text: String,
+    },
     /// The interpreter's output closed, for `cause`. `expected` when the
     /// session's shutdown stopped it; otherwise it died, which ends the
     /// session.
     #[non_exhaustive]
-    InterpreterExited { cause: String, expected: bool },
+    InterpreterExited {
+        /// Why its output closed, such as how its process exited and the last
+        /// of its stderr.
+        cause: String,
+        /// Whether the session's shutdown stopped it.
+        expected: bool,
+    },
     /// A binding a repository's config declared did not start, because the
     /// operator did not approve that declaration or nobody could be asked; the
     /// session runs without it. `reason` says which, and how to approve it.
     #[non_exhaustive]
     BindingRefused {
+        /// The name the binding was declared under.
         binding: String,
+        /// The config file that declared it, or `None` when it has none.
         declared_in: Option<std::path::PathBuf>,
+        /// Why it did not start, and how to approve it: the operator did not
+        /// approve the declaration, nobody could be asked, or the session had
+        /// no approver.
         reason: String,
     },
     /// The process holding the session's bindings exited while the session
@@ -336,7 +498,9 @@ pub enum Payload {
     /// running is `unknown`, and a later call to any of them fails.
     #[non_exhaustive]
     BindingExited {
+        /// The names of the bindings the process held.
         bindings: Vec<String>,
+        /// How the process ended, such as `it was killed by SIGKILL`.
         cause: String,
     },
     /// What the session's skill sources hold, as the session started: each
@@ -345,7 +509,9 @@ pub enum Payload {
     /// alone, with no Python run.
     #[non_exhaustive]
     SkillDiscovered {
+        /// Each skill served.
         skills: Vec<DiscoveredSkill>,
+        /// What discovery found wrong with a skill, or with a source.
         diagnostics: Vec<SkillDiagnostic>,
     },
     /// A skill's package was imported in the interpreter -- again, after
@@ -355,12 +521,22 @@ pub enum Payload {
     /// when it did.
     #[non_exhaustive]
     SkillImported {
+        /// The skill whose package was imported.
         skill: String,
+        /// The source serving it.
         source: String,
+        /// The agent whose code imported it, as the interpreter's protocol
+        /// names it, or `None` for code outside every execution.
         agent: Option<String>,
+        /// The digest of its files then, or `None` when the host gave none.
         digest: Option<String>,
+        /// Whether `outrig.skills.reload` imported it again.
         reload: bool,
+        /// Why the import failed, as a code such as `unsatisfied-dependency`,
+        /// or `None` when it did not fail.
         code: Option<String>,
+        /// Why the import failed, in full, its control characters escaped, or
+        /// `None` when it did not fail.
         reason: Option<String>,
     },
     /// A `/name` the user typed reached the event's subject on its user
@@ -368,8 +544,11 @@ pub enum Payload {
     /// Nothing of the skill runs until the agent's code invokes it.
     #[non_exhaustive]
     SkillDirectiveReceived {
+        /// The skill the `/name` names.
         skill: String,
+        /// The source serving it.
         source: String,
+        /// The id `message.sent` gave the message that carried it.
         message: MessageId,
     },
     /// The event's subject's code is calling `skill`'s entry through
@@ -382,13 +561,25 @@ pub enum Payload {
     /// were filled from.
     #[non_exhaustive]
     SkillInvocationStarted {
+        /// Its id, which the typed calls and the hosted requests made inside it
+        /// carry.
         invocation: InvocationId,
+        /// The skill whose entry is called.
         skill: String,
+        /// The source serving it.
         source: String,
+        /// The digest of the skill's files when its package was imported.
         digest: String,
+        /// The JSON of the `<Skill>Params` the entry is called with, cut to
+        /// 1,024 characters, or `None` when the session's events are not
+        /// observed.
         params: Option<String>,
+        /// Where the parameters came from.
         by: ParamsBy,
+        /// The typed call that parsed them from what the user typed, or `None`
+        /// when the caller passed them.
         call: Option<AgentRequestId>,
+        /// The bindings the entry's parameters were filled from.
         bindings: Vec<String>,
     },
     /// The entry of `invocation` ended, `duration` after it was called:
@@ -398,24 +589,43 @@ pub enum Payload {
     /// none reported anything.
     #[non_exhaustive]
     SkillInvocationFinished {
+        /// The invocation, as its `skill.invocation.started` numbered it.
         invocation: InvocationId,
+        /// How the entry ended.
         outcome: InvocationEnd,
+        /// How long the entry ran.
         #[serde(serialize_with = "seconds")]
         duration: Duration,
+        /// The qualified name of the type of what it returned, or `None` when
+        /// it did not return.
         result: Option<String>,
+        /// The qualified name of the type of what it raised, or `None` when it
+        /// did not raise.
         exception: Option<String>,
+        /// What the model requests of every child made inside the invocation
+        /// used, or `None` when none reported anything.
         usage: Option<Usage>,
     },
     /// A child agent was launched, by `parent`; the event's subject is the
     /// child's.
     #[non_exhaustive]
     AgentSpawned {
+        /// What the spawn called it: a label, which children can share.
         name: String,
+        /// The subject of the agent that launched it, or `owner` for the host
+        /// program's.
         parent: String,
+        /// Which kind of child it is.
         kind: ChildKind,
+        /// The `[models.<name>]` row as the spawn named it, or as its parent
+        /// runs: `default-model` for the host program's.
         model: String,
+        /// How deep it is: the main agent's children, and the host program's,
+        /// are at 1.
         depth: u32,
+        /// Its inputs, bound as variables before its first round.
         inputs: Vec<InputBrief>,
+        /// The channels a request child answers requests on.
         channels: Vec<ChannelBrief>,
     },
     /// A request was sent to the event's subject, a child: a submission, when
@@ -423,44 +633,65 @@ pub enum Payload {
     /// preview of what was sent -- a submission's inputs, by name.
     #[non_exhaustive]
     AgentRequestSent {
+        /// The request's id, which its other events carry.
         request: AgentRequestId,
+        /// The channel it was sent on, or `None` for a submission.
         channel: Option<String>,
+        /// The subject of the agent that made it, or `owner` for the host
+        /// program's.
         sender: String,
+        /// A preview of what was sent, cut to 1,024 characters: a submission's
+        /// inputs, by name.
         body: String,
+        /// How many answers that fail their check it takes before it ends
+        /// `rejected`.
         attempts_max: u32,
     },
     /// The child took the request: its code received it from its channel, or
     /// it was given the submission at the start of `round`.
     #[non_exhaustive]
     AgentRequestReceived {
+        /// The request the child took.
         request: AgentRequestId,
+        /// The child's round running then, or `None` when none was.
         round: Option<u32>,
     },
     /// The child answered the request, with `value` as a bounded preview. An
     /// answer that failed its check is followed by `agent.request.invalid`.
     #[non_exhaustive]
     AgentRequestReplied {
+        /// The request the child answered.
         request: AgentRequestId,
+        /// Which answer this is, counted from 1.
         attempt: u32,
+        /// A preview of the answer, cut to 1,024 characters.
         value: String,
     },
+    /// The child's answer to a request failed its check.
     #[non_exhaustive]
     AgentRequestInvalid {
+        /// The request the child answered.
         request: AgentRequestId,
+        /// Which answer failed, as `agent.request.replied` counted it.
         attempt: u32,
+        /// What failed the check, each with its path.
         problems: Vec<String>,
     },
     /// A work child reported progress on the submission it works on, which
     /// its sender reads from the handle. Settles nothing.
     #[non_exhaustive]
     AgentRequestProgress {
+        /// The submission the child works on.
         request: AgentRequestId,
+        /// The progress, as text cut to 1,024 characters.
         body: String,
     },
     /// The child failed the request on purpose, saying why.
     #[non_exhaustive]
     AgentRequestFailed {
+        /// The request the child failed.
         request: AgentRequestId,
+        /// Why, cut to 1,024 characters.
         message: String,
     },
     /// The request was cancelled, before or after the child received it: by
@@ -468,8 +699,11 @@ pub enum Payload {
     /// having ended without answering it after a warning.
     #[non_exhaustive]
     AgentRequestCancelled {
+        /// The request that was cancelled.
         request: AgentRequestId,
+        /// Whether the child had taken it.
         received: bool,
+        /// Why the host cancelled it, or `None` when its sender did.
         reason: Option<String>,
     },
     /// How the request ended, how many answers it took, and the child's
@@ -479,24 +713,36 @@ pub enum Payload {
     /// text its sender's exception carries as `__cause__`.
     #[non_exhaustive]
     AgentRequestSettled {
+        /// The request that ended.
         request: AgentRequestId,
+        /// How it ended.
         outcome: RequestEnd,
+        /// How many answers it took.
         attempts: u32,
+        /// The child's rounds it was open during.
         rounds: Vec<u32>,
+        /// The text of a model call's failure that ended a round of the
+        /// child's, for a submission the host then cancelled, or `None`. Its
+        /// sender's exception carries it as `__cause__`.
         cause: Option<String>,
     },
     /// An answer to a request that had already ended, refused.
     #[non_exhaustive]
     AgentRequestRefused {
+        /// The request the answer was for.
         request: AgentRequestId,
+        /// How the request had ended.
         ended: RequestEnd,
     },
     /// The event's subject released `released`; that ended `ended`, every
     /// child in their subtrees, and settled `requests`.
     #[non_exhaustive]
     AgentReleased {
+        /// The children the subject's code named, by id.
         released: Vec<String>,
+        /// Those, and every child below them, each ended or found wedged.
         ended: Vec<String>,
+        /// The requests that ended `released` with them.
         requests: Vec<AgentRequestId>,
     },
     /// The event's subject, a released child, did not stop: its code never
@@ -511,11 +757,20 @@ pub enum Payload {
     /// the same `request`.
     #[non_exhaustive]
     AgentCallStarted {
+        /// The id of the submission the call gives the child, which the call's
+        /// handle carries.
         request: AgentRequestId,
+        /// The subject of the agent whose code made the call.
         parent: String,
+        /// The declaration's `__module__`.
         module: String,
+        /// The declaration's `__qualname__`.
         qualname: String,
+        /// A SHA-256 of the source that declared it -- its module's file, or
+        /// the submission's source for a function declared in one -- or `None`
+        /// when none could be read.
         digest: Option<String>,
+        /// The skill invocation the call was made inside, or `None`.
         invocation: Option<InvocationId>,
     },
     /// The call ended and its child was released: how its submission ended,
@@ -526,10 +781,18 @@ pub enum Payload {
     /// observed.
     #[non_exhaustive]
     AgentCallSettled {
+        /// The call's submission, as `agent.call.started` named it.
         request: AgentRequestId,
+        /// How the submission ended.
         outcome: RequestEnd,
+        /// What every model request the child made used, or `None` when none
+        /// reported anything.
         usage: Option<Usage>,
+        /// The skill invocation the call was made inside, or `None`.
         invocation: Option<InvocationId>,
+        /// A preview of the result it was accepted with, cut to 1,024
+        /// characters, or `None` when it was not accepted or the session's
+        /// events are not observed.
         value: Option<String>,
     },
     /// An agent class's instance, made by `parent`'s code, launched its child,
@@ -538,19 +801,32 @@ pub enum Payload {
     /// could be read, the child's inputs, and its request channels.
     #[non_exhaustive]
     AgentInstanceStarted {
+        /// The instance's id, which its other events carry.
         instance: AgentInstanceId,
+        /// The subject of the agent whose code constructed it, or `owner` for
+        /// one the host program constructed.
         parent: String,
+        /// The class's `__module__`.
         module: String,
+        /// The class's `__qualname__`.
         qualname: String,
+        /// A SHA-256 of the source that declared the class -- its module's
+        /// file, or the submission's source for a class declared in one -- or
+        /// `None` when none could be read.
         digest: Option<String>,
+        /// The child's inputs, bound as variables before its first round.
         inputs: Vec<InputBrief>,
+        /// The child's request channels, one per request method.
         channels: Vec<ChannelBrief>,
     },
     /// The instance's child ended its orienting round, the one it has as it
     /// launches, and is ready; or `error` says why it cannot have that round.
     #[non_exhaustive]
     AgentInstanceReady {
+        /// The instance whose child it is.
         instance: AgentInstanceId,
+        /// Why the child cannot have that round -- the token budget spent, or a
+        /// model that cannot answer -- or `None` when it had it.
         error: Option<String>,
     },
     /// The instance released its child, `how`, which settled `requests`.
@@ -558,20 +834,31 @@ pub enum Payload {
     /// none reported anything.
     #[non_exhaustive]
     AgentInstanceReleased {
+        /// The instance that was released.
         instance: AgentInstanceId,
+        /// How it was released.
         how: InstanceRelease,
+        /// The requests on the child that the release, or the session's close,
+        /// ended.
         requests: Vec<AgentRequestId>,
+        /// What every model request the child made used, or `None` when none
+        /// reported anything.
         usage: Option<Usage>,
     },
     /// The instance was collected: its release follows, unless the session's
     /// close had released it.
     #[non_exhaustive]
-    AgentInstanceCollected { instance: AgentInstanceId },
+    AgentInstanceCollected {
+        /// The instance that was collected.
+        instance: AgentInstanceId,
+    },
     /// The handle of `request`, made through the instance, was collected
     /// while the request was open. The request goes on.
     #[non_exhaustive]
     AgentInstanceHandleCollected {
+        /// The instance the request was made through.
         instance: AgentInstanceId,
+        /// The request whose handle was collected.
         request: AgentRequestId,
     },
 
@@ -582,60 +869,113 @@ pub enum Payload {
     /// used together, each attempt counted once.
     #[non_exhaustive]
     ModelRoundCompleted {
+        /// The round that ended.
         round: u32,
+        /// Why OutRig ended it, such as the tool-call cap, or `None` when it
+        /// did not.
         stopped: Option<String>,
+        /// The round's tokens: the sum over its attempts, or `None` when none
+        /// reported any.
         usage: Option<Usage>,
+        /// Each of its model calls, and what the attempt that answered it used.
         calls: Vec<CallUsage>,
+        /// Every request the round sent, failed ones included.
         attempts: Vec<AttemptId>,
+        /// The largest `input_tokens` any of its calls reported, or `None`.
         input_tokens_max: Option<u64>,
+        /// The requests sent while it ran for the child agents its code
+        /// launched, and theirs below them.
         descendants: Vec<AttemptId>,
+        /// Its own usage and its descendants', each attempt counted once, or
+        /// `None` when none reported any.
         total: Option<Usage>,
     },
+    /// A round ended by an error, with what it had used so far.
     #[non_exhaustive]
     ModelRoundFailed {
+        /// The round that failed.
         round: u32,
+        /// The error that ended it.
         error: String,
+        /// Each model call it had made, and what the attempt that answered it
+        /// used.
         calls: Vec<CallUsage>,
+        /// The round's tokens so far: the sum over its attempts, or `None` when
+        /// none reported any.
         usage: Option<Usage>,
+        /// Every request the round sent, failed ones included.
         attempts: Vec<AttemptId>,
+        /// The requests sent while it ran for the child agents its code
+        /// launched, and theirs below them.
         descendants: Vec<AttemptId>,
+        /// Its own usage and its descendants', each attempt counted once, or
+        /// `None` when none reported any.
         total: Option<Usage>,
     },
+    /// A round ended while a model call was in flight, with what it had used so
+    /// far: its future was dropped, the call outlasted a release, or the
+    /// session ended.
     #[non_exhaustive]
     ModelRoundDropped {
+        /// The round that was dropped.
         round: u32,
+        /// Each model call it had made, and what the attempt that answered it
+        /// used.
         calls: Vec<CallUsage>,
+        /// The round's tokens so far: the sum over its attempts, or `None` when
+        /// none reported any.
         usage: Option<Usage>,
+        /// Every request the round sent, failed ones included.
         attempts: Vec<AttemptId>,
+        /// The requests sent while it ran for the child agents its code
+        /// launched, and theirs below them.
         descendants: Vec<AttemptId>,
+        /// Its own usage and its descendants', each attempt counted once, or
+        /// `None` when none reported any.
         total: Option<Usage>,
     },
     /// Requests a child the round launched made after the round had ended:
     /// spend added to that round's tree once its total was published.
     #[non_exhaustive]
     ModelRoundUsage {
+        /// The round the requests belong to.
         round: u32,
+        /// The requests its descendants sent after it ended.
         attempts: Vec<AttemptId>,
+        /// What they used together, or `None` when none reported any.
         usage: Option<Usage>,
     },
     /// One request a provider was sent, and how it ended.
     ModelAttempt(ModelAttempt),
+    /// A model call failed and will be made again, after a wait.
     #[non_exhaustive]
     ModelRetry {
+        /// The `[models.<name>]` row being retried.
         model: String,
         /// The try that failed, counted from 1 within its layer's retries.
         attempt: u32,
+        /// How long until the next try.
         #[serde(serialize_with = "seconds")]
         delay: Duration,
+        /// Why it failed, without the provider's response body: an HTTP status,
+        /// a connection error, or an unusable response.
         error: String,
+        /// The model call being retried.
         call_id: CallId,
+        /// The request that failed.
         attempt_id: AttemptId,
     },
+    /// A model call moved to the next of an alias's models, once the one before
+    /// had failed past its retries or could not take the call.
     #[non_exhaustive]
     ModelFailover {
+        /// The `[models.<name>]` row given up.
         from: String,
+        /// The `[models.<name>]` row the call moves to.
         to: String,
+        /// Why `from` was given up.
         error: String,
+        /// The model call that moved.
         call_id: CallId,
         /// The last request `from` was sent, or `None` when it was passed
         /// over without one.
@@ -647,48 +987,82 @@ pub enum Payload {
     /// that is answered, every later call is sent the notice too.
     #[non_exhaustive]
     ModelWithheld {
+        /// The `[models.<name>]` row that refused the call.
         model: String,
+        /// The model call that was refused.
         call_id: CallId,
+        /// The turn whose results are left out: the one the call answers.
         turn: u64,
+        /// The finish reason the refusal ended with, such as `content_filter`
+        /// or `refusal`.
         finish_reason: String,
     },
     /// A usage record that arrived after its attempt's event, accepted: it
     /// replaces that attempt's null usage, once.
     #[non_exhaustive]
     ModelUsageReplaced {
+        /// The model call the attempt served.
         call_id: CallId,
+        /// The attempt whose usage it replaces.
         attempt_id: AttemptId,
+        /// What the record says the attempt used.
         usage: Usage,
     },
     /// A usage record that changed nothing.
     #[non_exhaustive]
     ModelUsageRefused {
+        /// The model call the attempt served, or `None` for an attempt the
+        /// session has no record of.
         call_id: Option<CallId>,
+        /// The attempt the record names.
         attempt_id: AttemptId,
+        /// What the record says the attempt used.
         usage: Usage,
+        /// Why it changed nothing.
         reason: UsageRefusal,
     },
+    /// A message was put on a channel.
     #[non_exhaustive]
     MessageSent {
+        /// The id OutRig gives it, which its other events carry.
         message: MessageId,
+        /// The channel it was put on.
         channel: String,
+        /// Who sent it: `user`, or the agent's subject, such as
+        /// `agent/primary`.
         from: String,
+        /// Who it is for: `user`, or the agent's subject.
         to: String,
+        /// Its text, as the channel carries it.
         body: String,
     },
+    /// A message the other end did not take.
     #[non_exhaustive]
     MessageRefused {
+        /// The id OutRig gave it.
         message: MessageId,
+        /// The channel it was put on.
         channel: String,
+        /// Who sent it: `user`, or the agent's subject, such as
+        /// `agent/primary`.
         from: String,
+        /// Who it was for: `user`, or the agent's subject.
         to: String,
+        /// Why it was not taken.
         reason: String,
     },
+    /// The other end took a message. For a message to the agent, that is its
+    /// code receiving it, which can be well after it arrived.
     #[non_exhaustive]
     MessageReceived {
+        /// The id its `message.sent` gave it.
         message: MessageId,
+        /// The channel it was put on.
         channel: String,
+        /// Who sent it: `user`, or the agent's subject, such as
+        /// `agent/primary`.
         from: String,
+        /// Who took it: `user`, or the agent's subject.
         to: String,
     },
     /// The host program injected a live object it holds, which every kernel
@@ -696,7 +1070,9 @@ pub enum Payload {
     /// its type.
     #[non_exhaustive]
     BindingInjected {
+        /// The name agents reach it by, in `outrig.bindings`.
         binding: String,
+        /// The qualified name of the object's type.
         #[serde(rename = "type")]
         type_name: String,
     },
@@ -708,38 +1084,67 @@ pub enum Payload {
     /// said: diagnostic context, which the agent's own code can change.
     #[non_exhaustive]
     HostedReceived {
+        /// The id OutRig gives it, which its other events carry.
         request: RequestId,
+        /// The agent whose code made it, as the interpreter's protocol names
+        /// it.
         agent: String,
+        /// The binding whose object it was made of.
         binding: String,
+        /// The execution that made it, or `None`.
         execid: Option<ExecId>,
+        /// The skill invocation it was made inside, or `None`.
         invocation: Option<InvocationId>,
+        /// What it asks of its target.
         operation: Operation,
+        /// The attribute it names -- or, for `cmp`, the operator -- or `None`.
         member: Option<String>,
+        /// The qualified name of its target's type on the host, or `None`.
         target: Option<String>,
+        /// A preview of each positional argument.
         arguments: Vec<String>,
+        /// A preview of each keyword argument, by name.
         keywords: std::collections::BTreeMap<String, String>,
+        /// The request a callback made it under, or `None`.
         parent: Option<RequestId>,
+        /// Who saw it arrive.
         by: ReceivedBy,
     },
     /// A request's target is about to be invoked: published before it is.
     #[non_exhaustive]
     HostedDispatched {
+        /// The request, as its `hosted.received` numbered it.
         request: RequestId,
+        /// The agent whose code made it, as the interpreter's protocol names
+        /// it.
         agent: String,
+        /// The binding whose object it was made of.
         binding: String,
     },
     /// How a request ended.
     #[non_exhaustive]
     HostedEnded {
+        /// The request, as its `hosted.received` numbered it.
         request: RequestId,
+        /// The agent whose code made it, as the interpreter's protocol names
+        /// it.
         agent: String,
+        /// The binding whose object it was made of.
         binding: String,
+        /// How it ended.
         outcome: HostedOutcome,
+        /// Why, for an outcome that has a reason; otherwise `None`.
         reason: Option<HostedReason>,
+        /// What refused it, or `None`.
         detail: Option<String>,
+        /// The qualified name of what a `raised` call raised, or `None`.
         exception: Option<String>,
+        /// The host's traceback, its last 16 KiB, which agent code does not
+        /// get; or `None`.
         traceback: Option<String>,
+        /// Whether the caller was interrupted while the target ran.
         interrupted: bool,
+        /// How long it took, from its receipt.
         #[serde(serialize_with = "seconds")]
         duration: Duration,
     },
@@ -747,8 +1152,12 @@ pub enum Payload {
     /// call `parent`.
     #[non_exhaustive]
     HostedCallback {
+        /// The request the callable was passed in.
         parent: RequestId,
+        /// The agent whose code passed the callable, as the interpreter's
+        /// protocol names it.
         agent: String,
+        /// The binding whose library called it.
         binding: String,
     },
 }
@@ -864,25 +1273,52 @@ impl Payload {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Operation {
+    /// A read of the attribute the event's `member` names.
     Getattr,
+    /// A write of the attribute the event's `member` names.
     Setattr,
+    /// A deletion of the attribute the event's `member` names.
     Delattr,
+    /// A call of the target.
     Call,
+    /// A call of the target's attribute `member`, read and called in one
+    /// request: how a `for` loop reaches `__iter__` and `__next__`.
     Callattr,
+    /// The target's `repr`.
     Repr,
+    /// The target's `str`.
     Str,
+    /// A comparison of the target with another object, through the operator
+    /// method `member` names on the target's type.
     Cmp,
+    /// The target's `hash`.
     Hash,
+    /// The target's attribute names, as `dir` lists them, less those a request
+    /// may not name.
     Dir,
+    /// Whether an object of the connection's is an instance of the target, a
+    /// class.
     Instancecheck,
+    /// The next items of the target, an iterator, several in one request.
     Buffiter,
+    /// A slice of the target, through the item method `member` names, or
+    /// failing that its old-style slice method.
     Oldslicing,
+    /// The target's `__exit__`, as a `with` block in the agent's code ends,
+    /// with the exception that ended it.
     Ctxexit,
+    /// A check that the connection answers, which echoes what it was sent.
     Ping,
+    /// The connection's close.
     Close,
+    /// A request for the connection's root: the binding's object.
     Getroot,
+    /// A request for the methods of an object of the host's, which its proxy's
+    /// class is built from.
     Inspect,
+    /// A request for the target, pickled. Always refused.
     Pickle,
+    /// A release of references the interpreter held to an object of the host's.
     Del,
     /// A request type outside the protocol's table, which is refused.
     Unknown,
@@ -995,8 +1431,11 @@ pub enum HostedReason {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct ToolDefinition {
+    /// What the model calls it by.
     pub name: String,
+    /// What the model is told it does.
     pub description: String,
+    /// The JSON Schema of its arguments.
     pub parameters: Value,
 }
 
@@ -1007,18 +1446,33 @@ pub struct ModelCall {
     /// This assembly's place among the session's, from 0. A call moved to
     /// another model is assembled again, under the same `call_id`.
     pub call: u64,
+    /// The model call it was assembled for, which names the call in every model
+    /// event.
     pub call_id: CallId,
+    /// The round the call was made in.
     pub round: u32,
+    /// What it was held to.
     pub budget: CallBudget,
+    /// The whole request's estimated tokens, before `budget.estimate_scale`.
     pub estimate: u64,
+    /// The turns it was sent, oldest first, each with why it was chosen.
     pub carried: Vec<Chosen>,
+    /// The turns chosen but left out for size.
     pub evicted: Vec<Chosen>,
+    /// The turns chosen, and fitting, but left out so that the user's and the
+    /// model's turns alternate; empty unless `budget.role_alternation` is
+    /// [`RoleAlternation::Strict`].
     pub withheld: Vec<Chosen>,
     /// The round's opening, as rig's message JSON, when it was the call's
     /// prompt.
     pub opening: Option<Value>,
+    /// Where one role follows itself in what was sent.
     pub adjacent: Vec<Repeat>,
+    /// The parts of carried turns the call's provider cannot take, which it was
+    /// not sent.
     pub left_out: Vec<LeftOut>,
+    /// The carried turns whose results a provider refused a call for, each
+    /// result sent as a notice instead.
     pub refused: Vec<RefusedTurn>,
     /// The room, in estimated tokens, the call's view was cut down to, when
     /// this call cut it: what was chosen did not fit, so it was chosen again
@@ -1032,16 +1486,25 @@ pub struct ModelCall {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct CallBudget {
+    /// The `[models.<name>]` row the call was assembled for.
     pub model: String,
+    /// The context window the call was held to, in tokens.
     pub window: u32,
+    /// Where `window` came from.
     pub window_source: WindowSource,
+    /// The tokens of the window held back for the reply.
     pub reserve: u32,
+    /// What every call carries besides the conversation -- the system prompt
+    /// and the tool definitions -- in estimated tokens.
     pub overhead: u64,
     /// What the call's `estimate` was multiplied by to be held to the window: 1.0
     /// is the estimate as it stands, and above it the model's provider has
     /// reported more input tokens for a request than the estimate said.
     pub estimate_scale: f64,
+    /// The reply ceiling the call carried, or `None` when none was sent.
     pub max_tokens: Option<u32>,
+    /// Whether the model's provider requires the user's and the model's turns
+    /// to alternate, as its provider row says.
     pub role_alternation: RoleAlternation,
 }
 
@@ -1067,7 +1530,9 @@ pub enum WindowSource {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct Chosen {
+    /// The turn, by its id.
     pub turn: u64,
+    /// Why it was chosen.
     pub why: Why,
 }
 
@@ -1095,6 +1560,7 @@ pub struct Repeat {
     /// The turn that begins with the repeat, or `None` for the round's
     /// opening.
     pub turn: Option<u64>,
+    /// The role that follows itself.
     pub role: Role,
 }
 
@@ -1103,7 +1569,9 @@ pub struct Repeat {
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum Role {
+    /// The user's side, which carries tool results too.
     User,
+    /// The model's side.
     Assistant,
 }
 
@@ -1112,8 +1580,11 @@ pub enum Role {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct LeftOut {
+    /// The turn, by its id.
     pub turn: u64,
+    /// The message, counted from 0 within the turn's `messages`.
     pub message: u64,
+    /// The part, counted from 0 within the message's `content`.
     pub part: u64,
 }
 
@@ -1122,7 +1593,10 @@ pub struct LeftOut {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct RefusedTurn {
+    /// The turn, by its id.
     pub turn: u64,
+    /// What each of its tool results was sent as: why, and where the results
+    /// are.
     pub notice: String,
 }
 
@@ -1161,7 +1635,9 @@ pub enum Refusal {
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum ExecStatus {
+    /// It ran to completion.
     Ok,
+    /// It raised.
     Error,
     /// The interpreter refused it, disagreeing with the host about which
     /// execution held it.
@@ -1175,8 +1651,12 @@ pub enum ExecStatus {
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum ProbeVerdict {
+    /// The loop did not answer and its thread was idle: blocked in a system
+    /// call, such as a `subprocess.run` or a `time.sleep`.
     Blocked,
+    /// The loop did not answer and its thread kept a CPU busy.
     Spinning,
+    /// Nothing in the interpreter answered: native code holds the GIL.
     Starved,
 }
 
@@ -1195,7 +1675,9 @@ pub enum Abandoned {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct Held {
+    /// The name, as the agent's code bound it.
     pub name: String,
+    /// Its value's type, by name.
     #[serde(rename = "type")]
     pub type_name: String,
 }
@@ -1208,37 +1690,63 @@ pub struct Held {
 pub enum Awaited {
     /// A task: its name, and its coroutine's qualified name when it has one.
     #[non_exhaustive]
-    Task { name: String, code: Option<String> },
+    Task {
+        /// Its name, as `asyncio.Task.get_name` gives it.
+        name: String,
+        /// The qualified name of its coroutine's code, or `None` when it has
+        /// none.
+        code: Option<String>,
+    },
     /// A submission to a child agent: the request's id, and the child's id
     /// and spawn name once the child exists.
     #[non_exhaustive]
     Submission {
+        /// The request's id, which its events carry as `request`, or `None`
+        /// when the interpreter named none.
         id: Option<u64>,
+        /// The child's id, or `None` until the child exists.
         child: Option<String>,
+        /// The child's spawn name, or `None` until the child exists.
         name: Option<String>,
     },
     /// A request on a child's channel.
     #[non_exhaustive]
     Request {
+        /// The request's id, which its events carry as `request`, or `None`
+        /// when the interpreter named none.
         id: Option<u64>,
+        /// The child's channel the request is on.
         channel: String,
+        /// The child's id, or `None` until the child exists.
         child: Option<String>,
+        /// The child's spawn name, or `None` until the child exists.
         name: Option<String>,
     },
     /// A typed call of an `@outrig.agent` function, by its qualified name.
     #[non_exhaustive]
     Call {
+        /// The id of the call's submission, which its events carry as
+        /// `request`, or `None` when the interpreter named none.
         id: Option<u64>,
+        /// The function's `__module__` and `__qualname__`, joined by a dot.
         function: String,
+        /// The child's id, or `None` until the child exists.
         child: Option<String>,
+        /// The child's spawn name, or `None` until the child exists.
         name: Option<String>,
     },
     /// A skill's invocation.
     #[non_exhaustive]
-    Skill { id: u64, skill: String },
+    Skill {
+        /// The invocation's id, as `skill.invocation.started` gives it.
+        id: u64,
+        /// The skill whose entry the invocation calls.
+        skill: String,
+    },
     /// Any other future: its type's qualified name.
     #[non_exhaustive]
     Future {
+        /// The qualified name of the future's type.
         #[serde(rename = "type")]
         type_name: String,
     },
@@ -1249,8 +1757,11 @@ pub enum Awaited {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[non_exhaustive]
 pub enum ReturnWhen {
+    /// `FIRST_COMPLETED`: once any of its futures is done.
     FirstCompleted,
+    /// `FIRST_EXCEPTION`: once any of its futures raises, or once all are done.
     FirstException,
+    /// `ALL_COMPLETED`: once all of its futures are done.
     AllCompleted,
 }
 
@@ -1274,8 +1785,11 @@ pub enum WaitEnd {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct Background {
+    /// The execution that wrote it.
     pub id: ExecId,
+    /// What it wrote, bounded.
     pub output: String,
+    /// The bytes past the bound.
     pub dropped: u64,
 }
 
@@ -1284,11 +1798,21 @@ pub struct Background {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[non_exhaustive]
 pub struct Usage {
+    /// Every input token, the cache's read and write included, on every
+    /// provider.
     pub input_tokens: u64,
+    /// The tokens the model produced.
     pub output_tokens: u64,
+    /// The provider's total, or `input_tokens` and `output_tokens` added when
+    /// it gave none.
     pub total_tokens: u64,
+    /// The input tokens read from the provider's prompt cache, a part of
+    /// `input_tokens`.
     pub cached_input_tokens: u64,
+    /// The input tokens written to the provider's prompt cache, a part of
+    /// `input_tokens`.
     pub cache_creation_input_tokens: u64,
+    /// The tokens the model spent reasoning, where the provider reports them.
     pub reasoning_tokens: u64,
 }
 
@@ -1323,10 +1847,16 @@ impl std::iter::Sum for Usage {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct CallUsage {
+    /// Its place among the round's calls, from 0.
     pub index: u64,
+    /// The `[models.<name>]` row that answered it, which for an alias is not
+    /// always the first.
     pub model: String,
+    /// The id every event about the call carries.
     pub call_id: CallId,
+    /// The request that answered it.
     pub attempt_id: AttemptId,
+    /// What that request used, or `None` when the provider reported nothing.
     pub usage: Option<Usage>,
 }
 
@@ -1335,7 +1865,9 @@ pub struct CallUsage {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct ModelAttempt {
+    /// The model call it was sent for.
     pub call_id: CallId,
+    /// The request's own id, unique within the session.
     pub attempt_id: AttemptId,
     /// The `[models.<name>]` row it was sent for.
     pub model: String,
@@ -1359,7 +1891,9 @@ pub struct ModelAttempt {
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum ChildKind {
+    /// One that takes submissions and completes each.
     Work,
+    /// One that answers requests on its channels.
     Request,
 }
 
@@ -1368,9 +1902,12 @@ pub enum ChildKind {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct InputBrief {
+    /// The variable it is bound to.
     pub name: String,
+    /// Its type, as text.
     #[serde(rename = "type")]
     pub type_name: String,
+    /// A preview of its JSON form, cut to 1,024 characters.
     pub preview: String,
 }
 
@@ -1380,10 +1917,15 @@ pub struct InputBrief {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct DiscoveredSkill {
+    /// The name it is served under.
     pub name: String,
+    /// The source serving it.
     pub source: String,
+    /// Its description, from its `SKILL.md`.
     pub description: String,
+    /// The digest of its files at discovery.
     pub digest: String,
+    /// Whether it has a `skill.py`.
     pub executable: bool,
 }
 
@@ -1395,9 +1937,15 @@ pub struct DiscoveredSkill {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct SkillDiagnostic {
+    /// The skill it is about, or `None` for a source that could not be listed.
     pub skill: Option<String>,
+    /// The source it is about, or the one holding the skill.
     pub source: String,
+    /// What kind of problem it is: `shadowed`, `unknown-key`,
+    /// `metadata-invalid`, `duplicate-metadata-block`, or `source-error`.
     pub code: String,
+    /// The problem in full, each control character but a line break or a tab
+    /// escaped.
     pub message: String,
 }
 
@@ -1406,8 +1954,11 @@ pub struct SkillDiagnostic {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct ChannelBrief {
+    /// The channel's name, which `agent.request.sent` names it by.
     pub name: String,
+    /// The type of a request on it, as text.
     pub request: String,
+    /// The type of a reply to one, as text.
     pub reply: String,
 }
 
@@ -1491,6 +2042,7 @@ pub enum UsageRefusal {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Received {
+    /// The next event.
     Event(Arc<Event>),
     /// This many events, the oldest the subscription held, were dropped while
     /// it fell behind; the next event's id is that many past the last one
@@ -1502,8 +2054,10 @@ pub enum Received {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 #[non_exhaustive]
 pub enum TryRecvError {
+    /// No event is waiting yet.
     #[error("no event is waiting")]
     Empty,
+    /// The session has ended its stream, and every event held here was taken.
     #[error("the session's stream has ended")]
     Closed,
 }

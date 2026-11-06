@@ -1,6 +1,8 @@
 //! `[bindings.<name>]`: an object a session builds on the host, in a process of its own, and
 //! presents to its agent under a name (`plan/phase/0003-python/hosted-objects.md`).
 
+#![warn(missing_docs)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -119,12 +121,18 @@ impl Binding {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum FactoryValue {
+    /// A string, which the factory receives as a `str`.
     String(String),
+    /// An integer, which the factory receives as an `int`.
     Integer(i64),
     /// Finite: a NaN or an infinity has no JSON spelling to cross in.
     Float(f64),
+    /// A boolean, which the factory receives as a `bool`.
     Boolean(bool),
+    /// An array, which the factory receives as a `list`.
     Array(Vec<FactoryValue>),
+    /// A table, which the factory receives as a `dict`. A TOML table holding `path` is read as
+    /// a [`FactoryValue::Path`] instead.
     Table(BTreeMap<String, FactoryValue>),
     /// A host path, as written; `~` and a relative path resolve when the binding starts.
     Path(PathBuf),

@@ -1,12 +1,13 @@
 # outrig-cli
 
-`outrig-cli` provides the `outrig` command: it runs an LLM agent on your host and connects it to
-MCP servers running inside a [podman](https://podman.io/)-managed container, so tools like
-filesystem and shell access stay inside the sandbox you define. The agent layer is the
+`outrig-cli` provides the `outrig` command: it runs an LLM agent on your host and keeps what the
+agent does inside a [podman](https://podman.io/)-managed container -- the MCP servers whose tools
+it calls under `outrig run`, or the Python it writes under `outrig run-new`, a preview -- so tools
+like filesystem and shell access stay inside the sandbox you define. The agent layer is the
 [Rig](https://github.com/0xPlaygrounds/rig) crate; outrig's job is to run Rig in the host process
-and give it a container-isolated MCP tool set.
+and give it a container-isolated tool set.
 
-To embed the container/MCP machinery in your own Rust program without the LLM dependency graph,
+To run agent sessions from your own Rust program, or to use only the container and MCP machinery,
 depend on the [`outrig`](https://crates.io/crates/outrig) library crate instead.
 
 ## Install

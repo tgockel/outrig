@@ -675,7 +675,12 @@ impl StillRunning {
 pub enum Tasks {
     /// The first of them, sorted, and how many more there are.
     #[non_exhaustive]
-    Listed { names: Vec<String>, more: usize },
+    Listed {
+        /// Their names, sorted, at most the first 50.
+        names: Vec<String>,
+        /// How many there are past those named.
+        more: usize,
+    },
     /// The interpreter did not say: its event loop was not turning.
     CouldNotTell,
 }

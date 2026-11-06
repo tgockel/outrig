@@ -261,7 +261,12 @@ With `[events] mode = "record"` in either config file, `outrig run-new` writes
 call and the turns it was sent, each piece of Python the model submitted and how it ended, each
 message on the agent's channel, the tokens each round used, and what OutRig did along the way --
 a Ctrl-C, an interrupt, an execution it stopped waiting for. With the mode off, which is the
-default, there is no file.
+default, there is no file. A round is the agent's work on what was waiting when it began, and a
+turn one model call within it (see [Vocabulary](../concepts/python-runtime.md#vocabulary)).
+
+A session a [host program](host-programs.md) enters writes the same file, in its directory under
+the session root, `<session-root>/<id>/logs/events.jsonl`. That directory holds no `session.json`,
+so `outrig ls` does not list it; `scripts/render-session.py` renders it, saying so.
 
 ```toml
 [events]

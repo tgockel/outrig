@@ -24,6 +24,11 @@ keys whose values map to environment variables (Dockerfile build-args, MCP `env`
 their as-written form. A key outrig does not know is ignored with a warning rather than refused;
 see [What a load sets aside](#what-a-load-sets-aside).
 
+This page covers both agent loops, and uses `outrig run-new`'s words where they differ: a
+**round** is one prompt and the agent's work on it, which `outrig run` calls a turn, and a
+**turn** is one model call and the tool calls it asked for. See
+[Vocabulary](https://tgockel.github.io/outrig/concepts/python-runtime.html#vocabulary).
+
 ## Top level
 
 ```toml
@@ -67,7 +72,7 @@ env-allow = ["GITHUB_TOKEN"]                          # optional; global only
 | `default-agent`         | string  | no                     | repo   | Default `--agent`.        |
 | `default-model`         | string  | if agent omits `model` | global | Fallback model name.      |
 | `session-root`          | path    | no                     | global | Sessions root dir.        |
-| `tool-call-max`         | integer | no                     | global | Per-turn tool-call max.   |
+| `tool-call-max`         | integer | no                     | global | Tool calls per round.     |
 | `tool-result-max`       | integer | no                     | global | Per-tool-result byte max. |
 | `subagent-depth-max`    | integer | no                     | global | Max subagent nesting.     |
 | `subagent-width-max`    | integer | no                     | global | Max live subagents/agent. |
@@ -126,8 +131,9 @@ Since only the global config can set it, `outrig run` and the session commands (
 (on `outrig run`/`logs`/`discard`) instead points at one specific session directory. See
 [Sessions](https://tgockel.github.io/outrig/usage/sessions.html).
 
-`tool-call-max` is the default maximum number of tool calls in one user turn. The compiled-in
-default is `50`; config may set any value from `1` through `2000`.
+`tool-call-max` is the default maximum number of tool calls in one round: one prompt and the
+agent's work on it, which `outrig run` calls a turn. The compiled-in default is `50`; config may
+set any value from `1` through `2000`.
 `[agents.<name>].tool-call-max` overrides the top-level value for one agent, and
 `outrig run --max-tool-calls <n>` overrides both for one invocation.
 
@@ -168,6 +174,10 @@ wedged, since each is a thread and its memory in the interpreter. The compiled-i
 `64`; config may set any value from `1` through `1024`. A launch past it fails at once with
 `outrig.AgentLimitReached` rather than waiting, and releasing a child frees its place once its
 kernel is gone.
+
+Neither `children-max` nor `model-concurrency-max` bounds the CPU or memory a child's code uses
+once it is running: they bound how many children exist and how many model requests are in
+flight, and every agent's code shares the interpreter's one memory ceiling.
 
 `model-concurrency-max` is how many model requests a session has in flight at once, every agent's
 together, the main agent's included. The compiled-in default is `8`; config may set any value
@@ -443,7 +453,39 @@ grace-secs = 5
   program's process group: `SIGTERM`, then `SIGKILL` five seconds later. Time spent shutting down
   a session the program asked to shut down does not count. `0` stops the group at the first
   signal; at most `3600`. `outrig run-new --grace <secs>` overrides it for one invocation. See
-  [Usage -> outrig run](https://tgockel.github.io/outrig/usage/run.html#signals-and-the-grace).
+  [Host programs](https://tgockel.github.io/outrig/usage/host-programs.html#signals-and-the-grace).
+
+### What a host program's session reads
+
+A session a [host program](https://tgockel.github.io/outrig/usage/host-programs.html) enters with
+`outrig.Session` is built from the configuration `outrig run-new <script.py>` loaded. The program
+has no agent of its own and chooses its own mounts, so not all of it applies.
+
+These apply:
+
+- `default-image` and its `[images.<name>]` block: the image the session runs in, with its
+  `security`; with no `default-image`, outrig's
+  [built-in default](#the-built-in-default-image-config).
+- `[network]`: the session's network policy, as for `outrig run-new`.
+- `[bindings.<name>]`: each factory binding starts. One a repository's config declares starts
+  only if its exact declaration was approved in that repository before, at an `outrig run-new`
+  prompt, say: the program's session asks nobody, so it refuses one not yet approved.
+- `[events]`: with `mode = "record"`, the session's events go to `logs/events.jsonl` in its
+  directory under `session-root`.
+- `[models.<name>]`, `[providers.<name>]` and `default-model`: what an agent class the program
+  constructs runs on -- its `model=`, else `default-model`.
+- The top-level `children-max`, `model-concurrency-max`, `requests-max`, `token-budget`,
+  `subagent-depth-max`, `tool-call-max`, `tool-result-max` and `retry-budget-secs`.
+- `[host]`: the program's own grace.
+
+These do not:
+
+- `[workspace]` and `[[workspace.mounts]]` are not mounted. `outrig.config()` shows them, and a
+  program that wants them passes them to `outrig.Session(mounts=...)`.
+- `[agents.<name>]`, `default-agent` and an agent's `preamble` select nothing for an agent class:
+  its docstring is its instructions, and its model is `model=` or `default-model`.
+- `[images.<name>.mcp]` and `[sidecars.<sc>]`: no MCP server and no sidecar starts, as for
+  `outrig run-new`.
 
 ## `[repo]`
 
@@ -555,7 +597,7 @@ off long reasoning completions. It must be between `1` and `3600` seconds; `0` i
 because it is an *immediate* timeout rather than a disabled one and every request would fail
 before it could be answered. `retry-budget-secs` bounds *all* the attempts together: an
 LLM request that fails transiently is retried until it succeeds or the budget runs out, then
-ends the turn without ending the session. Which failures count as transient, how the wait is
+ends the round without ending the session. Which failures count as transient, how the wait is
 chosen, and how `Retry-After` is honored are described in
 [LLM providers](https://tgockel.github.io/outrig/concepts/llm-providers.html#transient-failures);
 this page is
@@ -666,7 +708,7 @@ of either style. Timeout, transient-retry, and `role-alternation` behavior match
 
 Anthropic requires an output-token ceiling on every request. outrig knows one for the model
 identifiers it recognizes; any other identifier needs `max-tokens` on the model or the
-agent, or the first turn fails saying so. See
+agent, or the first model call fails saying so. See
 [anthropic models](#anthropic-models).
 
 ### `api-key` syntax
@@ -758,7 +800,7 @@ disables retries for the whole chain, and reordering an alias can change which b
 governs it.
 
 When every candidate has failed the report names each one's reason, and what ends depends
-on why. If at least one failed recoverably -- a rate limit, an unusable response -- the
+on why. If at least one failed recoverably -- a rate limit, an unusable response -- `outrig run`'s
 **turn** ends, keeping any tool calls it had already run, and can be continued, or sent
 again if it failed on its first call. If every one was terminal, such as a `401` at each
 vendor, the **session** ends, exactly as that failure ends it for a single model: no resend
@@ -794,7 +836,7 @@ identifier = "gpt-4o"
 | `provider`       | string  | yes\*    | --      | Name of an entry in `[providers.<name>]`. |
 | `identifier`     | string  | yes      | --      | Model id passed to the provider API.      |
 | `style`          | string  | no       | --      | Overrides the provider's `style`.         |
-| `max-tokens`     | integer | no       | --      | Output-token ceiling per turn, see below. |
+| `max-tokens`     | integer | no       | --      | Output-token ceiling per call, see below. |
 | `context-window` | integer | no       | --      | The model's whole window in tokens.       |
 
 \* Required unless the entry sets `alias` instead, which forbids every field in this table
@@ -908,7 +950,7 @@ tiers decide which, highest priority first:
    ```
 
 Tier 2 is also a cap, not only a default: a tier-1 value *above* the published ceiling is
-lowered to it. The API refuses an over-ceiling request outright, so the whole turn fails
+lowered to it. The API refuses an over-ceiling request outright, so the whole model call fails
 rather than being cut short, and the published number is the only one that runs. This
 applies where outrig recognizes the identifier; for one it does not, there is no ceiling to
 cap against and the configured value travels whole.
@@ -969,10 +1011,10 @@ preamble = "You are a meticulous code reviewer..."
   to launch.
 - `temperature` (float, optional, default: provider default): sampling temperature.
 - `max-tokens` (integer, at least 1, optional, default: the model's `max-tokens`, else the
-  provider default): output token max per turn. Worth setting in one place or the other for an
+  provider default): output token max per model call. Worth setting in one place or the other for an
   Anthropic model whose identifier outrig does not recognize, which otherwise runs on a
   fallback ceiling -- see [anthropic models](#anthropic-models).
-- `tool-call-max` (integer, optional, default: top-level value or `50`): tool calls per turn.
+- `tool-call-max` (integer, optional, default: top-level value or `50`): tool calls per round.
 - `tool-result-max` (integer, optional, default: top-level value or `262144`): bytes per result.
 - `subagents` (bool, optional, default: `true`): whether this agent may launch subagents. When
   `false`, the `outrig__` subagent tools are not registered at all, so the agent's tool list and
@@ -991,7 +1033,8 @@ set, except `outrig run --model <name>` may supply the selected agent's model fo
 `agents.<a>.image` if set, otherwise `default-image`, otherwise outrig's
 [built-in default](#the-built-in-default-image-config). A run with no agent drops the middle
 rung: `--image` if given, otherwise `default-image`, otherwise the built-in.
-`tool-call-max` is per turn, not per session; follow-up prompts start a fresh count.
+`tool-call-max` is per round -- `outrig run`'s turn -- not per session; each new prompt starts a
+fresh count.
 `tool-result-max` is per result and applies equally to successful MCP results and MCP error
 messages. It also caps what `outrig__get_result` hands back from a subagent.
 
@@ -1083,12 +1126,17 @@ serialize   = true
   thread-safe. The binding then runs one call at a time across all its connections, every
   kernel's included.
 
+`<name>` is the global the agent's code reaches the binding under, so it is one Python can spell
+and the interpreter has not taken: ASCII letters, digits and `_`, not starting with a digit, and
+not a keyword; and not `runtime`, `asyncio`, `outrig`, or a name that begins and ends with `__`.
+A config that names a binding otherwise is refused at load, naming it.
+
 The agent's Python reaches a binding under its name and uses it as its library documents:
 `repo.head.commit` asks the host for `repo.head`, then for its `commit`, and gives back a value or
 another such object, waiting for each answer. Each request is checked on the host, where a
 private name -- one that starts with `_` -- is refused, and, with
-[`[events] mode = "record"`](#events), recorded with what it asked and how it ended (see
-`doc/reference/events.md`).
+[`[events] mode = "record"`](#events), recorded with what it asked and how it ended (see the
+[event log reference](https://tgockel.github.io/outrig/reference/events.html)).
 
 The bindings' process runs on the host, as you, in the workspace's host directory, with your
 environment less every variable the config names through `${VAR}` (each `api-key`,
@@ -1445,7 +1493,7 @@ capability-profile = "no-net-raw"
   mutually exclusive with `workspace` (the view already holds the workspace) and with
   `capability-profile = "drop-all"` (the view needs the mount capabilities). It grants
   `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` in the primary's user namespace -- a real posture
-  change; see [MCP Trust Model](../concepts/mcp-trust-model.md) and `SECURITY.md`. The same key
+  change; see [Trust Model](../concepts/mcp-trust-model.md) and `SECURITY.md`. The same key
   exists on the inline [`[images.<name>.mcp]`](#imagesnamemcp) one-liner form.
 - `start` (string, optional, default: `"auto"`): `"auto"` starts with the session; `"manual"`
   declares a sidecar that starts only when asked -- `/sidecar add <name>` in the REPL, or
@@ -1970,7 +2018,8 @@ image-config in the merged config but does not require agent/model/provider wiri
   that is declared must be its resolved host path. The error names the key.
 - Every `workspace.mounts[*].access`, if set, must be either `read-only` or `read-write`.
 - An unknown key, at any level, is ignored with a warning rather than rejected, except in
-  `[network]` and the `security` tables; see [What a load sets aside](#what-a-load-sets-aside).
+  `[network]`, `[bindings]` and the `security` tables; see
+  [What a load sets aside](#what-a-load-sets-aside).
 
 ## See also
 

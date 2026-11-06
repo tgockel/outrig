@@ -132,7 +132,7 @@ MCP binaries but should not copy `image.toml` into the image.
 
 OutRig expects MCP servers to be useful inside the container, not artificially narrow. A
 filesystem server can point at `/workspace` or another broad container path; a shell server can
-run commands inside the container. See [MCP Trust Model](../concepts/mcp-trust-model.md) for the
+run commands inside the container. See [Trust Model](../concepts/mcp-trust-model.md) for the
 boundary this relies on.
 
 ## Without MCP
