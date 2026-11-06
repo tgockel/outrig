@@ -10,9 +10,10 @@ use crate::config::{ApiKeyError, ConfigValidationError, EnvValueError};
 use crate::container::embedded::EmbeddedImageConfigError;
 
 /// Why `build.rs` could not embed the `outrig-enter` helper. It sets
-/// `OUTRIG_ENTER_UNAVAILABLE_REASON` only when it degrades, so `None` is the
-/// build that succeeded -- in which case this error is unreachable and the
-/// fallback is what a mismatched build would be told.
+/// `OUTRIG_ENTER_UNAVAILABLE_REASON` only when it degrades, so `None` is a
+/// build that embedded one -- the musl build or its static fallback -- in
+/// which case this error is unreachable and the default text is what a
+/// mismatched build would be told.
 fn filesystem_helper_unavailable_reason() -> &'static str {
     option_env!("OUTRIG_ENTER_UNAVAILABLE_REASON").unwrap_or(
         "install the matching `x86_64-unknown-linux-musl` or \
@@ -28,8 +29,10 @@ pub enum OutrigError {
 
     #[error(
         "this outrig was built without the filesystem-view helper\n\
-         build detail: {}",
-        filesystem_helper_unavailable_reason()
+         build detail: {}\n\
+         help: see {}usage/no-musl.html",
+        filesystem_helper_unavailable_reason(),
+        crate::PUBLIC_DOC_BASE_URL
     )]
     FilesystemHelperUnavailable,
 
@@ -818,8 +821,14 @@ mod tests {
     fn missing_filesystem_helper_error_carries_the_build_reason() {
         let rendered = OutrigError::FilesystemHelperUnavailable.to_string();
         assert!(rendered.contains("filesystem-view helper"), "{rendered}");
+        // An installed binary has no `doc/` tree, so the page is linked by URL.
+        assert!(
+            rendered.contains("https://tgockel.github.io/outrig/usage/no-musl.html"),
+            "{rendered}"
+        );
         if crate::container::enter::is_available() {
-            // Nothing degraded, so there is no build-time reason to report and
+            // Nothing degraded -- a fallback build that worked is not a
+            // degradation -- so there is no build-time reason to report and
             // the message falls back to naming both musl targets.
             assert!(rendered.contains("x86_64-unknown-linux-musl"), "{rendered}");
             assert!(

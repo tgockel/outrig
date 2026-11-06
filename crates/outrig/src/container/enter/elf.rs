@@ -9,8 +9,9 @@
 // No syscalls and no I/O -- the caller reads the file. This file is the single
 // source of truth: `launcher.rs` pulls it in with `include!`, so its header
 // must be plain `//` comments (inner `//!` docs are illegal mid-file). The
-// `outrig` crate also compiles it as `#[cfg(test)] mod elf` to run these tests
-// on the host.
+// crate's `build.rs` includes it too, as `mod elf`, to check that its fallback
+// build of the launcher came out static, and the `outrig` crate compiles it as
+// `#[cfg(test)] mod elf` to run these tests on the host.
 
 /// `PT_LOAD`, `PT_DYNAMIC` and `PT_INTERP` program-header types.
 const PT_LOAD: u32 = 1;
@@ -31,7 +32,7 @@ const PHDR_LEN: usize = 56;
 
 /// What the payload's ELF header says about how to run it.
 #[derive(Debug, PartialEq, Eq)]
-enum ElfKind {
+pub(crate) enum ElfKind {
     /// No `PT_INTERP`: run straight from the fd; nothing resolves through the
     /// target container.
     Static,
@@ -72,7 +73,7 @@ fn rd<const N: usize>(b: &[u8], off: usize) -> Result<[u8; N], ElfError> {
 /// header, the program-header table, and any `PT_INTERP` string, which for
 /// every real binary live at the very start). Little-endian only; both target
 /// architectures (x86_64, aarch64) are little-endian.
-fn elf_interp(bytes: &[u8]) -> Result<ElfKind, ElfError> {
+pub(crate) fn elf_interp(bytes: &[u8]) -> Result<ElfKind, ElfError> {
     if bytes.len() < EHDR_LEN || bytes[..4] != *b"\x7fELF" || bytes[4] != ELFCLASS64 {
         return Err(ElfError::NotElf64);
     }

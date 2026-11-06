@@ -10,7 +10,9 @@ use std::os::unix::fs::PermissionsExt;
 use outrig::container::enter;
 
 /// `PT_INTERP` present? A statically linked binary (including static-pie) has
-/// none; a dynamically linked one names its loader here.
+/// none; a dynamically linked one names its loader here. Both builds
+/// `build.rs` can embed -- musl, and the static fallback for the build
+/// machine's own target -- must have none.
 fn has_pt_interp(b: &[u8]) -> bool {
     const PT_INTERP: u32 = 3;
     let rd_u16 = |o: usize| u16::from_le_bytes(b[o..o + 2].try_into().unwrap());
@@ -27,8 +29,9 @@ fn has_pt_interp(b: &[u8]) -> bool {
 #[test]
 fn embedded_helper_is_static_elf64_and_materializes_0755() {
     if !enter::is_available() {
-        // Built without the musl target: materialize must fail with the
-        // actionable "built without the helper" message, not write a stub.
+        // Built with neither the musl target nor the static fallback:
+        // materialize must fail with the actionable "built without the
+        // helper" message, not write a stub.
         let dir = tempfile::tempdir().unwrap();
         let err = enter::materialize(dir.path()).unwrap_err();
         assert!(

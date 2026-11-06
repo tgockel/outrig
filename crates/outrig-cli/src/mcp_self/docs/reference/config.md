@@ -1066,9 +1066,10 @@ Injection is all-or-nothing because a half-injected set is a broken config -- yo
 `[images.outrig-default]` beside outrig's `[sidecars.outrig-default-fs]` would leave that
 block's `args` unreachable, which is a hard error for every command in the repo.
 
-**Without the `outrig-enter` launcher.** `view = "primary"` needs the launcher, which is only
-embedded when outrig was built with the `<arch>-unknown-linux-musl` target. Without it the
-built-in degrades rather than failing: `fs` switches to `workspace = "rw"`, giving the same
+**Without the `outrig-enter` launcher.** `view = "primary"` needs the launcher, which outrig
+builds for the `<arch>-unknown-linux-musl` target or, without that target, statically for the
+build machine's own target. Only when neither build works is it missing, and then the built-in
+degrades rather than failing: `fs` switches to `workspace = "rw"`, giving the same
 file tools over a bind mount, and `shell` is dropped. A shell has no honest degraded form --
 a bind-mounted sidecar sees none of the primary's toolchain, so it would report a different
 environment than the one you have.

@@ -14,7 +14,7 @@ the library is published first and the CLI second.
 - Install the musl target for this machine's architecture, `x86_64-unknown-linux-musl` or
   `aarch64-unknown-linux-musl`, with `rustup target add`. `outrig` builds its `outrig-enter`
   launcher for it, and the dry-run and publish below set `OUTRIG_REQUIRE_ENTER`, so without the
-  target they fail instead of warning.
+  target they fail instead of falling back to a static build for this machine's own target.
 
 ## Checklist
 
