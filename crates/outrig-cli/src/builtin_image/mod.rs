@@ -18,6 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
+use outrig::PUBLIC_DOC_BASE_URL;
 use outrig::config::{Config, ImageConfig, SidecarView, SidecarWorkspaceAccess};
 use outrig::container::enter;
 use outrig::error::Result;
@@ -106,13 +107,13 @@ pub(crate) fn inject(cfg: &mut Config) -> Injection {
     let mut notes = Vec::new();
     let launcher = enter::is_available();
     if !launcher {
-        notes.push(
+        notes.push(format!(
             "warning: this build has no `outrig-enter` launcher, so the built-in default's \
              `fs` server falls back to a read-write bind mount of the workspace and its \
-             `shell` server is unavailable. Install the <arch>-unknown-linux-musl target and \
-             rebuild outrig -- see doc/usage/run.md#the-built-in-default-image."
-                .to_string(),
-        );
+             `shell` server is unavailable. Rebuild outrig with the <arch>-unknown-linux-musl \
+             target installed, or with the host's static C library -- see \
+             {PUBLIC_DOC_BASE_URL}usage/no-musl.html"
+        ));
     }
 
     // Only materialize when the launcher can actually run it; without one the

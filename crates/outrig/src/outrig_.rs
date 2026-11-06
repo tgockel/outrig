@@ -2264,9 +2264,10 @@ view = "primary"
         validate_alone(&spec).expect("the ceiling itself is in range");
     }
 
-    /// A build without the musl target embeds no launcher, so a
-    /// `view = "primary"` spec has to fail before any container exists --
-    /// naming the artifact rather than surfacing an opaque podman error.
+    /// A build that embeds no launcher -- no musl build, and no static
+    /// fallback either -- has to fail a `view = "primary"` spec before any
+    /// container exists, naming the artifact rather than surfacing an opaque
+    /// podman error.
     #[test]
     fn validate_rejects_primary_view_without_the_helper() {
         let (clients, sidecars) = no_existing();

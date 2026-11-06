@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The built-in default image-config keeps its `view = "primary"` servers on a build without
+  the musl target.** Such a build used to have no `outrig-enter` launcher, so `fs` fell back to a
+  read-write bind mount of the workspace and `shell` was dropped. The `outrig` crate now builds
+  the launcher statically for the build machine's own target when the musl target is missing, so
+  both servers run as they do on a musl build, and they degrade only when that build fails too.
+  The note printed then links https://tgockel.github.io/outrig/usage/no-musl.html rather than a
+  `doc/` path an installed binary does not have. (#868)
+
 ### Fixed
 
 - **`outrig clean` no longer stops and deletes a stray container that started while its prompt

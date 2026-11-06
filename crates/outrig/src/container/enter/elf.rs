@@ -9,8 +9,9 @@
 // No syscalls and no I/O -- the caller reads the file. This file is the single
 // source of truth: `launcher.rs` pulls it in with `include!`, so its header
 // must be plain `//` comments (inner `//!` docs are illegal mid-file). The
-// `outrig` crate also compiles it as `#[cfg(test)] mod elf` to run these tests
-// on the host.
+// crate's `build.rs` includes it the same way, to check that its fallback
+// build of the launcher came out static, and the `outrig` crate compiles it as
+// `#[cfg(test)] mod elf` to run these tests on the host.
 
 /// `PT_INTERP` program-header type.
 const PT_INTERP: u32 = 3;
