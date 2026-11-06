@@ -1937,6 +1937,67 @@ async fn failed_add_sidecar_leaves_session_usable() {
     outrig.shutdown().await.expect("shutdown");
 }
 
+/// A dropped `add_sidecar` leaves the session as a failed one does: the
+/// container is gone and so is its interceptor attachment, so the same spec can
+/// be added again. The attachment used to outlive the dropped future, and every
+/// retry was refused as already attached until `shutdown`.
+#[tokio::test]
+async fn dropped_add_sidecar_leaves_its_name_free_under_the_interceptor() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let tag = format!(
+        "localhost/outrig-library-surface-dropped-add-{}:latest",
+        std::process::id(),
+    );
+    build_fixture_image(&tag);
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let spec = LaunchSpec::from_image(
+        tag.clone(),
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    )
+    .with_workspace(outrig::WorkspaceSpec::new(host_ws.path(), "/workspace"))
+    .with_network_mode(NetworkMode::Audit);
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    // A server that never answers `initialize` holds the add in its connect.
+    let hang = || {
+        SidecarSpec::from_image("slow", tag.as_str())
+            .with_server("hang", vec!["sleep".to_string(), "infinity".to_string()])
+    };
+    let first = tokio::time::timeout(Duration::from_secs(15), outrig.add_sidecar(hang())).await;
+    assert!(
+        first.is_err(),
+        "the first add must be dropped mid-connect: {first:?}"
+    );
+
+    // The dropped add's container is removed in the background.
+    for _ in 0..100 {
+        if sidecar_containers_labeled("slow").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        sidecar_containers_labeled("slow"),
+        Vec::<String>::new(),
+        "the dropped add should leave no container"
+    );
+
+    // The retry reaches the connect again (and is dropped there) instead of
+    // being refused at the attach.
+    let second = tokio::time::timeout(Duration::from_secs(15), outrig.add_sidecar(hang())).await;
+    assert!(
+        second.is_err(),
+        "the retry must reach the connect, not be refused: {second:?}"
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn added_sidecar_egress_obeys_network_policy() {
     let _guard = E2E_LOCK.lock().await;

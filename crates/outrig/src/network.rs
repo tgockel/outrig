@@ -616,6 +616,13 @@ pub struct NetworkInterceptor {
     /// under something a later attachment of the same name cannot be.
     generation: u64,
     attachments: BTreeMap<String, Attachment>,
+    /// Attachments [`retire_attachment`](Self::retire_attachment) took out of
+    /// `attachments`: still intercepting and still recording, but no longer
+    /// holding their container's name. Held until `shutdown`, which tears them
+    /// down in order: a teardown awaited anywhere else could be cancelled with
+    /// the attachments it had taken, and their unwritten audit records would
+    /// go uncounted.
+    retired: Vec<(String, Attachment)>,
 }
 
 /// Per-container interception state: the container's loops, the undo log for
@@ -685,6 +692,7 @@ impl NetworkInterceptor {
             session_id: session_id.to_string(),
             generation: 0,
             attachments: BTreeMap::new(),
+            retired: Vec::new(),
         })
     }
 
@@ -887,16 +895,42 @@ impl NetworkInterceptor {
         self.attachments.remove(container).is_some()
     }
 
+    /// Frees `container`'s name for a later [`attach`](Self::attach) without
+    /// ending its interception. Its loops keep running and its nft table stays
+    /// in place, so a container that is still alive -- one whose removal has
+    /// been requested but not confirmed -- stays filtered, and its connections
+    /// still write their audit records. The attachment is torn down in order by
+    /// [`shutdown`](Self::shutdown), which also accounts for any audit record it
+    /// could not write. Returns whether `container` was attached.
+    ///
+    /// For a caller that cannot await and cannot yet say the container is
+    /// gone -- a destructor unwinding an attach that was never committed, say.
+    /// [`detach`](Self::detach) is the form to use wherever awaiting is
+    /// possible, and [`drop_attachment`](Self::drop_attachment) the one for a
+    /// caller that knows the container is as good as gone.
+    pub fn retire_attachment(&mut self, container: &str) -> bool {
+        match self.attachments.remove_entry(container) {
+            Some(entry) => {
+                self.retired.push(entry);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Detaches every attachment, reporting what none of them could
     /// discharge. One container's failure does not skip another's teardown.
     pub async fn shutdown(mut self) -> Result<()> {
         self.cancel.cancel();
         // Attachments live in disjoint namespaces, so their grace periods,
         // resolver restores and nft deletes can overlap.
+        let attachments = std::mem::take(&mut self.attachments)
+            .into_iter()
+            .chain(std::mem::take(&mut self.retired));
         let failures =
-            futures_util::future::join_all(std::mem::take(&mut self.attachments).into_iter().map(
-                |(name, attachment)| async move { teardown_attachment(&name, attachment).await },
-            ))
+            futures_util::future::join_all(attachments.map(|(name, attachment)| async move {
+                teardown_attachment(&name, attachment).await
+            }))
             .await;
         let mut causes: Vec<NetworkTeardownCause> = failures.into_iter().flatten().collect();
         // Quiesced before the sweep, not after. An attachment whose drain
@@ -11811,6 +11845,7 @@ options edns0
             session_id: "sid-1".to_string(),
             generation: 0,
             attachments: BTreeMap::new(),
+            retired: Vec::new(),
         };
         let container = Container::holding_net_admin();
 

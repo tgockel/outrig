@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`NetworkInterceptor::retire_attachment` frees one container's name without ending its
+  interception.** Where `drop_attachment` aborts the loops and hands the undo to a background
+  reaper, this keeps the loops, the nft table and the resolver redirect in place, and tears the
+  attachment down in order at `shutdown`. It is for code that
+  cannot await and cannot say the container is gone, such as a destructor unwinding an attach
+  that was never committed. (#501)
+
 - **`OutrigError::ConfigFile`**: a fault a config file is refused for, wrapped in the path of the
   file it was read from. It carries the error it names the file on -- the parse's
   `OutrigError::Config` or `ConfigDottedKey`, or an `OutrigError::ConfigValidation` from the
@@ -73,6 +80,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that contains `:`. See the fix below for why it is now refused. (#365)
 
 ### Fixed
+
+- **A dropped `Outrig::add_sidecar` no longer leaves its network-interceptor attachment holding
+  the sidecar's name.** Under `audit` or `filter` mode, a future dropped while connecting the
+  sidecar's servers -- by a `tokio::time::timeout` or a `select!` -- removed the container but
+  kept the interceptor's entry for it. A retried add of the same sidecar, which gets the same
+  container name, was refused as "already attached" until `shutdown`. The attachment is now
+  retired with the future: the name is free, but the interception keeps running, because the
+  container's removal is only requested in the background. It is torn down in order -- loops
+  stopped, audit records drained, rules and resolver undone -- at `shutdown`, so a cancelled
+  teardown can never discard an audit record. (#501)
 
 - **`find_repo_root_with`/`load_project` no longer treat a config they cannot `stat` as
   absent.** A `.agents/outrig/config.toml` under a directory without search permission for the

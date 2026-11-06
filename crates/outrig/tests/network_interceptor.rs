@@ -950,6 +950,53 @@ async fn a_dropped_interceptor_has_put_the_resolver_back() {
         .expect("stop container");
 }
 
+/// `retire_attachment` frees the name the way `drop_attachment` does, but it
+/// ends nothing: a container whose removal is only requested stays intercepted
+/// until the retired attachment is torn down, which `shutdown` does in order
+/// (#501).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retired_attachment_keeps_intercepting_until_shutdown() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let container = start_recording_shell_container(dir.path()).await;
+    let before = read_resolv_conf(&container);
+
+    let mut interceptor = NetworkInterceptor::start(
+        &container,
+        &dir.path().join("logs"),
+        container.session_suffix(),
+    )
+    .await
+    .expect("start interceptor");
+    let intercepted = read_resolv_conf(&container);
+    assert_ne!(intercepted, before);
+
+    assert!(interceptor.retire_attachment(container.name()));
+    assert!(
+        !interceptor.retire_attachment(container.name()),
+        "nothing is left attached to retire"
+    );
+    assert_eq!(
+        read_resolv_conf(&container),
+        intercepted,
+        "retiring does not put the resolver back while the container lives"
+    );
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown tears the retired attachment down");
+    assert_eq!(read_resolv_conf(&container), before);
+    assert_no_host_shell_ran(&container);
+
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
 /// `drop_attachment` is that drop for one container: the resolver is back
 /// when it returns, the table goes through the reaper, and the name is free --
 /// an attach of the same container afterwards is not refused as already

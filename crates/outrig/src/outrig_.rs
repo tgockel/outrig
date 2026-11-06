@@ -1264,9 +1264,17 @@ impl Outrig {
             .await);
         }
 
-        match connect_sidecar_servers(&container, &spec, &self.log_dir, self.mcp_call_timeout_secs)
-            .await
-        {
+        // A no-op when the session has no interceptor. Armed across the connect
+        // because that is where a caller's timeout or `select!` drops this
+        // future, and the container's own `Drop` removes only the container.
+        let attachment = UncommittedAttachment::arm(self.network.as_mut(), container.name());
+        let connected =
+            connect_sidecar_servers(&container, &spec, &self.log_dir, self.mcp_call_timeout_secs)
+                .await;
+        // Both arms below see to the attachment themselves: the failure detaches
+        // it in order, and the commit keeps it for the session.
+        attachment.disarm();
+        match connected {
             Ok((clients, tools)) => {
                 self.sidecars.insert(spec.name.clone(), container);
                 self.clients
@@ -1571,6 +1579,46 @@ fn validate_sidecar_spec<C, S>(
         return Err(OutrigError::FilesystemHelperUnavailable);
     }
     Ok(())
+}
+
+/// A sidecar's interceptor attachment between a successful `attach` and the
+/// point where [`Outrig::add_sidecar`] either commits it or detaches it in
+/// order.
+///
+/// Dropped while still armed -- the add's future dropped mid-connect, by a
+/// timeout or a `select!` -- it retires the attachment. That frees the name,
+/// which a retried add of the same sidecar needs: it gets the same container
+/// name, and would be refused as already attached until `shutdown`. It does
+/// not end the interception, because the sidecar's own `Drop` only *requests*
+/// the container's removal in the background and nothing here can tell when it
+/// lands. A server that withheld `initialize` stays filtered, and its audit
+/// records are still written, until `shutdown` tears the attachment down in
+/// order.
+struct UncommittedAttachment<'a> {
+    network: Option<&'a mut NetworkInterceptor>,
+    container: String,
+}
+
+impl<'a> UncommittedAttachment<'a> {
+    fn arm(network: Option<&'a mut NetworkInterceptor>, container: &str) -> Self {
+        Self {
+            network,
+            container: container.to_string(),
+        }
+    }
+
+    /// The add reached a path that sees to the attachment itself.
+    fn disarm(mut self) {
+        self.network = None;
+    }
+}
+
+impl Drop for UncommittedAttachment<'_> {
+    fn drop(&mut self) {
+        if let Some(network) = self.network.take() {
+            network.retire_attachment(&self.container);
+        }
+    }
 }
 
 /// Stop `container` and report `source` with whatever stopping it could not
