@@ -113,3 +113,58 @@ process, from one ensured image, with the facade's items unchanged and that prom
   container.
 - `plan/phase/0003-python/lifecycle.md` -- "Descendants, and the owner's abrupt death", the sweep.
 - `plan/next/ci-configuration-coverage.md` -- the feature-matrix gap this task's CI step overlaps.
+
+## Decisions
+
+- **The facade's items are as 0.2.1 published them, not only as `8fb6eac` had them.** The 71
+  snapshot lines for the items Context lists are identical in `outrig-v0.2.1`'s `public-api.txt`
+  and this branch's, so an application moving its pin from crates.io 0.2.1 to the branch meets no
+  change in them. The changelog says "as 0.2.1 published them" on that evidence.
+- **Fork 3 -- no re-export, and the note is firmer than "the application checks".**
+  `outrig::process` was private in 0.2.1 too (`mod process;`); what it defines that 0.2.1 made
+  public is `outrig::Transcript`, re-exported at the root, and that and `OutrigError::Process` are
+  unchanged.
+- **Context's premise about the sweep was wrong, and the corrected fact is the stronger one.** No
+  removal goes by `org.outrig.session`. `Container::stop`, `Drop`'s detached removal and the
+  panic sweep each remove by the container's `org.outrig.attempt` token, and the sweep runs from
+  `with_panic_sweep` (or the hook only in a `panic = "abort"` build) since #349. So one tier's
+  stop cannot reach the other's container by construction. `lifecycle.md`'s "a sweep from the
+  panic hook" is corrected to say so.
+- **The coexistence tests are in-crate, in `agent_tests.rs`'s `e2e` module.** A round against a
+  mock model needs `agent::mock_http` and the round helpers, which are `#[cfg(test)]` and
+  crate-private; every Session-round e2e test already lives there. The facade is driven only
+  through its public calls, and `Outrig::primary()` (crate-private) is read for one thing: the
+  container name, hence the session id, the facade minted -- `Outrig` exposes neither, and naming
+  the id with `with_session_id` would have made "the ids differ" true by construction.
+- **Both stop orders, one test each.** "Stopping either container leaves the other running" needs
+  each to stop first once. After the first stop the survivor is asked to work rather than checked
+  as running: the facade answers a second `call_tool` (its MCP server's `podman exec` client
+  survived the Session's shutdown, which kills process groups), and the Session runs a second
+  round (its interpreter's client survived the facade's). A working survivor implies a running
+  container, so no separate `is_running` check. With removal mutated to filter on the session
+  label key alone, both tests fail at that step. The two tests take a lock across the fixture's
+  launch, so a cold image store builds `mcp-fs` once rather than twice in parallel -- the
+  `outrig` unit binary runs before the integration binaries that otherwise build it first.
+- **The image test pins the ensured tag through `harness::container_spec`.** `ensure_image` tags
+  `outrig-cache:<K>`; `LaunchSpec::from_config` over a `dockerfile` block builds `<block>:<K>`
+  (#456), a second image. `container_spec(.., Some(&tag), ..)` is the library's own way to give a
+  session an ensured tag -- `run-new` and host-program sessions use it -- and it is
+  `from_config` over the pinned tag, which only asks `podman image exists`. The README says so,
+  and the test asserts `probe_cached(<block>:<K>)` is false; giving it `None` instead fails there.
+- **"One image" is checked by image ID, not by name.** The tag's ID is read once ensured and
+  again after both start, and each container's `.Image` must equal it, so a rebuild under the
+  same tag or a different image under either path fails. `ContainerInspect::image_tag` is
+  compared between the two containers only, not to the ensured string: podman may report a
+  locally built tag as `localhost/...`, and CI's 4.9.3 and a developer's 5.x need not agree.
+- **The CI step is `cargo check`, not `cargo build`, on the default row only.** It compiles the
+  application's graph -- `outrig` alone, its dependencies' features unified with nothing of the
+  CLI's -- and runs `build.rs`; codegen would build the whole dependency graph again for no
+  question this asks. That graph differs from the workspace check's by 51 units, which the
+  default row's `cargo rustdoc -p outrig --lib` builds anyway and the arm64 row would build for
+  this step alone; the shape is a question of features, not of the architecture. The existing
+  `cargo check -p outrig --target x86_64-unknown-linux-musl` already builds `outrig` alone, and
+  could have carried the flag; a step of its own keeps the gnu target an application builds and
+  keeps the musl step about the libc.
+- **Follow-up:** `plan/next/session-ids-collide-within-a-second.md`. Both tiers mint ids with two
+  random bytes per second, so two starts in one second clash on the container name one time in
+  65,536; one process now mints several.

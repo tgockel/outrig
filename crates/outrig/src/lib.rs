@@ -8,7 +8,10 @@
 //! rather than a whole managed container drives them directly, and downstream
 //! crates do. Both tiers are a SemVer commitment -- `harness` from the 0.3.0
 //! release, before which it may still change -- and every other module is
-//! private, reaching this root only through the re-exports below.
+//! private, reaching this root only through the re-exports below. The
+//! facade's commitment holds before that release too, on `version/0.3.x`:
+//! [The container facade beside `harness`](#the-container-facade-beside-harness)
+//! above names its items and how a change to one is announced.
 
 // `network` and `nsfork` below are declared unconditionally and call `setns`
 // and `CLONE_NEW*`, which libc declares only under `linux_like` -- so an Apple

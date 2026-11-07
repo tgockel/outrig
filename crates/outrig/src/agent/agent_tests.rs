@@ -7878,10 +7878,11 @@ mod e2e {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::LaunchSpec;
+    use crate::config::McpServerSpec;
     use crate::container::ExecOptions;
     use crate::harness::{ExecutionStatus, Stopped, Verdict};
     use crate::python::testing::{ALPINE, pull};
+    use crate::{LaunchSpec, Outrig, WorkspaceSpec};
 
     /// How long past its deadline a shutdown may take: an interrupt's grace,
     /// the container's stop, the interpreter's exit, and the log's finish,
@@ -8280,5 +8281,154 @@ mod e2e {
             sessions.path().join(id).join("logs").is_dir(),
             "its logs under the session root"
         );
+    }
+
+    /// Which of a facade's container and a session is stopped first.
+    #[derive(Clone, Copy)]
+    enum First {
+        Session,
+        Facade,
+    }
+
+    /// Held across the fixture's launch, so two tests on a cold store build its image once.
+    static FIXTURE_BUILD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Whether `facade`'s filesystem server lists the workspace's `MARKER.txt`.
+    async fn lists_the_marker(facade: &Outrig) -> bool {
+        let listed = facade
+            .call_tool("fs", "list_directory", json!({ "path": "/workspace" }))
+            .await
+            .unwrap_or_else(|e| panic!("the facade's tool call failed: {e}"));
+        !listed.is_error && listed.render_text().contains("MARKER.txt")
+    }
+
+    /// Stop `session`, cleanly, and its container with it.
+    async fn stop_session(session: Session) {
+        let container = session.container_name().to_string();
+        let report = within(session.shutdown(DEFAULT_DRAIN)).await;
+        assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
+        assert!(gone(&container).await, "the session's container is stopped");
+    }
+
+    /// Stop `facade`, and its container with it.
+    async fn stop_facade(facade: Outrig) {
+        let container = facade.primary().name().to_string();
+        facade.shutdown().await.expect("the facade stops");
+        assert!(gone(&container).await, "the facade's container is stopped");
+    }
+
+    /// A container launched through the facade and a session, in one process, as an application
+    /// running an engine over each does: each has its own id, container and log directory, each
+    /// answers while the other runs, and stopping either leaves the other answering until its own
+    /// shutdown.
+    async fn a_facade_container_beside_a_session(first: First) {
+        pull(ALPINE).await;
+        let dir = tempfile::tempdir().expect("a test dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("a workspace");
+        std::fs::write(workspace.join("MARKER.txt"), "hi\n").expect("write MARKER.txt");
+        let session_logs = dir.path().join("session").join("logs");
+
+        // The facade as `tests/library_surface.rs` drives it: an image built from the fixture,
+        // its one MCP server, and the workspace that server lists.
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-fs");
+        let mcp = BTreeMap::from([(
+            "fs".to_string(),
+            McpServerSpec::Short(vec![
+                "mcp-server-filesystem".to_string(),
+                "/workspace".to_string(),
+            ]),
+        )]);
+        let spec = LaunchSpec::build(
+            fixture.join("Dockerfile"),
+            fixture,
+            BTreeMap::new(),
+            WorkspaceSpec::new(&workspace, "/workspace"),
+            mcp,
+            dir.path().join("facade").join("logs"),
+        );
+        // Not bounded by `within`: the fixture's first build installs node packages.
+        let facade = {
+            let _build = FIXTURE_BUILD.lock().await;
+            Outrig::launch(&spec)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"))
+        };
+        let facade_id = facade.primary().session_suffix().to_string();
+
+        let (addr, _requests) = mock_http::start(vec![
+            submit("toolu_first", "print('first')"),
+            text_reply("first"),
+            submit("toolu_second", "print('second')"),
+            text_reply("second"),
+        ])
+        .await;
+        let var = "OUTRIG_TEST_AGENT_E2E_BESIDE_A_FACADE";
+        let cfg = config_in(
+            Style::Messages,
+            addr,
+            var,
+            MODEL,
+            "[events]\nmode = \"record\"",
+            "max-tokens = 4096",
+        );
+        let mut session = within(
+            in_a_container(&cfg, var, &session_logs)
+                .record_events()
+                .start(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        let id = session.id().to_string();
+        assert_ne!(facade_id, id, "each mints a session id of its own");
+
+        assert!(lists_the_marker(&facade).await);
+        assert_eq!(round(&mut session, "first").await, "first");
+
+        match first {
+            First::Session => {
+                stop_session(session).await;
+                assert!(
+                    lists_the_marker(&facade).await,
+                    "the session's stop left the facade's server answering"
+                );
+                stop_facade(facade).await;
+            }
+            First::Facade => {
+                stop_facade(facade).await;
+                assert_eq!(
+                    round(&mut session, "second").await,
+                    "second",
+                    "the facade's stop left the session's interpreter answering"
+                );
+                stop_session(session).await;
+            }
+        }
+
+        // The session's log is its own: every record names it, and none names the facade.
+        let source = json!(format!("/outrig/session/{id}"));
+        let records = events::recorded(&session_logs);
+        assert!(!records.is_empty());
+        assert!(
+            records.iter().all(
+                |record| record["source"] == source && !record.to_string().contains(&facade_id)
+            ),
+            "{records:?}"
+        );
+    }
+
+    /// A session stopped first leaves a facade's container in the same process running and its
+    /// server answering.
+    #[tokio::test]
+    async fn a_session_stopped_first_leaves_a_facade_container_running() {
+        a_facade_container_beside_a_session(First::Session).await;
+    }
+
+    /// A facade's container stopped first leaves a session in the same process running and its
+    /// interpreter answering.
+    #[tokio::test]
+    async fn a_facade_container_stopped_first_leaves_a_session_running() {
+        a_facade_container_beside_a_session(First::Facade).await;
     }
 }

@@ -102,12 +102,6 @@ was built from the phase's exit criteria instead and silently omitted discovery,
 observability -- the exit criteria describe the first milestone, the deliverables describe the
 phase.
 
-**Enabling**
-
-| Task      | What it settles                                     |
-| --------- | ----------------------------------------------------|
-| `0003-40` | The container facade stays beside the harness       |
-
 **Application agents**
 
 | Task      | What it settles                                     |

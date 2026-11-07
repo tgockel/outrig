@@ -424,7 +424,10 @@ than by Rust. `0003-18` proved the arrangement and built its supervisor
   ends the bindings process, and its sessions' containers remain, as below.
 - **Containers keep the existing cleanup** (`crates/outrig/src/container/mod.rs`): an explicit stop
   on the normal path, a detached `podman rm -f` from `Drop` when the future that was to run the
-  stop is dropped, and a sweep from the panic hook. The detached removal is a process of its own,
+  stop is dropped, and a sweep when a panic ends the process -- `with_panic_sweep` around `main`,
+  or the panic hook in a `panic = "abort"` build (#349). Each removes by the container's
+  `org.outrig.attempt` label, never by its session's, so one session's stop or drop reaches no
+  other's container in the same process. The detached removal is a process of its own,
   which finishes even if the owner exits first, and an owner that drops a start part way can wait
   for it: `supervise` tracks each removal a drop hands over, and a supervised process group a drop
   kills until it is proven empty (`0003-29`).

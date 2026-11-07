@@ -151,6 +151,35 @@ println!("{:?}", report.verdict());
 # }
 ```
 
+## The container facade beside `harness`
+
+An application can run an engine of its own over the container facade beside one over `harness`,
+in one process. These items keep their 0.2 signatures and behavior on `version/0.3.x` -- in its
+pre-releases, the 0.3.0 release, and the 0.3.x releases after it -- until the first application to
+embed `harness` has retired the engine it runs over them:
+
+- `Outrig::launch`, `tools`, `call_tool`, `exec_capture` and `shutdown`;
+- `image::{ensure_image, compute_tag, compute_tag_for, probe_pulled, probe_cached,
+  read_image_env}`;
+- `LaunchSpec`, with `with_mount`, `with_mounts`, `with_sidecar` and `with_embedded_mcp_policy`;
+- `SidecarSpec`, `MountSpec`, `EmbeddedMcpPolicy`, `McpToolResult`, `ToolHandle` and
+  `CapabilityProfile`;
+- `OutrigError::{Io, McpStartupFailed, Process}`.
+
+A change to one is announced in this crate's `CHANGELOG.md`, with a migration note, before it
+lands, and a removal follows a `#[deprecated]` attribute by at least one tagged release: that is
+the notice an application pinned to a git revision gets. The repository's `public-api.txt` records
+every public item, and CI fails when the surface and that record differ, so a change to one shows
+in review.
+
+A container launched with `Outrig::launch` and a `harness::Session` do not touch each other: each
+mints its own session id and names its container for it, each writes its own log directory, and
+stopping one stops only its own containers. To run both from one image, ensure it once and give
+both the tag `image::ensure_image` returns -- `LaunchSpec::from_image(tag, ..)` for the facade, and
+`harness::container_spec(.., Some(&tag), ..)` for a session's `SessionBuilder::container`.
+`LaunchSpec::from_config` over a `dockerfile` image block builds the image under the block's name
+instead, which is a second image.
+
 ## Documentation
 
 Full docs render as an mdbook at <https://tgockel.github.io/outrig/>. Source lives in the

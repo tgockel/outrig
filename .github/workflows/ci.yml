@@ -90,6 +90,16 @@ jobs:
       # and turn that feature on, so this is the only place the published
       # configuration gets compiled at all.
       - run: cargo check ${{ matrix.cargo_args }}
+      # The shape an application depending on `outrig` with
+      # `default-features = false` builds: the library alone, its dependencies'
+      # features unified with nothing of the CLI's. The crate declares no
+      # default feature, so today this is `outrig`'s plain build; the flag is
+      # what keeps it the application's build if one is ever declared. One
+      # row: the shape is a question of features, not of the architecture, and
+      # the rustdoc step below builds the same dependency graph on this row,
+      # where the arm64 row builds it for nothing else.
+      - if: matrix.name == 'default'
+        run: cargo check -p outrig --no-default-features --locked
       # Strict rustdoc on the library, one row. Unlike the public-API snapshot this
       # depends on nothing that churns between nightlies -- a doc link either
       # resolves against the surface in this commit or it does not -- so it

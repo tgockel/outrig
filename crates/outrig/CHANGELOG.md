@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The container facade keeps the surface 0.2.1 published. Its items -- `Outrig::launch` and the
+calls on it, `image`'s functions, `LaunchSpec` and the types it takes -- keep their signatures and
+behavior on `version/0.3.x` until the first application to embed `harness` has retired the engine
+it runs over them, with a change announced here before it lands and a removal deprecated at least
+one tagged release first. A facade's container and a `harness::Session` run in one process
+without touching each other, from one ensured image. [The container facade beside
+`harness`](README.md#the-container-facade-beside-harness) lists the items and says how.
+`outrig::process` is private, as it was in 0.2.1; `outrig::Transcript`, which it defines, and
+`OutrigError::Process` are unchanged, and nothing re-exports the module.
+
 ### Added
 
 - **A long `runtime.wait` says what it waits on.** Once an agent's code has been suspended in
