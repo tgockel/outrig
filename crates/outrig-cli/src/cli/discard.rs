@@ -11,6 +11,14 @@
 //! finalizing, leaving a container behind. The running-check is
 //! closure-injected so tests can drive both branches without a podman
 //! dependency.
+//!
+//! The pair runs twice: once before the prompt, so a session already running
+//! is refused without asking, and once more right before the removal below,
+//! since the prompt can wait indefinitely and nothing refuses the record's
+//! removal the way an unforced `podman rm` refuses a live container. The
+//! second look narrows that window to the gap between it and the removal; it
+//! cannot close it. `is_running` is `FnMut` rather than `FnOnce` so it can
+//! answer both times.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -71,12 +79,12 @@ pub async fn execute_with<E, R, F, Fut>(
     stdin: R,
     store: &SessionStore,
     args: &DiscardArgs,
-    is_running: F,
+    mut is_running: F,
 ) -> Result<i32>
 where
     E: AsyncWrite + Unpin,
     R: AsyncBufRead + Unpin,
-    F: FnOnce(String) -> Fut,
+    F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<bool>>,
 {
     let target = resolve_target(args, store)?;
@@ -93,24 +101,7 @@ where
         stderr.write_all(msg.as_bytes()).await?;
     }
 
-    // The claim first: it is a local probe, and it is the one that answers
-    // for a session whose container has not been created yet.
-    if session::owner_is_live(&target.dir) {
-        return Err(OutrigError::Configuration(format!(
-            "session {} is still running (its launch holds {}); stop it before discarding",
-            target.id,
-            target.dir.display()
-        ))
-        .into());
-    }
-
-    if is_running(target.container_name.clone()).await? {
-        return Err(OutrigError::Configuration(format!(
-            "session {} is still running (container {}); stop it before discarding",
-            target.id, target.container_name
-        ))
-        .into());
-    }
+    refuse_if_running(&target, &mut is_running).await?;
 
     if !args.yes
         && !confirm(stderr, stdin, &target.dir, target.unreadable.as_deref()).await?
@@ -118,6 +109,13 @@ where
         stderr.write_all(b"[outrig] aborted\n").await?;
         return Ok(0);
     }
+
+    // The look above answers for the moment this call started; the prompt it
+    // gated can wait indefinitely, and nothing between it and here has asked
+    // again. Looking once more narrows the window to the gap between this
+    // check and the removal below -- it cannot close it, since nothing stops
+    // a third party starting the container the instant after.
+    refuse_if_running(&target, &mut is_running).await?;
 
     if !target.dangling.is_empty() {
         for link in &target.dangling {
@@ -141,6 +139,37 @@ where
         stderr.write_all(link_msg.as_bytes()).await?;
     }
     Ok(0)
+}
+
+/// Either check being true is a refusal, worded the way it was before there
+/// was a second look: this is called once before the prompt and once more
+/// right before the removal, and a caller moved mid-window should read the
+/// same error either time.
+async fn refuse_if_running<F, Fut>(target: &Target, is_running: &mut F) -> Result<()>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<bool>>,
+{
+    // The claim first: it is a local probe, and it is the one that answers
+    // for a session whose container has not been created yet.
+    if session::owner_is_live(&target.dir) {
+        return Err(OutrigError::Configuration(format!(
+            "session {} is still running (its launch holds {}); stop it before discarding",
+            target.id,
+            target.dir.display()
+        ))
+        .into());
+    }
+
+    if is_running(target.container_name.clone()).await? {
+        return Err(OutrigError::Configuration(format!(
+            "session {} is still running (container {}); stop it before discarding",
+            target.id, target.container_name
+        ))
+        .into());
+    }
+
+    Ok(())
 }
 
 async fn confirm<E, R>(

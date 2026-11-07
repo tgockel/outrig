@@ -1018,6 +1018,39 @@ async fn discard_refuses_when_running() {
     assert!(dir.exists(), "dir must remain after refusal");
 }
 
+/// #869: the container was stopped when `discard` made its first check --
+/// the one its own `[y/N]` prompt is answered for -- and is running by the
+/// time the removal would run. A closure that answers `false` once and
+/// `true` after is `discard`'s container check having asked twice: once
+/// before the prompt, which the record passes, and once more right before
+/// the removal, which it does not.
+#[tokio::test]
+async fn discard_refuses_when_the_container_starts_during_the_prompt() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let dir = store
+        .create(&sid, None, &mut sample_session(&sid))
+        .expect("create")
+        .0;
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(&b"y\n"[..]);
+    let args = args_for_id(sid.as_str(), false);
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let is_running = move |_: String| {
+        let asked = asked.clone();
+        async move { Ok(asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0) }
+    };
+    let err = discard::execute_with(&mut ew, stdin, &store, &args, is_running)
+        .await
+        .expect_err("should refuse at the second look");
+    drop(ew);
+    let msg = format!("{err}");
+    assert!(msg.contains("still running"), "{msg}");
+    assert!(dir.exists(), "dir must remain after refusal");
+}
+
 #[tokio::test]
 async fn discard_session_dir_path_works() {
     let root = tempfile::tempdir().expect("tempdir root");
@@ -1205,6 +1238,13 @@ async fn no_build_removals(names: Vec<String>) -> outrig_cli::error::Result<()> 
     panic!("no build container should have been removed, but {names:?} was");
 }
 
+/// The default second-look hook for tests that are not exercising the
+/// record-removal race: nothing is running, so every target the first look
+/// passed still gets removed.
+async fn no_recheck_running() -> outrig_cli::error::Result<BTreeSet<String>> {
+    Ok(BTreeSet::new())
+}
+
 fn clean_now() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)
 }
@@ -1307,6 +1347,7 @@ async fn clean_default_30d_removes_only_old_finished_sessions() {
         Vec::new(),
         no_removals,
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -1369,6 +1410,7 @@ async fn clean_custom_older_than_uses_requested_cutoff() {
         Vec::new(),
         no_removals,
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -1409,6 +1451,7 @@ async fn clean_without_yes_aborts_on_n() {
         Vec::new(),
         no_removals,
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -1450,6 +1493,7 @@ async fn clean_accepts_yes_at_prompt() {
         Vec::new(),
         no_removals,
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -1484,6 +1528,7 @@ async fn clean_skips_running_sessions() {
         Vec::new(),
         no_removals,
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -1496,6 +1541,181 @@ async fn clean_skips_running_sessions() {
         err.contains("no stopped sessions or stray containers older than 30d"),
         "stderr:\n{err}"
     );
+}
+
+/// #869: a session whose container was stopped at the preview's listing but
+/// is running by the time the removal would run -- someone (or something)
+/// started it while `clean` sat at its prompt -- keeps its record. The first
+/// look (the `running` set passed in) says it is stopped, so it previews and
+/// prompts as removable; `recheck_running`, standing in for the listing
+/// `clean` takes again right before the removal, says otherwise.
+#[tokio::test]
+async fn clean_keeps_a_session_whose_container_starts_during_the_prompt() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+    let started = SessionId("20260501T134412-3f2a".into());
+    let started_dir = store
+        .create(
+            &started,
+            None,
+            &mut session_with_age(&started, now, days(40), None),
+        )
+        .expect("create")
+        .0;
+    let stays_gone = SessionId("20260501T141907-9b1c".into());
+    let stays_gone_dir = store
+        .create(
+            &stays_gone,
+            None,
+            &mut session_with_age(&stays_gone, now, days(40), None),
+        )
+        .expect("create")
+        .0;
+    let started_container = format!("outrig-{}", started.as_str());
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    let rc = clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        BTreeSet::new(),
+        Vec::new(),
+        Vec::new(),
+        no_removals,
+        no_build_removals,
+        move || {
+            let started_container = started_container.clone();
+            async move { Ok(BTreeSet::from([started_container])) }
+        },
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+
+    assert_eq!(rc, 0, "a session kept at the second look is not a failure");
+    assert!(
+        started_dir.exists(),
+        "the session whose container started during the prompt must survive"
+    );
+    assert!(
+        !stays_gone_dir.exists(),
+        "a session that stayed stopped is still removed"
+    );
+    let err = drain(stderr_r).await;
+    assert!(err.contains(started.as_str()), "stderr:\n{err}");
+    assert!(
+        err.contains(&format!("[outrig] removed {}", stays_gone_dir.display())),
+        "stderr:\n{err}"
+    );
+}
+
+/// #869 follow-up: `classify_strays` ran before the second look, so a
+/// stopped sidecar labeled with a session the second look just retained must
+/// not ride along into the stray batch -- its record is still there, so the
+/// sidecar is not stray. Before the fix, `classify_strays`'s `target_ids`
+/// (built from the pre-prompt targets) still marked the retained session as
+/// "being removed", so its sidecar reached `remove_containers` anyway.
+#[tokio::test]
+async fn clean_does_not_sweep_the_sidecar_of_a_session_the_second_look_retained() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let dir = store
+        .create(&sid, None, &mut session_with_age(&sid, now, days(40), None))
+        .expect("create")
+        .0;
+    let primary_container = format!("outrig-{}", sid.as_str());
+    let sidecar = labeled(
+        "outrig-20260501T134412-3f2a-tools",
+        sid.as_str(),
+        Some("tools"),
+        false,
+        days(40),
+        now,
+    );
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    let rc = clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        BTreeSet::new(),
+        vec![sidecar],
+        Vec::new(),
+        no_removals,
+        no_build_removals,
+        move || {
+            let primary_container = primary_container.clone();
+            async move { Ok(BTreeSet::from([primary_container])) }
+        },
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+
+    assert_eq!(rc, 0);
+    assert!(
+        dir.exists(),
+        "the session whose container started during the prompt must survive"
+    );
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains("kept containers whose session record is still there"),
+        "stderr:\n{err}"
+    );
+}
+
+/// The `--unreadable` half of the same race: the record cannot be read, but
+/// the second look still protects it.
+#[tokio::test]
+async fn clean_unreadable_keeps_a_record_whose_container_starts_during_the_prompt() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = unreadable_session(tmp.path());
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(days(30), true)
+    };
+    let container = format!("outrig-{}", sid.as_str());
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let rc = clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        clean_now(),
+        BTreeSet::new(),
+        Vec::new(),
+        Vec::new(),
+        no_removals,
+        no_build_removals,
+        move || {
+            let container = container.clone();
+            async move { Ok(BTreeSet::from([container])) }
+        },
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+
+    assert_eq!(rc, 0);
+    assert!(
+        dir.join("session.json").exists(),
+        "the unreadable record must survive its container starting mid-prompt"
+    );
+    let err = drain(stderr_r).await;
+    assert!(err.contains(sid.as_str()), "stderr:\n{err}");
 }
 
 #[tokio::test]
@@ -1523,6 +1743,7 @@ async fn clean_removes_stale_unfinalized_non_running_sessions() {
         Vec::new(),
         no_removals,
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -1569,6 +1790,7 @@ async fn clean_removes_symlinked_session_target_and_link() {
         Vec::new(),
         no_removals,
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -1621,6 +1843,7 @@ async fn clean_removes_a_directory_duplicated_by_its_own_link_once() {
         Vec::new(),
         no_removals,
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean should remove the duplicate once and not fail on the second row");
@@ -1674,6 +1897,7 @@ async fn clean_keeps_files_outrig_did_not_write() {
         Vec::new(),
         no_removals,
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -1739,6 +1963,7 @@ async fn clean_carries_on_past_a_logs_that_is_not_a_directory() {
         Vec::new(),
         no_removals,
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -1872,6 +2097,7 @@ async fn clean_reports_a_stray_the_engine_still_has() {
             }])
         },
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -1936,6 +2162,7 @@ async fn clean_keeps_a_stray_that_started_after_the_listing() {
             }])
         },
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -2006,6 +2233,7 @@ async fn clean_session_scopes_the_stray_sweep_to_one_id() {
             Ok(Vec::new())
         },
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -2067,6 +2295,7 @@ async fn clean_removes_old_stopped_stray_containers() {
             }
         },
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -2136,6 +2365,7 @@ async fn clean_reports_a_stray_with_no_creation_time_and_leaves_it() {
             Ok(Vec::new())
         },
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -2227,6 +2457,7 @@ async fn clean_spares_containers_of_unreadable_records() {
             }
         },
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean must survive an unreadable record");
@@ -2299,6 +2530,7 @@ async fn clean_never_removes_running_or_record_backed_containers() {
             }
         },
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -2368,6 +2600,7 @@ async fn clean_sweeps_strays_of_records_removed_in_same_run() {
             }
         },
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -2440,6 +2673,7 @@ async fn clean_removes_old_build_containers_by_id() {
                 Ok(())
             }
         },
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -2488,6 +2722,7 @@ async fn clean_without_the_flag_reads_exactly_as_before() {
         Vec::new(),
         no_removals,
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -2720,6 +2955,7 @@ async fn clean_dangling(
         Vec::new(),
         no_removals,
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -2945,6 +3181,7 @@ async fn run_clean(
         Vec::new(),
         no_removals,
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");
@@ -3148,6 +3385,7 @@ async fn clean_unreadable_sweeps_the_removed_records_stopped_container() {
             Ok(Vec::new())
         },
         no_build_removals,
+        no_recheck_running,
     )
     .await
     .expect("clean");

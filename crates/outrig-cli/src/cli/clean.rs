@@ -14,6 +14,14 @@
 //! neither is one whose creation time cannot be read: with no age to measure
 //! against the cutoff, it is reported instead.
 //!
+//! The running check behind the session-store walk's refusal runs twice: once
+//! for the preview, built from the listing above, and once more right before
+//! each record's removal, since the prompt between them can wait indefinitely
+//! and nothing else asks again. A container started in that window is caught
+//! by the second look and the record is kept, the way a container the preview
+//! itself saw already is; the look narrows the remaining window to the gap
+//! between it and the removal, and cannot close it.
+//!
 //! `--build-containers` adds a third sweep, off by default and answered from
 //! its own listings. Separate for a reason beyond tidiness: buildah working
 //! containers are not podman containers and never appear in `podman ps -a`,
@@ -146,6 +154,7 @@ pub async fn execute(
         build,
         podman_remove_batch,
         buildah_remove_batch,
+        refresh_running,
     )
     .await;
     // tokio's stderr hands each write to a blocking-pool thread and returns
@@ -159,7 +168,7 @@ pub async fn execute(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_with<E, R, D, DFut, B, BFut>(
+pub async fn execute_with<E, R, D, DFut, B, BFut, L, LFut>(
     stderr: &mut E,
     stdin: R,
     store: &SessionStore,
@@ -170,6 +179,7 @@ pub async fn execute_with<E, R, D, DFut, B, BFut>(
     build: Vec<BuildContainer>,
     mut remove_containers: D,
     mut remove_build_containers: B,
+    mut recheck_running: L,
 ) -> Result<i32>
 where
     E: AsyncWrite + Unpin,
@@ -180,6 +190,12 @@ where
     DFut: Future<Output = Result<Vec<Kept>>>,
     B: FnMut(Vec<String>) -> BFut,
     BFut: Future<Output = Result<()>>,
+    // The second look a record removal takes right before it runs: a fresh
+    // read of which container names are running, taken only when there is a
+    // record removal to protect. `now` and `running` above are the one look
+    // the preview is built from; this is the one the removal is.
+    L: FnMut() -> LFut,
+    LFut: Future<Output = Result<BTreeSet<String>>>,
 {
     let listing = store.list()?;
     // `--session` narrows both sweeps together, which is the only way the
@@ -295,7 +311,7 @@ where
         .map(|s| s.entry.as_str())
         .filter(|entry| !target_ids.contains(entry))
         .collect();
-    let (stray_targets, stray_running, stray_undatable) = classify_strays(
+    let (mut stray_targets, stray_running, stray_undatable) = classify_strays(
         &sessions,
         &target_ids,
         &unreadable,
@@ -309,6 +325,7 @@ where
 
     write_skipped_running(
         stderr,
+        "[outrig] skipped running sessions:\n",
         &skipped_running,
         &dangling_running,
         &unreadable_running,
@@ -370,8 +387,33 @@ where
         return Ok(0);
     }
 
+    // Nothing between the preview's listing and this moment has looked at the
+    // containers again -- the prompt can wait indefinitely, and `--yes` only
+    // closes the length of that wait, not the gap it still leaves. A record
+    // target whose container started in that window is read here as live,
+    // the same as one the preview itself caught, and kept rather than
+    // removed; `--unreadable` records and dangling links get the same look.
+    // Skipped when there is nothing a removal could race, so a run with
+    // nothing but strays or build containers still needs no podman call here.
+    let running_now = if targets.is_empty() && dangling_targets.is_empty() && unreadable_targets.is_empty()
+    {
+        BTreeSet::new()
+    } else {
+        recheck_running().await?
+    };
+
     let mut removed = 0usize;
+    let mut kept_running = Vec::new();
+    let mut dangling_kept_running = Vec::new();
+    let mut unreadable_kept_running = Vec::new();
+
     for target in &targets {
+        if session::owner_is_live(&target.dir)
+            || running_now.contains(&target.session.container_name)
+        {
+            kept_running.push(target.session.clone());
+            continue;
+        }
         // What the session's directory still holds -- files outrig did not
         // write, which stay. Not a failure, unlike `kept` below.
         let left = store.remove_by_id(&target.session.id)?;
@@ -387,12 +429,21 @@ where
     }
 
     for link in &dangling_targets {
+        if running_now.contains(&link.container_name()) {
+            dangling_kept_running.push(*link);
+            continue;
+        }
         let (gone, msg) = super::unlink_dangling_report(store, link)?;
         removed += usize::from(gone);
         stderr.write_all(msg.as_bytes()).await?;
     }
 
     for skipped in &unreadable_targets {
+        if session::owner_is_live(&skipped.dir) || running_now.contains(&skipped.container_name())
+        {
+            unreadable_kept_running.push(*skipped);
+            continue;
+        }
         let left = store.remove_by_id(&skipped.id())?;
         removed += 1;
         let dir_msg = super::removal_report(&skipped.dir, &left);
@@ -403,6 +454,50 @@ where
             stderr.write_all(link_msg.as_bytes()).await?;
         }
     }
+
+    // Not an error: a session whose container is up when this looks is
+    // exactly the one the sweep promised to leave alone, whichever moment it
+    // started running in. The exit status stays 0 for these -- `kept` below,
+    // for a stray `podman rm` skipped or refused, is the failure case.
+    write_skipped_running(
+        stderr,
+        "[outrig] kept (container is now running):\n",
+        &kept_running,
+        &dangling_kept_running,
+        &unreadable_kept_running,
+    )
+    .await?;
+
+    // `classify_strays` ran before the second look, on the assumption (then
+    // correct) that every id in `target_ids` was going to lose its record
+    // this run -- which is what makes a labeled sidecar sharing that id a
+    // stray rather than a container a surviving record still owns. A session
+    // or `--unreadable` record the second look just retained breaks that
+    // assumption after the fact, so its labeled containers have to come back
+    // out of `stray_targets` before the batch below ever sees them: their
+    // record is still there, and a sidecar beside a surviving record is not
+    // stray.
+    let retained_ids: BTreeSet<&str> = kept_running
+        .iter()
+        .map(|s| s.id.as_str())
+        .chain(unreadable_kept_running.iter().map(|s| s.entry.as_str()))
+        .collect();
+    let retained_strays: Vec<LabeledContainer> = if retained_ids.is_empty() {
+        Vec::new()
+    } else {
+        let (keep, strays): (Vec<_>, Vec<_>) = stray_targets
+            .into_iter()
+            .partition(|c| retained_ids.contains(c.session_label.as_str()));
+        stray_targets = strays;
+        keep
+    };
+    write_stray_skipped(
+        stderr,
+        "[outrig] kept containers whose session record is still there \
+         (session started during the prompt):\n",
+        &retained_strays,
+    )
+    .await?;
 
     // One `podman rm` for every stray. Guard the empty case -- `podman rm
     // -f` with no names is an error.
@@ -579,6 +674,7 @@ fn older_than(session: &Session, cutoff: Duration, now: SystemTime) -> bool {
 
 async fn write_skipped_running<E>(
     stderr: &mut E,
+    header: &str,
     skipped: &[Session],
     dangling: &[&DanglingLink],
     unreadable: &[&SkippedSession],
@@ -590,9 +686,7 @@ where
         return Ok(());
     }
 
-    stderr
-        .write_all(b"[outrig] skipped running sessions:\n")
-        .await?;
+    stderr.write_all(header.as_bytes()).await?;
     for session in skipped {
         let line = format!("  {}  {}\n", session.id, session.container_name);
         stderr.write_all(line.as_bytes()).await?;
@@ -983,6 +1077,18 @@ async fn podman_remove_batch(names: Vec<String>) -> Result<Vec<Kept>> {
         }
     }
     Ok(left)
+}
+
+/// The running set, read again. The second look a record removal takes
+/// right before it runs, narrowing the window the preview's own listing
+/// leaves open between the prompt and the unlink to the gap between this
+/// call and that unlink -- it cannot close it, since nothing stops a third
+/// party starting the container the instant after. One more `podman ps -a`,
+/// same shape as the preview's; only the running set matters here; the
+/// labeled rows are not this call's concern.
+async fn refresh_running() -> Result<BTreeSet<String>> {
+    let (_labeled, running) = list_all_containers().await?;
+    Ok(running)
 }
 
 /// Which of `names` podman still has, and whether each is running or paused. Reuses the

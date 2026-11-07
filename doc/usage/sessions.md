@@ -327,6 +327,12 @@ writing an `ended_at`. The hold is released once the session's record is finaliz
 kernel releases it however the launching process dies, so a record left behind by a killed
 `outrig run` stays discardable.
 
+The check runs once before the `[y/N]` prompt and once more right before the record is removed,
+so a container someone starts while the prompt is open is still caught. The second look narrows
+the window between "running" being checked and the record going away to the time between that
+look and the removal; it does not close it -- nothing stops a container from starting the instant
+after.
+
 ## `outrig clean`
 
 Delete old stopped session records in bulk. Bare `outrig clean` uses a 30-day retention
@@ -360,6 +366,12 @@ symlink target and the symlink under the session root. A directory that holds an
 the record stays, and clean says what it kept. Running sessions are skipped so cleanup doesn't
 race a live `outrig run` or `outrig mcp` writer -- by the same two-part test `discard` uses, so
 a short `--older-than` cannot sweep up a session that is still building its image.
+
+That test runs once to build the preview and once more right before each record's removal, so a
+session whose container starts while the `Clean ...? [y/N]:` prompt is open is kept rather than
+removed, and reported the way a session the preview itself caught is. As with `discard`, the
+second look only narrows the gap between "running" being checked and the record going away; it
+cannot close it.
 
 A record outrig cannot read is not shown to you, so `--yes` does not remove it: `clean` names
 it and leaves it. Add `--unreadable` to have it previewed and removed with the rest, aged by the
