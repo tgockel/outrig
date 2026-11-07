@@ -179,13 +179,44 @@ pub fn run() -> ExitCode {
 /// stopped container, or a second Ctrl-C, the session was torn down and the
 /// process sat there until someone pressed Enter. Every session has finished
 /// its own teardown by the time `fut` resolves.
+///
+/// The runtime lives in a [`ShutdownOnDrop`] guard rather than a local
+/// binding so that a panic out of `fut` gets the same treatment as a normal
+/// return. `block_on` propagates such a panic by unwinding out of this
+/// function, and a bare local would then be dropped the ordinary way --
+/// `Runtime::drop` waits, with no timeout, for that same blocking read, which
+/// is the hang this function exists to avoid (#517). The guard's `Drop` runs
+/// on that unwind path and calls `shutdown_background()` just as the return
+/// path below does, so either way out stops waiting on blocking work.
 fn block_on_session(
     runtime: tokio::runtime::Runtime,
     fut: impl Future<Output = Result<i32>>,
 ) -> Result<i32> {
-    let result = runtime.block_on(fut);
-    runtime.shutdown_background();
+    let mut guard = ShutdownOnDrop(Some(runtime));
+    let result = guard
+        .0
+        .as_ref()
+        .expect("guard holds the runtime until shutdown")
+        .block_on(fut);
+    guard
+        .0
+        .take()
+        .expect("guard holds the runtime until shutdown")
+        .shutdown_background();
     result
+}
+
+/// Holds a [`tokio::runtime::Runtime`] and, if it is still there when this
+/// drops, shuts it down in the background instead of letting `Runtime::drop`
+/// wait on blocking work. See [`block_on_session`].
+struct ShutdownOnDrop(Option<tokio::runtime::Runtime>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
 }
 
 /// The subcommand `--config` is not read by, spelled as `outrig <name>`,
@@ -490,6 +521,47 @@ mod tests {
     use clap::{Parser, error::ErrorKind};
 
     use super::{Cli, Cmd, EnvFilter, ImageCmd, config_ignored_by, log_filter_spec, quiet_rustyline};
+
+    /// The guard in [`super::block_on_session`] has to catch the unwind path,
+    /// not just the return path: a panic out of the session future must
+    /// reach the caller without first waiting on blocking work still parked
+    /// in the runtime's blocking pool (#517). `park_rx.recv()` never returns
+    /// on its own -- `_park_tx` stays alive for the whole test -- so an
+    /// ordinary `Runtime::drop` here would hang, and `recv_timeout` below
+    /// would time out instead of observing the unwind.
+    #[test]
+    fn block_on_session_unwind_does_not_wait_on_blocking_work() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (_park_tx, park_rx) = mpsc::channel::<()>();
+        let (unwound_tx, unwound_rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime builds");
+            runtime.spawn_blocking(move || {
+                let _ = park_rx.recv();
+            });
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::block_on_session(runtime, async { panic!("injected session panic") })
+            }));
+            assert!(
+                result.is_err(),
+                "the injected panic should propagate out of block_on_session"
+            );
+            let _ = unwound_tx.send(());
+        });
+
+        unwound_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect(
+                "the unwind should reach the caller without waiting on the parked blocking task",
+            );
+    }
 
     /// The `outrig ...` lines of the README's `## Commands` fence, with
     /// trailing comments dropped and an `a|b` alternation in the final word

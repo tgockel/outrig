@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A panic out of a session's root future no longer hangs `outrig` on stdin, ignoring SIGINT and
+  SIGTERM.** `block_on_session` shuts its runtime down with `shutdown_background()` rather than
+  an ordinary drop, because a REPL's or a stdio MCP transport's blocking stdin read can still be
+  in flight and `Runtime::drop` waits for it with no timeout. That call ran only on the return
+  path: a panic unwinding out of the session future skipped it and dropped the `Runtime` the
+  ordinary way, so the process sat on the blocking read after the panic was reported, and tokio's
+  signal handlers, installed but orphaned once the runtime they report to was gone, no longer
+  ended it either -- only the other end of the pipe closing, or SIGKILL, did. The runtime now
+  lives in a guard whose `Drop` calls `shutdown_background()`, so the unwind path gets the same
+  treatment as the return path and the process exits promptly either way. No reachable panic site
+  is known yet; this closes the gap before one is found. (#517)
 - **`outrig image add`'s bootstrap no longer reads a `--global-config` that vanished while its
   "Configure outrig in this directory now?" prompt was up as an empty config.**
   `resolve_or_bootstrap` checked an explicit path once, before that prompt, and read the file
