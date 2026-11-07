@@ -517,7 +517,7 @@ program owns, whose methods marked `@outrig.agent` are its request channels. A c
 
 ```python
 class Agent:
-    def __init__(self, *, model=None, session=None, **inputs): ...
+    def __init__(self, *, model=None, session=None, facilities=None, **inputs): ...
 ```
 
 The base of an agent class: each instance is one long-lived child agent, and each method
@@ -542,13 +542,30 @@ request's handle at once: await it for the reply, of the return type. The body i
 Methods not marked are ordinary ones, which run here. What a class cannot declare raises
 `TypeError` as the class is made, naming the member.
 
-`Reviewer(**inputs, model=None)` binds each input, which must be data, in the child as a
-variable, launches the child in the background -- on `model`, a configured model or alias,
-or on yours -- and returns at once; a request made before the child exists waits for it. The
-child's first round is its own, to get ready in: `await reviewer.ready()` returns once it has
-ended, and raises what the launch met instead. `await reviewer.release()` ends the child and
-every request still open on it; `async with Reviewer() as reviewer:` waits for `ready()` on
-entry and releases on leaving. An instance collected unreleased is released then.
+`Reviewer(**inputs, model=None)` runs the class's `__init__` to its end, then its
+`__outrig_attach__`, and only then attaches the instance: binds each input, which must be
+data, in the child as a variable, launches the child in the background -- on `model`, a
+configured model or alias, or on yours -- and returns at once; a request made before the
+child exists waits for it. The child's first round is its own, to get ready in: `await
+reviewer.ready()` returns once it has ended, and raises what the launch met instead. `await
+reviewer.release()` ends the child and every request still open on it; `async with
+Reviewer() as reviewer:` waits for `ready()` on entry and releases on leaving. An instance
+collected unreleased is released then. `facilities=` is reserved: any value but `None`
+raises `NotImplementedError`.
+
+A subclass's `__init__` passes the base its keywords with `super().__init__(**inputs,
+model=...)`, which launches nothing; one that does not raises `TypeError` once it returns.
+Define `__outrig_attach__(self)` to finish what `__init__` cannot -- state a mixin's
+`__init__` sets after the subclass's own, say: OutRig calls it on the class, so it needs no
+`super()`, and ignores what it returns. A request method called before the instance is
+attached -- in `__init__` or `__outrig_attach__` -- raises `TypeError`. A constructor or hook
+that raises launches nothing, and its exception is the constructor call's; what it did to
+your own objects stands, since OutRig rolls nothing back. An agent constructed inside
+`__init__` or `__outrig_attach__` is attached at once, and its child runs on if the
+constructor then raises, until something releases it. The class's metaclass derives from
+`abc.ABCMeta`: a subclass that leaves an abstract method unimplemented raises `TypeError` at
+the call, before its `__init__`; and mixing in a class whose metaclass is another, not
+derived from it, raises `TypeError` as the class is made.
 
 In a program `outrig run-new` runs on the host, `Reviewer(**inputs, model=None, session=None)`
 is constructed on the running event loop its handles belong to, and its child is a root child

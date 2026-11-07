@@ -14,6 +14,7 @@ binds by name must not share one. A program on the host describes its types as d
 child's kernel makes into classes again (`described`, `rebuilt`).
 """
 
+import abc
 import asyncio
 import contextlib
 import copy
@@ -53,9 +54,10 @@ PREVIEW_MAX = 1024
 # What only the interpreter has, bound as it loads the package: `_call(declaration, arguments)`
 # makes a typed call from the calling kernel and returns its handle, and `_submitted_source(code)`
 # is the source of the submission that compiled `code`, or `None` for code none did; on the host
-# both stay `None`. `_launch(agent, inputs, model, session)` launches an agent class instance's
-# child and returns what the runtime keeps of the instance: the interpreter's from the calling
-# kernel, or, bound by `outrig._host`, a program's on the host.
+# both stay `None`. `_launch(agent, inputs, model, session, facilities)` attaches an agent class
+# instance once its construction has finished, launching its child, and returns what the runtime
+# keeps of the instance: the interpreter's from the calling kernel, or, bound by `outrig._host`, a
+# program's on the host.
 _call = None
 _launch = None
 _submitted_source = None
@@ -754,7 +756,23 @@ class RequestMethod:
     key: object  # what a subclass restating the channel must declare alike
 
 
-class Agent:
+class _Attaching(abc.ABCMeta):
+    """`outrig.Agent`'s metaclass, whose call constructs an instance and then attaches it: see
+    `help(outrig.Agent)`."""
+
+    def __call__(cls, *args, **kwargs):
+        agent = super().__call__(*args, **kwargs)
+        given = vars(agent).pop("_outrig_given", None)
+        if given is None:
+            raise TypeError(f"{cls.__module__}.{cls.__qualname__}.__init__ did not call "
+                            "super().__init__(**inputs, model=...), which gives outrig.Agent "
+                            "what to launch the child with; nothing was launched")
+        cls.__outrig_attach__(agent)
+        agent._outrig = _launch(agent, *given)
+        return agent
+
+
+class Agent(metaclass=_Attaching):
     """The base of an agent class: each instance is one long-lived child agent, and each method
     marked `@outrig.agent` is one of its request channels.
 
@@ -777,13 +795,30 @@ class Agent:
     Methods not marked are ordinary ones, which run here. What a class cannot declare raises
     `TypeError` as the class is made, naming the member.
 
-    `Reviewer(**inputs, model=None)` binds each input, which must be data, in the child as a
-    variable, launches the child in the background -- on `model`, a configured model or alias,
-    or on yours -- and returns at once; a request made before the child exists waits for it. The
-    child's first round is its own, to get ready in: `await reviewer.ready()` returns once it has
-    ended, and raises what the launch met instead. `await reviewer.release()` ends the child and
-    every request still open on it; `async with Reviewer() as reviewer:` waits for `ready()` on
-    entry and releases on leaving. An instance collected unreleased is released then.
+    `Reviewer(**inputs, model=None)` runs the class's `__init__` to its end, then its
+    `__outrig_attach__`, and only then attaches the instance: binds each input, which must be
+    data, in the child as a variable, launches the child in the background -- on `model`, a
+    configured model or alias, or on yours -- and returns at once; a request made before the
+    child exists waits for it. The child's first round is its own, to get ready in: `await
+    reviewer.ready()` returns once it has ended, and raises what the launch met instead. `await
+    reviewer.release()` ends the child and every request still open on it; `async with
+    Reviewer() as reviewer:` waits for `ready()` on entry and releases on leaving. An instance
+    collected unreleased is released then. `facilities=` is reserved: any value but `None`
+    raises `NotImplementedError`.
+
+    A subclass's `__init__` passes the base its keywords with `super().__init__(**inputs,
+    model=...)`, which launches nothing; one that does not raises `TypeError` once it returns.
+    Define `__outrig_attach__(self)` to finish what `__init__` cannot -- state a mixin's
+    `__init__` sets after the subclass's own, say: OutRig calls it on the class, so it needs no
+    `super()`, and ignores what it returns. A request method called before the instance is
+    attached -- in `__init__` or `__outrig_attach__` -- raises `TypeError`. A constructor or hook
+    that raises launches nothing, and its exception is the constructor call's; what it did to
+    your own objects stands, since OutRig rolls nothing back. An agent constructed inside
+    `__init__` or `__outrig_attach__` is attached at once, and its child runs on if the
+    constructor then raises, until something releases it. The class's metaclass derives from
+    `abc.ABCMeta`: a subclass that leaves an abstract method unimplemented raises `TypeError` at
+    the call, before its `__init__`; and mixing in a class whose metaclass is another, not
+    derived from it, raises `TypeError` as the class is made.
 
     In a program `outrig run-new` runs on the host, `Reviewer(**inputs, model=None, session=None)`
     is constructed on the running event loop its handles belong to, and its child is a root child
@@ -794,8 +829,8 @@ class Agent:
     it. In an agent's kernel, `session=` is refused: the child is in the kernel's own session.
     """
 
-    # What the runtime keeps of the instance, once it is made; and the request channels its class
-    # declares, each by name its sender.
+    # What the runtime keeps of the instance, once it is attached; and the request channels its
+    # class declares, each by name its sender.
     _outrig = None
     _outrig_channels = {}
 
@@ -803,7 +838,7 @@ class Agent:
         super().__init_subclass__(**kwargs)
         _declare_class(cls)
 
-    def __init__(self, *, model=None, session=None, **inputs):
+    def __init__(self, *, model=None, session=None, facilities=None, **inputs):
         name = f"{type(self).__module__}.{type(self).__qualname__}"
         if not type(self)._outrig_channels:
             raise TypeError(f"{name} declares no request channel -- no method marked "
@@ -811,11 +846,18 @@ class Agent:
         if model is not None and type(model) is not str:
             raise TypeError(f"model names a configured model, a str, not "
                             f"{schema._type_qualname(type(model))}")
+        if facilities is not None:
+            raise NotImplementedError("facilities= is not supported yet; leave it out")
         if _launch is None:
             raise RuntimeError(f"an instance of {name} runs in an agent's kernel, where OutRig "
                                "runs agent code, or in a program `outrig run-new` runs, and this "
                                "Python is neither")
-        self._outrig = _launch(self, inputs, model, session)
+        # What the metaclass attaches the instance with, once its construction has finished.
+        self._outrig_given = (inputs, model, session, facilities)
+
+    def __outrig_attach__(self):
+        """The hook a subclass defines to finish what `__init__` cannot, run before the child
+        launches: see `help(outrig.Agent)`. This one does nothing."""
 
     async def ready(self):
         """Return once the child has ended its first round, which is its own, to get ready in.
@@ -847,10 +889,11 @@ class Agent:
 
 
 def _runs(agent):
-    """What the runtime keeps of `agent`, an agent class's instance."""
+    """What the runtime keeps of `agent`, an agent class's instance, once it is attached."""
     if agent._outrig is None:
-        raise TypeError(f"this {type(agent).__qualname__} was not made by outrig.Agent.__init__: "
-                        "a subclass's __init__ calls super().__init__(**inputs, model=...)")
+        raise TypeError(f"this {type(agent).__qualname__} is not attached yet: its child launches "
+                        "once its construction -- __init__, then __outrig_attach__ -- has "
+                        "finished")
     return agent._outrig
 
 
@@ -871,7 +914,7 @@ def _declare_class(cls):
                             f"which {wrap} would make it not; remove {wrap}")
         if type(value) is _Marked:
             name = f"{where}.{member}"
-            if member == "user" or hasattr(Agent, member):
+            if member == "user" or any(member in vars(c) for c in Agent.__mro__):
                 taken = "the user channel's" if member == "user" else "a member of outrig.Agent"
                 raise TypeError(f"{name}: a request channel cannot be named {member!r}, which is "
                                 f"{taken}")

@@ -159,7 +159,9 @@ asyncio.run(main())
   or str-keyed dict of these, or a dataclass instance -- and is a variable of that name in the
   agent's Python. The agent's first round, in which it reads its instructions, follows:
   `await agent.ready()` waits for it, and `async with` waits for it on entry and releases the
-  agent on exit.
+  agent on exit. A subclass's own `__init__` calls `super().__init__(**inputs, model=...)`. The
+  agent starts only after that `__init__` returns and after `__outrig_attach__(self)`, a method
+  the class may define to finish its setup, so either can raise without starting anything.
 - **Its model.** `model=` names a configured model or alias; without it, `default-model`. No
   `[agents.<name>]` table, `default-agent`, image or preamble applies: the class's docstring is
   the agent's instructions. An unknown model, a full `children-max`, or a session that has closed

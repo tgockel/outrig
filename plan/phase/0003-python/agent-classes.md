@@ -153,9 +153,11 @@ given, raises when there is neither, and schedules the launch on the program's r
 which sends it over the owner connection ("From the host program").
 
 `0003-41` moves the launch out of `__init__`: a metaclass runs the most-derived constructor, then an
-optional hook, then attaches (`task-agents.md`, "Construction completes before attachment");
-`__init__` records `model`, `facilities` and the inputs and launches nothing. `0003-42` adds
-`facilities=` (`facilities.md`).
+optional hook, `__outrig_attach__`, then attaches (`task-agents.md`, "Construction completes before
+attachment"); `__init__` records `model`, `facilities` and the inputs and launches nothing. A
+subclass whose `__init__` skips `super().__init__` raises `TypeError` at construction, and an agent
+constructed inside another's `__init__` or hook is attached at once (`0003-41`'s `## Decisions`).
+`0003-42` gives `facilities=` its meaning (`facilities.md`).
 
 **Inputs reach the child as variables.** Each is bound under its name in the child's namespace,
 and the instructions carry a manifest -- name, type, bounded preview -- as a submission's do

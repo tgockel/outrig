@@ -920,6 +920,174 @@ async fn errors_surface_where_the_design_says() {
     );
 }
 
+/// A constructor that raises launches nothing: not when `__init__` raises
+/// after `super().__init__()` and after storing the application's task, nor
+/// when `__outrig_attach__` raises once `__init__` has returned, whole or with
+/// state left for the hook to finish. The exception is the constructor call's,
+/// what it did to the application's objects stands, and the record holds no
+/// spawn, no instance and no model call of the class's child.
+#[tokio::test]
+async fn a_constructor_that_raises_launches_nothing() {
+    let mut tree = tree(
+        "OUTRIG_TEST_INSTANCE_CONSTRUCTOR_RAISES",
+        "",
+        vec![(
+            "",
+            primary_waits(
+                r#"
+                class Half(outrig.Agent):
+                    """ROLE half. Answer requests on fizz."""
+                    def __init__(self, task, fail):
+                        super().__init__()
+                        self._task, self._fail = task, fail
+                        task.append('init')
+                        if fail == 'init':
+                            raise ValueError('__init__ raised')
+                        self._state = 'left for the hook' if fail == 'half' else 'whole'
+                    def __outrig_attach__(self):
+                        self._task.append(f'hook on {self._state}')
+                        raise ValueError('the hook raised')
+                    @outrig.agent
+                    async def fizz(self, message: str) -> Thing:
+                        """Reply with a Thing."""
+                        ...
+                for fail in ('init', 'hook', 'half'):
+                    task = []
+                    try:
+                        Half(task, fail)
+                    except ValueError as e:
+                        print(fail, e, task)
+                "#,
+            ),
+        )],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(
+        printed(&requests, "p1"),
+        "init __init__ raised ['init']\n\
+         hook the hook raised ['init', 'hook on whole']\n\
+         half the hook raised ['init', 'hook on left for the hook']\n"
+    );
+    assert!(kind(&events, "agent.spawned", None).is_empty(), "no spawn");
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.kind().starts_with("agent.instance")),
+        "no instance"
+    );
+    assert!(of_agent(&requests, "ROLE half").is_empty(), "no model call");
+}
+
+/// `__outrig_attach__` runs once `__init__` has returned -- what `__init__`
+/// set is there -- and before the instance is attached, without calling
+/// `super()`; a request method called in `__init__` raises `TypeError` and
+/// sends nothing. The instance is attached once the hook returns: its child
+/// is started and `ready()` settles.
+#[tokio::test]
+async fn the_hook_runs_between_init_and_attachment() {
+    let mut tree = tree(
+        "OUTRIG_TEST_INSTANCE_HOOK",
+        "",
+        vec![
+            (
+                "ROLE hooked",
+                ready_then(scripted(vec![text_reply("idle")])),
+            ),
+            (
+                "",
+                primary_waits(
+                    r#"
+                    class Hooked(outrig.Agent):
+                        """ROLE hooked. Answer requests on fizz."""
+                        def __init__(self, label):
+                            super().__init__(label=label)
+                            self.label = label
+                            try:
+                                self.fizz('early')
+                            except TypeError as e:
+                                print('in __init__:', 'not attached yet' in str(e))
+                        def __outrig_attach__(self):
+                            print('hook:', self.label, self._outrig is None)
+                            self.finished = True
+                        @outrig.agent
+                        async def fizz(self, message: str) -> Thing:
+                            """Reply with a Thing."""
+                            ...
+                    hooked = Hooked('x')
+                    print('finished', hooked.finished)
+                    await hooked.ready()
+                    print('ready')
+                    await hooked.release()
+                    "#,
+                ),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(
+        printed(&requests, "p1"),
+        "in __init__: True\nhook: x True\nfinished True\nready\n"
+    );
+    assert!(
+        kind(&events, "agent.request.sent", None).is_empty(),
+        "the early request sent nothing"
+    );
+    let started = kind(&events, "agent.instance.started", None);
+    assert_eq!(started.len(), 1);
+    assert_eq!(data(started[0])["qualname"], "Hooked");
+}
+
+/// An agent constructed inside another's `__init__` is attached at once, its
+/// child started before the outer instance's.
+#[tokio::test]
+async fn an_agent_constructed_in_a_constructor_is_attached_at_once() {
+    let mut tree = tree(
+        "OUTRIG_TEST_INSTANCE_NESTED",
+        "",
+        vec![
+            ("ROLE inner", ready_then(scripted(vec![text_reply("idle")]))),
+            ("ROLE outer", ready_then(scripted(vec![text_reply("idle")]))),
+            (
+                "",
+                primary_waits(&format!(
+                    r#"
+                    {inner}
+                    class Outer(outrig.Agent):
+                        """ROLE outer. Answer requests on fizz."""
+                        def __init__(self):
+                            super().__init__()
+                            self.inner = Inner()
+                        @outrig.agent
+                        async def fizz(self, message: str) -> Thing:
+                            """Reply with a Thing."""
+                            ...
+                    outer = Outer()
+                    await outer.inner.ready()
+                    await outer.ready()
+                    print('both ready')
+                    await outer.inner.release()
+                    await outer.release()
+                    "#,
+                    inner = indented(&fizzing("Inner", "inner"), 20),
+                )),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(printed(&requests, "p1"), "both ready\n");
+    let started: Vec<_> = kind(&events, "agent.instance.started", None)
+        .into_iter()
+        .map(|event| data(event)["qualname"].clone())
+        .collect();
+    assert_eq!(started, [json!("Inner"), json!("Outer")]);
+}
+
 /// With `children-max = 1` and an idle instance resident, a second instance's
 /// `ready()` and its first handle raise `AgentLimitReached` and it makes no
 /// spawn; releasing the first makes room for the next.

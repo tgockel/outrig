@@ -147,3 +147,53 @@ Each is a mock-driven test.
   `## Decisions` on the skipped `super().__init__` and on `_Instance`.
 - `crates/outrig/src/python/outrig/_agents.py`, `crates/outrig/src/python/outrig/_interpreter.py`
   (`_Instance`), `crates/outrig/src/agent/children.rs` (`make`), `runner.rs`.
+
+## Decisions
+
+- **The reversal.** `agent-classes.md`'s "`outrig.Agent.__init__` does two things ... Then it
+  schedules `runtime.spawn(...)` ... and returns the instance" no longer holds: `__init__` checks
+  its keywords -- a class with no channel, a `model` that is not a `str`, a Python with no
+  launcher -- and stores them on the instance as `_outrig_given`, launching nothing. The
+  metaclass, `_Attaching`, runs `super().__call__`, pops `_outrig_given`, calls the hook, and
+  attaches with `_launch(agent, inputs, model, session, facilities)`. `0003-34`'s "A subclass whose
+  `__init__` skips `super().__init__` raises `TypeError` saying so at its first call" is replaced
+  by fork 1's answer below. The checks stay in `__init__` rather than moving to the metaclass,
+  since a constructor that skips `super().__init__` is refused anyway.
+- **Fork 1: refused.** No `_outrig_given` after `__init__` returns means `Agent.__init__` did not
+  run: the metaclass raises `TypeError` naming `super().__init__(**inputs, model=...)`, before the
+  hook, with nothing launched. The maintainer chose this over attaching with the base's defaults,
+  which would have dropped any `model=` or inputs the author meant to pass without saying so.
+  `an_agent_class_is_checked_as_it_is_made`'s `Skipped` case asserts it at construction now.
+- **Fork 2: allowed.** An agent constructed inside another's `__init__` or hook is attached at
+  once, its child launched before the outer one's; there is no guard and no context variable.
+  The consequence is documented in `help(outrig.Agent)`: a child made in a constructor that then
+  raises runs on until something releases it -- today its instance's collection, and, once
+  `0003-45` binds the instance as the child's `self`, the session's end.
+- **The hook is `__outrig_attach__`**, a dunder OutRig owns. `Agent` defines it as a no-op with a
+  docstring, so the metaclass calls `cls.__outrig_attach__(agent)` unconditionally and `help()`
+  shows it. Its return value is ignored. The requirement's "without `super()`" is about the hook,
+  which OutRig calls directly; `super().__init__` remains how a subclass passes the base its
+  keywords.
+- **The metaclass derives from `abc.ABCMeta`**, so an application's abstract mixins work and an
+  abstract method left out raises at the class call, before `__init__`. The cost is that a class
+  whose metaclass is not derived from it -- a `typing.Protocol`, say, whose metaclass is another
+  `ABCMeta` subclass -- cannot be mixed in; Python raises `TypeError` at class creation.
+- **`_declare_class` checks a channel's name against `vars` of each class in `Agent.__mro__`**,
+  not `hasattr`: under `ABCMeta`, `hasattr(Agent, "register")` is true through the metaclass, so a
+  channel named `register` would have been refused as a member of `outrig.Agent`. The `__mro__`
+  walk reads the class and its bases, as an instance sees them, in the form the base-member check
+  beside it uses; `dir` would too, but Python documents it as an interactive convenience. Names
+  only `type` gives a class, `mro` among them, are no longer refused, which they never needed to
+  be: an instance never reaches them.
+- **`facilities` passes through `_launch` and is refused until `0003-42`.** `Agent.__init__`
+  takes `facilities=None`, so `inspect.signature` shows it, and raises `NotImplementedError` for
+  any other value rather than ignore a mapping. Both launchers, `_Instance` and `_Root`, take it.
+- **Attachment's checks are unchanged.** An input outside the subset, a construction outside
+  every execution, no running loop on the host: each still raises from `_Instance.__init__` or
+  `_Root.__init__`, now after the hook, with nothing launched.
+- **No new event and no close row.** A construction that raises in a kernel is in its execution's
+  traceback (`exec.completed`) and launches nothing to event, as a refused launch records none;
+  `doc/reference/events.md` says so under `agent.instance.started`. A construction is synchronous
+  Python inside an execution, which the **Executions** rows of the close table cover.
+- **The CHANGELOG entry for agent classes is amended, not added to**, since agent classes are
+  unreleased: no tagged release ever launched from `__init__`.

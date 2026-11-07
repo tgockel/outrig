@@ -525,7 +525,9 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
   `null` when none could be read, as for a class a submission declared with no function in its body;
   `inputs`, each `{name, type, preview}`; and `channels`, one per request method, each
   `{name, request, reply}`. An instance whose launch was refused, by a limit say, has no child and
-  records none of these events; its `ready()` and its requests raise the refusal.
+  records none of these events; its `ready()` and its requests raise the refusal. Nor does one
+  whose construction raised -- its class's `__init__` or `__outrig_attach__`, which run before the
+  launch -- whose exception is the constructor call's, in its execution's traceback.
 - `agent.instance.ready` -- the child has had the round it gets as it launches, in which it reads
   its instructions and prepares: `instance`, and `error`, `null`, or why it cannot have that round
   -- the token budget spent, or a model that cannot answer. A request sent before this may already

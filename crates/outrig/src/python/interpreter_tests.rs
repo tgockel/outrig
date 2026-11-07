@@ -7058,9 +7058,9 @@ fn an_agent_class_is_checked_as_it_is_made() {
             def __init__(self):
                 pass
         try:
-            Skipped().f(1)
+            Skipped()
         except TypeError as e:
-            print('skipped:', 'super().__init__(**inputs, model=...)' in str(e))
+            print('skipped:', 'did not call super().__init__(**inputs, model=...)' in str(e))
         "#);
     assert_eq!(
         k.output(200, &left_alone),
@@ -7317,6 +7317,71 @@ fn ready_raises_what_the_host_says_and_the_close_ends_a_launching_instance() {
         (&released["how"], &released["child"]),
         (&json!("closing"), &json!("c2"))
     );
+}
+
+/// An agent class's metaclass is an `abc.ABCMeta`: a subclass that leaves an abstract method out
+/// raises `TypeError` at the call, before its `__init__` runs; one that implements it constructs;
+/// a class whose metaclass is unrelated cannot be mixed in; and a request channel may still take
+/// a name `abc.ABCMeta` gives a class, such as `register`. `facilities=` is in the constructor's
+/// signature and refused for now, and `help(outrig.Agent)` says the construction's sequence.
+/// What is refused asks the host nothing.
+#[test]
+fn an_agent_class_is_constructed_then_attached() {
+    let mut k = Interpreter::start();
+    let (said, notices) = k.noted(
+        PRIMARY,
+        1,
+        &py(r#"
+            import abc, inspect, pydoc
+            import outrig
+            class Base(outrig.Agent):
+                "doc"
+                @abc.abstractmethod
+                def prepare(self): ...
+                @outrig.agent
+                async def register(self, name: str) -> int:
+                    "a name abc.ABCMeta gives a method of its own"
+            class Left(Base):
+                "doc"
+                def __init__(self):
+                    print('never')
+                    super().__init__()
+            try:
+                Left()
+            except TypeError as e:
+                print('abstract:', 'prepare' in str(e))
+            class Other(type):
+                pass
+            class Mixin(metaclass=Other):
+                pass
+            try:
+                class Mixed(Mixin, outrig.Agent):
+                    "doc"
+            except TypeError as e:
+                print('mixed:', 'metaclass conflict' in str(e))
+            class Done(Base):
+                "doc"
+                def prepare(self):
+                    pass
+            try:
+                Done(facilities={})
+            except NotImplementedError as e:
+                print('facilities:', 'facilities=' in str(e))
+            print('facilities' in inspect.signature(outrig.Agent.__init__).parameters)
+            told = pydoc.render_doc(outrig.Agent, renderer=pydoc.plaintext)
+            print(all(part in told for part in ('`__init__` to its end', '__outrig_attach__',
+                                                'rolls nothing back', 'abc.ABCMeta')))
+            "#),
+    );
+    assert_eq!(
+        said,
+        "abstract: True\nmixed: True\nfacilities: True\nTrue\nTrue\n"
+    );
+    assert!(notices.is_empty(), "nothing asked: {notices:?}");
+    let (_, notices) = k.noted(PRIMARY, 2, "done = Done()");
+    let (_, asked) = k.until("agent.spawn", notices);
+    assert_eq!(asked["instance"]["qualname"], "Done");
+    assert_eq!(asked["channels"][0]["name"], "register");
 }
 
 impl Interpreter {

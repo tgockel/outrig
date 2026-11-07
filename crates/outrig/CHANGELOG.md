@@ -580,9 +580,13 @@ without touching each other, from one ensured image. [The container facade besid
   named `user` or after one of `outrig.Agent`'s own members, a channel under `staticmethod` or
   `classmethod`, a subclass changing a channel's signature, two classes of one name among its
   types; `@outrig.agent` in another class's body is refused the same way.
-  `FooAgent(**inputs, model=...)` checks its inputs and returns at once, launching the child in
-  the background with the inputs bound in it; the child's first round, opened as it launches, is
-  for getting ready, and `await foo.ready()` waits for it. A call checks its arguments, sends the
+  `FooAgent(**inputs, model=...)` runs the class's `__init__` to its end, then its optional
+  `__outrig_attach__` hook, which OutRig calls without `super()`, and only then checks its inputs
+  and returns, launching the child in the background with the inputs bound in it: a constructor
+  or hook that raises launches nothing and spends no model round, and a subclass `__init__` that
+  skips `super().__init__` raises `TypeError`. The class's metaclass derives from `abc.ABCMeta`,
+  so abstract methods hold. The child's first round, opened as it launches, is for getting ready,
+  and `await foo.ready()` waits for it. A call checks its arguments, sends the
   request, and returns its handle at once, as a request on a child's channel does: one made before
   the child exists is held, counted against `requests-max`, and sent once the child exists. What
   the launch meets -- an unknown model, `subagent-depth-max`, `children-max`, the session

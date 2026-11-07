@@ -5222,7 +5222,7 @@ class _Instance:
     however it began.
     """
 
-    def __init__(self, agent, inputs, model, session):
+    def __init__(self, agent, inputs, model, session, facilities):
         cls = type(agent)
         if session is not None:
             raise TypeError(f"{cls.__qualname__}(session=...) names a session a program on the "

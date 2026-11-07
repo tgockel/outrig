@@ -1117,7 +1117,7 @@ class _Root:
     child of a session: its launch, the requests made before its child exists, and those open.
     Nothing here holds the instance, so that collecting it releases the child."""
 
-    def __init__(self, agent, inputs, model, session):
+    def __init__(self, agent, inputs, model, session, facilities):
         cls = type(agent)
         if session is None:
             session = current_session()
