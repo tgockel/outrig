@@ -16,6 +16,7 @@ child's kernel makes into classes again (`described`, `rebuilt`).
 
 import abc
 import asyncio
+import builtins
 import contextlib
 import copy
 import dataclasses
@@ -25,6 +26,7 @@ import inspect
 import json
 import keyword
 import math
+import operator
 import os
 import sys
 import types
@@ -40,12 +42,14 @@ __all__ = [
     "AgentRequestFailed",
     "BudgetExhausted",
     "CompletionRejected",
+    "Facility",
     "Request",
     "RequestCancelled",
     "RequestSettled",
     "SessionClosing",
     "Status",
     "agent",
+    "facility",
 ]
 
 # The longest preview of a value the session's events carry, in characters.
@@ -57,9 +61,11 @@ PREVIEW_MAX = 1024
 # both stay `None`. `_launch(agent, inputs, model, session, facilities)` attaches an agent class
 # instance once its construction has finished, launching its child, and returns what the runtime
 # keeps of the instance: the interpreter's from the calling kernel, or, bound by `outrig._host`, a
-# program's on the host.
+# program's on the host. `_resolve(kind, name)` is what the calling execution's kernel holds for a
+# facility, and raises outside every execution; on the host it stays `None`.
 _call = None
 _launch = None
+_resolve = None
 _submitted_source = None
 
 # How a request whose state is one of these has ended.
@@ -384,9 +390,22 @@ def declared_with_classes(t, where):
     return schema.Schema(node), list(compiler.classes)
 
 
-def one_name_each(classes, names=()):
-    """Raise `TypeError` if two of `classes` share a `__name__`, or one shares a name in `names`:
-    each is bound under its name in a child's namespace, where one name holds one thing."""
+def variable_name(name):
+    """Whether `name` can name a variable one agent gives another's namespace: an input, a
+    parameter's argument, a facility."""
+    return (
+        type(name) is str
+        and name.isidentifier()
+        and not keyword.iskeyword(name)
+        and not name.startswith("__")
+        and name not in RESERVED
+    )
+
+
+def one_name_each(classes, names=(), named="an input"):
+    """Raise `TypeError` if two of `classes` share a `__name__`, or one shares a name in `names`,
+    each what `named` says it is: each is bound under its name in a child's namespace, where one
+    name holds one thing."""
     seen = {name: None for name in names}
     for cls in classes:
         name = cls.__name__
@@ -397,7 +416,7 @@ def one_name_each(classes, names=()):
             if other is None:
                 raise TypeError(
                     f"class {schema._type_qualname(cls)} would be bound in the child under "
-                    f"{name!r}, which an input is named"
+                    f"{name!r}, which {named} is named"
                 )
             raise TypeError(
                 f"classes {schema._type_qualname(other)} and {schema._type_qualname(cls)} would "
@@ -722,6 +741,116 @@ def _digest(fn):
     return hashlib.sha256(source.encode() if type(source) is str else source).hexdigest()
 
 
+# ---------------------------------------------------------------------------- facilities
+
+
+class Facility:
+    """A reference to a facility -- an object an agent is given to act through -- which
+    `outrig.facility(name)` makes for one of the session's bindings, and which an agent's
+    `facilities` mapping holds in place of the binding it was given.
+
+    Every operation on it -- an attribute read, a call, an item access, iteration, `len`,
+    `repr`, a comparison -- is the same operation on what the calling agent's kernel holds for
+    the facility, decided at each use: for a binding, that kernel's own proxy of it. So a child
+    given a reference reaches the binding on its own connections, and its calls are its own.
+    Outside every execution it raises `RuntimeError`, as `outrig.bindings` does. In a program on
+    the host it is data to give an agent, and raises on use.
+    """
+
+    __module__ = "outrig"
+    __slots__ = ("_kind", "_name")
+
+    def __new__(cls, *args, **kwargs):
+        raise TypeError("a facility reference is made by outrig.facility(name)")
+
+    def __repr__(self):
+        try:
+            target = _target(self)
+        except RuntimeError as e:
+            kind, name = _identity(self)
+            return f"<outrig.Facility, {kind} {name!r}, unresolved: {e}>"
+        return repr(target)
+
+    def __enter__(self):
+        target = _target(self)
+        enter = getattr(type(target), "__enter__", None)
+        if enter is None:
+            raise TypeError(f"'{schema._type_qualname(type(target))}' object does not support "
+                            "the context manager protocol")
+        return enter(target)
+
+    def __exit__(self, *exc_info):
+        target = _target(self)
+        return type(target).__exit__(target, *exc_info)
+
+
+def _reference(kind, name):
+    """A reference to the facility of `kind` named `name`."""
+    ref = object.__new__(Facility)
+    object.__setattr__(ref, "_kind", kind)
+    object.__setattr__(ref, "_name", name)
+    return ref
+
+
+def _identity(ref):
+    """`(kind, name)` of `ref`, a `Facility`, read without resolving it."""
+    return object.__getattribute__(ref, "_kind"), object.__getattribute__(ref, "_name")
+
+
+def _target(ref):
+    """What the calling execution's kernel holds for `ref`'s facility."""
+    kind, name = _identity(ref)
+    if _resolve is None:
+        raise RuntimeError(
+            f"a reference to {kind} {name!r} resolves in an agent's kernel, where OutRig runs agent "
+            "code, and this Python is not one: here it is data to give an agent"
+        )
+    return _resolve(kind, name)
+
+
+def _on_target(operation, reflected=False):
+    """A method of `Facility`: `operation` applied to its target and the method's arguments, the
+    target second for a reflected operator and for `isinstance`."""
+
+    def method(self, *args, **kwargs):
+        target = _target(self)
+        if reflected:
+            return operation(args[0], target, *args[1:])
+        return operation(target, *args, **kwargs)
+
+    return method
+
+
+# Every other special method of `Facility`, each the same operation on its target, as
+# `HostedRoot`'s are on its root.
+_BINARY = "add sub mul truediv floordiv mod lshift rshift and or xor".split()
+Facility.__getattribute__ = _on_target(getattr)
+for _name in "setattr delattr iter next len bool hash str format dir int float abs".split():
+    setattr(Facility, f"__{_name}__", _on_target(getattr(builtins, _name)))
+for _name in [
+    *"call getitem setitem delitem contains eq ne lt le gt ge index neg pos invert".split(),
+    *_BINARY,
+    *(f"i{op}" for op in [*_BINARY, "pow"]),
+]:
+    setattr(Facility, f"__{_name}__", _on_target(getattr(operator, f"__{_name}__")))
+for _name in _BINARY:
+    setattr(Facility, f"__r{_name}__", _on_target(getattr(operator, f"__{_name}__"), True))
+Facility.__divmod__, Facility.__rdivmod__ = _on_target(divmod), _on_target(divmod, True)
+Facility.__pow__, Facility.__rpow__ = _on_target(pow), _on_target(pow, True)
+Facility.__instancecheck__ = _on_target(isinstance, True)
+Facility.__length_hint__ = _on_target(operator.length_hint)
+del _BINARY, _name
+
+
+def facility(name):
+    """A reference to the session's binding `name`, to give an agent in its `facilities=` dict:
+    see `help(outrig.Facility)`. Making one asks nothing of the binding, and a name the session
+    has not bound is refused when the agent is constructed."""
+    if type(name) is not str or not name:
+        raise TypeError(f"a binding is named by a non-empty str, not {name!r}")
+    return _reference("binding", name)
+
+
 # ---------------------------------------------------------------------------- agent classes
 
 
@@ -803,8 +932,22 @@ class Agent(metaclass=_Attaching):
     reviewer.ready()` returns once it has ended, and raises what the launch met instead. `await
     reviewer.release()` ends the child and every request still open on it; `async with
     Reviewer() as reviewer:` waits for `ready()` on entry and releases on leaving. An instance
-    collected unreleased is released then. `facilities=` is reserved: any value but `None`
-    raises `NotImplementedError`.
+    collected unreleased is released then.
+
+    `Reviewer(**inputs, facilities={"files": files})` gives the child, beside its data, the
+    objects it acts through, by name: the instance keeps a copy of the dict as
+    `reviewer.facilities`. A name follows an input's rules, and is not `outrig`, `self`, an
+    input's name or a class bound in the child. As the instance is attached, a binding's proxy --
+    the global the session bound it as -- becomes a reference to that binding (see
+    `help(outrig.Facility)`), which resolves in each kernel to that kernel's own proxy, so the
+    child's calls are its own; a proxy of an object a binding returned, a coroutine and a
+    generator are refused, naming the entry; anything else is the object itself, shared, and a
+    call on it is plain Python in the calling agent. The child is told of these and of no other
+    binding: its instructions list them, each is a global under its name where the name is free,
+    `outrig.bindings[name]` reaches each, and `runtime.bindings` lists the mapping as it stands.
+    Without `facilities=`, the child sees what this agent sees: the facilities it was given, or
+    the session's bindings. What any agent can reach is the session's either way: the mapping
+    decides what an agent is told, not what it may do.
 
     A subclass's `__init__` passes the base its keywords with `super().__init__(**inputs,
     model=...)`, which launches nothing; one that does not raises `TypeError` once it returns.
@@ -827,6 +970,7 @@ class Agent(metaclass=_Attaching):
     made into classes again there, and each reply is decoded here, into this program's own.
     Construct it, and leave its `async with`, inside the session's; the session's exit releases
     it. In an agent's kernel, `session=` is refused: the child is in the kernel's own session.
+    `facilities=` is refused on the host, with `NotImplementedError`.
     """
 
     # What the runtime keeps of the instance, once it is attached; and the request channels its
@@ -846,14 +990,30 @@ class Agent(metaclass=_Attaching):
         if model is not None and type(model) is not str:
             raise TypeError(f"model names a configured model, a str, not "
                             f"{schema._type_qualname(type(model))}")
-        if facilities is not None:
-            raise NotImplementedError("facilities= is not supported yet; leave it out")
+        if facilities is not None and type(facilities) is not dict:
+            raise TypeError(f"facilities is a dict of names to facilities, not "
+                            f"{schema._type_qualname(type(facilities))}")
         if _launch is None:
             raise RuntimeError(f"an instance of {name} runs in an agent's kernel, where OutRig "
                                "runs agent code, or in a program `outrig run-new` runs, and this "
                                "Python is neither")
-        # What the metaclass attaches the instance with, once its construction has finished.
-        self._outrig_given = (inputs, model, session, facilities)
+        # The agent's own mapping, a copy, from here on; and what the metaclass attaches the
+        # instance with, once its construction has finished.
+        self._outrig_facilities = None if facilities is None else dict(facilities)
+        self._outrig_given = (inputs, model, session, self._outrig_facilities)
+
+    @property
+    def facilities(self):
+        """This agent's facilities, by name: a copy of the dict its constructor was given as
+        `facilities=`, and the one mapping its child's view follows. Read-only as an attribute;
+        the dict is the agent's to change, and its child reads it as it stands.
+
+        Once the instance is attached, a binding's proxy in it is a reference to that binding
+        (`outrig.Facility`). An agent constructed without `facilities=` by an agent that was given
+        some has a copy of its maker's, taken as it is attached; one constructed where the view is
+        the session's has `None`, and its child sees every binding.
+        """
+        return self.__dict__.get("_outrig_facilities")
 
     def __outrig_attach__(self):
         """The hook a subclass defines to finish what `__init__` cannot, run before the child

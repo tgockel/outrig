@@ -23,7 +23,9 @@
 //! rule about them that looking cannot teach -- a call on one blocks the
 //! agent's event loop until the host answers -- since
 //! `repo.head.commit.hexsha` reads like a plain attribute chain
-//! (`plan/phase/0003-python/discovery.md`).
+//! (`plan/phase/0003-python/discovery.md`). A child given facilities is told
+//! of those in their place, and of no other binding
+//! (`plan/phase/0003-python/facilities.md`).
 //!
 //! So are the session's skills, for the primary agent alone, each by name and
 //! description as the Agent Skills standard lists them, and no more of each:
@@ -38,7 +40,7 @@ use std::time::Duration;
 use super::history::Window;
 use super::instructions::Instructions;
 use crate::harness::bindings::Brief;
-use crate::harness::event::InputBrief;
+use crate::harness::event::{FacilityBrief, FacilityKind, InputBrief};
 use crate::harness::skills::{Catalog, SkillBrief};
 
 /// What every agent is told first: how it acts.
@@ -93,7 +95,7 @@ pub(crate) fn preamble(
     );
     text.push_str(&rest(
         workspace,
-        holdings.bindings,
+        View::Session(holdings.bindings),
         window,
         "each time you are told messages are waiting",
     ));
@@ -124,10 +126,30 @@ const NOT_WAITING: &str = "Ending your round is not waiting: nothing opens a rou
 const NOT_A_WAIT: &str = "A round's end is not a wait: nothing opens a round when what you waited \
                           on finishes.";
 
+/// What an agent is told it acts through besides the interpreter.
+#[derive(Clone, Copy)]
+pub(crate) enum View<'a> {
+    /// The session's bindings, every one.
+    Session(&'a [Brief]),
+    /// The facilities its constructor gave it, or that it inherited from its
+    /// parent, and no other binding.
+    Given(&'a [Given]),
+}
+
+/// One facility a child was given, as its instructions describe it: what its
+/// events say of it, its description -- the operator's for a binding, the
+/// first line of its class's docstring for an object -- and whether a binding
+/// runs one call at a time.
+pub(crate) struct Given {
+    pub(crate) brief: FacilityBrief,
+    pub(crate) description: String,
+    pub(crate) serialize: bool,
+}
+
 /// What every agent is told after how it is reached: its conversation, a
-/// round beginning `begins`, its working directory, the interpreter, and the
-/// session's bindings.
-fn rest(workspace: Option<&Path>, bindings: &[Brief], window: Window, begins: &str) -> String {
+/// round beginning `begins`, its working directory, the interpreter, and what
+/// it acts through.
+fn rest(workspace: Option<&Path>, view: View<'_>, window: Window, begins: &str) -> String {
     let Window { first, recent } = window;
     let mut text = format!(
         "Your whole conversation is in `runtime.history.turns`, a `Turn` for each of your model \
@@ -154,8 +176,10 @@ fn rest(workspace: Option<&Path>, bindings: &[Brief], window: Window, begins: &s
          through `subprocess`. `help(x)` describes anything, and `help(runtime)` describes what \
          OutRig gives you.",
     );
-    if !bindings.is_empty() {
-        text.push_str(&hosted(bindings));
+    match view {
+        View::Session(bindings) if !bindings.is_empty() => text.push_str(&hosted(bindings)),
+        View::Given(given) if !given.is_empty() => text.push_str(&facilities(given)),
+        _ => {}
     }
     text
 }
@@ -192,7 +216,7 @@ pub(crate) struct ChannelText {
 /// a child, and none of the session's own preamble applies to it.
 pub(crate) fn child_preamble(
     workspace: Option<&Path>,
-    bindings: &[Brief],
+    view: View<'_>,
     window: Window,
     prompt: &str,
     inputs: &[InputBrief],
@@ -314,7 +338,7 @@ pub(crate) fn child_preamble(
             }
         }
     };
-    text.push_str(&rest(workspace, bindings, window, begins));
+    text.push_str(&rest(workspace, view, window, begins));
     text
 }
 
@@ -334,7 +358,6 @@ fn indented(schema: &str) -> String {
 /// least one: each by name and description, and how a hosted object is used,
 /// with the first one's name standing in for any of them.
 fn hosted(bindings: &[Brief]) -> String {
-    let example = &bindings[0].name;
     let mut text = String::from(
         "\n\nThese names are objects held by processes on the host, outside this container, \
          with the user's own authority there; use each as its library documents. Importing the \
@@ -352,15 +375,80 @@ fn hosted(bindings: &[Brief]) -> String {
             text.push_str(" Runs one call at a time.");
         }
     }
-    let _ = write!(
-        text,
-        "\n\nEvery attribute read, call, iteration step, `len`, `repr` and comparison on one \
-         is a request to the host, and it blocks your event loop until the host answers: no \
-         message arrives and no timer fires meanwhile. For a long call, `await \
+    text.push_str("\n\n");
+    text.push_str(&blocking(&bindings[0].name));
+    text.push_str(
+        " `runtime.bindings` lists them, and `outrig.bindings[name]` reaches each wherever its \
+         name holds something else: a binding never replaces a name your code bound before it \
+         came, nor a builtin.",
+    );
+    text
+}
+
+/// The rule about a hosted object that looking cannot teach, with `example`
+/// standing in for any of them.
+fn blocking(example: &str) -> String {
+    format!(
+        "Every attribute read, call, iteration step, `len`, `repr` and comparison on one is a \
+         request to the host, and it blocks your event loop until the host answers: no message \
+         arrives and no timer fires meanwhile. For a long call, `await \
          asyncio.to_thread(lambda: {example}.f(x))` runs the whole expression on a worker thread \
-         and keeps the loop turning. `runtime.bindings` lists them, and `outrig.bindings[name]` \
-         reaches each wherever its name holds something else: a binding never replaces a name \
-         your code bound before it came, nor a builtin."
+         and keeps the loop turning."
+    )
+}
+
+/// What a child given facilities is told of them, of which there is at least
+/// one: each by name, kind and description; how a binding among them is
+/// used; and that its mapping is read as it stands while its globals and this
+/// text were made once.
+fn facilities(given: &[Given]) -> String {
+    let mut text = String::from("\n\nYou were given these to act through, by name:\n");
+    for facility in given {
+        let (brief, description) = (&facility.brief, facility.description.trim());
+        match brief.kind {
+            FacilityKind::Binding => {
+                let _ = write!(
+                    text,
+                    "\n- `{}`, a binding the host holds: {description}",
+                    brief.name
+                );
+                if facility.serialize {
+                    text.push_str(" Runs one call at a time.");
+                }
+            }
+            _ => {
+                let _ = write!(
+                    text,
+                    "\n- `{}`, a `{}` in this interpreter",
+                    brief.name, brief.type_name
+                );
+                if !description.is_empty() {
+                    let _ = write!(text, ": {description}");
+                }
+            }
+        }
+    }
+    text.push_str("\n\n");
+    if let Some(binding) = given.iter().find(|f| f.brief.kind == FacilityKind::Binding) {
+        text.push_str(
+            "A binding is an object held by a process on the host, outside this container, with \
+             the user's own authority there; use it as its library documents. ",
+        );
+        text.push_str(&blocking(&binding.brief.name));
+        text.push(' ');
+    }
+    if given.iter().any(|f| f.brief.kind == FacilityKind::Object) {
+        text.push_str(
+            "An object is plain Python, shared with the agent that gave it to you, and a call on \
+             it runs here. ",
+        );
+    }
+    text.push_str(
+        "Each is a global of its name unless your code bound that name first, and \
+         `outrig.bindings[name]` reaches each wherever its name holds something else. \
+         `runtime.bindings` lists your facilities as they stand: one given after you began is \
+         reached as `outrig.bindings[name]`, never as a global. `outrig.bindings` reaches no \
+         other.",
     );
     text
 }
@@ -584,12 +672,89 @@ mod tests {
     fn preamble(brief: &ChildBrief<'_>, inputs: &[InputBrief]) -> String {
         child_preamble(
             None,
-            &[],
+            View::Session(&[]),
             Window::DEFAULT,
             "Name the capital.",
             inputs,
             brief,
         )
+    }
+
+    fn given(name: &str, kind: FacilityKind, type_name: &str, description: &str) -> Given {
+        Given {
+            brief: FacilityBrief {
+                name: name.into(),
+                kind,
+                target: None,
+                type_name: type_name.into(),
+            },
+            description: description.into(),
+            serialize: false,
+        }
+    }
+
+    /// A child given facilities is told of each by the name it was given under, with its
+    /// kind and description, and of no session binding; the blocking rule comes with a binding
+    /// among them, and with none it is not said. An empty mapping says nothing.
+    #[test]
+    fn a_child_given_facilities_is_told_of_them_and_no_other_binding() {
+        fn told(view: View<'_>) -> String {
+            child_preamble(
+                None,
+                view,
+                Window::DEFAULT,
+                "Review.",
+                &[],
+                &ChildBrief::Work,
+            )
+        }
+        let mut files = given(
+            "files",
+            FacilityKind::Binding,
+            "git.Repo",
+            "The repository.",
+        );
+        files.serialize = true;
+        let task = given(
+            "task",
+            FacilityKind::Object,
+            "app.Task",
+            "The task at hand.",
+        );
+        let text = told(View::Given(&[files, task]));
+        for said in [
+            "- `files`, a binding the host holds: The repository. Runs one call at a time.",
+            "- `task`, a `app.Task` in this interpreter: The task at hand.",
+            "`await asyncio.to_thread(lambda: files.f(x))`",
+            "An object is plain Python",
+            "one given after you began is reached as `outrig.bindings[name]`, never as a global",
+        ] {
+            assert!(text.contains(said), "{said}: {text}");
+        }
+        assert!(!text.contains("`repo`"), "{text}");
+
+        let text = told(View::Given(&[given(
+            "task",
+            FacilityKind::Object,
+            "app.Task",
+            "",
+        )]));
+        assert!(
+            text.contains("- `task`, a `app.Task` in this interpreter\n"),
+            "{text}"
+        );
+        assert!(!text.contains("blocks your event loop"), "{text}");
+
+        let none = told(View::Given(&[]));
+        assert!(!none.contains("act through"), "{none}");
+        let session = [Brief {
+            name: "repo".into(),
+            description: "The repository.".into(),
+            type_name: "git.Repo".into(),
+            serialize: true,
+        }];
+        let session = told(View::Session(&session));
+        assert!(session.contains("- `repo`: The repository."), "{session}");
     }
 
     #[test]

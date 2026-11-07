@@ -625,6 +625,10 @@ pub enum Payload {
         depth: u32,
         /// Its inputs, bound as variables before its first round.
         inputs: Vec<InputBrief>,
+        /// What it was given to act through, the view it is told of: its
+        /// constructor's facilities, or its parent's it inherited; `None` when
+        /// its view is the session's, every binding.
+        facilities: Option<Vec<FacilityBrief>>,
         /// The channels a request child answers requests on.
         channels: Vec<ChannelBrief>,
     },
@@ -816,6 +820,8 @@ pub enum Payload {
         digest: Option<String>,
         /// The child's inputs, bound as variables before its first round.
         inputs: Vec<InputBrief>,
+        /// The child's facilities, as `agent.spawned` carries them.
+        facilities: Option<Vec<FacilityBrief>>,
         /// The child's request channels, one per request method.
         channels: Vec<ChannelBrief>,
     },
@@ -1909,6 +1915,39 @@ pub struct InputBrief {
     pub type_name: String,
     /// A preview of its JSON form, cut to 1,024 characters.
     pub preview: String,
+}
+
+/// What a facility an agent was given is: one of the session's bindings, or a
+/// plain Python object of the interpreter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum FacilityKind {
+    /// One of the session's bindings, factory or live, which each agent's
+    /// kernel reaches over its own connections.
+    Binding,
+    /// A plain Python object, shared by the agents given it; a call on it
+    /// crosses no boundary and is not evented.
+    Object,
+}
+
+/// One facility a child was given, by the name it sees it under: its kind,
+/// the bound name it reaches -- `None` for a plain object -- and the qualified
+/// name of its type.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct FacilityBrief {
+    /// The name the child sees it under, a key of the mapping.
+    pub name: String,
+    /// What it is.
+    pub kind: FacilityKind,
+    /// The binding's name, which can differ from `name`; `None` for a plain
+    /// object.
+    pub target: Option<String>,
+    /// The qualified name of its type: the binding's object's on the host,
+    /// or the plain object's.
+    #[serde(rename = "type")]
+    pub type_name: String,
 }
 
 /// One skill the session serves, as discovery found it: its name, the source

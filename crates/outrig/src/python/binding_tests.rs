@@ -3971,7 +3971,7 @@ fn a_hosted_object_is_refused_as_a_childs_input() {
     );
     assert!(
         out.contains("repo is an object a binding holds on the host")
-            && out.contains("reaches the session's bindings itself"),
+            && out.contains("takes the binding in its constructor's facilities= dict"),
         "{out}"
     );
 }
@@ -4747,6 +4747,40 @@ fn closing_the_pool_ends_both_calls_unknown() {
             .then_some(())
         },
         || "the two calls to finish on the host".to_string(),
+    );
+}
+
+/// A kernel released between a thread's call for a binding's pool and that thread taking the
+/// pools' lock -- on its first use of the binding, as a narrowed child's is -- makes no pool: the
+/// thread's call raises, and nothing is left for the release to have missed. The lock is wrapped
+/// to end the kernel just before it is taken.
+#[test]
+fn a_kernel_released_as_a_pool_is_made_makes_none() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    relay.open("c");
+    let probe = r#"
+        import __main__
+        K = __main__._kernels['c']
+        lock = K._hosted_lock
+        class Ending:
+            def __enter__(self):
+                K._hosted_lock = lock
+                K.end()
+                return lock.__enter__()
+            def __exit__(self, *exc):
+                return lock.__exit__(*exc)
+        K._hosted_lock = Ending()
+        try:
+            K._pool('fx')
+        except RuntimeError as e:
+            print(e)
+        print(K._hosted)
+    "#;
+    assert_eq!(
+        relay.output(2, &py(probe)),
+        "agent 'c' was released, and its connections to the session's bindings closed with it\n\
+         {}\n"
     );
 }
 

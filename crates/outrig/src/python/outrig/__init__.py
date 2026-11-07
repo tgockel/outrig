@@ -6,6 +6,8 @@ see `help(outrig.schema)`.
 In an agent's kernel, `outrig.runtime` is the runtime of the execution reading it -- what the
 `runtime` global is, reachable from a module's code too -- and `outrig.bindings[name]` is that
 execution's own proxy of a binding, whatever the kernel's globals now hold under its name.
+`outrig.facility(name)` is a reference to the binding `name` that resolves the same way wherever
+it is used, which is how one agent gives another a binding: see `help(outrig.Facility)`.
 
 In a program `outrig run-new <script.py>` runs on the host, `outrig.config()` is a read-only view of
 the configuration it loaded, and `outrig.Session` enters a session the engine starts for it: see
@@ -33,12 +35,14 @@ from ._agents import (
     AgentRequestFailed,
     BudgetExhausted,
     CompletionRejected,
+    Facility,
     Request,
     RequestCancelled,
     RequestSettled,
     SessionClosing,
     Status,
     agent,
+    facility,
 )
 
 __all__ = [
@@ -51,12 +55,14 @@ __all__ = [
     "AgentRequestFailed",
     "BudgetExhausted",
     "CompletionRejected",
+    "Facility",
     "Request",
     "RequestCancelled",
     "RequestSettled",
     "SessionClosing",
     "Status",
     "agent",
+    "facility",
 ]
 
 # What only a kernel has. `outrig._kernel` binds each as the interpreter starts; anywhere else,

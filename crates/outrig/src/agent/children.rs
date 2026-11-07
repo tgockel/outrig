@@ -41,7 +41,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use super::channel::{Announcer, Injected};
 use super::history::Window;
 use super::ledger::{CallSlot, Ledger};
-use super::orientation::{self, ChannelText, ChildBrief};
+use super::orientation::{self, ChannelText, ChildBrief, Given, View};
 use super::resolve::{self, LlmResolveError};
 use super::round::Quiet;
 use super::window::Windows;
@@ -50,8 +50,9 @@ use crate::config::{Config, Limits, Secrets};
 use crate::events::Events;
 use crate::harness::bindings::Brief;
 use crate::harness::event::{
-    AgentInstanceId, AgentRequestId, ChannelBrief, ChildKind, InputBrief, InstanceRelease,
-    InvocationEnd, InvocationId, ParamsBy, Payload, RequestEnd, Subject, Usage,
+    AgentInstanceId, AgentRequestId, ChannelBrief, ChildKind, FacilityBrief, FacilityKind,
+    InputBrief, InstanceRelease, InvocationEnd, InvocationId, ParamsBy, Payload, RequestEnd,
+    Subject, Usage,
 };
 use crate::harness::lifecycle::Lifecycle;
 use crate::harness::{ClosedBy, RequestOutcome};
@@ -772,6 +773,12 @@ impl Inner {
         // (0003-30's fork 1): what a child needs, its parent's prompt says.
         resolved.preamble = None;
         let inputs = briefs(&line["manifest"]);
+        // The facilities it was given, and of each what its instructions say; none for a child
+        // whose view is the session's.
+        let mut given = given(&line["facilities"]);
+        let facilities: Option<Vec<FacilityBrief>> = given
+            .as_ref()
+            .map(|given| given.iter().map(|given| given.brief.clone()).collect());
         let channels: Vec<ChannelText> = line["channels"]
             .as_array()
             .into_iter()
@@ -821,6 +828,7 @@ impl Inner {
             model: model.to_string(),
             depth,
             inputs: inputs.clone(),
+            facilities: facilities.clone(),
             channels: briefed.clone(),
         });
         // An agent class instance's child, which has a round of its own as it launches: a root
@@ -838,6 +846,7 @@ impl Inner {
             _ => ChildBrief::Work,
         };
         // Made first, so an object injected meanwhile is announced, if also in the orientation.
+        // A child given facilities is told of none: what is injected later is not among them.
         let announcer = Announcer::of_requests(
             {
                 let weak = Arc::downgrade(self);
@@ -848,12 +857,25 @@ impl Inner {
                         .unwrap_or_default()
                 })
             },
-            self.injected.clone(),
+            if given.is_some() {
+                Injected::default()
+            } else {
+                self.injected.clone()
+            },
         );
         let bindings = [settings.bindings.clone(), self.injected.briefs()].concat();
+        for facility in given.iter_mut().flatten() {
+            facility.serialize =
+                facility.brief.target.as_ref().is_some_and(|target| {
+                    bindings.iter().any(|b| &b.name == target && b.serialize)
+                });
+        }
+        let view = given
+            .as_deref()
+            .map_or(View::Session(&bindings), View::Given);
         let preamble = orientation::child_preamble(
             settings.workspace.as_deref(),
-            &bindings,
+            view,
             Window::DEFAULT,
             line["prompt"].as_str().unwrap_or_default(),
             &inputs,
@@ -919,6 +941,7 @@ impl Inner {
                         qualname: text(&line["instance"]["qualname"]),
                         digest: line["instance"]["digest"].as_str().map(str::to_string),
                         inputs,
+                        facilities,
                         channels: briefed,
                     });
                 }
@@ -1826,6 +1849,35 @@ fn briefs(manifest: &Value) -> Vec<InputBrief> {
             preview: text(&input["preview"]),
         })
         .collect()
+}
+
+/// The facilities a spawn said its child was given, each with the description
+/// its instructions carry, and none yet serialized; `None` when its view is the
+/// session's.
+fn given(facilities: &Value) -> Option<Vec<Given>> {
+    let facilities = facilities.as_array()?;
+    Some(
+        facilities
+            .iter()
+            .map(|facility| {
+                let brief = FacilityBrief {
+                    name: text(&facility["name"]),
+                    kind: if facility["kind"] == "binding" {
+                        FacilityKind::Binding
+                    } else {
+                        FacilityKind::Object
+                    },
+                    target: facility["target"].as_str().map(str::to_string),
+                    type_name: text(&facility["type"]),
+                };
+                Given {
+                    brief,
+                    description: text(&facility["description"]),
+                    serialize: false,
+                }
+            })
+            .collect(),
+    )
 }
 
 fn text(value: &Value) -> String {

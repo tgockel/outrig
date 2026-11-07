@@ -23,7 +23,7 @@ use crate::harness::event::{Event, RequestEnd};
 use crate::python::testing::{Flag, py};
 
 /// Whether `request` is the first call of an instance's launch round.
-fn launching(request: &RecordedRequest) -> bool {
+pub(super) fn launching(request: &RecordedRequest) -> bool {
     opening(request).contains("you have just been launched")
 }
 
@@ -48,7 +48,7 @@ fn past_launch<'a>(requests: &'a [RecordedRequest], marker: &str) -> Vec<&'a Rec
 }
 
 /// The subject an event belongs to, or `""` for the session's own.
-fn subject(event: &Event) -> &str {
+pub(super) fn subject(event: &Event) -> &str {
     event
         .subject
         .as_ref()

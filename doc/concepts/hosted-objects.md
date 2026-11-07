@@ -36,6 +36,11 @@ agent's code bound, an input of the same name, and a builtin such as `print` kee
 which has no such global, reaches one. `runtime.bindings` lists each binding's name, description
 and host-side type, from what the session said when it started, so reading it sends no request.
 
+An agent class given [facilities](python-runtime.md#facilities) sees those instead: each under
+the name its dict gave it, a binding as that kernel's own proxy, and no other binding, by
+`runtime.bindings`, its globals or `outrig.bindings`. So do the children it makes without a dict
+of their own. Every kernel can still reach every binding; the dict decides what an agent is told.
+
 The agent is told each binding's name and description in its instructions, and a live object by
 its type's qualified name and the first line of its class's docstring. An agent already running
 when a live object is injected is told of it in its next tool result. Describing an object runs

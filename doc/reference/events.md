@@ -472,8 +472,12 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
   spawn called it; `parent`, the subject of the agent that launched it, or `owner` for the
   program's; `kind`, `work` or `request`; `model`, the `[models.<name>]` row as the spawn named
   it, or as its parent runs -- `default-model` for the program's; `depth`, the main agent's and
-  the program's children's being 1; `inputs`, each `{name, type, preview}`; and `channels`, a
-  request child's, each `{name, request, reply}`, its types as text.
+  the program's children's being 1; `inputs`, each `{name, type, preview}`; `facilities`, what
+  it was given to act through as the spawn found it, each `{name, kind, target, type}` --
+  `kind` `binding` or `object`, `target` the binding's own name or `null` for an object, `type`
+  the qualified name of the object's type -- or `null` when it sees the session's bindings; and
+  `channels`, a request child's, each `{name, request, reply}`, its types as text. A change to
+  an agent's facilities after its launch is not evented: nothing crosses when a dict changes.
 - `agent.request.sent` -- a request was made of the subject, a child: `request`; `channel`, or
   `null` for a submission; `sender`, the subject of the agent that made it, or `owner` for the
   program's; `body`, a preview of what was sent, a submission's inputs by name; and
@@ -523,8 +527,9 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
   `digest`, a SHA-256 of the source that declared the class -- its module's file, or the
   submission's source for a class declared in one, read through a function its body defines -- or
   `null` when none could be read, as for a class a submission declared with no function in its body;
-  `inputs`, each `{name, type, preview}`; and `channels`, one per request method, each
-  `{name, request, reply}`. An instance whose launch was refused, by a limit say, has no child and
+  `inputs`, each `{name, type, preview}`; `facilities`, as `agent.spawned` carries them; and
+  `channels`, one per request method, each `{name, request, reply}`. An instance whose launch was
+  refused, by a limit say, has no child and
   records none of these events; its `ready()` and its requests raise the refusal. Nor does one
   whose construction raised -- its class's `__init__` or `__outrig_attach__`, which run before the
   launch -- whose exception is the constructor call's, in its execution's traceback.

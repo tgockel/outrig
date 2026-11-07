@@ -5249,7 +5249,12 @@ impl Interpreter {
     /// Run `spawn` in the primary -- code that awaits `runtime.spawn` -- and answer it as the
     /// host does, by opening its kernel as `child`. Returns the spawn as the host was asked it.
     fn spawn_as(&mut self, id: u64, spawn: &str, child: &str) -> Value {
-        self.send(json!({"t": "exec", "agent": PRIMARY, "id": id, "src": spawn}));
+        self.spawn_from(PRIMARY, id, spawn, child)
+    }
+
+    /// [`Interpreter::spawn_as`], the spawn run in `parent`.
+    fn spawn_from(&mut self, parent: &str, id: u64, spawn: &str, child: &str) -> Value {
+        self.send(json!({"t": "exec", "agent": parent, "id": id, "src": spawn}));
         let asked = self.recv();
         assert_eq!(asked["t"], "agent.spawn", "{asked}");
         self.opened(json!({
@@ -5257,7 +5262,7 @@ impl Interpreter {
             "child": {"kind": asked["kind"], "spawn": asked["id"], "requests_max": 4},
         }));
         self.send(json!({
-            "t": "spawned", "agent": PRIMARY, "id": asked["id"], "child": child, "requests_max": 4,
+            "t": "spawned", "agent": parent, "id": asked["id"], "child": child, "requests_max": 4,
         }));
         let result = self.recv();
         assert!(
@@ -7323,7 +7328,7 @@ fn ready_raises_what_the_host_says_and_the_close_ends_a_launching_instance() {
 /// raises `TypeError` at the call, before its `__init__` runs; one that implements it constructs;
 /// a class whose metaclass is unrelated cannot be mixed in; and a request channel may still take
 /// a name `abc.ABCMeta` gives a class, such as `register`. `facilities=` is in the constructor's
-/// signature and refused for now, and `help(outrig.Agent)` says the construction's sequence.
+/// signature and takes a dict, and `help(outrig.Agent)` says the construction's sequence.
 /// What is refused asks the host nothing.
 #[test]
 fn an_agent_class_is_constructed_then_attached() {
@@ -7364,9 +7369,9 @@ fn an_agent_class_is_constructed_then_attached() {
                 def prepare(self):
                     pass
             try:
-                Done(facilities={})
-            except NotImplementedError as e:
-                print('facilities:', 'facilities=' in str(e))
+                Done(facilities=[])
+            except TypeError as e:
+                print('facilities:', 'a dict' in str(e))
             print('facilities' in inspect.signature(outrig.Agent.__init__).parameters)
             told = pydoc.render_doc(outrig.Agent, renderer=pydoc.plaintext)
             print(all(part in told for part in ('`__init__` to its end', '__outrig_attach__',
@@ -7760,4 +7765,247 @@ fn a_forked_process_cannot_fetch_a_skill() {
             "#),
     );
     assert_eq!(out, "source-error\n");
+}
+
+// ---------------------------------------------------------------------------- facilities
+
+/// What the facilities tests give an agent: a task, plain Python, whose counter shows a call on it
+/// ran where it was made, and whose `repr` would leave a file behind; and an open socket.
+const GIVEN: &str = r#"
+import os, socket, tempfile
+import outrig, __main__
+class Task:
+    """The task at hand.
+
+    More than its first line."""
+    def __init__(self):
+        self.updates = []
+        self.path = os.path.join(tempfile.mkdtemp(), 'repr')
+    def update_progress(self, text):
+        self.updates.append(text)
+        return len(self.updates)
+    def __repr__(self):
+        open(self.path, 'w').close()
+        return 'Task()'
+task = Task()
+sock = socket.socket()
+"#;
+
+/// What cannot be a facility is refused as the instance is attached, naming its key, and nothing
+/// launches: a generator, a coroutine, a key a child's variable cannot take -- `runtime`, `self`,
+/// `outrig` -- and one an input or a class bound in the child already takes. The mapping is a
+/// read-only attribute `help()` names, and a request method cannot take its name.
+#[test]
+fn what_cannot_be_a_facility_is_refused_naming_its_key() {
+    let mut k = Interpreter::start();
+    k.output(1, &py(FOO_AGENT));
+    k.output(2, &py(GIVEN));
+    let (said, notices) = k.noted(
+        PRIMARY,
+        3,
+        &py(r#"
+            import pydoc
+            async def co():
+                pass
+            coroutine = co()
+            for given, inputs in [
+                ({'gen': (x for x in ())}, {}),
+                ({'co': coroutine}, {}),
+                ({'runtime': 1}, {}),
+                ({'self': 1}, {}),
+                ({'outrig': 1}, {}),
+                ({'n': 1}, {'n': 2}),
+                ({'Thing': 1}, {}),
+            ]:
+                try:
+                    FooAgent(facilities=given, **inputs)
+                except (TypeError, ValueError) as e:
+                    print(type(e).__name__, repr(next(iter(given))) in str(e))
+            coroutine.close()
+            try:
+                class Named(outrig.Agent):
+                    "doc"
+                    @outrig.agent
+                    async def facilities(self) -> int:
+                        "a channel named like the mapping"
+            except TypeError as e:
+                print('a member of outrig.Agent' in str(e))
+            try:
+                FooAgent.facilities.fset
+                print(FooAgent.facilities.fset)
+            except AttributeError as e:
+                print(e)
+            told = pydoc.render_doc(FooAgent, renderer=pydoc.plaintext)
+            print('facilities' in told and 'outrig.Facility' in told)
+            "#),
+    );
+    assert_eq!(
+        said,
+        "TypeError True\nTypeError True\nValueError True\nValueError True\nValueError True\n\
+         ValueError True\nTypeError True\nTrue\nNone\nTrue\n"
+    );
+    assert!(notices.is_empty(), "nothing launched: {notices:?}");
+}
+
+/// A child given plain objects sees them and nothing else: each is the object itself, bound as
+/// a global and reached through `outrig.bindings`, listed by `runtime.bindings` with its type and
+/// its class's docstring's first line, read without running the object's `repr`; a call on it is
+/// plain Python, which crosses nothing. The spawn names each, and `help(runtime)` says the view is
+/// the mapping. A dict-less instance where the view is the session's has none, and a child given
+/// an empty mapping sees nothing.
+#[test]
+fn a_child_given_objects_sees_them_and_nothing_else() {
+    let mut k = Interpreter::start();
+    k.output(1, &py(FOO_AGENT));
+    k.output(2, &py(GIVEN));
+    let (_, notices) = k.noted(
+        PRIMARY,
+        3,
+        "r = FooAgent(facilities={'task': task, 'sock': sock})",
+    );
+    let (_, asked) = k.until("agent.spawn", notices);
+    let given = asked["facilities"].as_array().expect("a manifest");
+    assert_eq!(given.len(), 2, "{given:?}");
+    assert_eq!(
+        (&given[0]["name"], &given[0]["kind"], &given[0]["target"]),
+        (&json!("task"), &json!("object"), &Value::Null)
+    );
+    assert!(
+        given[0]["type"]
+            .as_str()
+            .is_some_and(|t| t.ends_with(".Task")),
+        "{given:?}"
+    );
+    assert_eq!(given[0]["description"], "The task at hand.");
+    assert_eq!(
+        (&given[1]["name"], &given[1]["kind"], &given[1]["type"]),
+        (&json!("sock"), &json!("object"), &json!("socket.socket"))
+    );
+    k.instance_launched(&asked, "c1");
+    // Nothing comes before each result: a call on the task crossed nothing.
+    let said = k.output_in(
+        "c1",
+        4,
+        &py(r#"
+            import __main__, outrig, pydoc
+            mine = runtime._kernel.facilities
+            print(task is mine['task'], outrig.bindings['task'] is task, list(outrig.bindings))
+            print(task.update_progress('x'), task.updates)
+            print([(b.name, b.kind, b.type.rpartition('.')[2], b.description)
+                   for b in runtime.bindings.values()])
+            try:
+                outrig.bindings['other']
+            except KeyError as e:
+                print('KeyError', e)
+            told = pydoc.render_doc(runtime, renderer=pydoc.plaintext)
+            print('the facilities you were given' in told, '[help cut at' in told)
+            "#),
+    );
+    assert_eq!(
+        said,
+        "True True ['task', 'sock']\n1 ['x']\n\
+         [('task', 'object', 'Task', 'The task at hand.'), \
+         ('sock', 'object', 'socket', 'A subclass of _socket.socket adding the makefile() method.')]\n\
+         KeyError 'other'\nTrue False\n"
+    );
+    let said = k.output(
+        5,
+        &py(r#"
+            import __main__, pydoc
+            print(r.facilities['task'] is task, r.facilities is __main__._kernels['c1'].facilities)
+            print(runtime._kernel.facilities, dict(runtime.bindings), task.updates)
+            told = pydoc.render_doc(runtime, renderer=pydoc.plaintext)
+            print('the facilities you were given' in told)
+            print(os.path.exists(task.path))
+            "#),
+    );
+    assert_eq!(said, "True True\nNone {} ['x']\nFalse\nFalse\n");
+
+    let (_, notices) = k.noted(
+        PRIMARY,
+        6,
+        "plain = FooAgent()\nempty = FooAgent(facilities={})",
+    );
+    let (rest, plain) = k.until("agent.spawn", notices);
+    assert!(plain["facilities"].is_null(), "the session's view: {plain}");
+    let (_, empty) = k.until("agent.spawn", rest);
+    assert_eq!(empty["facilities"], json!([]), "{empty}");
+    k.instance_launched(&empty, "c2");
+    assert_eq!(
+        k.output_in(
+            "c2",
+            7,
+            "import outrig\nprint(list(outrig.bindings), dict(runtime.bindings), 'task' in globals())"
+        ),
+        "[] {} False\n"
+    );
+}
+
+/// The mapping is the agent's to change, and read as it stands: an entry added is listed at the
+/// next read and reached through `outrig.bindings`, but is no global, and one that cannot be a
+/// facility raises at the read, naming it. A child made without a mapping -- by `runtime.spawn`,
+/// or an instance constructed with no `facilities=` -- gets a copy of its maker's, which changes
+/// apart from it.
+#[test]
+fn a_mapping_is_read_as_it_stands_and_a_dictless_child_inherits_it() {
+    let mut k = Interpreter::start();
+    k.output(1, &py(FOO_AGENT));
+    k.output(2, &py(GIVEN));
+    let (_, notices) = k.noted(PRIMARY, 3, "r = FooAgent(facilities={'task': task})");
+    let (_, asked) = k.until("agent.spawn", notices);
+    k.instance_launched(&asked, "c1");
+    let said = k.output_in(
+        "c1",
+        4,
+        &py(r#"
+            import outrig
+            mine = runtime._kernel.facilities
+            mine['extra'] = 5
+            print(list(runtime.bindings), outrig.bindings['extra'], 'extra' in globals())
+            async def co():
+                pass
+            mine['co'] = coroutine = co()
+            try:
+                runtime.bindings
+            except TypeError as e:
+                print("'co'" in str(e))
+            del mine['co']
+            coroutine.close()
+            "#),
+    );
+    assert_eq!(said, "['task', 'extra'] 5 False\nTrue\n");
+
+    let asked = k.spawn_from("c1", 5, "g = await runtime.spawn('g', prompt='p')", "g");
+    let names: Vec<&Value> = asked["facilities"]
+        .as_array()
+        .expect("a manifest")
+        .iter()
+        .map(|f| &f["name"])
+        .collect();
+    assert_eq!(names, [&json!("task"), &json!("extra")]);
+    let said = k.output_in(
+        "g",
+        6,
+        &py(r#"
+            import __main__, outrig
+            parents = __main__._kernels['c1'].facilities
+            print(task is parents['task'], list(outrig.bindings), extra)
+            runtime._kernel.facilities['more'] = 1
+            print('more' in parents, runtime._kernel.facilities is parents)
+            "#),
+    );
+    assert_eq!(said, "True ['task', 'extra'] 5\nFalse False\n");
+
+    k.output_in("c1", 7, &py(FOO_AGENT));
+    let (_, notices) = k.noted("c1", 8, "h = FooAgent()");
+    let (_, asked) = k.until("agent.spawn", notices);
+    assert_eq!(asked["facilities"][0]["name"], "task", "{asked}");
+    assert_eq!(
+        k.output_in(
+            "c1",
+            9,
+            "print(list(h.facilities), h.facilities is runtime._kernel.facilities)"
+        ),
+        "['task', 'extra'] False\n"
+    );
 }

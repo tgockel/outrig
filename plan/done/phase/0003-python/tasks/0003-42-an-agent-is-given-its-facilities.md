@@ -53,17 +53,19 @@ child opens its own connections and is attributed its own calls.
 ## Deliverables
 
 - **The facility reference.** A value with a `kind` and a `name` that resolves, at each attribute
-  read, call, item access, iteration, `len`, `repr` and comparison, to what the calling
-  execution's kernel holds for that facility, through `_kernel.py`'s `_calling`; outside every
-  execution it raises `RuntimeError` as `outrig.bindings` does. Kinds register a resolver and a
-  brief; this task registers `binding`, resolving to `Kernel.stub(name)` for a factory or live
-  binding, and `object`, which is the object itself and needs none. `outrig.facility(name)` makes
-  a `binding` reference (fork 1); the class is exposed for `isinstance`, with `kind` and `name`.
-  On the host (`0003-35`'s program; `0003-46`'s owner) the same call makes a reference that is
-  data to send and raises on use. The kinds registered later use the same registry: `service`
-  (`services.md`, `0003-44`), of which the MCP presenter is one, and `channel`
-  (`external-channels.md`, `0003-51`), which OR-CH1's "Channel discovery follows supplied
-  facilities" makes a dict entry.
+  read, call, item access, iteration, `len`, `repr` and comparison, to what the calling execution's
+  kernel holds for that facility, through `_kernel.py`'s `_calling`; outside every execution it
+  raises `RuntimeError` as `outrig.bindings` does. Kinds register a resolver and a brief; this task
+  registers `binding`, resolving to `Kernel.stub(name)` for a factory or live binding, and `object`,
+  which is the object itself and needs none. `outrig.facility(name)` makes a `binding` reference
+  (fork 1); the class is exposed for `isinstance`. Its kind and name are held privately, not as
+  attributes: every attribute read forwards, so a facility's own `name` or `kind` is never hidden
+  (decided in planning). On the host (`0003-35`'s program; `0003-46`'s owner) the same call makes a
+  reference that is data to send and raises on use; a host program's `facilities=` stays refused
+  with `NotImplementedError` until `0003-46` builds construction from the host (decided in
+  planning). The kinds registered later use the same registry: `service` (`services.md`, `0003-44`),
+  of which the MCP presenter is one, and `channel` (`external-channels.md`, `0003-51`), which
+  OR-CH1's "Channel discovery follows supplied facilities" makes a dict entry.
 - **The dict.** `Agent.__init__(..., facilities=None)` shallow-copies the dict at once into the
   canonical mapping, exposed from then on as a read-only property on the instance (fork 2;
   `facilities` recommended), whose name joins those a request channel cannot take. Keys follow
@@ -162,9 +164,9 @@ Each is a mock-driven test.
 ## Design forks
 
 1. **The reference's spelling -- Recommended: `outrig.facility(name)` returning an
-   `outrig.Facility` with `kind` and `name`.** Alternatives: `outrig.bindings.ref(name)`, which
-   ties the spelling to one kind; `outrig.Facility("binding", name)`, which makes the application
-   name a kind it has no other reason to know.
+   `outrig.Facility`**, with no public `kind` or `name` (revised in planning). Alternatives:
+   `outrig.bindings.ref(name)`, which ties the spelling to one kind; `outrig.Facility("binding",
+   name)`, which makes the application name a kind it has no other reason to know.
 2. **The mapping's attribute -- Recommended: `facilities`, a read-only property to the canonical
    dict.** Alternatives: `_facilities`, hidden from `help()` but still the one mapping;
    `capabilities`, the application's word, which an application can alias with a property of its
@@ -209,3 +211,105 @@ Each is a mock-driven test.
 - `crates/outrig/src/python/outrig/_interpreter.py` (`_inputs`, `_hosted_name`, `_Instance`,
   `Kernel`, `_bindings`, `_open`), `crates/outrig/src/python/outrig/_kernel.py`,
   `crates/outrig/src/agent/orientation.rs` (`child_preamble`, `hosted`).
+
+## Decisions
+
+- **The reversal.** `typed-agents.md`'s "A child has the same bindings ... giving co-hosted agents
+  different grants would be presentation only, so none is offered", its "A hosted object is not
+  in the subset, so it cannot be an input. It does not need to be one: a child has the session's
+  bindings already", and `agent-classes.md`'s constructor that refuses "a hosted reference" with
+  nothing launched no longer hold for an agent constructed with `facilities=`. The rationale
+  inverts: a child should not see every binding, so it does need the ones it should see given to
+  it, as references. A data input is still data, and `_hosted_name` now points a hosted object
+  given as one at `facilities=`. `security.md`'s reasoning stands whole: every kernel can still
+  reach every binding, and the view is presentation. `SECURITY.md`'s "Known boundaries" entry
+  says so rather than "every agent is given every binding".
+- **Fork 1, revised in planning: `outrig.facility(name)` returns an `outrig.Facility` with no
+  public `kind` or `name`.** The task text gave the reference both as attributes while also
+  forwarding every attribute read, so a facility's own `.name` would have been unreachable
+  through it. Nothing outside OutRig needs to ask a reference what it points at, and
+  `runtime.bindings` and the events already say; the pair is held in slots, read through
+  `_agents._identity`. `Facility()` raises `TypeError` naming `outrig.facility`. Its special
+  methods forward as `HostedRoot`'s do, by a copy of that loop: sharing one installer would move
+  `HostedRoot`'s methods out of the interpreter's globals, where `_hosted_frame` recognizes them
+  as machinery for tracebacks and interrupts
+  (`plan/next/a-facility-references-frames-are-machinery.md`).
+  `repr` of one that cannot resolve -- on the host, outside every execution -- returns a
+  description with the reason instead of raising, as `outrig.runtime`'s `repr` does outside every
+  execution. Where the interpreter looks through a stub to its root -- `help()`, `isinstance`
+  against a hosted class, an argument boxed for a hosted call -- it looks through a reference
+  first (`_stood_for`), so `repo.takes(outrig.facility("repo"))` sends the root.
+- **Fork 2: `facilities`, a read-only property** over `_outrig_facilities`, set in
+  `Agent.__init__`, so `self.facilities` holds the copy from `__init__` on. Being a member of
+  `outrig.Agent`, a request method of that name is refused by `_declare_class`'s existing check.
+- **Fork 3: read live.** `runtime.bindings`, `outrig.bindings` and the spawn's manifest classify
+  the mapping as they read it; only attachment writes back. The kernel's globals bind once, at its
+  build, and an entry that cannot be a facility there binds nothing and raises where it is read.
+  The orientation is composed once and says a later entry is reached through
+  `outrig.bindings[name]`.
+- **Fork 4: a binding's entry carries the session's description and type**, under the dict's
+  key, with "Runs one call at a time." for a serialized one. An object's carries its type's
+  qualified name and its class's first docstring line, read by `_serve.type_brief`, which
+  `_host._described` now uses too, so the two readers of a live object are one.
+- **Fork 5: a `HostedRoot` converts** to a `binding` reference by its pool's binding name.
+- **Fork 6: a dict-less agent inherits its maker's view**: the session's under the CLI's primary,
+  and a copy of the parent's mapping under a dict-constructed parent. The kind registry's
+  `inherited` flag is where 0003-51's channel kind opts out. The acceptance item about a root
+  holding `{"inbox": <channel>, "files": files}` needs 0003-51's fixture and is that task's to
+  test; no channel kind exists here.
+- **A dict-less instance's `facilities` is its inherited copy**, taken at attachment, where the
+  instance is in hand (`_Instance` keeps none afterward), and `None` under the session's view.
+  "As it stands at the spawn" is therefore "as it stands at attachment" for an instance; a
+  `runtime.spawn` child and a typed call's take it in `_spawn`.
+- **Host programs: `facilities=` stays refused**, with `NotImplementedError` from `_Root`, decided
+  in planning. `outrig.facility()` works on the host and makes a reference that raises on use;
+  0003-46 builds construction from the host, which is where it would be sent.
+- **A name the session has not bound is refused at attachment**, naming the entry, by the kind's
+  `brief`; a reference resolved to one raises `LookupError`, so `Kernel.stubs` never gains a
+  binding the session lacks.
+- **`Kernel.stubs` is a per-binding cache**, `bound(name)`, which globals, `outrig.bindings` and
+  references all go through, so `outrig.bindings["files"] is files` holds in a narrowed child as
+  `outrig.bindings["repo"] is repo` does in the primary. What a kernel offers as globals is
+  tracked apart (`_offered`), so a reference resolved first never keeps a binding injected later
+  from its global. The view is `Kernel.facilities`; `outrig.bindings` iterates it in the dict's
+  order (`facilities.md`'s open question).
+- **The spawn line's entries carry `description`** beside the events' four fields, so the host
+  renders an object's docstring line it has no other way to know; a binding's `serialize` is
+  looked up by target in the session's briefs. `facilities: null` means the session's view,
+  on the line and in both events.
+- **A narrowed child is told of no live object injected later**: its announcer is given an empty
+  `Injected`, and `bind_stubs` binds nothing in a mapping kernel, since an injected binding is
+  not among its facilities.
+- **`help(runtime)` says which view**: a kernel built from a mapping binds a sibling copy of its
+  child runtime class -- same name, bases and members, made once -- whose docstring's bindings
+  paragraph says the facilities are listed and `outrig.bindings` reaches no other. A copy and not
+  a subclass, so `help()` reads as the class's own does. The main agent's class has none, since
+  it is never given facilities. The `bindings` property's docstring was shortened so both views
+  fit `help()`'s bound.
+- **An input wins over an inherited facility of its name** in a `runtime.spawn` child, as an
+  input already wins over a binding's global; only a dict-constructed agent's own keys are checked
+  against its inputs and bound classes.
+- **An `object` facility that holds its instance keeps the instance alive**, and with it the
+  child, until an explicit release or the session's end -- the same as 0003-45's kernel-side
+  `self`.
+- **No new close row and no new event.** A reference at the close resolves to a request the
+  **Hosted calls** rows cover; a change to a mapping crosses nothing, and `doc/reference/events.md`
+  says it is not evented.
+- **An input's, a facility's and a host program's input's names follow one rule**,
+  `_agents.variable_name`, which the host's `_Root` now calls too.
+- **One acceptance line read against the rest.** "A `runtime.spawn` child of the dict-constructed
+  reviewer sees every binding" contradicts fork 6 and the item before it, under which that child
+  sees `files` and nothing else; it is read as the CLI primary's `runtime.spawn` child and a
+  dict-less `Reviewer`, which `facilities_tests` checks see every binding. Two earlier tests
+  changed because this task changes what they pinned: 0003-41's, which expected
+  `NotImplementedError` from `facilities=`, and `a_hosted_object_is_refused_as_a_childs_input`,
+  which pinned `_hosted_name`'s old wording.
+- **The test helper until 0003-45**: tests reach the child's mapping as `runtime._kernel.facilities`
+  (or `__main__._kernels[id].facilities`), standing in for `self.facilities` in the child.
+- **A kernel's release and its first use of a binding are ordered by the pools' lock.** A
+  binding a kernel did not reach at build -- one added to a narrowed child's mapping later, or
+  reached through a reference -- gets its pool at first use, on whatever thread uses it, so a
+  release could land between `_pool`'s check of `ended` and its taking of `_hosted_lock`: the pool
+  then made outlived the release, and its call's frame went to a forgotten relay and waited
+  forever. `_pool` checks `ended` under the lock `end` drains with, once `ended` is set: a pool is
+  drained with the rest, or never made.

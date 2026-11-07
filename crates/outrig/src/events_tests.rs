@@ -721,6 +721,20 @@ fn each_event_has_exactly_its_data_fields() {
                     type_name: text("str"),
                     preview: text("\"/workspace\""),
                 }],
+                facilities: Some(vec![
+                    FacilityBrief {
+                        name: text("files"),
+                        kind: FacilityKind::Binding,
+                        target: Some(text("repo")),
+                        type_name: text("git.Repo"),
+                    },
+                    FacilityBrief {
+                        name: text("task"),
+                        kind: FacilityKind::Object,
+                        target: None,
+                        type_name: text("app.Task"),
+                    },
+                ]),
                 channels: vec![ChannelBrief {
                     name: text("fizz"),
                     request: text("str"),
@@ -729,7 +743,14 @@ fn each_event_has_exactly_its_data_fields() {
             },
             "agent.spawned",
             &[
-                "name", "parent", "kind", "model", "depth", "inputs", "channels",
+                "name",
+                "parent",
+                "kind",
+                "model",
+                "depth",
+                "inputs",
+                "facilities",
+                "channels",
             ],
         ),
         (
@@ -851,6 +872,7 @@ fn each_event_has_exactly_its_data_fields() {
                 qualname: text("FooAgent"),
                 digest: None,
                 inputs: vec![],
+                facilities: None,
                 channels: vec![ChannelBrief {
                     name: text("fizz"),
                     request: text("str"),
@@ -859,7 +881,14 @@ fn each_event_has_exactly_its_data_fields() {
             },
             "agent.instance.started",
             &[
-                "instance", "parent", "module", "qualname", "digest", "inputs", "channels",
+                "instance",
+                "parent",
+                "module",
+                "qualname",
+                "digest",
+                "inputs",
+                "facilities",
+                "channels",
             ],
         ),
         (

@@ -422,6 +422,23 @@ def type_name(obj):
     return f"{module}.{_QUALNAME(cls)}"
 
 
+# The longest docstring line a type is described with.
+DOC_MAX = 300
+# A class's own namespace, read from `type` itself, so a metaclass's descriptor never runs.
+_CLASS_DICT = type.__dict__["__dict__"].__get__
+
+
+def type_brief(obj):
+    """`(type, doc)` for `obj`: the qualified name of its type, and the first line of that class's
+    own docstring, read from the class's slots, so nothing of `obj`'s own runs. What a live object
+    a program on the host injects is described with, and an object an agent is given as a
+    facility in its kernel."""
+    cls = type(obj)
+    doc = _CLASS_DICT(cls).get("__doc__")
+    first = doc.lstrip().partition("\n")[0].strip() if isinstance(doc, str) else ""
+    return type_name(cls), first[:DOC_MAX]
+
+
 def id_pack_of(obj):
     """The id_pack `obj` is handed out under, laid out as RPyC's `get_id_pack` lays one out -- a
     class as `(name, its id, 0)`, anything else as `(its type's name, the type's id, its id)` -- but

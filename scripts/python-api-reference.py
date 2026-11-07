@@ -150,6 +150,8 @@ KERNEL_ONLY = {
     "bindings": "reading it raises `RuntimeError`.",
     "skills": "each of its functions raises `RuntimeError`.",
     "Request": "declares a channel for `runtime.spawn`, which a program does not have.",
+    "facility": "makes a reference, which `facilities=` refuses on the host.",
+    "Facility": "what `outrig.facility` makes; each use of one raises `RuntimeError`.",
 }
 
 # Never constructed by a program; their constructors take internals.

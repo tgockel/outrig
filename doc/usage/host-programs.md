@@ -214,9 +214,11 @@ async def main():
     print(notes.lines)
 ```
 
-- **Where agents find it.** As `outrig.bindings["notes"]` in every kernel, and as the global
-  `notes` where that name is free: a variable the agent's code bound, an input of that name, and
-  a builtin such as `print` keep what they are. `runtime.bindings` lists it. An agent's
+- **Where agents find it.** As `outrig.bindings["notes"]` in every kernel that sees the
+  session's bindings -- every one but an agent class's given `facilities=`, and its children --
+  and as the global `notes` where that name is free: a variable the agent's code bound, an
+  input of that name, and a builtin such as `print` keep what they are. `runtime.bindings`
+  lists it. An agent's
   instructions name it with its type's qualified name and the first line of the type's
   docstring, and an agent already running is told of it in its next tool result. Nothing of the
   object itself is read to describe it: no `repr`, no property.

@@ -59,6 +59,9 @@ them says which system it describes.
   OutRig, or the engine acting for a host program.
 - A **binding** is an object a process on the host holds for the agents, reached under a name.
   [Hosted Objects](hosted-objects.md) describes them.
+- A **facility** is an object an agent is given to act through: a binding, or a plain Python
+  object. An agent class's constructor takes them in its `facilities=` dict; see
+  [Facilities](#facilities).
 
 ## Executions
 
@@ -146,7 +149,8 @@ way until the host answers; see [Hosted Objects](hosted-objects.md#a-call-blocks
 ## Child agents
 
 An agent's code can launch other agents. Each child is a kernel of its own in the same
-interpreter, with its own names, conversation and model calls, and the same bindings. Its id is
+interpreter, with its own names, conversation and model calls, and the bindings its parent
+sees: the session's, unless an agent above it was given [facilities](#facilities). Its id is
 `c1`, `c2`, and so on in launch order, and its events carry the subject `agent/c1`. A child has
 no user channel: only the code that launched it gives it work, and what it writes reaches you
 only through that code.
@@ -158,7 +162,8 @@ returns its `Child`. `prompt` is the first part of the child's instructions; `mo
 configured model or alias, else the child runs on its parent's; `inputs`, a dict, is bound in the
 child's namespace as variables. Inputs must be data -- `None`, str, int, bool, float, lists and
 str-keyed dicts of these, or dataclass instances -- and the child gets a copy. An object a binding
-holds cannot be an input; the child reaches the session's bindings itself.
+holds cannot be an input: the child reaches the bindings it sees by name, and an agent class takes
+one in its constructor's `facilities=` dict.
 
 There are two kinds of child:
 
@@ -318,6 +323,42 @@ conversation from one request to the next, so the second review can use what the
 unreleased is released then. A host program declares and drives agent classes the same way, its
 replies decoded into its own classes: see
 [Host programs -> Agent classes](../usage/host-programs.md#agent-classes).
+
+### Facilities
+
+An agent class's constructor takes, beside its data, a dict of the objects its child acts through:
+
+```python
+reviewer = Reviewer(facilities={"files": repo})
+```
+
+The instance keeps a copy as `reviewer.facilities`, and the child's view follows that mapping. Its
+instructions list each entry by name and kind; each is a global of its name where the name is
+free; `outrig.bindings[name]` reaches each; and `runtime.bindings` lists the mapping as it stands,
+read anew each time. No other binding is listed or reached by name: `outrig.bindings["repo"]`
+raises `KeyError` in the child above, though the session binds `repo`. A name follows an input's
+rules, and is not `outrig`, `self`, an input's name or a class bound in the child.
+
+- **A binding** -- its global, or `outrig.facility(name)` -- becomes a reference to that binding,
+  `outrig.Facility`, which resolves in each kernel to that kernel's own proxy. So a child's calls
+  go over its own connections and its `hosted.*` events name it, and a reference passed on
+  through several constructors is one binding with a caller at each level.
+- **A plain object** is the object itself, shared by the agents given it. A call on it is
+  ordinary Python in the calling agent: it crosses nothing, and is not evented.
+- **Refused**, naming the entry: a proxy of an object a binding returned (`repo.index`, say),
+  which belongs to one agent's connection -- give the binding, or a narrower binding of its own;
+  and a coroutine or generator, which one agent can consume once.
+
+A child made without `facilities=` -- by `runtime.spawn`, a typed call, or a constructor given
+none -- sees what its parent sees: a copy of its parent's mapping as it stands at the launch, or,
+under the main agent, every binding. A child given `{}` sees none. The mapping is the agent's to
+change; an entry added later is listed and reached through `outrig.bindings[name]`, but is no
+global, and its instructions, composed once, are not redone. The view is what an agent is told,
+not what it may do: agents in one session are not isolated from each other, and every kernel can
+reach every binding, as
+[`SECURITY.md`](https://github.com/tgockel/outrig/blob/trunk/SECURITY.md) says under "Known
+boundaries". A host program cannot give facilities yet; its
+`facilities=` raises `NotImplementedError`.
 
 ## Skills
 

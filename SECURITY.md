@@ -136,7 +136,8 @@ Issues that bear on **host integrity** are in scope, for example:
   Keep the program's imports, and the credentials it reads, outside paths an agent can write.
 - **Agents in one `outrig run-new` session are not isolated from each other.** They share one
   interpreter process, a thread each, so any agent's code can reach another's names, and every
-  agent is given every binding. The grant is the session's, not one agent's.
+  agent can reach every binding. An agent class given `facilities=` is told of those alone, which
+  narrows what it is told and not what it can do. The grant is the session's, not one agent's.
 - Hostname **deny** rules are best-effort against a hostile client. A container that resolves a
   name through the interceptor is bound to it and cannot shed that binding, but one that
   connects by address and asserts no name at all offers nothing to match against. Hostname deny

@@ -20,6 +20,8 @@ see `help(outrig.schema)`.
 In an agent's kernel, `outrig.runtime` is the runtime of the execution reading it -- what the
 `runtime` global is, reachable from a module's code too -- and `outrig.bindings[name]` is that
 execution's own proxy of a binding, whatever the kernel's globals now hold under its name.
+`outrig.facility(name)` is a reference to the binding `name` that resolves the same way wherever
+it is used, which is how one agent gives another a binding: see `help(outrig.Facility)`.
 
 In a program `outrig run-new <script.py>` runs on the host, `outrig.config()` is a read-only view of
 the configuration it loaded, and `outrig.Session` enters a session the engine starts for it: see
@@ -550,8 +552,22 @@ child exists waits for it. The child's first round is its own, to get ready in: 
 reviewer.ready()` returns once it has ended, and raises what the launch met instead. `await
 reviewer.release()` ends the child and every request still open on it; `async with
 Reviewer() as reviewer:` waits for `ready()` on entry and releases on leaving. An instance
-collected unreleased is released then. `facilities=` is reserved: any value but `None`
-raises `NotImplementedError`.
+collected unreleased is released then.
+
+`Reviewer(**inputs, facilities={"files": files})` gives the child, beside its data, the
+objects it acts through, by name: the instance keeps a copy of the dict as
+`reviewer.facilities`. A name follows an input's rules, and is not `outrig`, `self`, an
+input's name or a class bound in the child. As the instance is attached, a binding's proxy --
+the global the session bound it as -- becomes a reference to that binding (see
+`help(outrig.Facility)`), which resolves in each kernel to that kernel's own proxy, so the
+child's calls are its own; a proxy of an object a binding returned, a coroutine and a
+generator are refused, naming the entry; anything else is the object itself, shared, and a
+call on it is plain Python in the calling agent. The child is told of these and of no other
+binding: its instructions list them, each is a global under its name where the name is free,
+`outrig.bindings[name]` reaches each, and `runtime.bindings` lists the mapping as it stands.
+Without `facilities=`, the child sees what this agent sees: the facilities it was given, or
+the session's bindings. What any agent can reach is the session's either way: the mapping
+decides what an agent is told, not what it may do.
 
 A subclass's `__init__` passes the base its keywords with `super().__init__(**inputs,
 model=...)`, which launches nothing; one that does not raises `TypeError` once it returns.
@@ -574,6 +590,23 @@ of `session`, the current `outrig.Session` when not given: its model is `model`,
 made into classes again there, and each reply is decoded here, into this program's own.
 Construct it, and leave its `async with`, inside the session's; the session's exit releases
 it. In an agent's kernel, `session=` is refused: the child is in the kernel's own session.
+`facilities=` is refused on the host, with `NotImplementedError`.
+
+#### `outrig.Agent.facilities`
+
+```python
+@property
+def facilities(self): ...
+```
+
+This agent's facilities, by name: a copy of the dict its constructor was given as
+`facilities=`, and the one mapping its child's view follows. Read-only as an attribute;
+the dict is the agent's to change, and its child reads it as it stands.
+
+Once the instance is attached, a binding's proxy in it is a reference to that binding
+(`outrig.Facility`). An agent constructed without `facilities=` by an agent that was given
+some has a copy of its maker's, taken as it is attached; one constructed where the view is
+the session's has `None`, and its child sees every binding.
 
 #### `outrig.Agent.ready`
 
@@ -994,3 +1027,5 @@ describes; a program on the host has no use for them. What a program meets if it
 - `outrig.bindings` -- reading it raises `RuntimeError`.
 - `outrig.skills` -- each of its functions raises `RuntimeError`.
 - `outrig.Request` -- declares a channel for `runtime.spawn`, which a program does not have.
+- `outrig.facility` -- makes a reference, which `facilities=` refuses on the host.
+- `outrig.Facility` -- what `outrig.facility` makes; each use of one raises `RuntimeError`.

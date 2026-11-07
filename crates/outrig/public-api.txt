@@ -1177,6 +1177,9 @@ pub outrig::harness::event::ExecStatus::Error
 pub outrig::harness::event::ExecStatus::Lost
 pub outrig::harness::event::ExecStatus::Ok
 pub outrig::harness::event::ExecStatus::Refused
+#[non_exhaustive] pub enum outrig::harness::event::FacilityKind
+pub outrig::harness::event::FacilityKind::Binding
+pub outrig::harness::event::FacilityKind::Object
 #[non_exhaustive] pub enum outrig::harness::event::HostedOutcome
 pub outrig::harness::event::HostedOutcome::Cancelled
 pub outrig::harness::event::HostedOutcome::Raised
@@ -1257,6 +1260,7 @@ pub outrig::harness::event::Payload::AgentInstanceReleased::usage: core::option:
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentInstanceStarted
 pub outrig::harness::event::Payload::AgentInstanceStarted::channels: alloc::vec::Vec<outrig::harness::event::ChannelBrief>
 pub outrig::harness::event::Payload::AgentInstanceStarted::digest: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::AgentInstanceStarted::facilities: core::option::Option<alloc::vec::Vec<outrig::harness::event::FacilityBrief>>
 pub outrig::harness::event::Payload::AgentInstanceStarted::inputs: alloc::vec::Vec<outrig::harness::event::InputBrief>
 pub outrig::harness::event::Payload::AgentInstanceStarted::instance: outrig::harness::event::AgentInstanceId
 pub outrig::harness::event::Payload::AgentInstanceStarted::module: alloc::string::String
@@ -1305,6 +1309,7 @@ pub outrig::harness::event::Payload::AgentRequestSettled::rounds: alloc::vec::Ve
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentSpawned
 pub outrig::harness::event::Payload::AgentSpawned::channels: alloc::vec::Vec<outrig::harness::event::ChannelBrief>
 pub outrig::harness::event::Payload::AgentSpawned::depth: u32
+pub outrig::harness::event::Payload::AgentSpawned::facilities: core::option::Option<alloc::vec::Vec<outrig::harness::event::FacilityBrief>>
 pub outrig::harness::event::Payload::AgentSpawned::inputs: alloc::vec::Vec<outrig::harness::event::InputBrief>
 pub outrig::harness::event::Payload::AgentSpawned::kind: outrig::harness::event::ChildKind
 pub outrig::harness::event::Payload::AgentSpawned::model: alloc::string::String
@@ -1680,6 +1685,11 @@ impl outrig::harness::event::ExecId
 pub fn outrig::harness::event::ExecId::get(self) -> u64
 impl core::fmt::Display for outrig::harness::event::ExecId
 pub fn outrig::harness::event::ExecId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::event::FacilityBrief
+pub outrig::harness::event::FacilityBrief::kind: outrig::harness::event::FacilityKind
+pub outrig::harness::event::FacilityBrief::name: alloc::string::String
+pub outrig::harness::event::FacilityBrief::target: core::option::Option<alloc::string::String>
+pub outrig::harness::event::FacilityBrief::type_name: alloc::string::String
 #[non_exhaustive] pub struct outrig::harness::event::Held
 pub outrig::harness::event::Held::name: alloc::string::String
 pub outrig::harness::event::Held::type_name: alloc::string::String

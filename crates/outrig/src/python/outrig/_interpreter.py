@@ -1667,10 +1667,7 @@ class _Help:
         import pydoc
 
         # A binding's name stands for the binding's root, which is what is described.
-        request = [
-            object.__getattribute__(x, "_pool").root() if type(x) is HostedRoot else x
-            for x in request
-        ]
+        request = [_stood_for(x) for x in request]
         answer = io.StringIO()
         _pydoc_helper()(input=io.StringIO(), output=answer)(*request)
         text = answer.getvalue()
@@ -1735,6 +1732,8 @@ LABEL_CALLABLE = 105
 _schema = None
 # `outrig.skills`, from the same package: what serves `outrig_skills`, given the catalog.
 _skills = None
+# `outrig._serve`, from the same package: how a facility that is a plain object is described.
+_serve = None
 # The vendored RPyC, imported by `main` from the directory it is given, and the connection class
 # built over it; `None` when the interpreter was started without one.
 _rpyc = None
@@ -2412,6 +2411,17 @@ HostedRoot.__length_hint__ = _on_root(operator.length_hint)
 del _BINARY, _name
 
 
+def _stood_for(obj):
+    """What `obj` stands for, when agent code holds it in place of a hosted object: a facility
+    reference's target in the calling kernel, and a stub's root, fetched if need be. Anything else
+    is itself."""
+    if type(obj) is _agents.Facility:
+        obj = _agents._target(obj)
+    if type(obj) is HostedRoot:
+        obj = object.__getattribute__(obj, "_pool").root()
+    return obj
+
+
 def _target_type(obj):
     """The host type a proxy names, as a request's target says it; `None` for anything else."""
     if issubclass(type(obj), _rpyc.core.netref.BaseNetref):
@@ -2443,10 +2453,11 @@ def _load_outrig(directory):
     """Import OutRig's own package from `directory`, and give it this process's executions:
     `outrig.runtime` and `outrig.bindings` are those of the execution reading them. Its skills
     module gets the way to ask the host for a skill's files, and puts its finder in place."""
-    global _schema, _agents, _skills
+    global _schema, _agents, _skills, _serve
     sys.path.append(directory)
     import outrig._agents
     import outrig._kernel
+    import outrig._serve
     import outrig.schema
     import outrig.skills
 
@@ -2461,6 +2472,7 @@ def _load_outrig(directory):
     _schema = outrig.schema
     _agents = outrig._agents
     _skills = outrig.skills
+    _serve = outrig._serve
 
 
 def _calling():
@@ -2561,9 +2573,7 @@ def _connection_class(rpyc):
     stock_instancecheck = netref.BaseNetref.__instancecheck__
 
     def __instancecheck__(proxy, other):
-        if type(other) is HostedRoot:
-            other = object.__getattribute__(other, "_pool").root()
-        return stock_instancecheck(proxy, other)
+        return stock_instancecheck(proxy, _stood_for(other))
 
     netref.BaseNetref.__instancecheck__ = __instancecheck__
 
@@ -2768,8 +2778,11 @@ def _connection_class(rpyc):
             if type(obj) is tuple:
                 return consts.LABEL_TUPLE, tuple(self._box(item, seen) for item in obj)
             # Before anything else: a stub, or a proxy of a host list, answers `isinstance(x,
-            # list)`, and a proxy of a host method is callable. A stub sends its root, fetched
-            # here if need be, nested on this thread's connection.
+            # list)`, and a proxy of a host method is callable. A facility reference sends what it
+            # resolves to here, and a stub its root, fetched here if need be, nested on this
+            # thread's connection.
+            if type(obj) is _agents.Facility:
+                obj = _agents._target(obj)
             if type(obj) is HostedRoot:
                 pool = object.__getattribute__(obj, "_pool")
                 if pool is not self._pool:
@@ -3875,8 +3888,16 @@ the next request, which you answer with `await d.reply(value)`, or end with
 `await d.fail(message)`. You have no `runtime.complete`, and no user reaches you."""
 
 
-def _runtime_doc(channels):
-    """A runtime's docstring, `channels` being what that agent is told of its own channels.
+# What a runtime says of the bindings its agent sees: the session's, or the facilities it was given.
+_SESSION_BINDINGS = """`runtime.bindings` lists the objects the session hosts for you on the host, by name, with what
+each is; asking makes no request to any of them."""
+_GIVEN_BINDINGS = """`runtime.bindings` lists the facilities you were given, by name, with what each is, as your
+mapping stands; asking makes no request to any of them, and `outrig.bindings` reaches no other."""
+
+
+def _runtime_doc(channels, bindings=_SESSION_BINDINGS):
+    """A runtime's docstring, `channels` being what that agent is told of its own channels, and
+    `bindings` what it is told of the bindings it sees.
 
     Every runtime's docstring is whole. A kernel binds `runtime` and none of the classes behind
     it, so one that deferred to another class would send the agent reading it to a name it cannot
@@ -3899,8 +3920,7 @@ every call is held to the model's context window: see `help(runtime.context)`.
 `runtime.python` says what this interpreter can import -- `pip install` adds pure-Python
 packages, and nothing compiled loads -- and where code that needs more can run.
 
-`runtime.bindings` lists the objects the session hosts for you on the host, by name, with what
-each is; asking makes no request to any of them.
+{bindings}
 
 `await runtime.spawn(name, prompt=...)` launches a child agent to give work to, and
 `await runtime.release([child])` ends it: see `help(runtime.spawn)`.
@@ -3949,8 +3969,8 @@ class Runtime:
     async def spawn(self, name, *, prompt, model=None, inputs=None, requests=None):
         """Launch a child agent, and return its `Child` once it exists.
 
-        The child is a kernel of its own in this interpreter -- its own names, the session's
-        bindings, no user channel -- and the host runs its rounds, each model call one of the
+        The child is a kernel of its own in this interpreter -- its own names, the bindings you
+        see, no user channel -- and the host runs its rounds, each model call one of the
         session's. `prompt` is the first part of its instructions. `model` names a configured
         model or alias; without it, the child runs on yours. `inputs`, a dict of names to values,
         is bound in its namespace as variables, copies, before it starts: each must be data.
@@ -4016,9 +4036,12 @@ class Runtime:
         _agents.one_name_each(bound, copies)
         _agents.one_name_each(bound + sorted(classes, key=_type_qualname))
         kind = "request" if requests is not None else "work"
+        # The instance's own mapping, or what the child inherits of this agent's view.
+        facilities = instance.facilities if instance is not None else _inherited(kernel.facilities)
         spawn = next(_ids)
         line = {"t": "agent.spawn", "agent": kernel.agent, "id": spawn, "name": name,
                 "prompt": prompt, "model": model, "kind": kind, "manifest": manifest,
+                "facilities": None if facilities is None else _manifest(facilities),
                 "channels": said,
                 "invocations": [] if _skills is None else _skills._current(),
                 "instance": None if instance is None else instance.said}
@@ -4029,7 +4052,7 @@ class Runtime:
                                        "schema": d.schema.text()}}
         _refuse_long(line, "spawn", "shorten the prompt, or give fewer inputs or channels")
         _spawning[spawn] = {"parent": kernel, "name": name, "kind": kind, "channels": channels,
-                            "inputs": copies, "classes": bound,
+                            "inputs": copies, "classes": bound, "facilities": facilities,
                             "record": None if instance is None else instance.record}
         try:
             # Inside the `try`, so a line that could not be written leaves no entry behind.
@@ -4099,14 +4122,13 @@ class Runtime:
 
     @property
     def bindings(self):
-        """The session's bindings, by name, in the order the session gave them. Read-only.
+        """What you were given to act through, by name. Read-only.
 
-        Each is a `Binding`: its `name`, the global it is bound as; its `description`, as the
-        operator wrote it; and its `type`, the qualified name of the type of the object it holds on
-        the host. The answer comes from what the session said when it started, so asking reaches
-        no binding, runs no `repr()`, and reads no property.
+        Each is a `Binding`: its `name`, the global it is bound as; its `kind`, `binding` or
+        `object`; its `description`; and its `type`, the qualified name of its object's type.
+        Asking reaches no binding, runs no `repr()`, and reads no property.
         """
-        return _BINDINGS
+        return self._kernel.briefs()
 
     def names(self):
         """Every name you have bound, as `{name: type name}`, sorted by name.
@@ -4308,6 +4330,21 @@ class RequestRuntime(Runtime):
     __slots__ = ()
 
 
+def _given_runtime(cls, channels):
+    """`cls`, a child's runtime class, again, but for a docstring that says its agent was given
+    facilities: a sibling and not a subclass, so `help(runtime)` reads as `cls`'s does."""
+    return type(cls.__name__, cls.__bases__,
+                {**vars(cls), "__doc__": _runtime_doc(channels, _GIVEN_BINDINGS)})
+
+
+# Each child's runtime class, by the one a kernel built from facilities binds in its place. The
+# main agent's has none: it is never given facilities.
+_GIVEN_RUNTIMES = {
+    WorkRuntime: _given_runtime(WorkRuntime, _WORK_CHANNELS),
+    RequestRuntime: _given_runtime(RequestRuntime, _REQUEST_CHANNELS),
+}
+
+
 # ---------------------------------------------------------------------------- child agents
 #
 # Agent code launches a child with `runtime.spawn`: a kernel of this interpreter, with a thread and
@@ -4475,12 +4512,17 @@ def _copy_or_none(value):
 
 
 def _hosted_name(value):
-    """What `value` is, when a binding holds it on the host: for the message refusing it."""
+    """What `value` is, when it is a facility rather than data: for the message refusing it as
+    an input."""
     kind = type(value)
+    if kind is _agents.Facility:
+        return ("a facility reference, which an agent class takes in its constructor's facilities= "
+                "dict")
     if kind is HostedRoot or (_rpyc is not None and issubclass(kind, _rpyc.core.netref.BaseNetref)):
         return (
-            "an object a binding holds on the host; a child reaches the session's bindings itself, "
-            "by name, so give it the name, or the data you read from the object"
+            "an object a binding holds on the host: an agent class takes the binding in its "
+            "constructor's facilities= dict, and a child reaches the bindings it sees by name; or "
+            "give the data you read from the object"
         )
     return None
 
@@ -4495,13 +4537,7 @@ def _inputs(inputs, where):
                         f"{_type_qualname(type(inputs))}")
     manifest, copies, classes, encodings = [], {}, set(), {}
     for name, value in inputs.items():
-        if (
-            type(name) is not str
-            or not name.isidentifier()
-            or keyword.iskeyword(name)
-            or name.startswith("__")
-            or name in _agents.RESERVED
-        ):
+        if not _agents.variable_name(name):
             raise ValueError(f"{where}: input {name!r} cannot name a variable in the child")
         encoded, shape, found = _agents.walk(value, name, _hosted_name)
         manifest.append({"name": name, "type": shape, "preview": _agents.preview(encoded)})
@@ -4995,8 +5031,8 @@ class Child:
 
         Each input is bound in the child as a variable of its name, a copy: it must be data --
         `None`, a str, int, bool or float, a list or str-keyed dict of them, or a dataclass
-        instance -- so an object a binding holds is refused, and the child reaches the session's
-        bindings itself. `result` is declared with `outrig.schema`, and it and the dataclasses it
+        instance -- so an object a binding holds is refused, and the child reaches the bindings it
+        sees itself. `result` is declared with `outrig.schema`, and it and the dataclasses it
         uses are bound in the child under their names. The child completes with
         `await runtime.complete(value)`; an answer that fails its check counts one of `attempts`,
         and past them the submission ends `outrig.CompletionRejected`. The child works on one
@@ -5232,7 +5268,15 @@ class _Instance:
         methods = {name: send.__outrig_channel__ for name, send in cls._outrig_channels.items()}
         bound = list(dict.fromkeys(c for method in methods.values() for c in method.classes))
         _agents.one_name_each(bound, copies)
-        _agents.one_name_each(bound + sorted(classes, key=_type_qualname))
+        named = bound + sorted(classes, key=_type_qualname)
+        _agents.one_name_each(named)
+        if facilities is not None:
+            _attached(facilities, copies, named)
+        elif kernel.facilities is not None:
+            # Given none, where this kernel's view is a mapping: the child's is a copy of it,
+            # which is the instance's too.
+            facilities = vars(agent)["_outrig_facilities"] = _inherited(kernel.facilities)
+        self.facilities = facilities
         self.id = next(_ids)
         self.kernel, self.loop, self.inputs, self.model = kernel, kernel.loop, copies, model
         self.prompt = inspect.cleandoc(cls.__doc__)
@@ -5535,10 +5579,12 @@ class RequestEndpoint(Endpoint):
 class Kernel:
     """One agent's execution environment: its namespace, its loop, its slot, its backlog."""
 
-    def __init__(self, agent, child=None):
+    def __init__(self, agent, child=None, facilities=None):
         self.agent = agent
         # A child's record, which its parent shares; `None` for an agent that is no child.
         self.child = child
+        # The mapping this kernel's view follows, the agent's own; `None` for the session's view.
+        self.facilities = facilities
         # Set once the host has ended this kernel: it takes no more work, and is going.
         self.ended = False
         # What this kernel's code waits on the host to answer, by the id it asked under.
@@ -5565,6 +5611,8 @@ class Kernel:
         else:
             self.channels = {"progress": _ProgressOut(agent, child)}
             runtime = WorkRuntime
+        if facilities is not None:
+            runtime = _GIVEN_RUNTIMES[runtime]
         self.history = History()
         # Also `outrig.runtime`, from any code an execution of this kernel runs, whatever the
         # global comes to hold.
@@ -5598,32 +5646,94 @@ class Kernel:
         self._hosted = {}
         self._hosted_lock = threading.Lock()
         self._hosted_numbers = collections.defaultdict(lambda: itertools.count(1))
-        # The stub of each of the session's bindings, the runtime's own reference to what is bound
-        # under the binding's name.
+        # This kernel's stub of each binding it has reached, by the binding's name: what a
+        # reference to the binding resolves to here, and what a global of it holds.
         self.stubs = {}
-        self.bind_stubs()
+        # The bindings `bind_stubs` has offered as globals, for the session's view.
+        self._offered = set()
+        if facilities is None:
+            self.bind_stubs()
+        else:
+            self._bind_facilities()
 
     def announce(self, instance=None):
         """Say the kernel is ready: a root child's, with its instance's id."""
         _send({"t": "ready", "agent": self.agent, "version": _VERSION, "instance": instance})
 
     def bind_stubs(self):
-        """Give each of the session's bindings this kernel has no stub of one, which
-        `outrig.bindings` reaches, and bind it under its name too, among the names bound at boot,
-        which the inventory leaves out -- where neither this kernel's globals nor the builtins
-        hold that name already: a binding never replaces a name agent code bound, nor `print`.
-        Nothing, without RPyC."""
-        if _Hosted is None:
+        """Give each of the session's bindings not yet offered here this kernel's stub of it,
+        which `outrig.bindings` reaches, bound under its name too: what a kernel with the
+        session's view does as it is built, and again for each live object a program on the host
+        injects. Nothing, without RPyC, and nothing for a kernel whose view is a mapping, which
+        holds no binding injected later."""
+        if _Hosted is None or self.facilities is not None:
             return
         for name in _BINDINGS:
-            if name in self.stubs:
+            if name not in self._offered:
+                self._offered.add(name)
+                self._offer(name, self.bound(name))
+
+    def _bind_facilities(self):
+        """Bind each entry of this kernel's mapping under its name, as the kernel is built, as
+        `outrig.bindings` gives it. One that cannot be a facility binds nothing, and raises where
+        the mapping is read."""
+        for key in list(self.facilities):
+            try:
+                self._offer(key, self.facility(key))
+            except (TypeError, ValueError, LookupError, RuntimeError):
+                # Not a facility, or a binding's without RPyC: `_pool`'s `RuntimeError`.
                 continue
-            stub = self.stub(name)
-            # Checked and bound in one step, as agent code may bind the name on another thread;
-            # the stub joins `stubs` after, so a global that holds it was bound here.
-            if not hasattr(builtins, name) and self.globals.setdefault(name, stub) is stub:
-                self._boot[name] = stub
-            self.stubs[name] = stub
+
+    def _offer(self, name, value):
+        """Bind `value` as `name` among the names bound at boot, which the inventory leaves out,
+        where neither this kernel's globals nor the builtins hold the name already: what it is
+        given never replaces a name agent code bound, nor `print`."""
+        # Checked and bound in one step, as agent code may bind the name on another thread.
+        if not hasattr(builtins, name) and self.globals.setdefault(name, value) is value:
+            self._boot[name] = value
+
+    def bound(self, binding):
+        """This kernel's stub of `binding`, made at its first use here: what its global holds,
+        `outrig.bindings` gives, and a reference to it resolves to."""
+        stub = self.stubs.get(binding)
+        if stub is None:
+            stub = self.stubs.setdefault(binding, self.stub(binding))
+        return stub
+
+    def resolve(self, kind, name):
+        """What this kernel holds for the facility of `kind` named `name`: what a reference to it
+        resolves to here."""
+        return _KINDS[kind].resolve(self, name)
+
+    def facility(self, key):
+        """What `outrig.bindings[key]` gives in this kernel: the entry `key` of its mapping, read
+        now -- a reference resolved here, a plain object as itself -- or, for the session's view,
+        its stub of the binding `key`. `KeyError` for any other name."""
+        if self.facilities is None:
+            if _Hosted is None or key not in _BINDINGS:
+                raise KeyError(key)
+            return self.bound(key)
+        entry = _classified(key, self.facilities[key])
+        if type(entry) is _agents.Facility:
+            return self.resolve(*_agents._identity(entry))
+        return entry
+
+    def facility_names(self):
+        """The names `outrig.bindings` holds in this kernel, in order: the mapping itself, or the
+        session's manifest. Not to be iterated while agent code may change the mapping."""
+        if self.facilities is None:
+            return _BINDINGS if _Hosted is not None else {}
+        return self.facilities
+
+    def briefs(self):
+        """What `runtime.bindings` says in this kernel: the session's bindings, or its mapping's
+        entries as they stand, each classified and described now."""
+        if self.facilities is None:
+            return _BINDINGS
+        return types.MappingProxyType({
+            d["name"]: Binding(d["name"], d["description"], d["type"], d["kind"])
+            for d in _manifest(self.facilities)
+        })
 
     def stub(self, binding):
         """The root of `binding` -- an object in a process on the host -- as the `HostedRoot`
@@ -5645,12 +5755,14 @@ class Kernel:
         """This kernel's pool of connections to `binding`, made anew once the last has closed."""
         if _Hosted is None:
             raise RuntimeError(_rpyc_missing)
-        if self.ended:
-            raise RuntimeError(f"agent {self.agent!r} was released, and its connections to the "
-                               f"session's bindings closed with it")
         if not isinstance(binding, str) or not binding:
             raise TypeError("a binding is named by a non-empty str")
         with self._hosted_lock:
+            # Under the lock `end` drains the pools with, once it has set `ended`: a pool made
+            # here is drained with the rest, or never made.
+            if self.ended:
+                raise RuntimeError(f"agent {self.agent!r} was released, and its connections to "
+                                   f"the session's bindings closed with it")
             pool = self._hosted.get(binding)
             if pool is None or pool.closed is not None:
                 pool = self._hosted[binding] = _Pool(self, binding)
@@ -6341,12 +6453,15 @@ _WRAPPER = Kernel._run.__code__
 # ---------------------------------------------------------------------------- bindings
 
 
-class Binding(collections.namedtuple("Binding", ("name", "description", "type"))):
-    """One of the session's bindings: an object a process on the host holds, bound as `name`.
+class Binding(collections.namedtuple("Binding", ("name", "description", "type", "kind"))):
+    """What an agent was given under `name`: one of the session's bindings, or one of the
+    facilities its constructor was given.
 
-    `description` is what the operator says it is, and `type` the qualified name of the type of
-    the host's object. A record of what the session said at start; reading it asks the host
-    nothing.
+    `kind` is `binding` for an object a process on the host holds, which `description` says as
+    the operator wrote it, and `object` for a plain object of this interpreter, which the first
+    line of its class's docstring describes. `type` is the qualified name of the object's type.
+    Read from what the session said and from the object's class alone, so reading it asks the
+    host nothing and runs nothing of the object's.
     """
 
     __slots__ = ()
@@ -6374,7 +6489,7 @@ def _bindings(message):
         raise ValueError("bindings without a list of bindings and a list of paths")
     records = {}
     for entry in entries:
-        record = Binding(entry["name"], entry["description"], entry["type"])
+        record = Binding(entry["name"], entry["description"], entry["type"], "binding")
         if not all(isinstance(field, str) for field in record):
             raise ValueError(f"a binding whose fields are not strings: {entry!r}")
         records[record.name] = record
@@ -6394,6 +6509,115 @@ def _bindings(message):
         # Answered however it went, so the host never waits on it for good.
         if "id" in message:
             _send({"t": "bound", "agent": message.get("agent"), "id": message["id"]})
+
+
+# ---------------------------------------------------------------------------- facilities
+#
+# An agent constructed with `facilities=` has a mapping of its own, which its kernel's view follows
+# (`Kernel.facilities`); any other kernel's view is its maker's, the session's at the top. A
+# mapping holds references (`outrig.Facility`), each resolved in the calling kernel by its kind,
+# and plain objects, each itself. What it holds is classified as the agent is attached, in place,
+# and again wherever it is read: an entry may change at any time, and none is trusted until read.
+
+
+class _Kind(collections.namedtuple("_Kind", ("resolve", "brief", "inherited"))):
+    """A kind of facility reference: `resolve(kernel, name)` gives what `kernel` holds for the
+    facility named `name`; `brief(key, name)` gives `(type, description)`, raising for one the
+    session lacks; and `inherited` says whether a child made without a mapping of its own gets
+    the reference with the rest of its maker's."""
+
+    __slots__ = ()
+
+
+def _binding_brief(key, name):
+    binding = _BINDINGS.get(name)
+    if binding is None:
+        raise LookupError(f"facility {key!r} names binding {name!r}, which the session has not "
+                          f"bound")
+    return binding.type, binding.description
+
+
+def _resolve_binding(kernel, name):
+    if name not in _BINDINGS:
+        raise LookupError(f"the session has no binding {name!r}")
+    return kernel.bound(name)
+
+
+# Each kind of reference, by its name. A plain object needs none: it is itself.
+_KINDS = {"binding": _Kind(_resolve_binding, _binding_brief, True)}
+# What a facility's key may not be, beyond what an input's may not: the package, and the instance.
+_FACILITY_RESERVED = frozenset({"outrig", "self"})
+
+
+def _classified(key, value):
+    """`value`, the facility `key` names, as a mapping holds it: a reference, or a plain object. A
+    binding's stub becomes a reference to its binding; what cannot be a facility raises, naming
+    `key`. Reads `value`'s type alone, so nothing of its own runs."""
+    if not _agents.variable_name(key) or key in _FACILITY_RESERVED:
+        raise ValueError(f"facility {key!r} cannot name a variable in the child")
+    kind = type(value)
+    if kind is _agents.Facility:
+        return value
+    if kind is HostedRoot:
+        return _agents._reference("binding", object.__getattribute__(value, "_pool").binding)
+    if _rpyc is not None and issubclass(kind, _rpyc.core.netref.BaseNetref):
+        raise TypeError(
+            f"facility {key!r} is a proxy of an object a binding returned, which belongs to one "
+            "agent's connection: give the binding itself, or a narrower facility the session binds"
+        )
+    if kind in (types.CoroutineType, types.GeneratorType, types.AsyncGeneratorType):
+        raise TypeError(f"facility {key!r} is a {_plain_qualname(kind)}, which one agent can "
+                        "consume once, and is no facility: give what makes it")
+    return value
+
+
+def _described(key, entry):
+    """What `entry`, the classified facility `key` names, is: `{name, kind, target, type,
+    description}`, a reference's from what the session said of its facility, and a plain
+    object's from its class's slots, so nothing of its own runs."""
+    if type(entry) is _agents.Facility:
+        kind, target = _agents._identity(entry)
+        type_name, description = _KINDS[kind].brief(key, target)
+    else:
+        kind, target = "object", None
+        type_name, description = _serve.type_brief(entry)
+    return {"name": key, "kind": kind, "target": target, "type": type_name,
+            "description": description}
+
+
+def _manifest(facilities):
+    """What `facilities`, a mapping, holds as it stands, each entry `_described`."""
+    return [_described(key, _classified(key, value)) for key, value in list(facilities.items())]
+
+
+def _inherited(facilities):
+    """What a child made without a mapping gets of `facilities`, its maker's: a copy, each entry
+    classified, but for references of a kind that stays with its maker. `None` for `None`, the
+    session's view."""
+    if facilities is None:
+        return None
+    inherited = {}
+    for key, value in list(facilities.items()):
+        entry = _classified(key, value)
+        if type(entry) is not _agents.Facility or _KINDS[_agents._identity(entry)[0]].inherited:
+            inherited[key] = entry
+    return inherited
+
+
+def _attached(facilities, names, classes):
+    """Classify `facilities`, the mapping an agent class instance is attached with, in place; or
+    raise, naming the entry, if an entry cannot be a facility, names a binding the session has
+    not bound, or takes the name of an input in `names` or of a class in `classes`, which are
+    bound beside it in the child."""
+    for key, value in list(facilities.items()):
+        entry = _classified(key, value)
+        if type(entry) is _agents.Facility:
+            kind, target = _agents._identity(entry)
+            _KINDS[kind].brief(key, target)
+        if key in names:
+            raise ValueError(f"facility {key!r} is also an input's name")
+        facilities[key] = entry
+    _agents.one_name_each(classes, list(facilities), "a facility")
 
 
 def _close(message):
@@ -6481,7 +6705,7 @@ def _open(agent, main, child=None):
         record = spec["record"] or _Child(agent, spec["name"], spec["kind"], spec["parent"],
                                           spec["channels"], requests_max)
         record.id, record.requests_max = agent, requests_max
-    kernel = Kernel(agent, child=record)
+    kernel = Kernel(agent, child=record, facilities=None if spec is None else spec.get("facilities"))
     if record is not None:
         record.kernel = kernel
         for name, value in spec["inputs"].items():

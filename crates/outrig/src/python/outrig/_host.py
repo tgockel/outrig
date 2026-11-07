@@ -966,10 +966,6 @@ class Session:
 # An ASCII identifier, as the configuration's rule for a binding's name asks; `inject` refuses
 # the keywords, the kernel's own names and the dunders beside it.
 _BINDING_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-# The longest docstring line an object is described with.
-DOC_MAX = 300
-# A class's own namespace, read from `type` itself, so a metaclass's descriptor never runs.
-_CLASS_DICT = type.__dict__["__dict__"].__get__
 # Each session's server of its live objects, by its handle, from its entry until its exit.
 _servers = {}
 # The engine's lines about live objects, for `_serve_lines`.
@@ -986,12 +982,8 @@ def _described(name, obj, serialize):
     """What the engine is told of `obj`, injected as `name`: the qualified name of its type and
     the first line of that class's own docstring, read from the class's slots, so nothing of
     `obj`'s own runs."""
-    cls = type(obj)
-    doc = _CLASS_DICT(cls).get("__doc__")
-    lines = [line.strip() for line in doc.splitlines()] if isinstance(doc, str) else []
-    first = next((line for line in lines if line), "")
-    return {"name": name, "type": _serve.type_name(cls), "doc": first[:DOC_MAX],
-            "serialize": serialize}
+    kind, doc = _serve.type_brief(obj)
+    return {"name": name, "type": kind, "doc": doc, "serialize": serialize}
 
 
 def _server(handle, rpyc_dir):
@@ -1119,6 +1111,11 @@ class _Root:
 
     def __init__(self, agent, inputs, model, session, facilities):
         cls = type(agent)
+        if facilities is not None:
+            raise NotImplementedError(
+                f"{cls.__qualname__}(facilities=...) is taken in an agent's kernel; a program on "
+                "the host cannot give an agent facilities yet, so leave it out"
+            )
         if session is None:
             session = current_session()
         elif type(session) is not Session:
@@ -1135,8 +1132,7 @@ class _Root:
         }
         manifest, found, classes = [], set(), {}
         for name, value in inputs.items():
-            if (not name.isidentifier() or keyword.iskeyword(name) or name.startswith("__")
-                    or name in _agents.RESERVED):
+            if not _agents.variable_name(name):
                 raise ValueError(f"{cls.__qualname__}(): input {name!r} cannot name a variable in "
                                  "the child")
             encoded, shape, used = _agents.walk(value, name)

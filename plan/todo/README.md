@@ -106,7 +106,6 @@ phase.
 
 | Task      | What it settles                                     |
 | --------- | ----------------------------------------------------|
-| `0003-42` | An agent is given its facilities                    |
 | `0003-43` | Application code is provisioned before construction |
 | `0003-44` | A Rust service is a Python object                   |
 | `0003-45` | The instance is the child's `self`                  |

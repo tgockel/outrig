@@ -598,6 +598,24 @@ without touching each other, from one ensured image. [The container facade besid
   every one alive. Five events record each instance under its child's subject:
   `agent.instance.started`, `.ready`, `.released` with how and the child's usage, `.collected`,
   and `.handle.collected` for a handle dropped before its request ended.
+- **An agent class is given its facilities: `FooAgent(**inputs, facilities={"files": repo})`.**
+  The instance keeps a copy of the dict as `foo.facilities`, a read-only property, and its child's
+  view follows that mapping: its instructions list each entry by name and kind and no other
+  binding, each entry is a global of its name where the name is free, `outrig.bindings[name]`
+  reaches each and raises `KeyError` for a session binding the mapping does not name, and
+  `runtime.bindings` lists the mapping as it stands, each `Binding` gaining `kind`. As the
+  instance is attached, a binding's proxy in the dict becomes a reference to its binding,
+  `outrig.Facility`, which `outrig.facility(name)` also makes; it resolves at each use to the
+  calling kernel's own proxy, so a child's calls go over its own connections and are attributed
+  to it, through any number of constructors. A plain object is the object itself, its calls
+  plain Python and not evented; a proxy of a sub-object, a coroutine and a generator are refused,
+  naming the entry, as are names an input or a bound class already takes, `outrig` and `self`.
+  A child made without a dict -- by `runtime.spawn`, a typed call, or a constructor given none --
+  sees a copy of its parent's mapping, or every binding under the main agent. The mapping is the
+  agent's to change, read as it stands; its globals and instructions are made once. `agent.spawned`
+  and `agent.instance.started` carry `facilities`, each `{name, kind, target, type}`, or `null`
+  for the session's view. What an agent can reach is the session's either way. A host program's
+  `facilities=` raises `NotImplementedError`.
 - **A host program drives an agent class.** In a program `HostProgram` runs, an `outrig.Agent`
   subclass constructed on a running event loop inside an `outrig.Session`'s block -- or with
   `session=` naming one, a keyword every constructor now takes and a kernel's refuses -- launches
