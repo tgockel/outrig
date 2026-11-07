@@ -63,6 +63,14 @@ pub async fn ensure(
 /// call is the one that wrote the config: the caller's own signal for
 /// whether to set `default-image`, rather than a separate walk of its own
 /// that a `stat` between the two could answer differently from this one.
+///
+/// [`resolve_global_config`] is called twice around the "configure now?"
+/// prompt, not once before it: an explicit `--global-config` that is
+/// already gone is refused before the prompt fires, so a script with
+/// nothing scripted for it fails on the missing file rather than hanging
+/// on the question; the second call, right before the bootstrap reads the
+/// file, catches one removed during the wait a user paces rather than
+/// handing the bootstrap a path that read empty (#505).
 pub async fn resolve_or_bootstrap(
     cwd: &Path,
     global_override: Option<&Path>,
@@ -78,7 +86,9 @@ pub async fn resolve_or_bootstrap(
     match find_repo_root_from(cwd) {
         Ok(root) => Ok((root, name, false)),
         Err(OutrigError::NoRepoConfig) => {
-            let global_path = resolve_global_config(global_override)?;
+            // Fails fast, ahead of the prompt below, when an explicit
+            // `--global-config` is already missing.
+            resolve_global_config(global_override)?;
             eprintln!(
                 "[outrig] no .agents/outrig/config.toml found in {} or any parent.",
                 cwd.display()
@@ -103,6 +113,11 @@ pub async fn resolve_or_bootstrap(
                 eprintln!("[outrig] skipping; run `outrig init` later to set up.");
                 return Err(OutrigError::NoRepoConfig.into());
             }
+            // Re-resolved here, at the read itself: the prompt above waits on
+            // the user's own pace, so an explicit `--global-config` checked
+            // only before it could vanish in the meantime and be read as an
+            // empty config instead of refused (#505).
+            let global_path = resolve_global_config(global_override)?;
             let name = write_repo_config(cwd, global_path.as_deref(), name, prompt, hf).await?;
             Ok((cwd.to_path_buf(), Some(name), true))
         }

@@ -18,8 +18,9 @@ use tokio::time::timeout;
 
 use outrig::config::Config;
 use outrig::error::OutrigError;
-use outrig_cli::error::CliError;
+use outrig_cli::error::{CliError, Result};
 use outrig_cli::image_setup::add::{run_bootstrapped, run_with};
+use outrig_cli::init::prompt::{Field, PromptSource};
 use outrig_cli::init::repo::resolve_or_bootstrap;
 
 use common::scripted_prompt;
@@ -475,6 +476,76 @@ async fn fallback_no_returns_no_repo_config() {
 
     // Nothing was written.
     assert!(!tmp.path().join(".agents").exists());
+}
+
+/// Delegates every `PromptSource` call to `inner`, except that `ask_bool`
+/// removes `path` first -- standing in for #505's user, who deletes an
+/// explicit `--global-config` in the span between the bootstrap's "configure
+/// now?" prompt appearing and their answer landing.
+struct DeleteOnAskBool<'a, P> {
+    inner: P,
+    path: &'a Path,
+}
+
+impl<P: PromptSource> PromptSource for DeleteOnAskBool<'_, P> {
+    async fn ask_string(&mut self, field: &Field, default: &str) -> Result<String> {
+        self.inner.ask_string(field, default).await
+    }
+
+    async fn ask_bool(&mut self, field: &Field, default: bool) -> Result<bool> {
+        std::fs::remove_file(self.path).expect("the global config must exist to remove");
+        self.inner.ask_bool(field, default).await
+    }
+
+    async fn ask_select(&mut self, field: &Field, default_idx: usize) -> Result<usize> {
+        self.inner.ask_select(field, default_idx).await
+    }
+
+    async fn ask_multiselect(
+        &mut self,
+        field: &Field,
+        default_indices: &[usize],
+    ) -> Result<Vec<usize>> {
+        self.inner.ask_multiselect(field, default_indices).await
+    }
+}
+
+/// #505: an explicit `--global-config` that exists when the bootstrap's
+/// "configure now?" prompt fires, but is gone by the time the user answers
+/// it, must be refused the same way a `--global-config` missing from the
+/// start is -- not read as an empty config, which would let the wizard write
+/// a repo config whose agent has no model without ever saying why.
+#[tokio::test]
+async fn the_bootstrap_refuses_a_global_config_removed_while_the_prompt_is_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path().join("config.toml");
+    std::fs::write(&global, GLOBAL).unwrap();
+
+    // `y` to the only prompt this path reaches before the removed file
+    // would otherwise be read.
+    let (inner, _stderr) = scripted_prompt(b"y\n").await;
+    let mut prompt = DeleteOnAskBool {
+        inner,
+        path: &global,
+    };
+    let mut hf = common::StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    let err = timeout(
+        TEST_TIMEOUT,
+        resolve_or_bootstrap(tmp.path(), Some(&global), None, &mut prompt, &mut hf),
+    )
+    .await
+    .expect("the bootstrap must not hang")
+    .expect_err("a --global-config removed during the prompt must be refused");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "configuration: --global-config {} does not exist",
+            global.display()
+        ),
+    );
+    assert!(entries(tmp.path()).is_empty(), "{:?}", entries(tmp.path()));
 }
 
 /// #342: the bootstrap is where `image add` reads the global config, so a

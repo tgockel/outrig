@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig image add`'s bootstrap no longer reads a `--global-config` that vanished while its
+  "Configure outrig in this directory now?" prompt was up as an empty config.**
+  `resolve_or_bootstrap` checked an explicit path once, before that prompt, and read the file
+  after -- so a file removed in the window the prompt paces was read as missing and silently
+  treated as an empty global config, same as #342's unconfigured case, and the wizard wrote a
+  repo config whose agent has no model without saying why. The explicit path is now re-resolved a
+  second time, right before the bootstrap reads it, so a file gone by then is refused with the
+  same "--global-config <path> does not exist" error as one missing from the start; a path
+  already missing before the prompt is still refused ahead of it, so a scripted run with nothing
+  scripted for that prompt fails on the missing file rather than hanging on the question. `run`,
+  `mcp`, `build`, and the session commands check and read the file in one pass with no prompt
+  between, so they were never exposed. (#505)
 - **`outrig clean` and `outrig discard` no longer delete the record of a session whose container
   started while the `[y/N]` prompt was open.** Both commands decided what was removable from a
   single liveness check taken before the prompt -- `owner_is_live` for the session's directory, or
