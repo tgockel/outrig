@@ -503,6 +503,47 @@ pub enum Payload {
         /// How the process ended, such as `it was killed by SIGKILL`.
         cause: String,
     },
+    /// The session's application code was provisioned as it started: read
+    /// from `path` -- or from the bytes its owner gave, when that is `None` --
+    /// copied whole to a directory named for `digest`, which the interpreter
+    /// imports from as `mount`, with the packages `requires` names installed
+    /// in `packages`. The modules `imports` names are imported next, each
+    /// answered by an `application.imported`.
+    #[non_exhaustive]
+    ApplicationProvisioned {
+        /// The directory its owner gave, as given, or `None` for an archive.
+        path: Option<std::path::PathBuf>,
+        /// The first 16 hex digits of a BLAKE3 digest of its files' paths and
+        /// contents: its identity, the same for a directory and for an archive
+        /// holding the same files.
+        digest: String,
+        /// What its owner calls it, which nothing compares.
+        label: Option<String>,
+        /// Where the interpreter imports it from.
+        mount: String,
+        /// The requirement set its owner declared, sorted.
+        requires: Vec<String>,
+        /// Where the interpreter imports the requirement set from, or `None`
+        /// when it is empty.
+        packages: Option<String>,
+        /// The modules imported as the session starts, in order.
+        imports: Vec<String>,
+    },
+    /// A module of the session's application code was imported as the session
+    /// started, or failed to be, which fails the start. `code` and `reason`
+    /// say why, when it failed.
+    #[non_exhaustive]
+    ApplicationImported {
+        /// The module, as its owner named it.
+        module: String,
+        /// Why it did not import -- `import-failed`, `module-missing` or
+        /// `native-extension-unavailable` -- or `None` when it did.
+        code: Option<String>,
+        /// What was raised and the last 16 KiB of its traceback, its control
+        /// characters but line breaks and tabs escaped, or `None` when it
+        /// imported.
+        reason: Option<String>,
+    },
     /// What the session's skill sources hold, as the session started: each
     /// skill served, and why any other was left out, shadowed by an earlier
     /// source's, or served with a warning. Read from each skill's metadata
@@ -1213,6 +1254,8 @@ impl Payload {
             Payload::MessageRefused { .. } => "message.refused",
             Payload::MessageReceived { .. } => "message.received",
             Payload::BindingExited { .. } => "binding.exited",
+            Payload::ApplicationProvisioned { .. } => "application.provisioned",
+            Payload::ApplicationImported { .. } => "application.imported",
             Payload::SkillDiscovered { .. } => "skill.discovered",
             Payload::SkillImported { .. } => "skill.imported",
             Payload::SkillDirectiveReceived { .. } => "skill.directive.received",
@@ -1258,6 +1301,8 @@ impl Payload {
             | Self::BindingRefused { .. }
             | Self::BindingInjected { .. }
             | Self::BindingExited { .. }
+            | Self::ApplicationProvisioned { .. }
+            | Self::ApplicationImported { .. }
             | Self::SkillDiscovered { .. } => None,
             // An import is the agent's whose code made it, which may be none.
             Self::SkillImported { agent, .. } => agent.as_deref().map(Subject::agent),

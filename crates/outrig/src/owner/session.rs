@@ -40,8 +40,8 @@ use crate::events::Record;
 use crate::harness::bindings::Brief;
 use crate::harness::event::{Received, Subscription};
 use crate::harness::{
-    Closer, ContainerSpec, DEFAULT_DRAIN, Session, SessionBuilder, ShutdownReport, Stopped,
-    container_spec,
+    ApplicationSpec, Closer, ContainerSpec, DEFAULT_DRAIN, Session, SessionBuilder, ShutdownReport,
+    Stopped, container_spec,
 };
 use crate::image;
 use crate::supervise::{Owed, Tracked};
@@ -74,6 +74,8 @@ pub(crate) struct Request {
     pub(crate) mounts: Vec<MountRequest>,
     /// The interpreter's working directory, in one of the mounts; the image's when `None`.
     pub(crate) cwd: Option<PathBuf>,
+    /// The application code the program's agent classes are in, when it gave any.
+    pub(crate) application: Option<ApplicationRequest>,
     /// The live objects the program injected before entry, installed at the start.
     pub(crate) live: Vec<Live>,
 }
@@ -85,6 +87,17 @@ pub(crate) struct MountRequest {
     host_path: PathBuf,
     #[serde(default)]
     access: MountAccess,
+}
+
+/// The application code a program gives its session: a directory on the host, what it requires,
+/// and the modules imported as the session starts.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ApplicationRequest {
+    path: PathBuf,
+    #[serde(default)]
+    requires: Vec<String>,
+    #[serde(default)]
+    imports: Vec<String>,
 }
 
 /// A live object the program injects, which its own process serves: its binding's name, the
@@ -150,9 +163,17 @@ pub(crate) async fn run(
         reply,
         mounts,
         cwd,
+        application,
         live: injected,
     } = request;
-    let prepared = prepare(&context, &mounts, cwd.as_deref(), &injected).and_then(|config| {
+    let prepared = prepare(
+        &context,
+        &mounts,
+        cwd.as_deref(),
+        application.as_ref(),
+        &injected,
+    )
+    .and_then(|config| {
         let (id, logs) = session_dir(&config)?;
         Ok((config, id, logs))
     });
@@ -173,6 +194,13 @@ pub(crate) async fn run(
         .no_primary()
         .repo_root(&context.repo_root)
         .program(cwd);
+    if let Some(application) = application {
+        builder = builder.application(
+            ApplicationSpec::directory(application.path)
+                .requires(application.requires)
+                .imports(application.imports),
+        );
+    }
     if config.events.mode() == EventsMode::Record {
         builder = builder.record_events();
     }
@@ -487,11 +515,13 @@ async fn settled(owed: Owed) -> Stopped {
 /// The configuration a session starts from: the engine's, with the program's mounts, each at its
 /// host path, in place of the configured workspace and its mounts, which are the interactive
 /// session's. Checked, so nothing starts on paths that cannot be mounted, in a working directory
-/// that is none, or with a live object named as a configured binding.
+/// that is none, from application code in a directory that is none, or with a live object named
+/// as a configured binding.
 fn prepare(
     context: &Context,
     mounts: &[MountRequest],
     cwd: Option<&Path>,
+    application: Option<&ApplicationRequest>,
     live: &[Live],
 ) -> Result<Config, String> {
     let mut config = context.config.clone();
@@ -509,6 +539,14 @@ fn prepare(
             "the working directory {} is not a directory",
             cwd.display()
         ));
+    }
+    if let Some(application) = application.filter(|app| !app.path.is_dir()) {
+        let path = application.path.display();
+        return Err(if application.path.exists() {
+            format!("the application {path} is not a directory")
+        } else {
+            format!("the application {path} does not exist")
+        });
     }
     if let Some(live) = live
         .iter()

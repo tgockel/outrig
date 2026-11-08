@@ -1,5 +1,5 @@
-//! A binding's packages: its `requires`, installed once, pure Python only, into a cache keyed by
-//! the requirement set.
+//! A binding's packages, and application code's: its `requires`, installed once, pure Python
+//! only, into a cache keyed by the requirement set.
 //!
 //! The payload's own pip installs the set into `bindings/<hash>/` under the cache root, which the
 //! binding process imports from and the container later mounts read-only
@@ -151,7 +151,7 @@ const ARCHIVE_SUFFIXES: [&str; 12] = [
 
 /// The set as it is hashed and installed: each requirement checked to be a specifier, then
 /// trimmed, sorted and deduplicated.
-fn requirement_set(requires: &[String]) -> Result<Vec<String>> {
+pub(crate) fn requirement_set(requires: &[String]) -> Result<Vec<String>> {
     if let Some(problem) = requirement_problem(requires) {
         return Err(OutrigError::Configuration(problem));
     }
@@ -188,9 +188,9 @@ pub(crate) fn requirement_problem(requires: &[String]) -> Option<String> {
         .find(|req| !SPECIFIER.is_match(req) || archive(req))
         .map(|bad| {
             format!(
-                "{bad:?} is not a requirement specifier: a binding's `requires` names \
-                 distributions resolved from an index -- a name, extras, a version specifier, \
-                 markers -- and not a path, an archive, a URL or a pip option"
+                "{bad:?} is not a requirement specifier: `requires` names distributions \
+                 resolved from an index -- a name, extras, a version specifier, markers -- and \
+                 not a path, an archive, a URL or a pip option"
             )
         })
 }
@@ -375,10 +375,7 @@ fn check_pure(stage: &Path, dists: &[Dist], set: &[String]) -> Result<()> {
     }
     for entry in walkdir::WalkDir::new(stage) {
         let entry = entry.map_err(|e| OutrigError::Io(e.into()))?;
-        if !matches!(
-            entry.path().extension().and_then(|ext| ext.to_str()),
-            Some("so" | "pyd")
-        ) {
+        if !extension_module(entry.path()) {
             continue;
         }
         let file = entry.path().strip_prefix(stage).unwrap_or(entry.path());
@@ -392,6 +389,14 @@ fn check_pure(stage: &Path, dists: &[Dist], set: &[String]) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Whether `path` names a compiled extension module, which the payload's interpreter cannot load.
+pub(crate) fn extension_module(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("so" | "pyd")
+    )
 }
 
 /// An installed distribution, from its `.dist-info` directory.

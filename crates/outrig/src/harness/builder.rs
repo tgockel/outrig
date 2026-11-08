@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use super::application::{self, ApplicationSpec, Prepared};
 use super::approval::Approver;
 use super::bindings::{self, BindingSpec, Bindings, Declared, Places, Setup};
 use super::event::{DEFAULT_CAPACITY, Subscription};
@@ -18,7 +19,7 @@ use crate::error::{IoPathExt, OutrigError};
 use crate::events::{Events, StreamBuilder};
 use crate::image::ImageTag;
 use crate::outrig_::resolve_session_id;
-use crate::python::host::Interpreter;
+use crate::python::host::{Interpreter, READY_TIMEOUT};
 use crate::python::payload::RPYC_MOUNT;
 use crate::{EmbeddedMcpPolicy, LaunchSpec, Outrig};
 
@@ -95,6 +96,12 @@ pub struct SessionBuilder {
     repo_root: Option<PathBuf>,
     /// The sources of the session's skills, by name, in precedence order.
     skill_sources: Vec<(String, Arc<dyn SkillSource>)>,
+    /// The application code given through [`SessionBuilder::application`].
+    application: Option<ApplicationSpec>,
+    /// How long each module the application imports at start may take, in
+    /// place of [`READY_TIMEOUT`].
+    #[cfg(test)]
+    import_bound: Option<std::time::Duration>,
     /// Where a test's bindings install and remember approvals, in place of
     /// the user's own.
     #[cfg(test)]
@@ -149,6 +156,9 @@ impl SessionBuilder {
             approver: None,
             repo_root: None,
             skill_sources: Vec::new(),
+            application: None,
+            #[cfg(test)]
+            import_bound: None,
             #[cfg(test)]
             places: None,
             #[cfg(test)]
@@ -302,6 +312,26 @@ impl SessionBuilder {
         self
     }
 
+    /// Provision `spec`'s application code -- the package holding the task-bound class and what
+    /// it imports -- into the session's interpreter, importable in every kernel, before any
+    /// opens. No approval is asked: the owner is trusted as the operator is.
+    ///
+    /// The code is read as the session starts and copied whole to a directory named for its
+    /// digest, which the container mounts read-only under `/outrig/app/`: the session runs that
+    /// snapshot, whatever happens to the original meanwhile. It goes on `sys.path` after OutRig's
+    /// own package and before the workspace, so a file in the workspace cannot take the place of
+    /// one of its modules, and its requirement set is installed and placed beside it. The
+    /// modules its specification names are then imported, each on a thread of the interpreter's
+    /// own, and one that does not import fails the start, naming it and ending with the end of
+    /// its traceback; the session's events record each step. [`Session::application`] says
+    /// which code the session runs.
+    ///
+    /// A session holds one application: a later call replaces an earlier one.
+    pub fn application(mut self, spec: ApplicationSpec) -> Self {
+        self.application = Some(spec);
+        self
+    }
+
     /// A subscription to the session's events, from its first, holding up to
     /// [`DEFAULT_CAPACITY`] of them for its reader.
     pub fn subscribe(&mut self) -> Subscription {
@@ -336,6 +366,7 @@ impl SessionBuilder {
         bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         skills::check_sources(&self.skill_sources)
             .map_err(|e| start_error(OutrigError::Configuration(e)))?;
+        application::check(self.application.as_ref()).map_err(start_error)?;
         Ok(())
     }
 
@@ -382,6 +413,35 @@ impl SessionBuilder {
         }
     }
 
+    /// Where the session's requirement sets install and its approvals are remembered: the
+    /// user's, unless a test gave its own.
+    fn places(&self) -> Result<Places, OutrigError> {
+        #[cfg(test)]
+        if let Some(places) = &self.places {
+            return Ok(places.clone());
+        }
+        Places::user()
+    }
+
+    /// The application code given, read, copied and its requirement set installed, or `None`
+    /// when none was given.
+    async fn prepare_application(&mut self) -> Result<Option<Prepared>, OutrigError> {
+        let Some(spec) = self.application.take() else {
+            return Ok(None);
+        };
+        let places = self.places()?;
+        Ok(Some(application::prepare(spec, &places).await?))
+    }
+
+    /// How long each module the application imports at start may take.
+    fn import_wait(&self) -> std::time::Duration {
+        #[cfg(test)]
+        if let Some(bound) = self.import_bound {
+            return bound;
+        }
+        READY_TIMEOUT
+    }
+
     fn report(&mut self, progress: Progress) {
         if let Some(report) = &mut self.progress {
             report(progress);
@@ -397,6 +457,7 @@ impl SessionBuilder {
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         skills::check_sources(&self.skill_sources)
             .map_err(|e| start_error(OutrigError::Configuration(e)))?;
+        application::check(self.application.as_ref()).map_err(start_error)?;
         let repo_root = chosen_repo_root(self.repo_root.as_deref()).map_err(start_error)?;
         let mut spec = match self.container.take() {
             Some(spec) => spec,
@@ -420,6 +481,7 @@ impl SessionBuilder {
                 .as_ref()
                 .map_or_else(|| repo_root.clone(), |workspace| lexical(&workspace.host))
         });
+        let application = self.prepare_application().await.map_err(start_error)?;
         let mut bindings = self
             .start_bindings(declared, &repo_root, &cwd, &events)
             .await
@@ -428,11 +490,12 @@ impl SessionBuilder {
             bindings.allow_live().await;
         }
         if bindings.rpyc_dir().is_some()
-            && let Err(e) = same_paths(&self.config, &mut spec, &bindings)
+            && let Err(e) = same_paths(&self.config, &mut spec)
         {
             bindings.stop_after_failed_start().await;
             return Err(start_error(e));
         }
+        spec.packages = package_mounts(&bindings, application.as_ref());
 
         self.report(Progress::Started(Step::Container));
         let outrig = match Outrig::launch(&spec).await {
@@ -480,7 +543,15 @@ impl SessionBuilder {
         );
         #[cfg(test)]
         let session = session.failing(self.fail_stop.take());
-        assemble(session, resolved.as_mut(), workspace.as_deref(), &catalog).await
+        let application = application.map(|application| (application, self.import_wait()));
+        assemble(
+            session,
+            application,
+            resolved.as_mut(),
+            workspace.as_deref(),
+            &catalog,
+        )
+        .await
     }
 
     /// `declared`, less the repository's bindings not approved, installed and
@@ -495,10 +566,7 @@ impl SessionBuilder {
         if declared.is_empty() {
             return Ok(Bindings::default());
         }
-        #[cfg(test)]
-        let places = self.places.clone().map_or_else(Places::user, Ok)?;
-        #[cfg(not(test))]
-        let places = Places::user()?;
+        let places = self.places()?;
         let setup = Setup {
             config: &self.config,
             repo_root,
@@ -592,6 +660,13 @@ impl SessionBuilder {
         self
     }
 
+    /// Give each module the application imports at start `bound` to import in.
+    #[cfg(test)]
+    pub(crate) fn import_bound(mut self, bound: std::time::Duration) -> Self {
+        self.import_bound = Some(bound);
+        self
+    }
+
     /// Install the session's requirement sets under `root`, with `pip_env`
     /// added to pip's environment, and remember approvals in `approvals`, in
     /// place of the user's cache, index and state directory.
@@ -619,6 +694,7 @@ impl SessionBuilder {
     pub(crate) async fn start_on_host(mut self) -> Result<Session, SessionError> {
         let mut resolved = self.resolution()?;
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
+        application::check(self.application.as_ref()).map_err(start_error)?;
         let repo_root = chosen_repo_root(self.repo_root.as_deref()).map_err(start_error)?;
         let id = self.host_id.take().unwrap_or_else(|| "test".to_string());
         let log_dir = self.host_log.clone().unwrap_or_default();
@@ -630,6 +706,7 @@ impl SessionBuilder {
         )
         .await;
         let cwd = self.workdir.clone().unwrap_or_else(|| repo_root.clone());
+        let application = self.prepare_application().await.map_err(start_error)?;
         let mut bindings = self
             .start_bindings(declared, &repo_root, &cwd, &events)
             .await
@@ -660,7 +737,15 @@ impl SessionBuilder {
             setup,
         )
         .failing(self.fail_stop.take());
-        assemble(session, resolved.as_mut(), workspace.as_deref(), &catalog).await
+        let application = application.map(|application| (application, self.import_wait()));
+        assemble(
+            session,
+            application,
+            resolved.as_mut(),
+            workspace.as_deref(),
+            &catalog,
+        )
+        .await
     }
 }
 
@@ -707,16 +792,25 @@ async fn default_container(
     Ok(spec.with_session_id(id))
 }
 
-/// `session`, with the primary agent `resolved` names -- none, for a session
-/// with no primary agent -- in a container whose workspace is `workspace`,
-/// holding the session's skills, `catalog`, and idle. A primary that cannot be
-/// built stops what the start launched.
+/// `session`, with its application code provisioned -- each module imported
+/// at start within the bound beside it -- and the primary agent `resolved`
+/// names -- none, for a session with no primary agent -- in a container whose
+/// workspace is `workspace`, holding the session's skills, `catalog`, and
+/// idle. Application code that does not import, or a primary that cannot be
+/// built, stops what the start launched.
 async fn assemble(
     mut session: Session,
+    application: Option<(Prepared, std::time::Duration)>,
     resolved: Option<&mut ResolvedAgent>,
     workspace: Option<&Path>,
     catalog: &Arc<Catalog>,
 ) -> Result<Session, SessionError> {
+    if let Some((application, bound)) = application
+        && let Err(e) = session.provision(application, bound).await
+    {
+        session.abandon().await;
+        return Err(SessionError::Start(Failure(e.into())));
+    }
     if let Some(resolved) = resolved
         && let Err(e) = session.build_primary(resolved, workspace, catalog).await
     {
@@ -746,20 +840,14 @@ fn start_error(e: OutrigError) -> SessionError {
 
 /// `spec`, rewritten for a session with bindings: every directory it mounts
 /// appears in the container at its host path, so a path the agent writes and
-/// a path the library reads name one file, and each binding's package
-/// directory, and the vendored RPyC the interpreter reaches them with, is
-/// bound read-only beside the payload.
+/// a path the library reads name one file.
 ///
 /// The workspace's container path becomes its host path, unless `config`
 /// declared another, which is an error naming the key. A `LaunchSpec` cannot
 /// say whether its container path was declared -- one from the configuration
 /// holds `/workspace` when none was -- so the configuration decides. A mount
 /// whose container path is not its host path is an error.
-fn same_paths(
-    config: &Config,
-    spec: &mut LaunchSpec,
-    bindings: &Bindings,
-) -> Result<(), OutrigError> {
+fn same_paths(config: &Config, spec: &mut LaunchSpec) -> Result<(), OutrigError> {
     let differs = |key: String, container: &Path, host: &Path, declared_in| {
         ConfigValidationError::BindingContainerPath {
             key,
@@ -792,17 +880,29 @@ fn same_paths(
             Err(differs(key, &mount.container, &mount.host, None))?;
         }
     }
-    spec.packages = bindings
-        .package_dirs()
-        .into_iter()
+    Ok(())
+}
+
+/// What the container binds read-only beside the payload, under OutRig's own
+/// root: each requirement set's directory, the bindings' and the
+/// application's, once each; the application's snapshot; and the vendored RPyC
+/// the interpreter reaches the bindings with.
+fn package_mounts(bindings: &Bindings, application: Option<&Prepared>) -> Vec<ContainerMount> {
+    let mut dirs = bindings.package_dirs();
+    if let Some(dir) = application.and_then(Prepared::packages)
+        && !dirs.contains(&dir)
+    {
+        dirs.push(dir);
+    }
+    dirs.into_iter()
         .map(|dir| ContainerMount::shared_read_only(dir, bindings::container_path(dir)))
+        .chain(application.map(Prepared::snapshot))
         .chain(
             bindings
                 .rpyc_dir()
                 .map(|dir| ContainerMount::shared_read_only(dir, Path::new(RPYC_MOUNT))),
         )
-        .collect();
-    Ok(())
+        .collect()
 }
 
 /// A container for a session, and the MCP servers it leaves out.

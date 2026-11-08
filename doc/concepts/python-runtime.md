@@ -395,6 +395,33 @@ the totals of the round the invocation ran in count as well. A skill grants noth
 with the authority of the agent that invokes it, which is why a repository's skills need no
 approval and a repository's bindings do.
 
+## Application code
+
+A session's owner -- a Rust program embedding OutRig, through `SessionBuilder::application`, or a
+host program, through `outrig.Session(application=outrig.Application(...))` -- may give it
+application code: the package its agent classes are in, and what they import. It is a directory
+whose top-level entries are packages and modules, as a project's `src/` is, or, from Rust, the
+bytes of a tar of one.
+
+As the session starts, OutRig reads the code on the host, with no Python run and no link followed,
+skipping names that begin `.` and `__pycache__`. A compiled extension module (`.so`, `.pyd`) in it
+fails the start before anything is copied, since the interpreter loads no compiled code. The rest
+is copied whole to a directory named for the digest of its files' paths and contents, which the
+container mounts read-only at `/outrig/app/<digest>`. Every kernel imports from that snapshot, so
+an edit made to the original while the session runs changes nothing until the next session, and
+the digest says which code the session ran. The interpreter puts it on `sys.path` after OutRig's
+own package and before the workspace, so no file in the workspace takes the place of one of its
+modules. Its `requires`, written as a binding's are, is installed as a binding's is, pure-Python
+wheels only, and placed beside it. Neither the agent nor its `pip` installs anything of it.
+
+The modules the owner names are imported as the session starts, before any kernel opens, on a
+thread of the interpreter's own, outside every execution: what they print goes to the session's
+`output.unattributed`. One that raises, is nowhere to import from, reaches compiled code, or takes
+more than 30 seconds to import fails the start, naming the module and ending with the end of its
+traceback, and no model is called. `application.provisioned` and `application.imported` record
+each step (see [Events](../reference/events.md)). A module the owner does not name imports when
+something first imports it.
+
 ## See also
 
 - [Reference -> CLI](../reference/cli.md#outrig-run-new) -- `outrig run-new`'s interactive

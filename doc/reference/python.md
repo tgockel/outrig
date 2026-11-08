@@ -157,14 +157,15 @@ The `[events]` table: `mode` is `"off"` or `"record"`.
 
 A program runs agents in a session it owns: an `outrig.Session`, entered with `async with`, which
 `outrig.current_session()` returns inside the block. An `outrig.Mount` is a directory its container
-sees, and its `events()` yields an `outrig.Event` for each record, with an `outrig.Missed` where
-records were lost. See [Host programs](../usage/host-programs.md#sessions).
+sees, an `outrig.Application` the code its agent classes are in, and its `events()` yields an
+`outrig.Event` for each record, with an `outrig.Missed` where records were lost. See [Host
+programs](../usage/host-programs.md#sessions).
 
 ### `outrig.Session`
 
 ```python
 class Session:
-    def __init__(self, *, mounts=(), cwd=None, grace=None): ...
+    def __init__(self, *, mounts=(), cwd=None, grace=None, application=None): ...
 ```
 
 A session this program owns, with no primary agent: a container, the interpreter in it,
@@ -186,9 +187,12 @@ Making one checks its inputs and starts nothing:
   finish before it stops what is left, at most an hour, or `None` for the engine's default,
   five. It bounds that wait only: interrupting kernels and stopping the bindings and the
   container after it take bounded times of their own.
+- `application`: an `Application`, the code this program's agent classes are in, which every
+  kernel of the session imports from; or `None`.
 
 Relative paths are made absolute against the working directory now. A mount that does not
-exist, is not a directory, or is `/`, and a `cwd` that is not a directory, fail entry.
+exist, is not a directory, or is `/`, a `cwd` that is not a directory, and an application
+whose path is not a directory, fail entry.
 
 `async with` starts it in the image `default-image` names, with the configured factory
 bindings -- a repository's own only where its exact declaration was approved in that
@@ -294,6 +298,34 @@ same file on both sides: one a live object returns names the file agent code ope
 
 `host_path` is the directory, a str or path made absolute against the working directory when
 the `Mount` is made. `access` is `"read-only"`, the default, or `"read-write"`.
+
+### `outrig.Application`
+
+```python
+@dataclasses.dataclass(frozen=True)
+class Application:
+    path: str
+    requires: tuple = ()
+    imports: tuple = ()
+```
+
+A session's application code: the package holding this program's agent classes and what
+they import, which the session's interpreter imports from in every kernel.
+
+`path` is a directory whose top-level entries are packages and modules, as a project's `src/`
+is, a str or path made absolute against the working directory when the `Application` is made.
+`requires` names the distributions it imports beyond the standard library and `outrig`, as a
+binding's `requires` does: a name, extras, a version specifier and markers, never a path or a
+URL. `imports` names the modules imported as the session starts, in order.
+
+Entry reads the directory with no Python run, refuses it if anything in it is compiled or a
+link, and copies it whole to a directory named for its digest, which the container mounts
+read-only: the session runs that copy, whatever happens to `path` meanwhile. The copy goes on
+`sys.path` after the `outrig` package and before the working directory, so no file there takes
+the place of one of its modules, and its `requires` -- pure-Python wheels only -- is installed
+and placed beside it. Each module of `imports` is then imported, and one that raises, is not
+found, reaches compiled code or takes more than 30 seconds fails entry, naming it and ending
+with the end of its traceback. A module not named imports when something first imports it.
 
 ### `outrig.current_session`
 

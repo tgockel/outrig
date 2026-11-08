@@ -424,6 +424,24 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             None,
         ),
         (
+            "application.provisioned",
+            {
+                "path": "/r/app",
+                "digest": "0123456789abcdef",
+                "label": "v1",
+                "mount": "/outrig/app/0123456789abcdef",
+                "requires": ["pure==1.0"],
+                "packages": "/outrig/bindings/fedcba9876543210",
+                "imports": ["review.agents"],
+            },
+            None,
+        ),
+        (
+            "application.imported",
+            {"module": "review.agents", "code": None, "reason": None},
+            None,
+        ),
+        (
             "skill.discovered",
             {
                 "skills": [

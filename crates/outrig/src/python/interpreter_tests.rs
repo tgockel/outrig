@@ -8009,3 +8009,158 @@ fn a_mapping_is_read_as_it_stands_and_a_dictless_child_inherits_it() {
         "['task', 'extra'] False\n"
     );
 }
+
+/// A directory holding the application package `review`: `agents` records the thread it was
+/// imported on, `broken` raises, `loud` raises what cannot be formatted, and `fast` imports
+/// `native`, which is compiled code in the workspace.
+fn application() -> tempfile::TempDir {
+    let app = tempfile::tempdir().expect("tempdir");
+    let review = app.path().join("review");
+    std::fs::create_dir(&review).expect("the package's directory");
+    for (name, source) in [
+        ("__init__.py", ""),
+        (
+            "agents.py",
+            "import threading\nTHREAD = threading.current_thread().name\n",
+        ),
+        ("broken.py", "raise ValueError('the broken module')\n"),
+        (
+            "loud.py",
+            "class Loud(Exception):\n\
+             \x20   @property\n\
+             \x20   def __notes__(self):\n\
+             \x20       raise SystemExit('not now')\n\
+             raise Loud()\n",
+        ),
+        ("fast.py", "import native\n"),
+    ] {
+        std::fs::write(review.join(name), source).expect("write");
+    }
+    app
+}
+
+/// The interpreter working in `workspace`, with no kernel, told the application in `app` and to
+/// import `imports` under id 1.
+fn told_application(workspace: &Path, app: &Path, imports: &[&str]) -> Interpreter {
+    let mut k = Interpreter::spawn_opening(
+        &Start {
+            dir: Some(workspace),
+            ..Start::default()
+        },
+        false,
+    );
+    k.send(json!({
+        "t": "application", "agent": PRIMARY, "id": 1, "paths": [app], "imports": imports,
+    }));
+    k
+}
+
+/// The application goes on `sys.path` before the workspace, so a workspace module named like one
+/// of its packages does not take that package's place.
+#[test]
+fn the_application_comes_before_the_workspace_on_sys_path() {
+    let (workspace, app) = (tempfile::tempdir().expect("tempdir"), application());
+    std::fs::write(workspace.path().join("review.py"), "SHADOW = True\n").expect("write");
+    let mut k = told_application(workspace.path(), app.path(), &[]);
+    k.open_on_main(PRIMARY);
+    assert_eq!(
+        k.output(
+            1,
+            &format!(
+                "import review, sys\n\
+                 print(review.__file__)\n\
+                 print(sys.path.index({app:?}) < sys.path.index({workspace:?}))\n\
+                 print(sys.path.index({app:?}) > sys.path.index({lib:?}))",
+                app = app.path(),
+                workspace = workspace.path(),
+                lib = package(),
+            )
+        ),
+        format!(
+            "{}\nTrue\nTrue\n",
+            app.path().join("review/__init__.py").display()
+        )
+    );
+}
+
+/// Each module imported at start is answered as it imports, on a thread of the interpreter's
+/// own, and the first that does not import ends them: a module that raises carries its
+/// traceback, and one that is nowhere is missing.
+#[test]
+fn each_module_imported_at_start_is_answered_until_one_fails() {
+    let (workspace, app) = (tempfile::tempdir().expect("tempdir"), application());
+    let mut k = told_application(
+        workspace.path(),
+        app.path(),
+        &["review.agents", "review.broken", "review.agents"],
+    );
+    let imported = k.recv();
+    assert_eq!(
+        imported,
+        json!({"t": "imported", "agent": PRIMARY, "id": 1, "module": "review.agents", "error": null})
+    );
+    let failed = k.recv();
+    assert_eq!(failed["module"], "review.broken", "{failed}");
+    assert_eq!(failed["error"]["code"], "import-failed", "{failed}");
+    assert_eq!(
+        failed["error"]["message"], "ValueError was raised",
+        "{failed}"
+    );
+    let traceback = text(&failed["error"]["traceback"]);
+    assert!(
+        traceback.contains("review/broken.py\", line 1")
+            && traceback
+                .trim_end()
+                .ends_with("ValueError: the broken module"),
+        "{traceback}"
+    );
+    // Nothing more is answered: the next message is the kernel's `ready`.
+    k.open_on_main(PRIMARY);
+    assert_eq!(
+        k.output(1, "import review.agents\nprint(review.agents.THREAD)"),
+        "application\n"
+    );
+
+    let mut k = told_application(workspace.path(), app.path(), &["review.absent"]);
+    let missing = k.recv();
+    assert_eq!(missing["error"]["code"], "module-missing", "{missing}");
+    assert!(
+        text(&missing["error"]["message"]).contains("'review.absent'"),
+        "{missing}"
+    );
+}
+
+/// A module imported at start that reaches compiled code says so, as an execution's import does,
+/// and so does one that is compiled code itself, built for a platform whose suffix this
+/// interpreter does not look for, rather than being called missing.
+#[test]
+fn a_module_reaching_compiled_code_is_said_to() {
+    let (workspace, app) = (tempfile::tempdir().expect("tempdir"), application());
+    let foreign = "glibc_only.cpython-313-x86_64-linux-gnu.so";
+    for file in ["native.abi3.so", foreign] {
+        std::fs::write(workspace.path().join(file), b"not really").expect("write");
+    }
+    for (module, file) in [("review.fast", "native.abi3.so"), ("glibc_only", foreign)] {
+        let mut k = told_application(workspace.path(), app.path(), &[module]);
+        let failed = k.recv();
+        assert_eq!(
+            failed["error"]["code"], "native-extension-unavailable",
+            "{failed}"
+        );
+        assert!(text(&failed["error"]["message"]).contains(file), "{failed}");
+    }
+}
+
+/// A module whose failure cannot be formatted is still answered for, as an execution's failure
+/// is still reported: `traceback` guards its read of `__notes__` against `Exception` alone.
+#[test]
+fn a_module_whose_failure_cannot_be_formatted_is_still_answered_for() {
+    let (workspace, app) = (tempfile::tempdir().expect("tempdir"), application());
+    let mut k = told_application(workspace.path(), app.path(), &["review.loud"]);
+    let failed = k.recv();
+    assert_eq!(failed["error"]["code"], "import-failed", "{failed}");
+    assert_eq!(
+        text(&failed["error"]["traceback"]),
+        "Loud: its traceback could not be formatted (SystemExit while formatting it)\n"
+    );
+}

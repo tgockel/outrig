@@ -148,7 +148,7 @@ kwargs      = {{ out = {out:?} }}
 
 /// The test wheels' directory, built off the test's runtime: building them unpacks the payload
 /// on a runtime of its own, which cannot start inside another.
-fn wheels() -> &'static Path {
+pub(super) fn wheels() -> &'static Path {
     std::thread::scope(|scope| scope.spawn(wheel_links).join().expect("the wheels build"))
 }
 
@@ -174,7 +174,7 @@ async fn stop(session: Session) -> ShutdownReport {
 }
 
 /// What `source` printed, run in `session`'s primary kernel.
-async fn output(session: &Session, source: &str) -> String {
+pub(super) async fn output(session: &Session, source: &str) -> String {
     let mut execution = session
         .interpreter()
         .submit(source)
@@ -239,7 +239,7 @@ async fn raised(flag: &Flag) {
 }
 
 /// The events the subscription holds.
-fn taken(events: &mut Subscription) -> Vec<Arc<Event>> {
+pub(super) fn taken(events: &mut Subscription) -> Vec<Arc<Event>> {
     let mut held = Vec::new();
     while let Ok(received) = events.try_recv() {
         if let Received::Event(event) = received {

@@ -46,6 +46,7 @@
 // Here rather than crate-wide: the frozen 0.2 surface is undocumented.
 #![warn(missing_docs)]
 
+mod application;
 mod approval;
 pub(crate) mod bindings;
 mod builder;
@@ -58,6 +59,7 @@ pub(crate) mod skills;
 
 use std::time::Duration;
 
+pub use self::application::{ApplicationIdentity, ApplicationSpec};
 pub use self::approval::{Approval, ApprovalRequest, Approver};
 pub use self::bindings::BindingSpec;
 pub(crate) use self::builder::chosen_repo_root;

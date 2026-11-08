@@ -17,8 +17,8 @@
 //!   engine answers the same at the same version, before the program's script runs; a program
 //!   speaking another version is answered with an `error` and ended, and its start fails.
 //! - **Requests**, answered by `id` with a line of the same `t`, or an `error`: `config`;
-//!   `session.start` (`session`, `mounts`, `cwd`, and `live`, the objects injected before
-//!   entry), answered with the session's `id`, its `requests_max`, the `bindings` its
+//!   `session.start` (`session`, `mounts`, `cwd`, `application` -- `path`, `requires`,
+//!   `imports` -- and `live`, the objects injected before entry), answered with the session's `id`, its `requests_max`, the `bindings` its
 //!   configuration declares and the `rpyc` the program serves live objects with, once it has
 //!   started; `inject` (`session`, `name`, `type`, `doc`, `serialize`), answered once every kernel
 //!   has the binding; `admission.close` (`session`), answered once the gate is closed; and

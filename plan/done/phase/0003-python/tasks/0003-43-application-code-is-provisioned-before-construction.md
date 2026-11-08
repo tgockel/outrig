@@ -172,6 +172,107 @@ Each is a mock-driven test unless it says otherwise; the mock model is not calle
    would let the digest drift under the session and the agent see edits mid-round; iteration is
    a new session.
 
+## Decisions
+
+- **Forks 1-5 take their recommendations.** A snapshot in a digest-named cache directory,
+  mounted read-only at `/outrig/app/<digest>` and placed on `sys.path` (1); after `/outrig/lib`
+  and `/outrig/rpyc` and before the workspace, the requirement set's directory with it (2); a
+  directory and an uncompressed tar of bytes now, a wheel open (3); the import at start on a
+  thread of the interpreter's own, named `application`, outside every kernel, its output the
+  process's stderr and so `output.unattributed` (4); a snapshot, never a live mount (5). The
+  `sys.path` move is a move, not a skip: a requirement set the application shares with a binding
+  was placed after the workspace by `_bindings`, and goes before it with the code.
+- **The digest recipe** is `package_name`'s, split out as `payload::digest`: BLAKE3 over each
+  file's path and contents, each preceded by its length as a little-endian `u64` -- a skill
+  listing's framing -- in path order, cut to its first 16 hex digits. `package_name` followed
+  each with a NUL, which review found ambiguous once contents are arbitrary: `a.txt` holding
+  `x\0b.txt\0y` hashed as `a.txt` and `b.txt`, and the second session would reuse the first's
+  snapshot. The `outrig` package's directory is renamed by the change, as by any release. It
+  names the cache directory and the mount and is what `application.provisioned`,
+  `ApplicationIdentity` and a save carry. 64 bits suffice: the owner supplies both sides of every
+  comparison, so nothing adversarial chooses a collision. Paths are sorted byte-wise after the
+  walk, since the walk's order is not (`/` sorts after `-`). Empty directories are not part of
+  it, and a directory and a tar of the same files agree.
+- **Reading.** A directory is read by `skills::read_tree`, the walk `DirectorySource` uses
+  (`listed`, `read_beneath`), so the bounds, the names skipped (`.`-prefixed, `__pycache__`) and
+  the refusal of links and non-regular files are a skill directory's by construction. An archive
+  is unpacked with `Entry::unpack_in` into a stage under the cache root -- a member landing
+  outside it is refused, as `payload::unpack` refuses one -- and the stage read by the same
+  `read_tree`, so an archive reads as the directory does rather than by a second reader's copy of
+  the rules. Each member is first put to `skills::admits`, beside the rules it applies: one
+  beneath a skipped name -- a `.git`, a `.venv` -- is not unpacked at all, and one past a file's
+  size, the depth or the entry count is refused from its header, so the stage never holds what
+  the directory form would not have read. Its bounds are never stricter than `read_tree`'s, which
+  still decides: entries are counted once per path, as a tar may repeat a directory's header
+  before each of its files, and `git archive`'s pax global header is not counted. Every file is
+  read whole into memory before anything is written: the digest covers contents, so a warm start
+  reads them anyway, and the copy written on a miss is then the bytes that were hashed.
+  `ApplicationSpec::archive` takes `Cow<'static, [u8]>`, so an `include_bytes!` static is not
+  copied. A skill file's size refusal now reads "a file this source serves", as its siblings do.
+- **Pure Python is a fixed fact the application plans around**, not a check the requirements ask
+  for: the interpreter is a static build that loads no extension module. `install::extension_module`
+  is the one Rust predicate for a compiled file, shared with `check_pure`; a `.so` or `.pyd` in
+  the artifact is refused as `not-pure-python` naming the file before anything is written.
+  `plan/next/use-the-images-python.md` stays the only way around it.
+- **The line is `{"t": "application", paths, imports}` under a request id**, answered by one
+  `imported` line per module, `{module, error}`, `error` being `{code, message, traceback}` or
+  `null`. The deliverable's line also named the digest; nothing in the interpreter reads it, so it
+  is not sent. `paths` is the snapshot's directory then the requirement set's, as the interpreter
+  sees them. The host's query is the one that takes several answers: `Query::Imported` holds an
+  `mpsc` sender, dispatch finds it with `get`, and `Interpreter::provision` removes it once the
+  last module answered, failed or ran out of time. One request per module was weighed and not
+  taken: the line the deliverable describes carries the list, and the stream already names the
+  module that ran past the bound.
+- **The bound** is `READY_TIMEOUT`, 30 seconds, per module, as a kernel's ready is bounded. A
+  `#[cfg(test)]` builder hook, `import_bound`, shortens it for the test of a module that sleeps.
+  The traceback is the last 16 KiB of `format_exception`, `_serve.TEXT_MAX`, as an event carries
+  one; a skill's `import-failed` carries none to copy. A failure's code and message come from
+  `skills._import_error`, which a skill's failed import reports through too; `module-missing` --
+  a `ModuleNotFoundError` naming the module or a package holding it -- only when that found no
+  compiled code, since a module that is a `.so` of another platform's suffix is not found either.
+  Formatting the traceback reads the exception, so what that raises (a `__notes__` raising
+  `SystemExit`) is reported as `_format_error` reports it, through the shared `_unformatted`, and
+  the module is still answered for. The interpreter stops at the first module that did not
+  import.
+- **A failure** is `InterpreterError::Import { module, reason }`, shaped as `Open { agent, reason }`
+  is: "the application's module `review.agents` did not import (import-failed): ValueError was
+  raised" followed by the traceback's tail, or "did not import within 30s". Provisioning runs in
+  `assemble`, shared by `start` and `start_on_host`, before the primary is built, through
+  `Session::provision`; a failure takes `Session::abandon`, the path a primary that cannot be
+  built takes, so no kernel was opened and no model called. `Progress::Finished(Step::Python)`
+  is reported before the imports, as it is before the primary's kernel opens.
+- **"The session's facts" is `Session::application()`**, beside `id()` and `python_version()`: an
+  `ApplicationIdentity { digest, label, requires }`, `requires` the sorted, deduplicated set
+  `install::requirement_set` makes. Nothing in the crate read "facts" before this task. The host
+  program reads the identity from `application.provisioned` in `session.events()`; its
+  `session.start` answer is unchanged.
+- **`SessionBuilder::application` replaces**, as `container`, `approver` and `repo_root` do; only
+  `bind` and `skill_source`, which take many, accumulate. `application::check` -- each
+  requirement a specifier, each import a dotted name -- runs in `check()` and at the top of both
+  start paths, beside `skills::check_sources`.
+- **Mounts.** `package_mounts` in `builder.rs` assembles `spec.packages` once: every requirement
+  set's directory, the bindings' and the application's, deduplicated; the snapshot; RPyC.
+  `same_paths` keeps its one job, the workspace and mounts at their host paths, and runs only
+  with bindings, as before. The read-only mount under `/outrig/app` was run in a container
+  (`application_tests.rs`'s e2e test): the reserved-path check applies to caller mounts only.
+- **No `label` on the Python `Application`.** OR-A2-4's identity label is the Rust owner's; a host
+  program can add one when it needs it. `outrig.Application(path, requires=(), imports=())` is a
+  frozen dataclass like `Mount`, its path made absolute when it is made; `prepare` refuses a path
+  that does not exist or is not a directory before anything starts, worded as the `cwd` check is.
+- **No close row.** The mounts end with the container, which **The interpreter and the
+  container** covers, and nothing of an application runs outside a kernel after the start: the
+  import thread has ended by the time the start answers.
+- **Tests write the user's cache**, as `package_dir` does: snapshots are content-addressed and
+  idempotent. "A second session copies nothing" is `a_snapshot_already_taken_is_not_copied_again`,
+  which re-provisions into a cache root it cannot write. The acceptance's `pure-fixture` is the
+  test wheels' `pure`. `review.agents.__file__` under `/outrig/app/` and the read-only write are
+  asserted in the container test; on the host the snapshot is the cache directory itself.
+- **Not adopted from review:** moving the bounded reader out of `skills.rs` into a module of its
+  own (two callers, one shared walk); one install path for the bindings' and the application's
+  sets (three lines alike); preparing the application concurrently with the bindings' installs
+  (worth it only for a cold cache, at the price of cross-cleanup). Snapshots are never pruned:
+  `plan/next/application-snapshots-are-never-pruned.md`.
+
 ## Dependencies
 
 - **Hard: `0003-39`.** The `application` line, its thread and the `sys.path` placement are

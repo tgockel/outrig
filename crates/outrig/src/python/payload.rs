@@ -49,6 +49,11 @@ pub(crate) const PAYLOAD_MOUNT: &str = "/outrig/python";
 /// user's home.
 pub(crate) const BINDINGS_MOUNT: &str = "/outrig/bindings";
 
+/// Where a session's application code is bound, read-only, inside the primary
+/// container, as `<APPLICATION_MOUNT>/<digest>`: the snapshot the session
+/// took of it, which the interpreter puts on `sys.path` before the workspace.
+pub(crate) const APPLICATION_MOUNT: &str = "/outrig/app";
+
 /// Where the vendored RPyC is bound, read-only, inside the primary container of
 /// a session with bindings: the interpreter imports it from there to reach
 /// them.
@@ -182,33 +187,45 @@ pub(crate) async fn package_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// `outrig-` and the first 16 hex digits of a digest of `files`' paths and
-/// contents: [`package_dir`] writes [`PACKAGE`] under its name.
+/// `outrig-` and [`digest`] of `files`: [`package_dir`] writes [`PACKAGE`]
+/// under its name.
 fn package_name(files: &[(&str, &str)]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    for (path, source) in files {
-        hasher.update(path.as_bytes());
-        hasher.update(&[0]);
-        hasher.update(source.as_bytes());
-        hasher.update(&[0]);
-    }
-    format!("outrig-{}", &hasher.finalize().to_hex()[..16])
+    format!("outrig-{}", digest(files))
 }
 
-/// Write `files` to `dir`, staged beside it and renamed into place as
-/// [`unpack`] does, so `dir` holds the whole package or does not exist. Run
-/// under [`locked_once`], which has made `dir`'s parent.
-fn write_package(dir: &Path, files: &[(&str, &str)]) -> Result<()> {
+/// The first 16 hex digits of a BLAKE3 digest of `files`' paths and contents,
+/// in the order given, each preceded by its length, as a skill's listing is
+/// digested: what names the `outrig` package's directory and a session's
+/// application code. The lengths frame each part, so no two lists of files
+/// hash the same bytes, as a separator in contents that may hold it would.
+pub(crate) fn digest(files: &[(impl AsRef<str>, impl AsRef<[u8]>)]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for (path, contents) in files {
+        for part in [path.as_ref().as_bytes(), contents.as_ref()] {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+    }
+    hasher.finalize().to_hex()[..16].to_string()
+}
+
+/// Write `files`, each by its path under `dir`, to `dir`, staged beside it
+/// and renamed into place as [`unpack`] does, so `dir` holds every file or
+/// does not exist. Run under [`locked_once`], which has made `dir`'s parent.
+pub(crate) fn write_package(
+    dir: &Path,
+    files: &[(impl AsRef<str>, impl AsRef<[u8]>)],
+) -> Result<()> {
     let parent = dir.parent().expect("the package directory has a parent");
     let stage = tempfile::Builder::new()
         .prefix(".write-")
         .tempdir_in(parent)
         .path_ctx("create a directory in", parent)?;
-    for (path, source) in files {
-        let file = stage.path().join(path);
+    for (path, contents) in files {
+        let file = stage.path().join(path.as_ref());
         let at = file.parent().expect("a package file is in a directory");
         std::fs::create_dir_all(at).path_ctx("create", at)?;
-        std::fs::write(&file, source).path_ctx("write", &file)?;
+        std::fs::write(&file, contents).path_ctx("write", &file)?;
     }
     match std::fs::rename(stage.path(), dir) {
         Ok(()) => Ok(()),
@@ -219,7 +236,7 @@ fn write_package(dir: &Path, files: &[(&str, &str)]) -> Result<()> {
 
 /// The user's cache directory, or a configuration error naming `what` could
 /// not be placed.
-pub(super) fn cache_dir(what: &str) -> Result<PathBuf> {
+pub(crate) fn cache_dir(what: &str) -> Result<PathBuf> {
     xdg_root(
         std::env::var_os("XDG_CACHE_HOME"),
         std::env::var_os("HOME"),
@@ -293,7 +310,7 @@ fn unpack_once(archive: &[u8], dir: &Path, subtree: &str) -> Result<()> {
 /// holds the lock beside it: of concurrent callers one builds and the rest
 /// find its result. `build` makes `dir` appear whole or not at all -- a stage
 /// renamed into place, as [`unpack`] does.
-pub(super) fn locked_once(dir: &Path, build: impl FnOnce() -> Result<()>) -> Result<()> {
+pub(crate) fn locked_once(dir: &Path, build: impl FnOnce() -> Result<()>) -> Result<()> {
     let parent = dir.parent().expect("the directory has a parent");
     std::fs::create_dir_all(parent).path_ctx("create", parent)?;
     let lock = lock_path(dir);
@@ -696,6 +713,16 @@ mod tests {
         locked_once(&dir, || write_package(&dir, &files)).unwrap();
         assert_eq!(std::fs::read_to_string(dir.join(PROGRAM)).unwrap(), altered);
         assert_ne!(package_name(&files), package_name(PACKAGE));
+    }
+
+    /// A file whose contents spell out another file's path and contents is
+    /// not those two files.
+    #[test]
+    fn files_are_told_apart_whatever_their_contents_hold() {
+        assert_ne!(
+            digest(&[("a.txt", "x\0b.txt\0y")]),
+            digest(&[("a.txt", "x"), ("b.txt", "y")])
+        );
     }
 
     #[test]

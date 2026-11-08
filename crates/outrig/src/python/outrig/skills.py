@@ -536,6 +536,20 @@ def _drop_below(package):
         sys.modules.pop(key, None)
 
 
+def _import_error(error):
+    """What a failed import is reported as: `native-extension-unavailable` when compiled code is
+    the reason, `import-failed` otherwise, each with its message. The interpreter reports a module
+    of the application's that did not import at start the same way."""
+    found = _native(error)
+    if found is None:
+        return {"code": "import-failed", "message": f"{_type_name(type(error))} was raised"}
+    return {
+        "code": "native-extension-unavailable",
+        "message": f"importing it reached {found[0]!r}, whose {found[1]} is compiled code, which "
+        "this interpreter cannot load",
+    }
+
+
 def _native(exc):
     """The module and compiled file an `ImportError` among `exc`, its causes and its contexts
     shows compiled code to be the reason for, or `None`. Read through `BaseException`'s own
@@ -953,14 +967,7 @@ class _Loader:
         if type(error) is SkillError:
             said = {"code": error.code, "message": error.message}
         elif error is not None:
-            found = _native(error)
-            said = {"code": "import-failed", "message": f"{_type_name(type(error))} was raised"}
-            if found is not None:
-                said = {
-                    "code": "native-extension-unavailable",
-                    "message": f"importing it reached {found[0]!r}, whose {found[1]} is compiled "
-                    "code, which this interpreter cannot load",
-                }
+            said = _import_error(error)
         line = {"t": "skill.imported", "skill": self.name, "digest": self.digest}
         line.update(reload=self.name in _reloading, error=said)
         _notify(_from_agent(line))

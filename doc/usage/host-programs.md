@@ -65,14 +65,23 @@ async with outrig.Session(mounts=[repo], cwd="./repo") as session:
 print(session.shutdown_report)
 ```
 
-- **Making one starts nothing.** `outrig.Session(mounts=(), cwd=None, grace=None)` checks its
-  inputs and returns. `mounts` are the directories of this host the container sees, each an
-  `outrig.Mount(host_path, access="read-only")` or a path, which is mounted read-only. Each
-  appears in the container at its own path, so a path names the same file in the program and in
-  agent code; nothing else of the host is there. `cwd`, a directory inside one of them, is where
-  agent code runs and what its imports find; without it, the image's working directory is. Relative
-  paths are taken from the program's working directory when the session is made, and a directory
-  given twice, or a `cwd` outside every mount, raises `ValueError`.
+- **Making one starts nothing.** `outrig.Session(mounts=(), cwd=None, grace=None,
+  application=None)` checks its inputs and returns. `mounts` are the directories of this host the
+  container sees, each an `outrig.Mount(host_path, access="read-only")` or a path, which is
+  mounted read-only. Each appears in the container at its own path, so a path names the same file
+  in the program and in agent code; nothing else of the host is there. `cwd`, a directory inside
+  one of them, is where agent code runs and what its imports find; without it, the image's
+  working directory is. Relative paths are taken from the program's working directory when the
+  session is made, and a directory given twice, or a `cwd` outside every mount, raises
+  `ValueError`.
+- **Its application code.** `application=outrig.Application(path, requires=(), imports=())` gives
+  the session the package the program's agent classes are in: `path` a directory whose top-level
+  entries are packages and modules, `requires` what it imports beyond the standard library and
+  `outrig`, written as a binding's `requires` is, and `imports` the modules imported as the
+  session starts. Entering copies the directory to a read-only snapshot every kernel imports from,
+  ahead of `cwd`, and fails -- naming the module and ending with its traceback -- when a module of
+  `imports` does not import, or when the directory does not exist or holds compiled code.
+  [Application code](../concepts/python-runtime.md#application-code) says how.
 - **The configuration's workspace is not mounted.** `[workspace]` and `[[workspace.mounts]]` are
   the interactive session's; `outrig.config().workspace` and `outrig.config().mounts` show them
   to a program that mounts them itself.

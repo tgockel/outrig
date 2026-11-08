@@ -138,8 +138,10 @@ pub(crate) const PRIMARY: &str = "primary";
 pub(crate) const OWNER: &str = "owner";
 
 /// How long a started interpreter has to greet. CPython starts and compiles
-/// the program in well under a second; this only has to be finite.
-const READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// the program in well under a second; this only has to be finite. A kernel
+/// has as long to report ready, and a module of the application's as long to
+/// import at start.
+pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The longest reply line read whole. The interpreter bounds everything it
 /// sends, and its largest reply -- an inventory of 200 names and types of up
@@ -314,6 +316,10 @@ pub(crate) enum InterpreterError {
     /// The interpreter could not read a file it was asked for.
     #[error("the Python interpreter could not read the file: {0}")]
     Read(String),
+    /// A module of the session's application code did not import as it started: `reason` says
+    /// how -- a code and the end of its traceback, or the bound it ran past.
+    #[error("the application's module `{module}` did not import {reason}")]
+    Import { module: String, reason: String },
     /// The session was closed to new work. Nothing was sent.
     #[error(transparent)]
     Closed(#[from] Closed),
@@ -547,6 +553,8 @@ enum Query {
     File(oneshot::Sender<Result<Option<FileText>, String>>),
     /// Bindings declared: every kernel has a stub of each.
     Bound(oneshot::Sender<()>),
+    /// The application declared: the answer for each module imported at start, as it comes.
+    Imported(mpsc::UnboundedSender<Imported>),
 }
 
 /// One protocol line from the interpreter, which names the agent it concerns.
@@ -640,6 +648,13 @@ enum Reply {
     Bound {
         id: ExecId,
     },
+    /// A module of the application the host told of under `id` was imported at start, or
+    /// failed to be.
+    Imported {
+        id: ExecId,
+        module: String,
+        error: Option<ImportFailure>,
+    },
     /// A `runtime.wait` the agent's code has been suspended in for a while:
     /// what it waits on, and for how long so far.
     Wait {
@@ -703,6 +718,24 @@ pub(crate) fn bindings_message(
         .collect();
     let paths: Vec<String> = paths.into_iter().collect();
     json!({"t": "bindings", "bindings": bindings, "paths": paths})
+}
+
+/// One module of the application's, as the interpreter answered for its import at start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Imported {
+    pub(crate) module: String,
+    /// Why it did not import, or `None` when it did.
+    pub(crate) error: Option<ImportFailure>,
+}
+
+/// Why a module of the application's did not import at start.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct ImportFailure {
+    /// `import-failed`, `native-extension-unavailable` or `module-missing`.
+    pub(crate) code: String,
+    pub(crate) message: String,
+    /// The last 16 KiB of the traceback.
+    pub(crate) traceback: String,
 }
 
 impl Interpreter {
@@ -1260,6 +1293,57 @@ impl Interpreter {
         }
     }
 
+    /// Tell the interpreter the session's application code, before any kernel opens: `paths`,
+    /// its directories as the interpreter sees them, go on `sys.path` before the workspace, and
+    /// `imports` are imported in order on a thread of its own. Handled by the interpreter as a
+    /// whole, like `bindings`, rather than by any one kernel. Waits for its answer for each
+    /// module, each within `bound`, calling `answered` with each; done at the first that did not
+    /// import, or did not answer in time.
+    pub(crate) async fn provision(
+        &self,
+        paths: &[String],
+        imports: &[String],
+        bound: Duration,
+        mut answered: impl FnMut(&Imported),
+    ) -> Result<(), InterpreterError> {
+        let (sender, mut answers) = mpsc::unbounded_channel();
+        let line = json!({"t": "application", "paths": paths, "imports": imports});
+        let id = self.ask(line, Query::Imported(sender), |_, _| {})?;
+        let imported = async {
+            for module in imports {
+                let imported = match tokio::time::timeout(bound, answers.recv()).await {
+                    Ok(Some(imported)) => imported,
+                    Ok(None) => return Err(InterpreterError::Gone(lock(&self.table).cause())),
+                    Err(_) => {
+                        let reason = format!("within {bound:?}");
+                        return Err(InterpreterError::Import {
+                            module: module.clone(),
+                            reason,
+                        });
+                    }
+                };
+                answered(&imported);
+                if let Some(failure) = imported.error {
+                    let ImportFailure {
+                        code,
+                        message,
+                        traceback,
+                    } = failure;
+                    let reason = format!("({code}): {message}\n{}", traceback.trim_end());
+                    return Err(InterpreterError::Import {
+                        module: imported.module,
+                        reason,
+                    });
+                }
+            }
+            Ok(())
+        }
+        .await;
+        // Answers come one per module, so the query is kept until the last is in.
+        lock(&self.table).queries.remove(&id);
+        imported
+    }
+
     /// Queue `line` as it is, for a test that speaks the protocol itself.
     #[cfg(test)]
     pub(crate) fn send_line(&self, line: Value) {
@@ -1360,11 +1444,22 @@ impl Interpreter {
     /// is sent.
     fn request<T>(
         &self,
-        mut fields: Value,
+        fields: Value,
         waiting: fn(oneshot::Sender<T>) -> Query,
         before: impl FnOnce(&mut Table, ExecId),
     ) -> Result<oneshot::Receiver<T>, InterpreterError> {
         let (waiter, receiver) = oneshot::channel();
+        self.ask(fields, waiting(waiter), before)?;
+        Ok(receiver)
+    }
+
+    /// [`Interpreter::request`], with `query` registered for its answers: its id.
+    fn ask(
+        &self,
+        mut fields: Value,
+        query: Query,
+        before: impl FnOnce(&mut Table, ExecId),
+    ) -> Result<ExecId, InterpreterError> {
         let mut table = lock(&self.table);
         table.open()?;
         let id = table.next_id();
@@ -1372,8 +1467,8 @@ impl Interpreter {
         fields["agent"] = json!(&*self.agent);
         fields["id"] = json!(id);
         self.send(fields)?;
-        table.queries.insert(id, waiting(waiter));
-        Ok(receiver)
+        table.queries.insert(id, query);
+        Ok(id)
     }
 
     /// Ask the interpreter to cancel execution `id`'s task, which raises
@@ -2370,6 +2465,14 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
                 let _ = waiter.send(tasks);
             }
             _ => tracing::warn!("ignored task listing {id}, which nothing asked for"),
+        },
+        Reply::Imported { id, module, error } => match lock(table).queries.get(&id) {
+            Some(Query::Imported(answers)) => {
+                let _ = answers.send(Imported { module, error });
+            }
+            _ => {
+                tracing::warn!("ignored the import of {module} under {id}, which nothing asked for")
+            }
         },
         Reply::File { id, file, error } => match lock(table).queries.remove(&id) {
             Some(Query::File(waiter)) => {

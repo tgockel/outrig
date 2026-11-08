@@ -3253,10 +3253,16 @@ def _format_error(exc):
             report.stack.pop()
         return "".join(report.format())
     except BaseException as e:
-        return (
-            f"{_type_name(type(exc))}: its traceback could not be formatted "
-            f"({_type_name(type(e))} while formatting it)\n"
-        )
+        return _unformatted(exc, e)
+
+
+def _unformatted(exc, e):
+    """What is reported of `exc` when formatting it raised `e`: each named by its type, read
+    around its metaclass."""
+    return (
+        f"{_type_name(type(exc))}: its traceback could not be formatted "
+        f"({_type_name(type(e))} while formatting it)\n"
+    )
 
 
 _MISSING = object()
@@ -6511,6 +6517,80 @@ def _bindings(message):
             _send({"t": "bound", "agent": message.get("agent"), "id": message["id"]})
 
 
+# ---------------------------------------------------------------------------- application code
+#
+# The package the session's owner supplies, which the host copied whole to a directory named for
+# its digest and mounted read-only: told once, before any kernel opens. Its directory and its
+# requirement set's go on `sys.path` after OutRig's own package and before the workspace, so that
+# nothing in the agent-writable workspace can take the place of one of its modules. The modules
+# the owner names are then imported on a thread of their own -- not the reader, which never runs
+# a module's code or waits on one, and not a kernel, since there may be none yet -- and each
+# answered: imported, or why not, with the end of its traceback. The import runs outside every
+# execution, so what it prints goes to the process's stderr, unattributed.
+
+def _application(message):
+    """Take the session's application code: its directories onto `sys.path`, and the import of
+    its modules started on a thread of its own. Reader thread only."""
+    paths, imports = message.get("paths"), message.get("imports")
+    if (
+        not isinstance(paths, list)
+        or not isinstance(imports, list)
+        or not all(isinstance(item, str) for item in [*paths, *imports])
+    ):
+        raise ValueError("application without a list of paths and a list of imports")
+    # Moved, not skipped, when already there: a requirement set the application shares with a
+    # binding was placed after the workspace by `_bindings`, and goes before it with the code.
+    for entry in paths:
+        while entry in sys.path:
+            sys.path.remove(entry)
+    at = sys.path.index(_WORKSPACE) if _WORKSPACE in sys.path else len(sys.path)
+    sys.path[at:at] = paths
+    if imports:
+        reply = {"t": "imported", "agent": message.get("agent"), "id": message.get("id")}
+        threading.Thread(
+            target=_import_application, args=(reply, imports), name="application", daemon=True
+        ).start()
+
+
+def _import_application(reply, imports):
+    """Import each of `imports`, in order, answering for each with `reply`: imported, or why not.
+    Done at the first that did not import, which fails the session's start."""
+    for module in imports:
+        error = None
+        try:
+            importlib.import_module(module)
+        except BaseException as e:
+            error = _import_failure(module, e)
+        told = _notify({**reply, "module": module, "error": error})
+        if error is not None or told is False:
+            return
+
+
+def _import_failure(module, e):
+    """Why `module`'s import raised `e`: as a skill's failed import is reported, or, when that
+    finds no compiled code to blame, `module-missing` when it or a package holding it is nowhere
+    to import from. With the end of the traceback, as an event carries one, its imports explained
+    as an execution's are; formatting it reads the exception, which is agent code, and whatever
+    that raises is reported as `_format_error` reports it, so the module is still answered for."""
+    _explain_imports(e)
+    said = _skills._import_error(e)
+    name = e.name if type(e) is ModuleNotFoundError else None
+    if (
+        said["code"] == "import-failed"
+        and type(name) is str
+        and (module == name or module.startswith(f"{name}."))
+    ):
+        said = {
+            "code": "module-missing",
+            "message": f"no module named {name!r} is in the application or elsewhere on `sys.path`",
+        }
+    try:
+        text = "".join(traceback.format_exception(e))
+    except BaseException as failed:
+        text = _unformatted(e, failed)
+    return {**said, "traceback": text[-_serve.TEXT_MAX:]}
+
+
 # ---------------------------------------------------------------------------- facilities
 #
 # An agent constructed with `facilities=` has a mapping of its own, which its kernel's view follows
@@ -7179,6 +7259,9 @@ def _route(line):
         return
     if kind == "bindings":
         _bindings(message)
+        return
+    if kind == "application":
+        _application(message)
         return
     if kind == "close":
         _close(message)

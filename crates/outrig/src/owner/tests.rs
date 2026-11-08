@@ -1142,6 +1142,114 @@ async fn paths_a_program_cannot_mount_fail_its_entry() {
     assert!(ran.exit.left_open().is_empty());
 }
 
+/// Application code a program gives its session is imported as the session starts, and the
+/// session's events say so. Entry raises `RuntimeError` for an application directory that does
+/// not exist, before anything starts, and for a module of it that does not import, naming the
+/// module and ending with its traceback, once what the start made is proven stopped; making the
+/// session raises `TypeError` for what is not an `outrig.Application`.
+#[tokio::test]
+async fn a_programs_session_imports_its_application() {
+    let bed = Bed::new();
+    let review = bed.dir.join("src/review");
+    std::fs::create_dir_all(&review).unwrap();
+    for (name, source) in [
+        ("__init__.py", ""),
+        ("agents.py", "AGENTS = True\n"),
+        ("broken.py", "raise ValueError('the broken module')\n"),
+    ] {
+        std::fs::write(review.join(name), source).unwrap();
+    }
+    bed.write(
+        "application.py",
+        r#"
+        import asyncio, json, outrig
+
+        async def watch(session, seen):
+            async for item in session.events():
+                if isinstance(item, outrig.Event) and item.type.startswith("application."):
+                    seen.append([item.type, item.data.get("module"), item.data.get("code")])
+
+        async def entered(application):
+            try:
+                async with outrig.Session(application=application):
+                    return "entered"
+            except RuntimeError as e:
+                return str(e)
+
+        def made(**inputs):
+            try:
+                outrig.Session(application=outrig.Application("src", **inputs))
+                return "made"
+            except TypeError as e:
+                return str(e)
+
+        async def main():
+            seen = []
+            session = outrig.Session(application=outrig.Application("src", imports=["review.agents"]))
+            async with session:
+                watcher = asyncio.create_task(watch(session, seen))
+            await watcher
+            try:
+                outrig.Session(application="src")
+            except TypeError as e:
+                not_one = str(e)
+            print(json.dumps([
+                seen,
+                await entered(outrig.Application("missing", imports=["review.agents"])),
+                await entered(outrig.Application("src", imports=["review.broken"])),
+                not_one,
+                made(imports="review.agents"),
+            ]))
+
+        asyncio.run(main())
+        "#,
+    );
+    let program = bed
+        .start(
+            "application.py",
+            bed.config("", false),
+            bed.sessions(),
+            |p| p,
+        )
+        .await;
+    let ran = bed.finish(program).await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    let said = &ran.json()[0];
+    assert_eq!(
+        said[0],
+        serde_json::json!([
+            ["application.provisioned", null, null],
+            ["application.imported", "review.agents", null],
+        ])
+    );
+    let dir = bed.dir.to_str().unwrap();
+    assert_eq!(
+        said[1],
+        format!("the application {dir}/missing does not exist")
+    );
+    let broken = said[2].as_str().unwrap();
+    assert!(
+        broken
+            .starts_with("the application's module `review.broken` did not import (import-failed)")
+            && broken.ends_with("ValueError: the broken module")
+            && !broken.contains("not proven stopped"),
+        "{broken}"
+    );
+    assert!(
+        said[3]
+            .as_str()
+            .unwrap()
+            .starts_with("application takes an outrig.Application"),
+        "{said}"
+    );
+    assert_eq!(said[4], "imports takes a list of strings, not one string");
+    assert!(
+        ran.exit.left_open().is_empty(),
+        "{:?}",
+        left_open(&ran.exit)
+    );
+}
+
 /// A program whose `outrig` package speaks another version of the owner protocol is refused at
 /// its greeting: the start fails saying so, and the script never runs.
 #[tokio::test]

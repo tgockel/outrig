@@ -1323,6 +1323,18 @@ pub outrig::harness::event::Payload::AgentStarted::tool_call_max: u64
 pub outrig::harness::event::Payload::AgentStarted::tool_result_max: u64
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentStopped
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentWedged
+#[non_exhaustive] pub outrig::harness::event::Payload::ApplicationImported
+pub outrig::harness::event::Payload::ApplicationImported::code: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::ApplicationImported::module: alloc::string::String
+pub outrig::harness::event::Payload::ApplicationImported::reason: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub outrig::harness::event::Payload::ApplicationProvisioned
+pub outrig::harness::event::Payload::ApplicationProvisioned::digest: alloc::string::String
+pub outrig::harness::event::Payload::ApplicationProvisioned::imports: alloc::vec::Vec<alloc::string::String>
+pub outrig::harness::event::Payload::ApplicationProvisioned::label: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::ApplicationProvisioned::mount: alloc::string::String
+pub outrig::harness::event::Payload::ApplicationProvisioned::packages: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::ApplicationProvisioned::path: core::option::Option<std::path::PathBuf>
+pub outrig::harness::event::Payload::ApplicationProvisioned::requires: alloc::vec::Vec<alloc::string::String>
 #[non_exhaustive] pub outrig::harness::event::Payload::BindingExited
 pub outrig::harness::event::Payload::BindingExited::bindings: alloc::vec::Vec<alloc::string::String>
 pub outrig::harness::event::Payload::BindingExited::cause: alloc::string::String
@@ -1826,6 +1838,17 @@ pub outrig::harness::Tasks::Listed::names: alloc::vec::Vec<alloc::string::String
 pub outrig::harness::Verdict::Clean
 pub outrig::harness::Verdict::NotProvenStopped
 pub outrig::harness::Verdict::StoppedWithUnknown
+#[non_exhaustive] pub struct outrig::harness::ApplicationIdentity
+pub outrig::harness::ApplicationIdentity::digest: alloc::string::String
+pub outrig::harness::ApplicationIdentity::label: core::option::Option<alloc::string::String>
+pub outrig::harness::ApplicationIdentity::requires: alloc::vec::Vec<alloc::string::String>
+pub struct outrig::harness::ApplicationSpec
+impl outrig::harness::ApplicationSpec
+pub fn outrig::harness::ApplicationSpec::archive(impl core::convert::Into<alloc::borrow::Cow<'static, [u8]>>) -> Self
+pub fn outrig::harness::ApplicationSpec::directory(impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn outrig::harness::ApplicationSpec::imports<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn outrig::harness::ApplicationSpec::label(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::harness::ApplicationSpec::requires<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 #[non_exhaustive] pub struct outrig::harness::ApprovalRequest
 pub outrig::harness::ApprovalRequest::declaration: alloc::string::String
 pub outrig::harness::ApprovalRequest::declared_in: core::option::Option<std::path::PathBuf>
@@ -1930,6 +1953,7 @@ pub fn outrig::harness::RunningProgram::terminate(&self)
 pub async fn outrig::harness::RunningProgram::wait(&mut self) -> core::result::Result<outrig::harness::ProgramExit, outrig::error::OutrigError>
 pub struct outrig::harness::Session
 impl outrig::harness::Session
+pub fn outrig::harness::Session::application(&self) -> core::option::Option<&outrig::harness::ApplicationIdentity>
 pub fn outrig::harness::Session::close_admission(&self)
 pub fn outrig::harness::Session::closer(&self) -> outrig::harness::Closer
 pub fn outrig::harness::Session::container_name(&self) -> &str
@@ -1945,6 +1969,7 @@ pub fn outrig::harness::Session::user_channel(&self) -> core::option::Option<out
 pub fn outrig::harness::Session::waits(&self) -> outrig::harness::Waits
 pub struct outrig::harness::SessionBuilder
 impl outrig::harness::SessionBuilder
+pub fn outrig::harness::SessionBuilder::application(self, outrig::harness::ApplicationSpec) -> Self
 pub fn outrig::harness::SessionBuilder::approver(self, impl outrig::harness::Approver + 'static) -> Self
 pub fn outrig::harness::SessionBuilder::bind(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<outrig::harness::BindingSpec>) -> Self
 pub fn outrig::harness::SessionBuilder::bindings_env<K, V>(self, impl core::iter::traits::collect::IntoIterator<Item = (K, V)>) -> Self where K: core::convert::Into<std::ffi::os_str::OsString>, V: core::convert::Into<std::ffi::os_str::OsString>

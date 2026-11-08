@@ -78,7 +78,8 @@ session's own: the one `session.json` and `outrig ls` show, which its containers
 The interpreter belongs to the session rather than to one agent, so events about it --
 `output.unattributed`, `interpreter.diagnostic`, and `interpreter.exited` -- carry no `subject`,
 and neither do the session's own, `session.state` and `session.report`, those of its bindings,
-`binding.refused`, `binding.injected` and `binding.exited`, or what its skill sources hold,
+`binding.refused`, `binding.injected` and `binding.exited`, those of its application code,
+`application.provisioned` and `application.imported`, or what its skill sources hold,
 `skill.discovered`. A request to a binding is the agent's that made it, and so is the import of a
 skill, which code outside every execution makes for no agent.
 
@@ -274,6 +275,22 @@ three times for one call before the rejection ends it.
   `bindings`, the names it held, and `cause`, such as `it was killed by SIGKILL`. The session goes
   on without them: each request the process was running ends `unknown`, and a later one raises an
   error saying how the process ended.
+- `application.provisioned` -- the session's application code was copied to its snapshot and
+  mounted, before any kernel opened:
+  - `path`: the directory its owner gave, as given, or `null` for an archive of bytes.
+  - `digest`: the first 16 hex digits of a BLAKE3 digest of its files' paths and contents, the
+    same for a directory and for an archive holding the same files.
+  - `label`: what its owner calls it, which nothing compares, or `null`.
+  - `mount`: where the interpreter imports it from, `/outrig/app/<digest>` in a container.
+  - `requires`: the requirement set its owner declared, sorted.
+  - `packages`: where the interpreter imports that set from, or `null` when it is empty.
+  - `imports`: the modules imported next, in order, each answered by an `application.imported`.
+- `application.imported` -- a module of the application's was imported as the session started:
+  `module`; and `code` and `reason`, both `null` when it imported. Otherwise the session does not
+  start: `code` is `import-failed` for a module that raised, `module-missing` for one that is
+  nowhere to import from, and `native-extension-unavailable` for one whose import reached
+  compiled code, and `reason` is what was raised followed by the last 16 KiB of its traceback.
+  A module whose import did not end within 30 seconds has no event; the start's error names it.
 - `skill.discovered` -- what the session's skill sources hold, published once as it starts when it
   was given any source, read from each skill's metadata with no Python run:
   - `skills`: each skill served, as `{name, source, description, digest, executable}`; `digest`

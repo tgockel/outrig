@@ -134,6 +134,14 @@ Issues that bear on **host integrity** are in scope, for example:
   audits it. A live object it injects into its sessions (`session.inject`) acts with the
   program's authority, and every request an agent makes of it is published as a binding's is.
   Keep the program's imports, and the credentials it reads, outside paths an agent can write.
+- **Application code** (`SessionBuilder::application`, `outrig.Session(application=...)`, 0.3)
+  runs in the container with the agent's authority, which is arbitrary execution there: it is the
+  owner's code, trusted as the owner is. Its snapshot is mounted read-only so that the code the
+  session ran is the code the owner supplied, which its digest attests -- not so that the agent
+  cannot change its behavior: the agent's code and the application's share one interpreter, and
+  a monkeypatch is plain Python. Anything the process can read, the agent can print, so
+  application code holds no credential: a client that needs one is a binding on the host, which
+  the application is given a reference to.
 - **Agents in one `outrig run-new` session are not isolated from each other.** They share one
   interpreter process, a thread each, so any agent's code can reach another's names, and every
   agent can reach every binding. An agent class given `facilities=` is told of those alone, which

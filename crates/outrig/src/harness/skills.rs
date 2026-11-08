@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read as _};
 use std::os::fd::{AsFd, AsRawFd as _, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -196,30 +196,103 @@ impl SkillSource for DirectorySource {
     }
 
     fn files(&self, skill: &str) -> io::Result<Vec<SkillFile>> {
-        let mut files = Vec::new();
-        walk(&self.skill_dir(skill)?, "", 0, &mut files, &mut 0)?;
-        files.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(files)
+        listed(&self.skill_dir(skill)?)
     }
 
     fn read(&self, skill: &str, path: &str) -> io::Result<Vec<u8>> {
-        let parts: Vec<&str> = path.split('/').map(component).collect::<io::Result<_>>()?;
-        let mut file = self.skill_dir(skill)?;
-        for part in parts {
-            file = open_at(&file, part)?;
-        }
-        if file_type(&nix::sys::stat::fstat(&file)?) != SFlag::S_IFREG {
-            return Err(io::Error::other(format!(
-                "{path:?} is not a regular file, which is all this source serves"
-            )));
-        }
-        let mut data = Vec::new();
-        File::from(file).take(FILE_MAX + 1).read_to_end(&mut data)?;
-        if data.len() as u64 > FILE_MAX {
-            return Err(too_large(path));
-        }
-        Ok(data)
+        read_beneath(&self.skill_dir(skill)?, path)
     }
+}
+
+/// Every file beneath the directory `root`, with its contents, in path order: read as a
+/// [`DirectorySource`] reads a skill's directory, `root` itself followed wherever it leads and
+/// nothing below it reached through a link, held to the same bounds and skipping the same names.
+pub(crate) fn read_tree(root: &Path) -> io::Result<Vec<(String, Vec<u8>)>> {
+    let dir = open_root(root, None)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{} does not exist", root.display()),
+        )
+    })?;
+    listed(&dir)?
+        .into_iter()
+        .map(|file| {
+            let data = read_beneath(&dir, &file.path)?;
+            Ok((file.path, data))
+        })
+        .collect()
+}
+
+/// Whether [`read_tree`] would read the member of an archive at `path`, `size` bytes long, once
+/// the archive was unpacked: asked before the member is written, so that nothing it would skip or
+/// refuse is. `Ok(false)` for a member beneath a name it skips, and an error for one larger than a
+/// file may be, deeper than it reads, or -- `seen` holding the paths admitted so far -- past the
+/// entries it reads.
+pub(crate) fn admits(path: &Path, size: u64, seen: &mut HashSet<String>) -> io::Result<bool> {
+    let names: Vec<Option<&str>> = path
+        .components()
+        .filter_map(|part| match part {
+            Component::Normal(name) => Some(name.to_str()),
+            _ => None,
+        })
+        .collect();
+    // A name that is not UTF-8 is never served, as `entries` skips one.
+    if names.iter().any(|name| name.is_none_or(skipped)) {
+        return Ok(false);
+    }
+    if names.is_empty() {
+        // The archive's own directory, `./`.
+        return Ok(true);
+    }
+    // Counted once per path, as the walk counts its entries: an archive may hold a member more
+    // than once, such as a directory's header before each of its files.
+    let entry = names
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("/");
+    if seen.insert(entry) && seen.len() > ENTRIES_MAX {
+        return Err(too_many());
+    }
+    let path = path.to_string_lossy();
+    // A file may be `DEPTH_MAX` directories down; what is deeper still is refused by the walk.
+    if names.len() > DEPTH_MAX + 1 {
+        return Err(too_deep(&path));
+    }
+    if size > FILE_MAX {
+        return Err(too_large(&path));
+    }
+    Ok(true)
+}
+
+/// Every file beneath `dir`, in path order.
+fn listed(dir: &OwnedFd) -> io::Result<Vec<SkillFile>> {
+    let mut files = Vec::new();
+    walk(dir, "", 0, &mut files, &mut 0)?;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+/// The regular file `path` names beneath `dir`, reached one component at a time without
+/// following a link, at most [`FILE_MAX`] long.
+fn read_beneath(dir: &impl AsFd, path: &str) -> io::Result<Vec<u8>> {
+    let parts: Vec<&str> = path.split('/').map(component).collect::<io::Result<_>>()?;
+    let mut file = dir.as_fd().try_clone_to_owned()?;
+    for part in parts {
+        file = open_at(&file, part)?;
+    }
+    if file_type(&nix::sys::stat::fstat(&file)?) != SFlag::S_IFREG {
+        return Err(io::Error::other(format!(
+            "{path:?} is not a regular file, which is all this source serves"
+        )));
+    }
+    let mut data = Vec::new();
+    File::from(file).take(FILE_MAX + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > FILE_MAX {
+        return Err(too_large(path));
+    }
+    Ok(data)
 }
 
 /// The directory `root` names, or `None` when there is none; inside `base`, when given one.
@@ -292,9 +365,21 @@ fn open_at(dir: &impl AsFd, name: &str) -> io::Result<OwnedFd> {
     })
 }
 
+fn too_many() -> io::Error {
+    io::Error::other(format!(
+        "it holds more than the {ENTRIES_MAX} entries this source serves"
+    ))
+}
+
+fn too_deep(path: &str) -> io::Error {
+    io::Error::other(format!(
+        "{path:?} is deeper than the {DEPTH_MAX} directories this source serves"
+    ))
+}
+
 fn too_large(path: &str) -> io::Error {
     io::Error::other(format!(
-        "{path:?} is larger than the {} MiB a skill's file may be",
+        "{path:?} is larger than the {} MiB a file this source serves may be",
         FILE_MAX >> 20
     ))
 }
@@ -321,9 +406,7 @@ fn entries(dir: &impl AsFd, count: &mut usize) -> io::Result<Vec<(String, FileSt
         }
         *count += 1;
         if *count > ENTRIES_MAX {
-            return Err(io::Error::other(format!(
-                "it holds more than the {ENTRIES_MAX} entries this source serves"
-            )));
+            return Err(too_many());
         }
         match nix::sys::stat::fstatat(dir, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(stat) => found.push((name.to_string(), stat)),
@@ -351,9 +434,7 @@ fn walk(
             continue;
         }
         if depth == DEPTH_MAX {
-            return Err(io::Error::other(format!(
-                "{path:?} is deeper than the {DEPTH_MAX} directories this source serves"
-            )));
+            return Err(too_deep(&path));
         }
         walk(
             &open_at(dir, &name)?,
@@ -1310,7 +1391,7 @@ impl SkillDiagnostic {
 
 /// `text` with each control character but a line break or a tab escaped, so what it quotes of a
 /// skill -- the line a parser stopped at, say -- cannot drive the terminal it is shown on.
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     let mut shown = String::with_capacity(text.len());
     for c in text.chars() {
         if c.is_control() && c != '\n' && c != '\t' {

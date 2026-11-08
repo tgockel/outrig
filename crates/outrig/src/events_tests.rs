@@ -371,6 +371,30 @@ fn each_event_has_exactly_its_data_fields() {
             &["binding", "declared_in", "reason"],
         ),
         (
+            Payload::ApplicationProvisioned {
+                path: None,
+                digest: text("0123456789abcdef"),
+                label: Some(text("review 1.4")),
+                mount: text("/outrig/app/0123456789abcdef"),
+                requires: vec![text("pure==1.0")],
+                packages: Some(text("/outrig/bindings/fedcba9876543210")),
+                imports: vec![text("review.agents")],
+            },
+            "application.provisioned",
+            &[
+                "path", "digest", "label", "mount", "requires", "packages", "imports",
+            ],
+        ),
+        (
+            Payload::ApplicationImported {
+                module: text("review.agents"),
+                code: Some(text("import-failed")),
+                reason: Some(text("ValueError was raised\nTraceback ...")),
+            },
+            "application.imported",
+            &["module", "code", "reason"],
+        ),
+        (
             Payload::SkillDiscovered {
                 skills: vec![DiscoveredSkill {
                     name: text("review"),

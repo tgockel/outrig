@@ -19,6 +19,25 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **Application code is provisioned before construction.** `SessionBuilder::application` takes
+  an `ApplicationSpec` -- a directory (`ApplicationSpec::directory`) or the bytes of a tar of one
+  (`ApplicationSpec::archive`), with the `requires` it imports and the `imports` to run at start,
+  and a `label` of the owner's -- and a host program gives one with
+  `outrig.Session(application=outrig.Application(path, requires=(), imports=()))`. The code is
+  read on the host with no Python run, held to a skill directory's bounds, refused when it holds
+  a link or a compiled extension module, and copied to a snapshot under
+  `~/.cache/outrig/applications/<digest>`, which the container mounts read-only at
+  `/outrig/app/<digest>`; the interpreter puts it on `sys.path` before the workspace. Its
+  `requires` installs as a binding's does, pure-Python wheels only. The modules it names are
+  imported on a thread of the interpreter's own before any kernel opens, and one that raises
+  (`import-failed`), is nowhere (`module-missing`), reaches compiled code
+  (`native-extension-unavailable`) or takes more than 30 seconds fails the start, naming it and
+  ending with its traceback. `application.provisioned` and `application.imported` record each
+  step (`Payload::ApplicationProvisioned`, `Payload::ApplicationImported`), and
+  `Session::application` gives the `ApplicationIdentity` -- digest, label, requirement set -- a
+  save will compare. A requirement that is not a specifier is now refused as "`requires` names
+  distributions resolved from an index", without saying "a binding's", and a skill file over
+  8 MiB as larger than "a file this source serves may be".
 - **A long `runtime.wait` says what it waits on.** Once an agent's code has been suspended in
   `runtime.wait` for a second, the interpreter tells the host what it waits on -- a task by its
   name and coroutine, a handle by its request and child, a typed call by its function, a skill's

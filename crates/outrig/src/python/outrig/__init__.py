@@ -75,6 +75,7 @@ _HOST_ONLY = frozenset(
         "config",
         "Session",
         "Mount",
+        "Application",
         "Event",
         "Missed",
         "ShutdownReport",

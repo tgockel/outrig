@@ -61,13 +61,15 @@ SECTIONS = [
         "Sessions",
         "A program runs agents in a session it owns: an `outrig.Session`, entered with `async "
         "with`, which `outrig.current_session()` returns inside the block. An `outrig.Mount` is a "
-        "directory its container sees, and its `events()` yields an `outrig.Event` for each "
-        "record, with an `outrig.Missed` where records were lost. See [Host "
+        "directory its container sees, an `outrig.Application` the code its agent classes are "
+        "in, and its `events()` yields an `outrig.Event` for each record, with an "
+        "`outrig.Missed` where records were lost. See [Host "
         "programs](../usage/host-programs.md#sessions).",
         "_host.py",
         [
             "outrig.Session",
             "outrig.Mount",
+            "outrig.Application",
             "outrig.current_session",
             "outrig.Event",
             "outrig.Missed",

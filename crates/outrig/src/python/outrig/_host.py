@@ -445,6 +445,43 @@ class Mount:
 
 
 @dataclasses.dataclass(frozen=True)
+class Application:
+    """A session's application code: the package holding this program's agent classes and what
+    they import, which the session's interpreter imports from in every kernel.
+
+    `path` is a directory whose top-level entries are packages and modules, as a project's `src/`
+    is, a str or path made absolute against the working directory when the `Application` is made.
+    `requires` names the distributions it imports beyond the standard library and `outrig`, as a
+    binding's `requires` does: a name, extras, a version specifier and markers, never a path or a
+    URL. `imports` names the modules imported as the session starts, in order.
+
+    Entry reads the directory with no Python run, refuses it if anything in it is compiled or a
+    link, and copies it whole to a directory named for its digest, which the container mounts
+    read-only: the session runs that copy, whatever happens to `path` meanwhile. The copy goes on
+    `sys.path` after the `outrig` package and before the working directory, so no file there takes
+    the place of one of its modules, and its `requires` -- pure-Python wheels only -- is installed
+    and placed beside it. Each module of `imports` is then imported, and one that raises, is not
+    found, reaches compiled code or takes more than 30 seconds fails entry, naming it and ending
+    with the end of its traceback. A module not named imports when something first imports it.
+    """
+
+    path: str
+    requires: tuple = ()
+    imports: tuple = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, "path", str(pathlib.Path(self.path).absolute()))
+        for name in ("requires", "imports"):
+            value = getattr(self, name)
+            if isinstance(value, str):
+                raise TypeError(f"{name} takes a list of strings, not one string")
+            value = tuple(value)
+            if not all(isinstance(item, str) for item in value):
+                raise TypeError(f"{name} takes strings, not {value!r}")
+            object.__setattr__(self, name, value)
+
+
+@dataclasses.dataclass(frozen=True)
 class Event:
     """One record of a session's events, as `events.jsonl` records it.
 
@@ -738,9 +775,12 @@ class Session:
       finish before it stops what is left, at most an hour, or `None` for the engine's default,
       five. It bounds that wait only: interrupting kernels and stopping the bindings and the
       container after it take bounded times of their own.
+    - `application`: an `Application`, the code this program's agent classes are in, which every
+      kernel of the session imports from; or `None`.
 
     Relative paths are made absolute against the working directory now. A mount that does not
-    exist, is not a directory, or is `/`, and a `cwd` that is not a directory, fail entry.
+    exist, is not a directory, or is `/`, a `cwd` that is not a directory, and an application
+    whose path is not a directory, fail entry.
 
     `async with` starts it in the image `default-image` names, with the configured factory
     bindings -- a repository's own only where its exact declaration was approved in that
@@ -771,7 +811,7 @@ class Session:
     directory under the session root, and `None` before.
     """
 
-    def __init__(self, *, mounts=(), cwd=None, grace=None):
+    def __init__(self, *, mounts=(), cwd=None, grace=None, application=None):
         if isinstance(mounts, str):
             raise TypeError("mounts takes Mount entries or paths, not one path")
         if grace is not None:
@@ -790,6 +830,9 @@ class Session:
         ):
             raise ValueError(f"cwd {self._cwd} is in none of the session's mounts")
         self._grace = grace
+        if application is not None and not isinstance(application, Application):
+            raise TypeError(f"application takes an outrig.Application or None, not {application!r}")
+        self._application = None if application is None else dataclasses.asdict(application)
         # Each live object injected, by name: what it is, and whether its calls take turns. Under
         # `_lock`, with entry, so an injection from another thread is never lost or doubled.
         self._live = {}
@@ -826,6 +869,7 @@ class Session:
                 session=self._handle,
                 mounts=self._mounts,
                 cwd=self._cwd,
+                application=self._application,
                 live=live,
             )
         except BaseException:

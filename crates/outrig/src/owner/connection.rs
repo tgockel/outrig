@@ -20,7 +20,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::LeftOpen;
-use super::session::{self, Command, Context, Live, MountRequest, Request};
+use super::session::{self, ApplicationRequest, Command, Context, Live, MountRequest, Request};
 use crate::harness::DEFAULT_DRAIN;
 use crate::python::host::next_line;
 use crate::python::supervisor::quoted;
@@ -134,6 +134,7 @@ struct Start {
     #[serde(default)]
     mounts: Vec<MountRequest>,
     cwd: Option<PathBuf>,
+    application: Option<ApplicationRequest>,
     #[serde(default)]
     live: Vec<Live>,
 }
@@ -201,6 +202,7 @@ pub(crate) async fn serve(
                             reply: id,
                             mounts: start.mounts,
                             cwd: start.cwd,
+                            application: start.application,
                             live: start.live,
                         };
                         started.spawn(session::run(

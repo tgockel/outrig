@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use super::application::{ApplicationIdentity, Prepared};
 use super::bindings::{Bindings, Brief};
 use super::builder::{self, SessionBuilder};
 use super::event::{Payload, SessionState};
@@ -21,7 +22,7 @@ use crate::agent::orientation::Holdings;
 use crate::agent::window::Windows;
 use crate::agent::{Agent, AgentError, ResolvedAgent};
 use crate::config::{Config, Secrets};
-use crate::python::host::{Interpreter, PRIMARY, Waits, bindings_message};
+use crate::python::host::{Interpreter, InterpreterError, PRIMARY, Waits, bindings_message};
 use crate::python::hosted::Relay;
 use crate::python::supervisor::STOP_GRACE;
 
@@ -59,6 +60,8 @@ pub struct Session {
     container_name: String,
     lifecycle: Arc<Lifecycle>,
     bindings: Bindings,
+    /// The application code it runs, when its owner gave any.
+    application: Option<ApplicationIdentity>,
     /// Every model call the session makes, whichever agent makes it.
     ledger: Ledger,
     /// The child agents its agents launch.
@@ -132,6 +135,7 @@ impl Session {
             container_name,
             lifecycle,
             bindings,
+            application: None,
             ledger,
             children,
             #[cfg(test)]
@@ -179,6 +183,21 @@ impl Session {
         self.children
             .root(PRIMARY, 1, &resolved.model, agent.slot().clone());
         self.agent = Some(agent);
+        Ok(())
+    }
+
+    /// Provision `application` into the interpreter before any kernel opens:
+    /// tell it the code, as it sees it, and import the modules it names, each
+    /// within `bound`, recording each step.
+    pub(crate) async fn provision(
+        &mut self,
+        application: Prepared,
+        bound: Duration,
+    ) -> Result<(), InterpreterError> {
+        let events = self.lifecycle.events();
+        let in_container = self.container.is_some();
+        let provisioned = application.provision(&self.interpreter, events, bound, in_container);
+        self.application = Some(provisioned.await?);
         Ok(())
     }
 
@@ -243,6 +262,13 @@ impl Session {
     /// The name of the container the interpreter runs in.
     pub fn container_name(&self) -> &str {
         &self.container_name
+    }
+
+    /// Which application code the session runs -- its digest, its label and its requirement
+    /// set -- or `None` when its owner gave none (see
+    /// [`SessionBuilder::application`]).
+    pub fn application(&self) -> Option<&ApplicationIdentity> {
+        self.application.as_ref()
     }
 
     /// The user's end of the primary agent's `user` channel: how what the
@@ -452,6 +478,7 @@ impl Session {
             container_name: _,
             lifecycle,
             mut bindings,
+            application: _,
             ledger: _,
             children,
             #[cfg(test)]
