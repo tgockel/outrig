@@ -81,6 +81,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Dockerfile a cache key hashes is now framed, so one cannot share a key with another whose
+  tail spells the first's build-arg lines.** `CacheKey::compute` and `compute_with_labels` hashed
+  the Dockerfile's raw bytes straight into the resolved build-arg block that follows, with nothing
+  between them to say where the Dockerfile ended. A Dockerfile ending `# A=1` and a newline, built
+  with no build args, and a Dockerfile ending `# ` with no trailing newline, built with `A=1`, fed
+  the hasher the same bytes; the second build reported a cache hit on the first's image, with
+  `ARG A` empty inside it. Both callers now hash the Dockerfile to a blake3 digest first --
+  fixed-width, so no split of its bytes and the block's can agree -- through the new
+  `hash_dockerfile`. Every cache key changes, so every image rebuilds once. (#583)
+
 - **`NetworkInterceptor::attach` now refuses a *borrowed* container (`Container::attach`) that
   currently holds `CAP_NET_ADMIN`, not only one outrig launched.** The #363 refusal read
   `Container::holds_net_admin`, which comes from outrig's own `--cap-add`/`--cap-drop` lowering --

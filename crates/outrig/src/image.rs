@@ -247,10 +247,7 @@ impl CacheKey {
     ) -> Result<String> {
         let mut hasher = blake3::Hasher::new();
 
-        let dockerfile_bytes = tokio::fs::read(dockerfile)
-            .await
-            .path_ctx("read", dockerfile)?;
-        hasher.update(&dockerfile_bytes);
+        hash_dockerfile(dockerfile, &mut hasher).await?;
 
         hash_pairs(build_args, &mut hasher);
 
@@ -275,10 +272,7 @@ impl CacheKey {
 
         let mut hasher = blake3::Hasher::new();
 
-        let dockerfile_bytes = tokio::fs::read(dockerfile)
-            .await
-            .path_ctx("read", dockerfile)?;
-        hasher.update(&dockerfile_bytes);
+        hash_dockerfile(dockerfile, &mut hasher).await?;
 
         hash_pairs(build_args, &mut hasher);
         hasher.update(b"\n[outrig-labels]\n");
@@ -315,6 +309,21 @@ fn pairs_block(pairs: &BTreeMap<String, String>) -> String {
 /// UTF-8 text here, which never holds `0xFF`, so the byte keeps an escaped block from matching
 /// anything it hashed. A backslash gets into the block only as an escape, so a block without one
 /// is hashed as it always was, and an image whose pairs hold neither character keeps its tag.
+/// Read `dockerfile` and hash its content's digest, not the bytes themselves, into `hasher`.
+///
+/// A 32-byte blake3 digest is fixed-width, so it frames the Dockerfile unambiguously from
+/// whatever `hasher` is fed next -- the resolved build-args block, in both callers. Hashing the
+/// raw bytes left no boundary between the two: a Dockerfile ending `# A=1\n`, built with no
+/// build args, fed the hasher the same bytes as one ending `# ` with no trailing newline, built
+/// with `A=1`, and the second build reused the first's image with `ARG A` unset. See #583.
+async fn hash_dockerfile(dockerfile: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
+    let dockerfile_bytes = tokio::fs::read(dockerfile)
+        .await
+        .path_ctx("read", dockerfile)?;
+    hasher.update(blake3::hash(&dockerfile_bytes).as_bytes());
+    Ok(())
+}
+
 fn hash_pairs(pairs: &BTreeMap<String, String>, hasher: &mut blake3::Hasher) {
     let block = pairs_block(pairs);
     if block.contains('\\') {

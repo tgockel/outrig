@@ -89,7 +89,8 @@ async fn labeled_key(
         .expect("CacheKey::compute_with_labels")
 }
 
-/// The key a release before [`pairs_block`] computed: each pair a raw `key=value` line.
+/// The key a release before [`pairs_block`] computed: each pair a raw `key=value` line,
+/// framed the Dockerfile as [`hash_dockerfile`] does now (#583) so this isolates escaping alone.
 async fn unescaped_key(
     dockerfile: &Path,
     args: &BTreeMap<String, String>,
@@ -103,7 +104,8 @@ async fn unescaped_key(
             .collect::<String>()
     };
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&std::fs::read(dockerfile).expect("read Dockerfile"));
+    let dockerfile_bytes = std::fs::read(dockerfile).expect("read Dockerfile");
+    hasher.update(blake3::hash(&dockerfile_bytes).as_bytes());
     hasher.update(raw(args).as_bytes());
     if !labels.is_empty() {
         hasher.update(b"\n[outrig-labels]\n");
@@ -162,6 +164,47 @@ async fn build_arg_change_changes_key() {
     let ka = key(&dockerfile, &a, ctx.path()).await;
     let kb = key(&dockerfile, &b, ctx.path()).await;
     assert_eq!(ka, kb);
+}
+
+/// Before #583's fix, a Dockerfile's raw bytes were hashed directly into the Dockerfile's block,
+/// with nothing to say where it ended and the resolved build-arg block began. A Dockerfile ending
+/// `# A=1\n`, built with no build args, then fed the hasher the same bytes as one ending `# ` with
+/// no trailing newline, built with `A=1` -- the two Dockerfiles and build-arg sets below -- so
+/// long as the context the two builds share is the same, as it is here. `hash_dockerfile` now
+/// hashes the Dockerfile to a fixed-width digest first, so no split of these bytes between the
+/// Dockerfile and the build-arg block can make the two keys agree.
+#[tokio::test]
+async fn dockerfile_tail_cannot_spell_a_build_arg_the_dockerfile_does_not_take() {
+    let ctx = make_ctx(&[("marker", "x\n")]);
+
+    let no_arg_dockerfile = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        no_arg_dockerfile.path().join("Dockerfile"),
+        "FROM alpine\nARG A\nRUN echo $A > /a\n# A=1\n",
+    )
+    .expect("write Dockerfile");
+
+    let with_arg_dockerfile = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        with_arg_dockerfile.path().join("Dockerfile"),
+        "FROM alpine\nARG A\nRUN echo $A > /a\n# ",
+    )
+    .expect("write Dockerfile");
+
+    let k_no_arg = key(
+        &no_arg_dockerfile.path().join("Dockerfile"),
+        &BTreeMap::new(),
+        ctx.path(),
+    )
+    .await;
+    let k_with_arg = key(
+        &with_arg_dockerfile.path().join("Dockerfile"),
+        &map(&[("A", "1")]),
+        ctx.path(),
+    )
+    .await;
+
+    assert_ne!(k_no_arg, k_with_arg);
 }
 
 #[tokio::test]
