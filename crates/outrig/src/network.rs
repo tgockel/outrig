@@ -726,8 +726,10 @@ impl NetworkInterceptor {
     /// A container launched holding `CAP_NET_ADMIN` -- `cap-add` of
     /// `NET_ADMIN`, or of `ALL` with no `NET_ADMIN` in `cap-drop` -- is
     /// refused before anything is changed: whatever it runs as root could
-    /// delete the table this installs and leave no record. Only the launch is
-    /// consulted, so a borrowed container is never refused.
+    /// delete the table this installs and leave no record. A borrowed
+    /// container (`Container::attach`) has no launch to read, so it is
+    /// refused the same way if the engine reports it currently holds the
+    /// capability, however that came to be (#549).
     pub async fn attach(&mut self, container: &Container) -> Result<()> {
         let name = container.name();
         if self.attachments.contains_key(name) {
@@ -740,6 +742,15 @@ impl NetworkInterceptor {
                 "container {name:?} holds CAP_NET_ADMIN through `cap-add`, which would let it \
                  remove the nftables redirect that network interception installs; remove \
                  NET_ADMIN (or ALL) from `cap-add`, or run with `[network] mode = \"default\"`"
+            )));
+        }
+        if container.attached_holds_net_admin().await? {
+            return Err(OutrigError::Configuration(format!(
+                "container {name:?} currently holds CAP_NET_ADMIN (reported by `podman \
+                 inspect`), which would let it remove the nftables redirect that network \
+                 interception installs; outrig did not launch this borrowed container, so \
+                 remove whatever grants it the capability, or run with `[network] \
+                 mode = \"default\"`"
             )));
         }
 
@@ -11990,5 +12001,84 @@ options edns0
             );
         }
         assert!(interceptor.attachments.is_empty());
+    }
+
+    /// A *borrowed* container (`Container::attach`) has no launch for
+    /// `holds_net_admin` to read, so before #549 it was never refused however
+    /// much `CAP_NET_ADMIN` its engine state actually granted. `attach` now
+    /// also asks the engine directly, through `Container::attached_holds_net_admin`,
+    /// and refuses on what that reports.
+    #[tokio::test]
+    async fn a_borrowed_container_holding_net_admin_is_refused_by_its_effective_capabilities() {
+        let _emitting = crate::process::process_tests::emitting().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = AuditSink::open(dir.path().join(NETWORK_LOG), "sid-1".to_string())
+            .await
+            .expect("open sink");
+        let mut interceptor = NetworkInterceptor {
+            cancel: CancellationToken::new(),
+            policy: Arc::new(compiled(NetworkPolicy::allow_all())),
+            audit,
+            session_id: "sid-1".to_string(),
+            generation: 0,
+            attachments: BTreeMap::new(),
+            retired: Vec::new(),
+        };
+        let container = Container::attached_reporting_effective_caps("[CAP_CHOWN CAP_NET_ADMIN]");
+        assert!(
+            !container.holds_net_admin(),
+            "a borrowed container's launch-derived flag has nothing to say"
+        );
+
+        let refused = interceptor
+            .attach(&container)
+            .await
+            .expect_err("the engine reported CAP_NET_ADMIN, so the attach is refused");
+
+        let OutrigError::Configuration(message) = refused else {
+            panic!("expected a configuration error, got {refused:?}");
+        };
+        assert!(
+            message.contains("CAP_NET_ADMIN") && message.contains("podman"),
+            "the refusal names the capability and how it was found: {message}"
+        );
+        assert!(interceptor.attachments.is_empty());
+    }
+
+    /// The same borrowed container, with no `CAP_NET_ADMIN` in what the
+    /// engine reports, is not refused by the new check -- it still has to get
+    /// past every other step `attach` takes, which this stand-in container
+    /// cannot answer, so the only thing asserted is that the refusal this
+    /// test is about does not fire.
+    #[tokio::test]
+    async fn a_borrowed_container_without_net_admin_is_not_refused_by_effective_capabilities() {
+        let _emitting = crate::process::process_tests::emitting().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = AuditSink::open(dir.path().join(NETWORK_LOG), "sid-1".to_string())
+            .await
+            .expect("open sink");
+        let mut interceptor = NetworkInterceptor {
+            cancel: CancellationToken::new(),
+            policy: Arc::new(compiled(NetworkPolicy::allow_all())),
+            audit,
+            session_id: "sid-1".to_string(),
+            generation: 0,
+            attachments: BTreeMap::new(),
+            retired: Vec::new(),
+        };
+        let container = Container::attached_reporting_effective_caps("[CAP_CHOWN CAP_SYS_CHROOT]");
+
+        let refused = interceptor
+            .attach(&container)
+            .await
+            .expect_err("this stand-in container has no real pid to continue past");
+
+        let OutrigError::Configuration(message) = refused else {
+            panic!("expected a configuration error, got {refused:?}");
+        };
+        assert!(
+            !message.contains("CAP_NET_ADMIN"),
+            "the NET_ADMIN refusal did not fire: {message}"
+        );
     }
 }

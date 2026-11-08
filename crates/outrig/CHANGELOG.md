@@ -81,6 +81,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`NetworkInterceptor::attach` now refuses a *borrowed* container (`Container::attach`) that
+  currently holds `CAP_NET_ADMIN`, not only one outrig launched.** The #363 refusal read
+  `Container::holds_net_admin`, which comes from outrig's own `--cap-add`/`--cap-drop` lowering --
+  the one thing a borrowed container does not have, since outrig did not launch it. `attach`
+  recorded `LaunchFacts::default()` for it, `net_admin` was always `false`, and the redirect table
+  installed in its netns could be deleted by its own root with nothing recorded: the #363 fix
+  working as documented, and the one case where it said "refused" and meant it only for a
+  container outrig started. `NetworkInterceptor::attach` now also asks a borrowed container's
+  engine state directly, through the new `Container::attached_holds_net_admin`
+  (`podman inspect --format {{.EffectiveCaps}}`), and refuses on what that reports -- exact for
+  `--privileged` and for anything a host's `containers.conf` grants on its own, neither of which
+  the launch-derived check could ever see. An owned container still answers from the launch alone;
+  the extra engine round trip is only for one outrig did not launch. The CLI is unaffected: `outrig
+  mcp --attach` already refuses `--network audit`/`filter` outright. (#549)
+
 - **The DNS forward no longer clips a resolver's answer at 4096 bytes.** Under `audit` or
   `filter` mode, `recv_dns_answer` read a UDP answer into a fixed 4096-byte buffer; a response
   larger than that -- reachable once a stub advertises an EDNS payload above it, which common

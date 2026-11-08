@@ -219,7 +219,9 @@ launch, a sidecar follows its `on-failure` (`warn` drops it, `abort` ends the se
 not let a container change its netfilter, so the nested-runtime recipe in
 [Containers](../concepts/containers.md) runs under either mode. A container that needs
 `NET_ADMIN` runs under `mode = "default"`, or `--network default`, which installs nothing to
-remove. A container outrig did not start is not inspected.
+remove. A container outrig did not start (`Container::attach`) has no launch for the check above
+to read, so it is asked directly: `podman inspect`'s effective capabilities, which also catches
+`--privileged` and anything a host's `containers.conf` grants on its own.
 
 Lookups are forwarded to the host's own resolvers: the `nameserver` entries in the host's
 `/etc/resolv.conf`, in order. Forwarding happens in the host's network namespace, so a loopback
