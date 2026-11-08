@@ -287,6 +287,40 @@ context    = "ctx"
         );
     }
 
+    /// A header nesting an unknown key under a fixed table -- rather than
+    /// splitting a chosen name -- is an ordinary unknown key: no quoting
+    /// hint, no refused load. See issue #536.
+    #[test]
+    fn nested_unknown_table_under_fixed_table_is_just_a_warning() {
+        let toml = r#"
+session-root = "sessions"
+
+[workspace.new-thing]
+enabled = true
+"#;
+        let cfg = Config::load_from_str(toml).expect("a nested unknown table is not a dotted name");
+        assert_eq!(warned(&cfg), [("workspace.new-thing", 4)]);
+    }
+
+    /// `[network]` stays strict -- an unknown key under it still fails the
+    /// load -- but it is not a chosen name either, so no quoting hint is
+    /// owed. See issue #536.
+    #[test]
+    fn nested_unknown_table_under_network_is_refused_without_hint() {
+        let toml = r#"
+[network.new-thing]
+enabled = true
+"#;
+        let err = Config::load_from_str(toml).expect_err("network stays strict");
+        let OutrigError::Config(toml_err) = &err else {
+            panic!("expected OutrigError::Config, not the dotted-name hint, got: {err:?}");
+        };
+        assert!(
+            toml_err.to_string().contains("unknown field `new-thing`"),
+            "got: {toml_err}",
+        );
+    }
+
     #[test]
     fn mcp_short_and_full_normalize_equal() {
         let short_toml = r#"

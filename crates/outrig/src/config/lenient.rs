@@ -146,14 +146,19 @@ pub(super) fn parse(text: &str, file: Option<&Path>, skip_bad_values: bool) -> R
             .strip_prefix("unknown field `")
             .and_then(|rest| rest.split_once("`, "));
         if let Some((name, fields)) = unknown {
-            if follows_dot_in_header(text, span.start) {
+            let found = holder(&doc, &span, name, &dropped, &[]);
+            // A misquoted dotted name can only split an entry in a map of
+            // names the user chose: `[models.opus-4.7]` is model `opus-4`
+            // with a stray key `7`. Elsewhere a `.` in the header just
+            // happens to precede an ordinary unknown key, as
+            // `[workspace.new-thing]` does, and the hint would be wrong.
+            let names_entry = found.as_ref().is_some_and(|(path, _)| names_an_entry(path));
+            if names_entry && follows_dot_in_header(text, span.start) {
                 return Err(OutrigError::ConfigDottedKey {
                     source: failed(err),
                 });
             }
-            let Some((path, table)) =
-                holder(&doc, &span, name, &dropped, &[]).filter(|(path, _)| !is_strict(path))
-            else {
+            let Some((path, table)) = found.filter(|(path, _)| !is_strict(path)) else {
                 return Err(failed(err).into());
             };
             // The message lists every field the table takes, so this one
@@ -170,7 +175,7 @@ pub(super) fn parse(text: &str, file: Option<&Path>, skip_bad_values: bool) -> R
                 let start = key.span().start;
                 let keep = fields.contains(&k)
                     || (tagged && k == "style")
-                    || follows_dot_in_header(text, start);
+                    || (names_entry && follows_dot_in_header(text, start));
                 if (k == name || !keep) && dropped.insert(start) {
                     let path = child(&path, Seg::Key(k.to_string()));
                     warnings.push(warning(&path, start, ConfigWarningKind::UnknownKey));
@@ -455,6 +460,26 @@ fn is_record_list(path: &[Seg]) -> bool {
     match path {
         [Seg::Key(top), Seg::Key(list)] => top == "workspace" && list == "mounts",
         [Seg::Key(top), _, Seg::Key(list)] => top == "sidecars" && list == "mounts",
+        _ => false,
+    }
+}
+
+/// Whether `path` is an entry in a map of names the user chose --
+/// `providers.<n>`, `models.<n>`, `agents.<n>`, `images.<n>`, `sidecars.<n>`,
+/// or `images.<n>.mcp.<s>` -- where a misquoted dotted name can split the
+/// entry in two and wants the quoting hint. Anywhere else a `.` in a header
+/// is either part of a fixed table's own path or an ordinary unknown key, and
+/// the hint would be nonsense: `[workspace.new-thing]` is not a `workspace`
+/// named `new-thing`.
+fn names_an_entry(path: &[Seg]) -> bool {
+    match path {
+        [Seg::Key(top), Seg::Key(_)] => {
+            matches!(
+                top.as_str(),
+                "providers" | "models" | "agents" | "images" | "sidecars"
+            )
+        }
+        [Seg::Key(top), Seg::Key(_), Seg::Key(mid), Seg::Key(_)] => top == "images" && mid == "mcp",
         _ => false,
     }
 }

@@ -81,6 +81,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A header opening an unknown table nested under a fixed one is set aside with a warning, not
+  refused.** `[workspace.new-thing]` failed the load and told the reader to quote a dotted name
+  that was not one -- the inline form of the same key, `new-thing = { ... }` under `[workspace]`,
+  already loaded with a warning. The quoting hint is for a chosen name split by a stray `.` --
+  `[models.opus-4.7]`, `[images.my.thing]` -- so it now fires only where the table an unknown key
+  landed in is itself a `providers`, `models`, `agents`, `images`, or `sidecars` entry (including
+  an `images.<n>.mcp.<s>`); elsewhere, as under `[workspace]`, the key is an ordinary unknown one,
+  warned about and ignored like its inline form. `[network.new-thing]` is still refused, as any
+  unknown key under `[network]` is, but no longer with the wrong hint. (#536)
+
 - **A dropped `Outrig::add_sidecar` no longer leaves its network-interceptor attachment holding
   the sidecar's name.** Under `audit` or `filter` mode, a future dropped while connecting the
   sidecar's servers -- by a `tokio::time::timeout` or a `select!` -- removed the container but
