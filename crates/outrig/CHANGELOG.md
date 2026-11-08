@@ -81,6 +81,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The DNS forward no longer clips a resolver's answer at 4096 bytes.** Under `audit` or
+  `filter` mode, `recv_dns_answer` read a UDP answer into a fixed 4096-byte buffer; a response
+  larger than that -- reachable once a stub advertises an EDNS payload above it, which common
+  libraries do -- arrived at the container truncated mid-record, with `TC` still clear and the
+  header's record count unchanged, rather than with `TC` set so the stub retries over TCP.
+  `record_dns_bindings` then bound only the addresses that happened to parse before the cut, so a
+  hostname `allow` could silently miss one the resolver did send. The buffer is now
+  `DNS_UDP_MAX_DATAGRAM` (65535), past what a UDP/IPv4 or UDP/IPv6 datagram can actually carry, so
+  nothing forwarded is clipped. (#543)
+
 - **A header opening an unknown table nested under a fixed one is set aside with a warning, not
   refused.** `[workspace.new-thing]` failed the load and told the reader to quote a dotted name
   that was not one -- the inline form of the same key, `new-thing = { ... }` under `[workspace]`,

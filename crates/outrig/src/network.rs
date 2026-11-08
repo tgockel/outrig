@@ -92,6 +92,15 @@ const DNS_PORT: u16 = 53;
 /// the attachment's bound on those. Past it the listener stops reading and
 /// the backlog waits in its receive buffer.
 const DNS_IN_FLIGHT: usize = 64;
+/// The largest a UDP datagram can be on any IPv4 or IPv6 path: 65535 minus
+/// the UDP header, which is itself above what either protocol can actually
+/// carry in one packet (65507 for IPv4, 65527 for IPv6 without a jumbogram,
+/// which UDP does not use). Sized here rather than to a resolver's own
+/// payload limit, because `recv_dns_answer` reads before it has parsed
+/// anything -- what the resolver was asked for is not evidence yet of what it
+/// sent. See #543: a 4096-byte buffer silently discarded the rest of a larger
+/// answer instead of refusing to forward it.
+const DNS_UDP_MAX_DATAGRAM: usize = 65535;
 /// How many connections one attachment carries at once. Each holds two of the
 /// process's descriptors -- the container's end and the upstream one -- and
 /// the usual soft limit on those is 1024, so this keeps one container from
@@ -3860,13 +3869,20 @@ async fn serve_dns_connection(mut stream: TcpStream, peer: SocketAddr, context: 
 /// discarding everything else. Returning the first datagram to arrive would
 /// let anything able to land a packet on this ephemeral port decide what a
 /// name resolves to.
+///
+/// The receive buffer is [`DNS_UDP_MAX_DATAGRAM`], not whatever the query's
+/// own `OPT` record advertised: the interceptor forwards that record
+/// unchanged, so the resolver sizes its answer to it, but reading less than
+/// the datagram actually sent would discard the rest without an error --
+/// `recv_from` does not surface `MSG_TRUNC` -- and hand the client a message
+/// whose header still claims the full record count.
 async fn recv_dns_answer(
     socket: &UdpSocket,
     query: Option<&DnsQuery>,
     resolver: SocketAddr,
 ) -> io::Result<Vec<u8>> {
     let deadline = tokio::time::Instant::now() + DNS_TIMEOUT;
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; DNS_UDP_MAX_DATAGRAM];
     loop {
         let (n, peer) = match tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await {
             Ok(Ok(received)) => received,
@@ -9034,6 +9050,111 @@ mod tests {
             .expect("the answer did not come from the address the query was sent to")
             .expect("receive reply");
         assert_eq!(dns_txid(&reply[..n]), Some(0x3333));
+
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// #543: a response larger than the old 4096-byte receive buffer reached
+    /// the client clipped, header unchanged (`ancount` still counting every
+    /// record, `TC` still clear). 300 A records for one name, at ~28 bytes
+    /// apiece, comfortably clears the old buffer; the receive buffer now
+    /// holds any UDP datagram, so nothing is lost in the forward.
+    #[tokio::test]
+    async fn a_resolver_answer_past_the_old_buffer_size_reaches_the_client_whole() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let bindings = empty_bindings();
+        let (listener, cancel, mut tasks) = spawned_dns_loop(
+            vec![resolver.local_addr().expect("resolver addr")],
+            bindings.clone(),
+        )
+        .await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        send_query(&client, listener, 0x5555, "big.test").await;
+        let (query, from) = forwarded_query(&resolver, DNS_TIMEOUT)
+            .await
+            .expect("the query should reach the resolver");
+
+        let answers: Vec<Rr> = (0..300)
+            .map(|i| Rr::A("big.test", [10, 0, (i >> 8) as u8, i as u8], 60))
+            .collect();
+        let answer = dns_packet(query.txid, DNS_RESPONSE_FLAGS, "big.test", &answers);
+        assert!(
+            answer.len() > 4096,
+            "fixture must exceed the old buffer to reproduce #543: {} bytes",
+            answer.len()
+        );
+        resolver.send_to(&answer, from).await.expect("send answer");
+
+        let mut reply = vec![0u8; DNS_UDP_MAX_DATAGRAM];
+        let n = tokio::time::timeout(Duration::from_secs(1), client.recv(&mut reply))
+            .await
+            .expect("no reply arrived")
+            .expect("receive reply");
+        assert_eq!(
+            &reply[..n],
+            &answer[..],
+            "the client must receive the resolver's answer byte-for-byte, not clipped"
+        );
+
+        // Every record parsed, not just however many fit in the old buffer:
+        // the last one, which a 4096-byte read never reached, is bound.
+        assert_eq!(
+            resolved_names(&bindings, ip("10.0.1.43")),
+            resolved(&["big.test"])
+        );
+
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// An answer as large as a UDP/IPv4 datagram can actually be -- 65535
+    /// minus the 8-byte UDP header and 20-byte IPv4 header, which is as
+    /// close to the buffer's size as a real datagram reaches -- is still
+    /// forwarded whole, not mistaken for a clip of something larger.
+    #[tokio::test]
+    async fn a_resolver_answer_at_the_largest_real_datagram_size_reaches_the_client_whole() {
+        const MAX_IPV4_UDP_PAYLOAD: usize = 65535 - 8 - 20;
+
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let (listener, cancel, mut tasks) = spawned_dns_loop(
+            vec![resolver.local_addr().expect("resolver addr")],
+            empty_bindings(),
+        )
+        .await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        send_query(&client, listener, 0x6666, "exact.test").await;
+        let (query, from) = forwarded_query(&resolver, DNS_TIMEOUT)
+            .await
+            .expect("the query should reach the resolver");
+
+        let mut answer = dns_packet(
+            query.txid,
+            DNS_RESPONSE_FLAGS,
+            "exact.test",
+            &[Rr::A("exact.test", [198, 51, 100, 11], 60)],
+        );
+        // Padded with a trailing, unparsed tail to land on the largest
+        // datagram the kernel will actually carry. `answered_by` only looks
+        // at the header and question, both ahead of the padding, so the
+        // datagram still passes as this query's answer.
+        answer.resize(MAX_IPV4_UDP_PAYLOAD, 0);
+        resolver.send_to(&answer, from).await.expect("send answer");
+
+        let mut reply = vec![0u8; DNS_UDP_MAX_DATAGRAM];
+        let n = tokio::time::timeout(Duration::from_secs(1), client.recv(&mut reply))
+            .await
+            .expect("no reply arrived")
+            .expect("receive reply");
+        assert_eq!(
+            &reply[..n],
+            &answer[..],
+            "an answer this large must still arrive whole"
+        );
 
         cancel.cancel();
         let failures = stop_tasks(&mut tasks).await;
