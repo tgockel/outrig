@@ -2041,7 +2041,7 @@ const PYTHON_KEYWORDS: [&str; 35] = [
 /// A binding's name is a global in every kernel, so it must be one Python can
 /// spell and one the interpreter has not taken: `runtime`, `asyncio`, the
 /// `outrig` module, or a module's own `__dunder__` attributes.
-fn check_binding_name(
+pub(crate) fn check_binding_name(
     name: &str,
     declared_in: Option<PathBuf>,
 ) -> Result<(), ConfigValidationError> {

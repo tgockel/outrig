@@ -199,6 +199,7 @@ fn every_harness_event_type_grows_without_a_break() {
         "outrig::harness::event::InvocationId",
         "outrig::harness::event::MessageId",
         "outrig::harness::event::RequestId",
+        "outrig::harness::event::ServiceCallId",
         "outrig::harness::event::Subject",
         "outrig::harness::event::Subscription",
     ];

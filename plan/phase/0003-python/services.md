@@ -15,8 +15,8 @@ are OR-A3-1 through OR-A3-5 of `A-03-rust-service-facilities.md`. The first appl
 Rust embedder of `outrig::harness` whose facilities are Rust over its own clients; nothing of its
 names appears in a mechanism here.
 
-Spellings of types, methods, lines and keys are illustrative; `0003-44` fixes them and records them
-in its `## Decisions`.
+The spellings of types, methods, lines and keys here are those `0003-44` built; its `## Decisions`
+records the calls behind them.
 
 ## What exists, and what this page reverses
 
@@ -81,8 +81,10 @@ pub trait Service: Send + Sync + 'static {
   in place of the policy's default, for a service whose calls legitimately run long. A
   description may change after start ("The crossing", `service.described`).
 - **`CallContext`**: the call's id as the host minted it, the service's bound name, the agent and
-  execution the call is attributed to, the deadline, and a `CancellationToken` (`tokio-util`,
-  already a dependency) that the deadline, an interrupt and the close trigger. A `call` that
+  execution the call is attributed to, the deadline, and a cancellation signal that the
+  deadline, an interrupt and the close trigger: `cx.cancelled()` resolves then, and
+  `cx.is_cancelled()` says so. It is a `tokio-util` `CancellationToken` inside, kept private, since
+  the public surface names no crate outside `public_api_boundary.rs`'s list. A `call` that
   observes the token returns promptly with `ServiceError::Cancelled`; one that does not is aborted
   ("Dispatch, deadline and cancel").
 - **`ServiceError`**: a `category` from a `#[non_exhaustive]` enum -- `InvalidArguments`,
@@ -124,8 +126,10 @@ Python or Rust objects.
 - **A call is a `service.call` line** from the interpreter: the ask id the answer is matched by,
   the `agent` and `exec` from the calling context (as `_from_agent` names them for a skill request,
   `crates/outrig/src/python/outrig/skills.py:461`), the `invocation` when inside a skill, the
-  service, the method's exact name, the generation the method came from, the arguments, and an
-  optional `timeout` that may only lower the deadline. The host accepts `agent` only for a kernel
+  service, the method's exact name, the generation the method came from, the arguments as JSON
+  text, and an optional `timeout` that may only lower the deadline. As text, arguments the host's
+  parser refuses -- nested past its depth -- end that call refused rather than making the line
+  unreadable, which would leave its caller waiting. The host accepts `agent` only for a kernel
   it opened, as the relay accepts an `rpc` line's (`hosted.rs:343-353`). Before sending, the
   interpreter measures the complete encoded line against the host's line bound (`REPLY_LINE_MAX`,
   16 MiB, `host.rs:147`): the reader cuts a longer line and keeps the stream in step
@@ -133,7 +137,8 @@ Python or Rust objects.
   would ever be armed for it. A line over the bound raises `ValueError` in the caller naming the
   bound and the size, sends nothing and registers no wait, as a spawn whose arguments take more
   than 1 MiB to describe does (`_interpreter.py:4844`).
-- **The answer is a `service` line** with the ask id and `ok` holding the result, or `error`
+- **The answer is a `service` line** with the ask id and `ok` holding the result as JSON text,
+  which the caller decodes, or `error`
   holding the call id, the outcome, the category, the message and, for an argument the schema
   refused, the JSON path. The host answers every line it accepts, at the close included, so no
   thread waits for good, as `skills.rs:1241` guarantees for a skill request.
@@ -340,7 +345,8 @@ the family's own id is `call`, minted on the host; `execid` and `invocation` are
 interpreter made, said so in `events.md`; "attempt" is not used.
 
 - `service.bound` -- at start, per service: `service`, `kind` (`rust`, or the presenter kind of a
-  service OutRig ships, such as `mcp`), `methods` (count), `generation`.
+  service OutRig ships, such as `mcp`), `methods` (count), `generation`, `unchecked` (methods whose
+  schema did not compile).
 - `service.described` -- a description changed: `service`, `generation`, `changes` (`added`,
   `removed`, `changed`, by exact name), `unchecked` (methods whose schema did not compile).
 - `service.call.received` -- `call`, `service`, `kind`, `method` (exact), `generation`, `agent`,
@@ -348,11 +354,14 @@ interpreter made, said so in `events.md`; "attempt" is not used.
   policy records bodies.
 - `service.call.dispatched` -- `call`, `service`, `method`, `agent`: published before `call` is
   invoked.
-- `service.call.cancel.sent` -- `call`, `reason` (`deadline`, `interrupted`, `closed`, `stopped`).
+- `service.call.cancel.sent` -- `call`, `service`, `agent`, `reason` (`deadline`, `interrupted`,
+  `closed`; the first holds).
 - `service.call.ended` -- `call`, `service`, `kind`, `method`, `agent`, `execid`, `outcome` (the
-  five), `category`, `reason`, `detail` (the path for invalid arguments; the limit and size for
-  result too large), `bytes`, `duration`, and `body`, a bounded preview present only when the
-  policy records bodies.
+  five), `category` (the service's, for `raised`), `reason` (for `refused`, `cancelled` and
+  `unknown`), `detail` (the path for invalid arguments; the limit and size for result too large),
+  `bytes`, `duration`, and `body`, a bounded preview present only when the policy records bodies.
+  The Python `outrig.ServiceError` carries a refusal's reason as its `category` too, so `category`
+  answers "why" for every call that returned no result but an abandoned one.
 
 An MCP call is a service call and uses this family with `kind: "mcp"` and the fields
 `mcp-presenter.md` adds (`tool`, `listing`, `state`, `failure`); the MCP lifecycle events --

@@ -258,3 +258,154 @@ the Python side driven as the interpreter's tests drive agent code.
 - `crates/outrig/src/python/hosted.rs`, `host.rs`, `outrig/_interpreter.py`, `outrig/skills.py`,
   `outrig/_kernel.py`, `outrig/schema.py`; `crates/outrig/src/harness/builder.rs`, `bindings.rs`,
   `report.rs`, `lifecycle.rs`; `crates/outrig/src/agent/orientation.rs`.
+
+## Decisions
+
+- **The two reversals.** `embedding.md`'s "There is no Rust trait for presenting a Rust object to
+  agent Python in 0.3. An embedder whose service is Rust ships a pure-Python client package and
+  declares it as a binding, hosted like any library" is replaced by `Service` and
+  `SessionBuilder::serve`: the first application's facilities are Rust over clients the embedded
+  CPython cannot load, so the binding route cost a second client stack and a process per service,
+  and the descriptor format it said a trait needs is the one the MCP presenter needs too.
+  `hosted-objects.md`'s "**Rejected: a Rust service trait.**" is replaced by a service model with
+  no proxies -- not RPyC's server in Rust, not FFI under a Python class -- whose calls are JSON
+  lines on the interpreter pipe. Both plan pages already pointed at `services.md`; a Python
+  library stays a binding, and a Rust service with a pure-Python client may still be bound as one.
+- **The validator is `jsonschema` 0.61.0**, `default-features = false`. Surveyed 2026-11-08
+  against `boon` 0.6.1: both pass 100% of the official suite's required tests for draft 2020-12
+  and draft 7 (Bowtie's badges, `bowtie.report/badges/rust-{boon,jsonschema}/compliance/*.json`),
+  and the first cut took `boon` for its four-crate footprint. Review found that the suite does not
+  test what a service needs most: `boon` compares numbers as `f64`. Of twelve numeric cases run
+  against both, `boon` got six wrong -- `maximum: 9007199254740992` accepting
+  `9007199254740993`, the same at `minimum`, `multipleOf: 2` and `3` accepting integers past
+  2^53 that are not multiples, and `multipleOf: 0.1` and `0.01` refusing `0.3` and `19.99` --
+  and `jsonschema` none, comparing integers exactly and `multipleOf` as fractions. Its cost:
+  about twenty crates the lock lacked (`referencing`, `jsonschema-value`, `jsonschema-regex`,
+  `fraction`, `num`, `num-cmp`, `email_address`, `uuid-simd`, `bytecount`, `micromap`, a second
+  `fancy-regex`, ...), and `serde_json`'s `float_roundtrip` on for the whole workspace through
+  feature unification, which makes float parsing exact and the suite passes with it. It is built
+  `offline()`, loading nothing outside a schema: a `$ref` to a file, a URL or a relative document
+  does not compile, and its method is unchecked. `default-features = false` alone does not hold
+  that -- Cargo unifies an embedder's `resolve-file` or `resolve-http` into the one `jsonschema`
+  both use -- so the tests turn `resolve-file` on, as such an embedder would, and
+  `a_schema_is_compiled_and_checked` has the crate load a schema file by default and the check
+  refuse it. The validator reads `$schema` and takes draft 2020-12 without one. A refusal names
+  `instance_path()`, a JSON pointer (`/x`, `/a/b`, `""` for the object itself), and the `masked()`
+  message, which names the problem and not the value. `a_schema_is_compiled_and_checked` holds the
+  numeric cases.
+- **The renderer's coverage**, `outrig/_services.py`: an object schema's `properties`,
+  `required`, `default` and `description`; property types `string`, `integer`, `number`,
+  `boolean`, `null`, `array` (with `items`), `object`, a list of types, `enum` and `const` as
+  `Literal`, `anyOf` and `oneOf` as a union, and `$ref` into `#/$defs/` or `#/definitions/`. A
+  required property is positional-or-keyword in schema order; an optional one is keyword-only,
+  showing its schema default (or `...`), and is left out of the call when not passed -- the
+  schema's default is the service's to apply. A property whose type it cannot spell is a
+  parameter with no annotation. A schema that is not an object of identifier-named properties --
+  a top-level `anyOf`, a property named `self`, `read-file` or `class`, a keyword it does not know
+  at the top -- renders `(**arguments)` and its schema in the docstring, cut to 2,000 characters.
+  `additionalProperties` adds no `**`: a call of an undeclared argument goes through `call()`.
+- **Defaults**: deadline 600 s (`DEFAULT_MCP_CALL_TIMEOUT_SECS`), grace 5 s, `result_max`
+  16 MiB measured as compact JSON by counting the serializer's bytes, `record_bodies` off.
+  `ServiceDescription::call_deadline`, the service's own ceiling, is added: `services.md` and
+  `mcp-presenter.md` rely on it though the task's list omitted it.
+- **Spellings.** Builder: `serve`, `service_policy`. Types: `Service`, `ServiceFuture` (our own
+  alias, so no `futures` type is in the API), `ServiceDescription` (`with_method`,
+  `with_call_deadline`), `MethodDescription` (`with_result`), `CallContext` (`call`, `service`,
+  `agent`, `execution`, `invocation`, `deadline`, `cancelled`, `is_cancelled`), `ServiceError`,
+  `ServiceErrorCategory` (snake_case), `ServicePolicy`, `ServiceCall`; events' `ServiceCallId`,
+  `ServiceKind::Rust`, `ServiceOutcome`, `ServiceReason`, `ServiceChanges`. Lines: `services`
+  (only when a session has one, so existing sessions' wire is unchanged), `service.described`,
+  `service.call`, `service`, `service.cancel`. Python: `outrig.Service`, `outrig.ServiceError`,
+  `outrig.ServiceMethod`; a generated class is `outrig.services.<name>`. The presenter kind is
+  crate-private (`ServiceKind` decides it), since no application presenter is read.
+- **The token stays private.** The deliverable's `CancellationToken` is what `CallContext` holds,
+  and what it offers is `cancelled()`, a future that resolves when the token is triggered, and
+  `is_cancelled()`: `tokio-util` is not among the crates the public surface may name
+  (`crates/outrig/tests/public_api_boundary.rs`), so a release of it would otherwise be an
+  outrig major. A service's own task clones the context and awaits `cancelled()` there.
+- **Category and reason.** In events and the report, `category` is the service's, for `raised`;
+  `reason` says why for `refused`, `cancelled` and `unknown`, as `HostedReason` covers all three.
+  The Python `ServiceError` also carries a refusal's reason as its `category`, as the acceptance
+  reads it (`category == "invalid_arguments"`), so `category` answers "why" for every call but an
+  abandoned one. `each_outcome_reaches_agent_code_as_its_fields` pins the mapping.
+- **A call from a kernel the host did not open is answered**, refused `unknown_agent`, with a
+  warning and no event -- unlike the relay, which drops such a line -- because the service wait
+  has no timeout of its own and a dropped line would hold its thread for good. The object refuses
+  in Python first: a call from another kernel's execution raises `TypeError` (as `_Pool.request`
+  does), and one on a released kernel's object `RuntimeError`, so only a forged line reaches it.
+- **The wait.** `_ask_host`'s wait is split out as `_await_host(ask_id, line, timeout)`, which a
+  service call uses with its own encoded line and no timeout of its own, and `_ask_host` keeps its
+  signature for the skills module. The line is measured by `_refuse_long`, which now takes a
+  `limit` (`SERVICE_LINE_MAX`, `REPLY_LINE_MAX`'s twin, each naming the other) and returns the line
+  it encoded, so it is encoded once. `_encode(strict=True)` refuses a NaN -- a token the host
+  cannot parse, so a line it would never answer -- with `ValueError`, and writes text unescaped,
+  so non-ASCII arguments do not reach the bound twice as soon; a lone surrogate falls back to
+  `_clean`. An exception out of the wait -- the interrupt -- sends `service.cancel` and re-raises.
+- **One session table.** A kernel with the session's view presents `_SESSION`, the bindings' and
+  services' records together, each resolved through `_KINDS` by its record's `kind`:
+  `offer_session` replaces `bind_stubs`, and `facility`, `facility_names` and `briefs` have no
+  kind of their own. A binding is still left out of `outrig.bindings` without RPyC.
+  `outrig.facility(name)` reads the kind from that table through `_agents._kind_of`, installed as
+  `_resolve` is; on the host every name stays a binding's until a host program may give
+  facilities.
+- **The close is read, not heard.** A call that ends after `lifecycle.closed()` is listed in the
+  report; the table needs no `on_close` hook of its own, since it reads the same admission at each
+  end.
+- **The close tells services first.** At the drain's end `Services::terminate` triggers every
+  token, reason `closed`, before `stop_live` interrupts the kernels, so the interrupt's
+  `service.cancel` cannot win the first-reason-holds race; the shutdown then waits the grace plus
+  a second for them. `report()` seals the table and reports a call still in flight -- its abort
+  not yet seen -- as `unknown`, `closed`, aborting it.
+- **A panic** in a service's `call` ends the call `raised`, `failed`, with "the service's call
+  panicked": no payload crosses, since a panic message is the service's internals. The fixture's
+  credential is in its `panic` method's message, so `internals_never_cross` fails if one ever
+  does.
+- **A description that changes** is `Services::redescribe`, crate-private (fork 5 as
+  recommended): a test drives it, and `0003-55`'s relisting will. The interpreter makes the next
+  generation's class and reassigns `__class__` on every kernel's object, so `svc` and
+  `outrig.bindings["svc"]` stay one object; a method held from the old class keeps its
+  generation, and the host refuses one the new description lacks.
+- **The attribute convenience**: a dunder-shaped name stands for no method, and a name the class
+  already uses (`call`, `method`, `methods`, `_service`, ...) gains `_`. An ambiguous attribute is
+  a descriptor raising `AttributeError`, so `hasattr` is false and `dir` leaves it out.
+- **`help(svc)` shows `self`.** pydoc documents the generated class, whose methods are functions
+  with `__signature__` including `self` -- so `inspect.signature(svc.echo)` is `(x: int)` -- and
+  shows `echo(self, x: int)`, as it shows every class's methods.
+- **Measured.** A 500-method description's class and one object of it take 18-20 ms in the
+  interpreter (three runs: 18.2, 18.5, 19.7 ms), `five_hundred_methods_are_cheap`. Per kernel the
+  object is one `object.__new__`; the class is made once per description.
+- **The CLI prints no service rows**: `outrig run-new` serves none, so its report's `services` is
+  always empty. `scripts/render-session.py` renders them in a session page's report.
+- **Arguments and results cross as JSON text.** The arguments ride in the `service.call` line as
+  a string, which the host parses on the call's task, and a result rides in the answer as one,
+  which the caller decodes. A value one side's parser refuses -- nested past `serde_json`'s 128
+  levels, say -- then ends that call, refused as invalid arguments or raised in the caller as
+  `ValueError`, rather than making the whole line unreadable: the reader drops a line it cannot
+  read, and a call waiting with no timeout of its own would wait for good. The result is
+  serialized once, for its size and for the line. Previews are the texts cut to 1,024 characters,
+  so an argument preview is the interpreter's spelling (`{"x": 12345}`) and a result's the
+  host's. A result too deep for the interpreter's decoder is past where serializing it would
+  already strain the host's stack, so `answer()`'s unit test holds the text and nothing drives
+  one end to end. `arguments_the_host_cannot_read_are_refused_at_once` drives 200 levels.
+- **A call's stop is told outside the table's lock.** `Flight::stop` is shared: `stop()` takes it
+  out of the table and tells it with the table unlocked, and `run` copies what it says before
+  `ended` locks the table, so the two locks are never held in opposite orders -- a call cancelled
+  before dispatch, told to stop again by the close, deadlocked the reader and the shutdown
+  otherwise. The race is too narrow to drive, so no test holds it.
+- **The renderer stops at a depth.** `_annotation` follows `$ref`s, unions and `items` 32 steps
+  and leaves a deeper type unspelled, so a chain of 1,100 `$ref`s renders `(*, x=...)` instead of
+  raising `RecursionError` -- which, raised while the `services` line was taken, left every
+  service of the session without an object (`a_long_reference_chain_leaves_every_service_bound`).
+  It also visits at most 256 schemas for one type, a `$ref` counted each time it is met: a depth
+  bounds each path but not how many there are, and definitions that branch to one another are as
+  many as their product -- twenty, each an `anyOf` of three `$ref`s to the next, are 3^20 paths
+  in under 2 KiB, which held the interpreter's reader of host lines for longer than the test's
+  step allows (`a_branching_reference_graph_renders_at_once`). A budget over memoizing each
+  definition's type, which would spell more such graphs: what a definition renders to depends on
+  the path that reached it, through the cycle check and the depth.
+- **The fallback's receiver is positional only**, `(self, /, **arguments)`, so a schema that
+  names an argument `self` -- which sends its method to the fallback -- takes it as an argument
+  (`an_argument_named_self_is_an_argument`).
+- **Not built here**: a cap on calls in flight per agent, as the relay's 1,024 --
+  `plan/next/bound-service-calls-in-flight.md`. Audience classification of the new fields is
+  `0003-68`'s, with the rest.

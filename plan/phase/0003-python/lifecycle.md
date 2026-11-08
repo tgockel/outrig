@@ -275,6 +275,27 @@ the session.
 - *Held, queued, or waiting for the serialize turn.* As a factory binding's rows above: refused or
   `cancelled`, never invoked, through the same relay and the same flag in the serving module.
 
+**Service calls** (`0003-44`)
+
+- *Made after the close.* Outcome: `refused`, admission closed, answered at once; the caller gets
+  an `outrig.ServiceError` with that category. Invoked: no. Effects: none.
+- *Received, not yet dispatched* -- its arguments being checked. Outcome: `cancelled`, with the
+  reason, if an interrupt or the close's terminate reached it first; otherwise it is dispatched,
+  and a row below. Invoked: no, when cancelled. Effects: none, when cancelled.
+- *Running* -- its service's `call` invoked, on a task of its own. Outcome: it drains to the
+  deadline; `returned` or `raised` if `call` finishes in time. At terminating, before the kernels
+  are interrupted, its cancellation token is triggered, reason `closed`, and the service policy's
+  grace given: a `call` that honors it ends `raised` with the category `cancelled`, or `returned`
+  if it finished anyway; one still running is aborted at its next await point and reported
+  `unknown`, reason `closed`. A `call` blocking a thread is abandoned without waiting on the
+  thread, which runs on in the embedder's process. Invoked: yes. Effects: known only if it
+  returned or raised; an `unknown` one's effects are open, and nothing calls it again.
+- *Its result larger than the policy's bound.* Outcome: `refused`, result too large, after the
+  service returned. Invoked: yes. Effects: whatever the service did stands.
+
+A service has no process of its own to stop: it is the embedder's object, dropped with the
+session.
+
 **Root agents** (`0003-35`)
 
 - *Launching, idle, working, or collected.* As the agent-instance rows above; the owner is the
@@ -312,10 +333,10 @@ own task. It holds:
 - that admission closed;
 - whether owned execution is proven stopped: the bindings process reaped with its group empty,
   and the container stopped, which takes the interpreter and its kernels with it;
-- an outcome for each execution, each hosted call, each child work item and each request on a
-  child's request channel that was live at the close. The hosted calls are read last, once the
-  container has stopped, and no hosted call is recorded after them, so `session.report` lists
-  every hosted outcome the stream holds from after the close;
+- an outcome for each execution, each hosted call, each call of a service, each child work item
+  and each request on a child's request channel that was live at the close. The hosted calls and
+  the service calls are read last, once the container has stopped, and none is recorded after
+  them, so `session.report` lists every such outcome the stream holds from after the close;
 - event delivery: the last sequence the stream published, and how many events each subscriber
   missed (`observability.md`). The stream never waits on a subscriber, so a stalled one cannot
   delay shutdown; the report says what it missed instead.
@@ -336,6 +357,13 @@ is one of five, the same outcomes its events record:
 - `unknown` -- forwarded, with no reply: its binding was killed at shutdown, its binding process
   died, or, for a live object, its call was still running in the host program when the report was
   sealed (`0003-36`); whether its target was invoked, or finished, is open.
+
+A service call's is one of the same five (`services.md`): `returned`; `raised`, with the
+service's category; `refused`, never invoked -- admission closed, an unknown method, arguments its
+schema refused -- or, once invoked, a result too large; `cancelled`, never invoked, because an
+interrupt or the close reached it before its dispatch; and `unknown`, invoked and abandoned after
+its grace, with the reason `deadline`, `interrupted` or `closed`. An `unknown` service call makes
+the verdict stopped with unknown, as an `unknown` hosted call does.
 
 An interrupted call that the binding had already invoked is none of these: it runs on, and its
 reply records `returned` or `raised` with the note that the caller had been interrupted.

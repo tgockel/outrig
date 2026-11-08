@@ -75,6 +75,10 @@ heck               = { version = "0.5.0",   default-features = false }
 http               = { version = "1.5.0",   default-features = false }
 ignore             = { version = "0.4.31",  default-features = false }
 jiff               = { version = "0.2.35",  default-features = false }
+# Checks a service call's arguments against its JSON Schema, comparing numbers exactly. Its
+# default features fetch files and URLs; the check is built offline whatever features an
+# embedder unifies in, so a schema's `$ref` resolves only within the schema.
+jsonschema         = { version = "0.61.0",  default-features = false }
 miniz_oxide        = { version = "0.9.1",   default-features = false }
 nix                = { version = "0.31.3",  default-features = false }
 rand               = { version = "0.10.2",  default-features = false }

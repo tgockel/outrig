@@ -55,6 +55,7 @@ use crate::harness::event::{
     Subject, Usage,
 };
 use crate::harness::lifecycle::Lifecycle;
+use crate::harness::services::ServiceBrief;
 use crate::harness::{ClosedBy, RequestOutcome};
 use crate::python::host::{Channels, ChildLines, Counts, Interpreter, OWNER};
 
@@ -88,6 +89,7 @@ pub(crate) struct Settings {
     /// again.
     pub(crate) windows: Windows,
     pub(crate) bindings: Vec<Brief>,
+    pub(crate) services: Vec<ServiceBrief>,
     pub(crate) container: String,
 }
 
@@ -870,9 +872,13 @@ impl Inner {
                     bindings.iter().any(|b| &b.name == target && b.serialize)
                 });
         }
-        let view = given
-            .as_deref()
-            .map_or(View::Session(&bindings), View::Given);
+        let view = given.as_deref().map_or(
+            View::Session {
+                bindings: &bindings,
+                services: &settings.services,
+            },
+            View::Given,
+        );
         let preamble = orientation::child_preamble(
             settings.workspace.as_deref(),
             view,
@@ -1862,10 +1868,10 @@ fn given(facilities: &Value) -> Option<Vec<Given>> {
             .map(|facility| {
                 let brief = FacilityBrief {
                     name: text(&facility["name"]),
-                    kind: if facility["kind"] == "binding" {
-                        FacilityKind::Binding
-                    } else {
-                        FacilityKind::Object
+                    kind: match facility["kind"].as_str() {
+                        Some("binding") => FacilityKind::Binding,
+                        Some("service") => FacilityKind::Service,
+                        _ => FacilityKind::Object,
                     },
                     target: facility["target"].as_str().map(str::to_string),
                     type_name: text(&facility["type"]),

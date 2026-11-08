@@ -37,6 +37,7 @@ flowchart LR
     loops -- "submit_python" --> primary
     loops -- "submit_python" --> child
     primary -- "binding calls" --> bindings
+    primary -- "service calls" --> owner
 ```
 
 ## Vocabulary
@@ -59,8 +60,10 @@ them says which system it describes.
   OutRig, or the engine acting for a host program.
 - A **binding** is an object a process on the host holds for the agents, reached under a name.
   [Hosted Objects](hosted-objects.md) describes them.
-- A **facility** is an object an agent is given to act through: a binding, or a plain Python
-  object. An agent class's constructor takes them in its `facilities=` dict; see
+- A **service** is an object a Rust program that embeds OutRig serves by name, whose methods are
+  calls to the host made by value; see [Services](#services).
+- A **facility** is an object an agent is given to act through: a binding, a service, or a plain
+  Python object. An agent class's constructor takes them in its `facilities=` dict; see
   [Facilities](#facilities).
 
 ## Executions
@@ -343,6 +346,10 @@ rules, and is not `outrig`, `self`, an input's name or a class bound in the chil
   `outrig.Facility`, which resolves in each kernel to that kernel's own proxy. So a child's calls
   go over its own connections and its `hosted.*` events name it, and a reference passed on
   through several constructors is one binding with a caller at each level.
+- **A service** -- its global, or `outrig.facility(name)` -- becomes a reference to that service,
+  which resolves in each kernel to that kernel's own object of it, so a child's calls are
+  attributed to the child. A child given none finds no service: not in its instructions,
+  `runtime.bindings`, its globals or `outrig.bindings`.
 - **A plain object** is the object itself, shared by the agents given it. A call on it is
   ordinary Python in the calling agent: it crosses nothing, and is not evented.
 - **Refused**, naming the entry: a proxy of an object a binding returned (`repo.index`, say),
@@ -351,14 +358,63 @@ rules, and is not `outrig`, `self`, an input's name or a class bound in the chil
 
 A child made without `facilities=` -- by `runtime.spawn`, a typed call, or a constructor given
 none -- sees what its parent sees: a copy of its parent's mapping as it stands at the launch, or,
-under the main agent, every binding. A child given `{}` sees none. The mapping is the agent's to
-change; an entry added later is listed and reached through `outrig.bindings[name]`, but is no
-global, and its instructions, composed once, are not redone. The view is what an agent is told,
-not what it may do: agents in one session are not isolated from each other, and every kernel can
-reach every binding, as
+under the main agent, every binding and service. A child given `{}` sees none. The mapping is
+the agent's to change; an entry added later is listed and reached through `outrig.bindings[name]`,
+but is no global, and its instructions, composed once, are not redone. The view is what an agent
+is told, not what it may do: agents in one session are not isolated from each other, and every
+kernel can reach every binding and service, as
 [`SECURITY.md`](https://github.com/tgockel/outrig/blob/trunk/SECURITY.md) says under "Known
-boundaries". A host program cannot give facilities yet; its
-`facilities=` raises `NotImplementedError`.
+boundaries". A host program cannot give facilities yet; its `facilities=` raises
+`NotImplementedError`.
+
+## Services
+
+A Rust program that embeds OutRig can serve the agents objects of its own, written in Rust, with
+`SessionBuilder::serve(name, service)`. A **service** describes its methods -- each by an exact
+name, with a JSON Schema for its arguments -- and answers a call of one by value: JSON in, JSON
+out. Nothing of it is in the container, and no process runs for it. Each kernel gets an object of
+a class made from the description, a subclass of `outrig.Service`, one method per described one,
+its signature and docstring rendered from the schema:
+
+```python
+issue = tracker.file_issue("Flaky test", labels=["ci"])   # {"id": 42, "url": "..."}
+help(tracker)                                              # its methods, from the schema
+```
+
+The object is the global of the service's name where that name is free, and
+`outrig.bindings[name]` always; `runtime.bindings` lists it with `kind` `service`, and the agent's
+instructions name it beside the bindings.
+
+- **Names.** `tracker.call("file-issue", {"title": "..."})` calls a method by its exact name,
+  `tracker.method(name)` gives one, and `tracker.methods` lists them. A method's attribute is its
+  name with `-` as `_`, and a trailing `_` for a keyword or a name the class already uses; two
+  names that would meet one attribute leave it to neither, and reading it says so.
+- **Checked on the host.** The host checks a call's arguments against the method's schema before
+  the service sees them, and refuses those that do not match, naming the first failing JSON path.
+  A schema the checker cannot compile leaves its method unchecked, and `service.bound` says so.
+- **A call blocks its caller**, as a binding's does: the kernel's event loop waits with it, and
+  `await asyncio.to_thread(tracker.file_issue, "...")` keeps it turning.
+- **A deadline.** A call has ten minutes, unless the owner's `ServicePolicy` or the service sets
+  another; `timeout=` on `call` shortens it, and one past it raises `ValueError`. At the deadline,
+  on Ctrl-C, or when the session's drain ends, the service is told to stop. One still running a
+  grace later -- five seconds -- is abandoned, and its outcome is unknown: what it did may stand,
+  and nothing calls it again.
+- **What a call raises.** A call that returns no result raises `outrig.ServiceError`: `outcome`
+  is `refused` (never made, or its result larger than the policy lets one be -- 16 MiB by
+  default), `raised` (the service said it failed, with its `category`), `cancelled` or `unknown`,
+  and `category`, `reason`, `path` and `message` say the rest. A call whose line would be longer
+  than the host reads, 16 MiB, raises `ValueError` and sends nothing.
+
+A method that starts long work should return at once, with a ticket: the call returns a value,
+the owner delivers the completion on a channel -- the user channel, say -- and the agent waits
+for it with `runtime.wait`, holding no call meanwhile. A call that waits inside the service holds
+its caller's thread, and at the close the session's drain.
+
+Each call is recorded as `service.call.*` events, with the agent that made it, and one that ended
+after the close is in `session.report`'s `services`. Its arguments and result are not recorded
+unless the owner's policy says to. Binding a service is a grant, as binding a library is: every
+method it describes is callable by every agent of the session, and a service that should do less
+describes less.
 
 ## Skills
 
@@ -426,7 +482,8 @@ something first imports it.
 
 - [Reference -> CLI](../reference/cli.md#outrig-run-new) -- `outrig run-new`'s interactive
   session: what you type, what is printed, how it ends.
-- [Hosted Objects](hosted-objects.md) -- objects on the host the agents' Python uses.
+- [Hosted Objects](hosted-objects.md) -- objects on the host the agents' Python uses; a
+  [service](#services) is the Rust counterpart.
 - [Host programs](../usage/host-programs.md) -- a Python program on the host that owns sessions.
 - [Python API](../reference/python.md) -- the `outrig` package a host program imports.
 - [Event Log](../reference/events.md) -- what a session records.

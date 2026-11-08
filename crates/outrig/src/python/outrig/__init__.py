@@ -22,6 +22,10 @@ value or with an `outrig.AgentError`: see `help(outrig.AgentError)` and `help(ou
 its own: see `help(outrig.agent)`. A subclass of `outrig.Agent` declares a long-lived child
 instead, whose methods marked `@outrig.agent` are its request channels: see `help(outrig.Agent)`.
 
+Each service the session's owner serves from Rust is an `outrig.Service`, its methods calls to
+the host by value; a call that returns no result raises `outrig.ServiceError`: see
+`help(outrig.Service)`.
+
 `outrig.skills` reaches the session's skills, whose code imports as `outrig_skills.<name>`: see
 `help(outrig.skills)`.
 """
@@ -44,6 +48,7 @@ from ._agents import (
     agent,
     facility,
 )
+from ._services import Service, ServiceError, ServiceMethod
 
 __all__ = [
     "schema",
@@ -59,6 +64,9 @@ __all__ = [
     "Request",
     "RequestCancelled",
     "RequestSettled",
+    "Service",
+    "ServiceError",
+    "ServiceMethod",
     "SessionClosing",
     "Status",
     "agent",

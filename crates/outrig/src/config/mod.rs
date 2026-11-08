@@ -29,9 +29,9 @@ pub use validate::{
     BuildImageNameError, ConfigValidationError, MountRuleViolation, check_build_image_name,
 };
 pub(crate) use validate::{
-    check_entrypoint_hosting, check_mcp_call_timeout_secs, check_sidecar_image, check_sidecar_name,
-    check_view_exclusions, is_valid_mcp_server_name, mcp_call_timeout_secs_in_range,
-    mcp_command_is_empty, validate_binding, validate_session_paths,
+    check_binding_name, check_entrypoint_hosting, check_mcp_call_timeout_secs, check_sidecar_image,
+    check_sidecar_name, check_view_exclusions, is_valid_mcp_server_name,
+    mcp_call_timeout_secs_in_range, mcp_command_is_empty, validate_binding, validate_session_paths,
 };
 
 use crate::error::{IoPathExt, OutrigError, Result};

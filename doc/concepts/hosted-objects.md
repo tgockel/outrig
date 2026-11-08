@@ -26,7 +26,9 @@ A binding's object comes from one of two places:
   and gives its session with `session.inject(name, obj)`. It stays in the program's process,
   which serves every request for it, to every agent of the session, including agents made later.
 
-Nothing is bound by default.
+Nothing is bound by default. A Rust program that embeds OutRig can also serve objects written in
+Rust, with `SessionBuilder::serve`; those are not bindings, and have no process and no proxy:
+see [Python Runtime -> Services](python-runtime.md#services).
 
 ## Where agent code finds one
 

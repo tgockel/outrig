@@ -931,6 +931,14 @@ class Builder:
             + (f" ({text(c.get('reason'))})" if c.get("reason") is not None else "")
             for c in objs(d.get("hosted"))
         ]
+        services = [
+            f"service call {text(c.get('call'))} to {text(c.get('service'))}."
+            f"{text(c.get('method'))} by {text(c.get('agent'))}: {text(c.get('outcome'))}"
+            + "".join(
+                f" ({text(c.get(why))})" for why in ("category", "reason") if c.get(why) is not None
+            )
+            for c in objs(d.get("services"))
+        ]
         requests = [
             f"request {text(r.get('request'))} of {text(r.get('child'))}"
             + (
@@ -964,6 +972,7 @@ class Builder:
             *([f"why not: {text(stopped.get('reason'))}"] if "reason" in stopped else []),
             *(outcomes or ["no execution was running at the close"]),
             *calls,
+            *services,
             *requests,
             *stop,
         ]

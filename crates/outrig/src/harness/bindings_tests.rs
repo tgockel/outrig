@@ -163,13 +163,13 @@ fn counting(answer: Approval) -> (impl Fn(&ApprovalRequest) -> Approval, Arc<Ato
     (approver, asked)
 }
 
-async fn start(builder: SessionBuilder) -> Session {
+pub(super) async fn start(builder: SessionBuilder) -> Session {
     within(builder.start_on_host())
         .await
         .unwrap_or_else(|e| panic!("the session did not start: {e}"))
 }
 
-async fn stop(session: Session) -> ShutdownReport {
+pub(super) async fn stop(session: Session) -> ShutdownReport {
     within(session.shutdown(DEFAULT_DRAIN)).await
 }
 

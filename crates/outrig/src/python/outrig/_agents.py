@@ -68,6 +68,14 @@ _launch = None
 _resolve = None
 _submitted_source = None
 
+
+def _kind_of(name):
+    """The kind of facility the session gives under `name`, which `facility(name)` makes a
+    reference of: the interpreter replaces this with its own, which knows the session's
+    services; anywhere else every name is a binding's."""
+    return "binding"
+
+
 # How a request whose state is one of these has ended.
 _ENDED = ("accepted", "failed")
 
@@ -746,13 +754,14 @@ def _digest(fn):
 
 class Facility:
     """A reference to a facility -- an object an agent is given to act through -- which
-    `outrig.facility(name)` makes for one of the session's bindings, and which an agent's
-    `facilities` mapping holds in place of the binding it was given.
+    `outrig.facility(name)` makes for one of the session's bindings or services, and which an
+    agent's `facilities` mapping holds in place of the binding or service it was given.
 
     Every operation on it -- an attribute read, a call, an item access, iteration, `len`,
     `repr`, a comparison -- is the same operation on what the calling agent's kernel holds for
-    the facility, decided at each use: for a binding, that kernel's own proxy of it. So a child
-    given a reference reaches the binding on its own connections, and its calls are its own.
+    the facility, decided at each use: for a binding, that kernel's own proxy of it; for a
+    service, that kernel's own object of it. So a child given a reference reaches the facility
+    as itself, and its calls are its own.
     Outside every execution it raises `RuntimeError`, as `outrig.bindings` does. In a program on
     the host it is data to give an agent, and raises on use.
     """
@@ -843,12 +852,12 @@ del _BINARY, _name
 
 
 def facility(name):
-    """A reference to the session's binding `name`, to give an agent in its `facilities=` dict:
-    see `help(outrig.Facility)`. Making one asks nothing of the binding, and a name the session
-    has not bound is refused when the agent is constructed."""
+    """A reference to the session's binding or service `name`, to give an agent in its
+    `facilities=` dict: see `help(outrig.Facility)`. Making one asks nothing of the binding or the
+    service, and a name the session has not bound is refused when the agent is constructed."""
     if type(name) is not str or not name:
-        raise TypeError(f"a binding is named by a non-empty str, not {name!r}")
-    return _reference("binding", name)
+        raise TypeError(f"a binding or service is named by a non-empty str, not {name!r}")
+    return _reference(_kind_of(name), name)
 
 
 # ---------------------------------------------------------------------------- agent classes

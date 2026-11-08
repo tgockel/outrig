@@ -10,6 +10,7 @@ use super::approval::Approver;
 use super::bindings::{self, BindingSpec, Bindings, Declared, Places, Setup};
 use super::event::{DEFAULT_CAPACITY, Subscription};
 use super::lifecycle::Lifecycle;
+use super::services::{self, Service, ServicePolicy, Services};
 use super::skills::{self, Catalog, SkillSource};
 use super::{Failure, Session, SessionError};
 use crate::agent::{self, AgentError, ResolvedAgent};
@@ -90,6 +91,10 @@ pub struct SessionBuilder {
     progress: Option<Box<dyn FnMut(Progress) + Send>>,
     /// Bindings given through [`SessionBuilder::bind`], as given.
     bound: Vec<(String, BindingSpec)>,
+    /// Services given through [`SessionBuilder::serve`], in order.
+    served: Vec<(String, Arc<dyn Service>)>,
+    /// How the session's services are called.
+    service_policy: ServicePolicy,
     /// The bindings process's environment, exactly, when the owner gave one.
     bindings_env: Option<Vec<(OsString, OsString)>>,
     approver: Option<Arc<dyn Approver>>,
@@ -152,6 +157,8 @@ impl SessionBuilder {
             record: false,
             progress: None,
             bound: Vec::new(),
+            served: Vec::new(),
+            service_policy: ServicePolicy::default(),
             bindings_env: None,
             approver: None,
             repo_root: None,
@@ -252,6 +259,29 @@ impl SessionBuilder {
     /// start.
     pub fn bind(mut self, name: impl Into<String>, spec: impl Into<BindingSpec>) -> Self {
         self.bound.push((name.into(), spec.into()));
+        self
+    }
+
+    /// Serve `service` to agent Python as `name`, beside the bindings, with no
+    /// approval asked: the owner is trusted as the operator is.
+    ///
+    /// Every kernel gets an object of a class generated from the service's
+    /// description, under `name` where the name is free and as
+    /// `outrig.bindings[name]` always; an agent given facilities sees it only
+    /// when its mapping names it. Each call of a described method is checked
+    /// against its schema and dispatched to [`Service::call`] under the
+    /// [`SessionBuilder::service_policy`]. A name a binding could not take --
+    /// not a Python identifier, a keyword, `runtime`, `asyncio`, `outrig` -- or
+    /// that a binding or another service already takes, fails the start.
+    pub fn serve(mut self, name: impl Into<String>, service: Arc<dyn Service>) -> Self {
+        self.served.push((name.into(), service));
+        self
+    }
+
+    /// Call the session's services under `policy`, in place of
+    /// [`ServicePolicy::default`].
+    pub fn service_policy(mut self, policy: ServicePolicy) -> Self {
+        self.service_policy = policy;
         self
     }
 
@@ -363,7 +393,8 @@ impl SessionBuilder {
         } else if let Some(name) = &self.agent {
             agent::find_agent(&self.config, name).map_err(|e| SessionError::Resolve(Failure(e)))?;
         }
-        bindings::gather(&self.config, &self.bound).map_err(start_error)?;
+        let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
+        services::check_names(&declared, &self.served).map_err(start_error)?;
         skills::check_sources(&self.skill_sources)
             .map_err(|e| start_error(OutrigError::Configuration(e)))?;
         application::check(self.application.as_ref()).map_err(start_error)?;
@@ -442,6 +473,21 @@ impl SessionBuilder {
         READY_TIMEOUT
     }
 
+    /// Serve the services given through [`SessionBuilder::serve`] to
+    /// `interpreter`, before any kernel opens.
+    fn serve_services(
+        &mut self,
+        interpreter: &Interpreter,
+        lifecycle: &Arc<Lifecycle>,
+    ) -> Services {
+        Services::serve(
+            std::mem::take(&mut self.served),
+            self.service_policy.clone(),
+            interpreter,
+            lifecycle,
+        )
+    }
+
     fn report(&mut self, progress: Progress) {
         if let Some(report) = &mut self.progress {
             report(progress);
@@ -455,6 +501,7 @@ impl SessionBuilder {
     pub async fn start(mut self) -> Result<Session, SessionError> {
         let mut resolved = self.resolution()?;
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
+        services::check_names(&declared, &self.served).map_err(start_error)?;
         skills::check_sources(&self.skill_sources)
             .map_err(|e| start_error(OutrigError::Configuration(e)))?;
         application::check(self.application.as_ref()).map_err(start_error)?;
@@ -521,6 +568,7 @@ impl SessionBuilder {
         bindings.connect(&interpreter, &events);
         bindings.declare(&interpreter, bindings::container_path);
         skills::serve(&catalog, &interpreter, &events);
+        let services = self.serve_services(&interpreter, &lifecycle);
         self.report(Progress::Finished(Step::Python));
 
         let primary = outrig.primary();
@@ -539,6 +587,7 @@ impl SessionBuilder {
             name,
             lifecycle,
             bindings,
+            services,
             setup,
         );
         #[cfg(test)]
@@ -694,6 +743,7 @@ impl SessionBuilder {
     pub(crate) async fn start_on_host(mut self) -> Result<Session, SessionError> {
         let mut resolved = self.resolution()?;
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
+        services::check_names(&declared, &self.served).map_err(start_error)?;
         application::check(self.application.as_ref()).map_err(start_error)?;
         let repo_root = chosen_repo_root(self.repo_root.as_deref()).map_err(start_error)?;
         let id = self.host_id.take().unwrap_or_else(|| "test".to_string());
@@ -724,6 +774,7 @@ impl SessionBuilder {
         bindings.connect(&interpreter, &events);
         bindings.declare(&interpreter, Path::to_path_buf);
         skills::serve(&catalog, &interpreter, &events);
+        let services = self.serve_services(&interpreter, &lifecycle);
         self.report(Progress::Finished(Step::Python));
         let workspace = self.host_workspace.take().or(self.workdir.clone());
         let setup = self.child_setup(workspace.clone());
@@ -734,6 +785,7 @@ impl SessionBuilder {
             "(host)".into(),
             lifecycle,
             bindings,
+            services,
             setup,
         )
         .failing(self.fail_stop.take());

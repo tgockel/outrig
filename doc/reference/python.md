@@ -36,6 +36,10 @@ value or with an `outrig.AgentError`: see `help(outrig.AgentError)` and `help(ou
 its own: see `help(outrig.agent)`. A subclass of `outrig.Agent` declares a long-lived child
 instead, whose methods marked `@outrig.agent` are its request channels: see `help(outrig.Agent)`.
 
+Each service the session's owner serves from Rust is an `outrig.Service`, its methods calls to
+the host by value; a call that returns no result raises `outrig.ServiceError`: see
+`help(outrig.Service)`.
+
 `outrig.skills` reaches the session's skills, whose code imports as `outrig_skills.<name>`: see
 `help(outrig.skills)`.
 
@@ -384,6 +388,7 @@ class ShutdownReport:
     stopped: Stopped
     executions: tuple[ExecutionOutcome, ...]
     hosted: tuple[HostedCall, ...]
+    services: tuple[ServiceCall, ...]
     requests: tuple[RequestOutcome, ...]
     bindings: BindingStop | None
     events: EventDelivery
@@ -394,14 +399,15 @@ What a session's shutdown found: `session.shutdown_report` after the exit.
 `verdict` is what it adds up to:
 
 - `"clean"`: everything the session started is stopped, and every outcome is known.
-- `"stopped_with_unknown"`: everything is stopped, and some execution or hosted call was cut
-  off. Its outcome is unknown, never failed: its effect may stand.
+- `"stopped_with_unknown"`: everything is stopped, and some execution, hosted call or service
+  call was cut off. Its outcome is unknown, never failed: its effect may stand.
 - `"not_proven_stopped"`: something could not be confirmed stopped, and may still be acting;
   the exit raised `ShutdownException`. Do not reuse what the session ran on.
 
 `closed_by`, a `ClosedBy`, is what closed admission; `stopped`, a `Stopped`, whether
 everything is proven stopped; `executions`, each execution running when admission closed;
-`hosted`, each hosted call whose outcome came after admission closed; `requests`, each
+`hosted`, each hosted call whose outcome came after admission closed; `services`, each
+`ServiceCall` whose outcome came after it; `requests`, each
 `RequestOutcome`, a request made of a child agent that was open then; `bindings`, a
 `BindingStop`, how the process holding the bindings stopped, or `None` for a session with
 none; and `events`, an `EventDelivery`, how the session's events were delivered. It never
@@ -460,6 +466,26 @@ A hosted request whose outcome came after a session's admission closed: its `req
 the `agent` that made it, its `binding`, its `outcome` -- `"returned"`, `"raised"`,
 `"refused"`, `"cancelled"` or `"unknown"` -- and the `reason` for one of the last three, such
 as `"admission_closed"` or `"killed"`, or `None`.
+
+### `ServiceCall`
+
+```python
+@dataclasses.dataclass(frozen=True)
+class ServiceCall:
+    call: int
+    service: str
+    method: str
+    agent: str
+    outcome: str
+    category: str | None
+    reason: str | None
+```
+
+A call of a service's method whose outcome came after a session's admission closed: its
+`call` id, the `service`, the `method` by its exact name, the `agent` that made it, its
+`outcome` -- `"returned"`, `"raised"`, `"refused"`, `"cancelled"` or `"unknown"` -- the
+service's `category` for a `"raised"` one, and the `reason` for one of the last three, such as
+`"admission_closed"` or `"closed"`; each `None` where there is none.
 
 ### `RequestOutcome`
 
@@ -1061,3 +1087,6 @@ describes; a program on the host has no use for them. What a program meets if it
 - `outrig.Request` -- declares a channel for `runtime.spawn`, which a program does not have.
 - `outrig.facility` -- makes a reference, which `facilities=` refuses on the host.
 - `outrig.Facility` -- what `outrig.facility` makes; each use of one raises `RuntimeError`.
+- `outrig.Service` -- the class of a service's object, which only a kernel holds.
+- `outrig.ServiceError` -- what a call of a service's method raises, which only a kernel makes.
+- `outrig.ServiceMethod` -- what a service's object lists of its methods, which only a kernel holds.

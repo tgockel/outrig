@@ -14,12 +14,14 @@ use serde_json::{Value, json};
 
 use super::agent_tests::{messages, round};
 use super::children_tests::{
-    Tree, data, exec_outputs, kind, of_agent, primary_runs, printed, serving, tree_built,
+    Tree, data, exec_outputs, kind, of_agent, primary_runs, printed, raised, serving, tree_built,
 };
 use super::instance_tests::{launching, subject};
 use super::mock_http::{RecordedRequest, Responder, submit, system_text, text_reply};
+use crate::harness::Service;
 use crate::harness::event::Event;
-use crate::python::testing::{pip_env, py, wheel_links};
+use crate::harness::services_tests::Fixture;
+use crate::python::testing::{Flag, pip_env, py, wheel_links, within};
 
 /// The fixture library bound twice, where no approval is asked for.
 const BINDINGS: &str = r#"
@@ -428,4 +430,202 @@ async fn an_agent_sees_what_it_was_given_and_its_calls_are_its_own() {
         7,
         "the refused Reviewer launched nothing"
     );
+}
+
+/// The primary's code for a service given as a facility: its own call, a `Helper` given the
+/// service by reference and asked once, its own call after the helper's release, and a `Bare`
+/// given nothing.
+const SERVED: &str = r#"
+import outrig
+class Helper(outrig.Agent):
+    """ROLE helper. Use what you were given."""
+    @outrig.agent
+    async def go(self, q: str) -> str:
+        """Do `q`."""
+class Bare(outrig.Agent):
+    """ROLE bare. Say what you see."""
+    @outrig.agent
+    async def look(self, q: str) -> str:
+        """Look at `q`."""
+print(svc.echo(x=1))
+h = Helper(facilities={'svc': outrig.facility('svc')})
+await h.ready()
+print(await h.go('x'))
+await h.release()
+print(svc.echo(x=2))
+b = Bare(facilities={})
+await b.ready()
+await b.release()
+"#;
+
+/// The helper's launch round: its view, and a call of its own.
+const SERVED_HELPER: &str = r#"
+print(svc.echo(x=3), type(svc).__qualname__, [(b.name, b.kind) for b in runtime.bindings.values()])
+"#;
+
+/// The helper's request: answered with another call of its own.
+const SERVED_GO: &str = r#"
+d = await runtime.channels['go'].receive()
+await d.reply(str(svc.echo(x=4)))
+"#;
+
+/// The bare child's launch round: what it can find of the service, which is nothing.
+const SERVED_BARE: &str = r#"
+import outrig
+try:
+    outrig.bindings['svc']
+except KeyError:
+    print('no svc')
+try:
+    svc
+except NameError:
+    print('NameError')
+print(list(runtime.bindings))
+"#;
+
+/// A service in a facility dict: the child given it has an object of its own, whose calls are
+/// attributed to the child, and the parent's go on after the child's release; a child given
+/// nothing finds no service anywhere, nor in its instructions. The primary is told of the
+/// service beside its bindings, and the child of the one it was given.
+#[tokio::test]
+async fn a_service_given_as_a_facility_is_the_childs_own() {
+    let fixture = Fixture::new();
+    let given = Arc::clone(&fixture) as Arc<dyn Service>;
+    let mut tree = tree_built(
+        "OUTRIG_TEST_SERVICE_FACILITIES_KEY",
+        "",
+        vec![
+            ("ROLE helper", rounds(SERVED_HELPER, SERVED_GO)),
+            ("ROLE bare", serving(SERVED_BARE)),
+            ("", primary_runs(SERVED)),
+        ],
+        None,
+        move |builder| builder.serve("svc", given),
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (report, events, requests) = tree.end().await;
+    assert!(report.services.is_empty(), "{report:?}");
+    assert_eq!(printed(&requests, "p1"), "{'x': 1}\n{'x': 4}\n{'x': 2}\n");
+
+    let helpers = instances(&events, "Helper");
+    assert_eq!(helpers.len(), 1, "{helpers:?}");
+    let (helper, facilities) = &helpers[0];
+    assert_eq!(
+        *facilities,
+        json!([{"name": "svc", "kind": "service", "target": "svc",
+                "type": "outrig.services.svc"}])
+    );
+    assert_eq!(
+        exec_outputs(&events, &format!("agent/{helper}"))[0],
+        "{'x': 3} svc [('svc', 'service')]\n"
+    );
+    let callers: Vec<(i64, String)> = fixture
+        .seen()
+        .into_iter()
+        .map(|(_, args, agent)| (args["x"].as_i64().unwrap_or_default(), agent))
+        .collect();
+    assert_eq!(
+        callers,
+        [
+            (1, "primary".to_string()),
+            (3, helper.clone()),
+            (4, helper.clone()),
+            (2, "primary".to_string()),
+        ]
+    );
+    let received: Vec<String> = kind(&events, "service.call.received", None)
+        .iter()
+        .map(|event| {
+            data(event)["agent"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        received,
+        ["primary", helper.as_str(), helper.as_str(), "primary"]
+    );
+
+    let bares = instances(&events, "Bare");
+    assert_eq!(
+        exec_outputs(&events, &format!("agent/{}", bares[0].0)),
+        ["no svc\nNameError\n[]\n"]
+    );
+    let bare_told = system_text(&of_agent(&requests, "ROLE bare")[0].body);
+    assert!(!bare_told.contains("svc"), "{bare_told}");
+    let helper_told = system_text(&of_agent(&requests, "ROLE helper")[0].body);
+    for said in [
+        "- `svc`, a service the host runs: The test service.",
+        "hands back a ticket: wait for its completion with `runtime.wait`",
+    ] {
+        assert!(helper_told.contains(said), "{said}: {helper_told}");
+    }
+    let primary_told = system_text(&requests[0].body);
+    for said in [
+        "These names are services the host runs",
+        "- `svc`: The test service.",
+        "Every call of a service's method is a request to the host",
+    ] {
+        assert!(primary_told.contains(said), "{said}: {primary_told}");
+    }
+}
+
+/// A method that starts long work hands back a ticket within the round, and the agent waits
+/// for the completion the owner sends on the user channel with `runtime.wait`, no call held
+/// meanwhile.
+#[tokio::test]
+async fn a_ticket_is_waited_for_on_a_channel() {
+    let fixture = Fixture::new();
+    let given = Arc::clone(&fixture) as Arc<dyn Service>;
+    let waiting = Flag::new();
+    let source = format!(
+        r#"
+await runtime.channels['user'].receive()
+print(svc.ask(question='how many?'))
+forever = asyncio.create_task(asyncio.Event().wait())
+open({flag}, 'w').close()
+try:
+    await runtime.wait({{forever}}, timeout=30)
+except runtime.MessageAvailable:
+    print('answered', (await runtime.channels['user'].receive()).body)
+"#,
+        flag = waiting.py()
+    );
+    let mut tree = tree_built(
+        "OUTRIG_TEST_SERVICE_TICKETS_KEY",
+        "",
+        vec![("", primary_runs(&source))],
+        None,
+        move |builder| builder.serve("svc", given),
+    )
+    .await;
+    let user = tree.session.user_channel().expect("a primary agent");
+    let gathered = Arc::clone(&tree.events);
+    let meanwhile = async {
+        raised(&waiting).await;
+        let events = gathered.lock().expect("events").clone();
+        assert_eq!(
+            (
+                kind(&events, "service.call.received", None).len(),
+                kind(&events, "service.call.ended", None).len()
+            ),
+            (1, 1),
+            "the ticket's call ended before the wait"
+        );
+        user.send("t-1 says 42").await.expect("delivered");
+    };
+    let ((), ()) = tokio::join!(
+        async {
+            round(&mut tree.session, "go").await;
+        },
+        within(meanwhile)
+    );
+    let (_, _, requests) = tree.end().await;
+    assert_eq!(
+        printed(&requests, "p1"),
+        "{'ticket': 't-1'}\nanswered t-1 says 42\n"
+    );
+    assert_eq!(fixture.calls(), 1);
 }

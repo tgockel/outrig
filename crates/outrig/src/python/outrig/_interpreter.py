@@ -76,6 +76,7 @@ import io
 import itertools
 import json
 import keyword
+import math
 import mmap
 import multiprocessing.pool
 import operator
@@ -177,6 +178,17 @@ _send_lock = threading.Lock()
 
 def _encode(message):
     return (json.dumps(_clean(message)) + "\n").encode("utf-8")
+
+
+def _encode_strict(message):
+    """`message` as a protocol line, refusing what is not JSON -- a NaN or an infinity, which
+    `json.dumps` writes as a token the host cannot parse -- with `ValueError`, and writing text as
+    itself rather than escaped, so a large line is the size of its text."""
+    text = json.dumps(message, allow_nan=False, ensure_ascii=False)
+    try:
+        return (text + "\n").encode("utf-8")
+    except UnicodeEncodeError:  # a lone surrogate, which `_clean` makes safe
+        return (json.dumps(_clean(message), allow_nan=False) + "\n").encode("utf-8")
 
 
 def _write_line(line):
@@ -1734,6 +1746,8 @@ _schema = None
 _skills = None
 # `outrig._serve`, from the same package: how a facility that is a plain object is described.
 _serve = None
+# `outrig._services`, from the same package: the class each service's object is made from.
+_services_mod = None
 # The vendored RPyC, imported by `main` from the directory it is given, and the connection class
 # built over it; `None` when the interpreter was started without one.
 _rpyc = None
@@ -2453,11 +2467,12 @@ def _load_outrig(directory):
     """Import OutRig's own package from `directory`, and give it this process's executions:
     `outrig.runtime` and `outrig.bindings` are those of the execution reading them. Its skills
     module gets the way to ask the host for a skill's files, and puts its finder in place."""
-    global _schema, _agents, _skills, _serve
+    global _schema, _agents, _skills, _serve, _services_mod
     sys.path.append(directory)
     import outrig._agents
     import outrig._kernel
     import outrig._serve
+    import outrig._services
     import outrig.schema
     import outrig.skills
 
@@ -2465,6 +2480,8 @@ def _load_outrig(directory):
     outrig._agents._call = _call
     outrig._agents._launch = _Instance
     outrig._agents._submitted_source = _submitted_source
+    outrig._agents._kind_of = lambda name: getattr(_SESSION.get(name), "kind", "binding")
+    outrig._services._call = _service_call
     outrig.skills._install(
         _ask_host, _notify, _compiled_cause, lambda: next(_ids), _refuse_closing,
         lambda: _observing,
@@ -2473,6 +2490,7 @@ def _load_outrig(directory):
     _agents = outrig._agents
     _skills = outrig.skills
     _serve = outrig._serve
+    _services_mod = outrig._services
 
 
 def _calling():
@@ -3895,8 +3913,8 @@ the next request, which you answer with `await d.reply(value)`, or end with
 
 
 # What a runtime says of the bindings its agent sees: the session's, or the facilities it was given.
-_SESSION_BINDINGS = """`runtime.bindings` lists the objects the session hosts for you on the host, by name, with what
-each is; asking makes no request to any of them."""
+_SESSION_BINDINGS = """`runtime.bindings` lists the objects the session hosts for you on the host and the services it
+serves, by name, with what each is; asking makes no request to any of them."""
 _GIVEN_BINDINGS = """`runtime.bindings` lists the facilities you were given, by name, with what each is, as your
 mapping stands; asking makes no request to any of them, and `outrig.bindings` reaches no other."""
 
@@ -4130,9 +4148,10 @@ class Runtime:
     def bindings(self):
         """What you were given to act through, by name. Read-only.
 
-        Each is a `Binding`: its `name`, the global it is bound as; its `kind`, `binding` or
-        `object`; its `description`; and its `type`, the qualified name of its object's type.
-        Asking reaches no binding, runs no `repr()`, and reads no property.
+        Each is a `Binding`: its `name`, the global it is bound as; its `kind`, `binding`,
+        `service` or `object`; its `description`; and its `type`, the qualified name of its
+        object's type. Asking reaches no binding or service, runs no `repr()`, and reads no
+        property.
         """
         return self._kernel.briefs()
 
@@ -4424,8 +4443,16 @@ _asking = threading.local()
 
 def _ask_host(line):
     """Send `line`, a request about a skill, and return the host's answer to it, a line with `ok`
-    or with `error`. Blocks only the calling thread, which may be any but the reader's: an
-    import on a kernel's loop holds that loop meanwhile, as a hosted call does.
+    or with `error`, waiting at most `ASK_TIMEOUT` (`_await_host`)."""
+    ask_id = line["id"] = next(_ids)
+    return _await_host(ask_id, _encode(line), ASK_TIMEOUT)
+
+
+def _await_host(ask_id, line, timeout):
+    """Write `line`, an encoded request asked as `ask_id`, and return the host's answer to it, a
+    line with `ok` or with `error`; `timeout` bounds the wait, in seconds, and `None` leaves it to
+    the host. Blocks only the calling thread, which may be any but the reader's: an import on a
+    kernel's loop holds that loop meanwhile, as a hosted call does.
 
     An interrupt of the primary raises in the wait -- or, by `_on_sigint`'s rule, is left for it
     when it landed in this program's machinery, and raised rather than any answer, for a request
@@ -4435,7 +4462,6 @@ def _ask_host(line):
     if threading.current_thread() is _reader_thread or _PROTO_OUT is None:
         where = "from a forked process" if _PROTO_OUT is None else "from the reader thread"
         return {"error": {"code": "source-error", "message": f"the host cannot be asked {where}"}}
-    ask_id = line["id"] = next(_ids)
     execution = _CURRENT.get()
     interruptible = execution is not None and _agent_code_outward(
         sys._getframe(), execution.kernel
@@ -4444,13 +4470,13 @@ def _ask_host(line):
     try:
         answers = _answers[ask_id] = queue.SimpleQueue()
         left = _asking.left = [] if interruptible else None
-        _write_line(_encode(line))
-        deadline = time.monotonic() + ASK_TIMEOUT
+        _write_line(line)
+        deadline = None if timeout is None else time.monotonic() + timeout
         answer = None
         while answer is None and not left:
-            wait = deadline - time.monotonic()
+            wait = SIGNAL_CHECK if deadline is None else deadline - time.monotonic()
             if wait <= 0:
-                text = f"the host did not answer within {ASK_TIMEOUT} s"
+                text = f"the host did not answer within {timeout} s"
                 return {"error": {"code": "source-error", "message": text}}
             with contextlib.suppress(queue.Empty):
                 answer = answers.get(timeout=min(wait, SIGNAL_CHECK))
@@ -4462,14 +4488,16 @@ def _ask_host(line):
         _asking.left = outer
 
 
-def _refuse_long(message, what, how):
-    """Raise `ValueError`, saying `how` to shorten it, if `message` -- a `what` agent code sends
-    the host -- would be a protocol line longer than `MESSAGE_MAX`, which bounds a channel message
-    too. The host drops a line past its own bound unread, and answers nothing to it."""
-    size = len(_encode(message))
-    if size > MESSAGE_MAX:
-        raise ValueError(f"this {what} is {size} bytes as sent, past the {MESSAGE_MAX} allowed; "
+def _refuse_long(message, what, how, limit=MESSAGE_MAX, encode=None):
+    """`message` -- a `what` agent code sends the host -- as its protocol line, made by `encode`,
+    `_encode` unless given; or `ValueError`, saying `how` to shorten it, if that line would be
+    longer than `limit`: `MESSAGE_MAX`, which bounds a channel message too, unless the line has a
+    bound of its own. The host drops a line past its own bound unread, and answers nothing to it."""
+    line = (encode or _encode)(message)
+    if len(line) > limit:
+        raise ValueError(f"this {what} is {len(line)} bytes as sent, past the {limit} allowed; "
                          f"{how}")
+    return line
 
 
 def _loose_preview(value):
@@ -5655,10 +5683,12 @@ class Kernel:
         # This kernel's stub of each binding it has reached, by the binding's name: what a
         # reference to the binding resolves to here, and what a global of it holds.
         self.stubs = {}
-        # The bindings `bind_stubs` has offered as globals, for the session's view.
+        # The bindings and services offered as globals, for the session's view.
         self._offered = set()
+        # This kernel's object of each service it has reached, by the service's name.
+        self.services = {}
         if facilities is None:
-            self.bind_stubs()
+            self.offer_session()
         else:
             self._bind_facilities()
 
@@ -5666,18 +5696,28 @@ class Kernel:
         """Say the kernel is ready: a root child's, with its instance's id."""
         _send({"t": "ready", "agent": self.agent, "version": _VERSION, "instance": instance})
 
-    def bind_stubs(self):
-        """Give each of the session's bindings not yet offered here this kernel's stub of it,
-        which `outrig.bindings` reaches, bound under its name too: what a kernel with the
-        session's view does as it is built, and again for each live object a program on the host
-        injects. Nothing, without RPyC, and nothing for a kernel whose view is a mapping, which
-        holds no binding injected later."""
-        if _Hosted is None or self.facilities is not None:
+    def offer_session(self):
+        """Give each of the session's bindings and services not yet offered here what this kernel
+        holds for it -- a binding's stub, a service's object -- which `outrig.bindings` reaches,
+        bound under its name too: what a kernel with the session's view does as it is built, and
+        again for each live object a program on the host injects. Nothing for a binding without
+        RPyC, and nothing for a kernel whose view is a mapping, which holds nothing given later."""
+        if self.facilities is not None:
             return
-        for name in _BINDINGS:
+        for name in self.facility_names():
             if name not in self._offered:
                 self._offered.add(name)
-                self._offer(name, self.bound(name))
+                self._offer(name, self.facility(name))
+
+    def service(self, name):
+        """This kernel's object of the service `name`, made at its first use here: what its
+        global holds, `outrig.bindings` gives, and a reference to it resolves to."""
+        obj = self.services.get(name)
+        if obj is None:
+            obj = self.services.setdefault(
+                name, _services_mod._made(_SERVICES[name].cls, name, self)
+            )
+        return obj
 
     def _bind_facilities(self):
         """Bind each entry of this kernel's mapping under its name, as the kernel is built, as
@@ -5714,11 +5754,12 @@ class Kernel:
     def facility(self, key):
         """What `outrig.bindings[key]` gives in this kernel: the entry `key` of its mapping, read
         now -- a reference resolved here, a plain object as itself -- or, for the session's view,
-        its stub of the binding `key`. `KeyError` for any other name."""
+        what it holds for the session's binding or service `key`. `KeyError` for any other
+        name."""
         if self.facilities is None:
-            if _Hosted is None or key not in _BINDINGS:
+            if key not in self.facility_names():
                 raise KeyError(key)
-            return self.bound(key)
+            return self.resolve(_SESSION[key].kind, key)
         entry = _classified(key, self.facilities[key])
         if type(entry) is _agents.Facility:
             return self.resolve(*_agents._identity(entry))
@@ -5728,14 +5769,17 @@ class Kernel:
         """The names `outrig.bindings` holds in this kernel, in order: the mapping itself, or the
         session's manifest. Not to be iterated while agent code may change the mapping."""
         if self.facilities is None:
-            return _BINDINGS if _Hosted is not None else {}
+            if _Hosted is not None:
+                return _SESSION
+            # A binding needs RPyC to be reached; a service does not.
+            return {name: record for name, record in _SESSION.items() if record.kind != "binding"}
         return self.facilities
 
     def briefs(self):
         """What `runtime.bindings` says in this kernel: the session's bindings, or its mapping's
         entries as they stand, each classified and described now."""
         if self.facilities is None:
-            return _BINDINGS
+            return _SESSION
         return types.MappingProxyType({
             d["name"]: Binding(d["name"], d["description"], d["type"], d["kind"])
             for d in _manifest(self.facilities)
@@ -6464,8 +6508,10 @@ class Binding(collections.namedtuple("Binding", ("name", "description", "type", 
     facilities its constructor was given.
 
     `kind` is `binding` for an object a process on the host holds, which `description` says as
-    the operator wrote it, and `object` for a plain object of this interpreter, which the first
-    line of its class's docstring describes. `type` is the qualified name of the object's type.
+    the operator wrote it; `service` for one the host serves, whose object here is made from its
+    description, which `description` is; and `object` for a plain object of this interpreter,
+    which the first line of its class's docstring describes. `type` is the qualified name of the
+    object's type.
     Read from what the session said and from the object's class alone, so reading it asks the
     host nothing and runs nothing of the object's.
     """
@@ -6476,6 +6522,9 @@ class Binding(collections.namedtuple("Binding", ("name", "description", "type", 
 # The session's bindings, by name, as the host declared them (`_bindings`); empty until then, and
 # for a session with none.
 _BINDINGS = types.MappingProxyType({})
+# The session's bindings and services together, each by its record, whose `kind` says which: what
+# a kernel with the session's view presents (`Kernel.offer_session`). A name is one or the other.
+_SESSION = types.MappingProxyType({})
 
 
 def _bindings(message):
@@ -6489,7 +6538,7 @@ def _bindings(message):
     different versions of one package. Each kernel open then binds a stub for each, as one opened
     later does.
     """
-    global _BINDINGS
+    global _BINDINGS, _SESSION
     entries, paths = message.get("bindings"), message.get("paths")
     if not isinstance(entries, list) or not isinstance(paths, list):
         raise ValueError("bindings without a list of bindings and a list of paths")
@@ -6502,6 +6551,7 @@ def _bindings(message):
     if not all(isinstance(path, str) for path in paths):
         raise ValueError("a binding package path that is not a string")
     _BINDINGS = types.MappingProxyType({**_BINDINGS, **records})
+    _SESSION = types.MappingProxyType({**_SESSION, **records})
     at = sys.path.index(_SITE) if _SITE in sys.path else len(sys.path)
     for path in paths:
         if path not in sys.path:
@@ -6510,11 +6560,133 @@ def _bindings(message):
     try:
         for kernel in list(_kernels.values()):
             if not kernel.ended:  # a released one needs none, and could make none
-                kernel.bind_stubs()
+                kernel.offer_session()
     finally:
         # Answered however it went, so the host never waits on it for good.
         if "id" in message:
             _send({"t": "bound", "agent": message.get("agent"), "id": message["id"]})
+
+
+# ---------------------------------------------------------------------------- services
+
+
+class _Served(collections.namedtuple("_Served", ("record", "cls", "deadline"))):
+    """One of the session's services, as this interpreter holds it: its `Binding` record, the
+    class its objects are made from, and the longest a call of it may run, in seconds."""
+
+    __slots__ = ()
+
+
+# The session's services, by name, as the host declared them (`_declare_services`); empty until
+# then, and for a session with none.
+_SERVICES = types.MappingProxyType({})
+# The longest line the host reads, in bytes, `REPLY_LINE_MAX` in `host.rs`: a longer one is cut
+# unread, so a call in it would never be made, nor its deadline armed.
+SERVICE_LINE_MAX = 16 << 20
+
+
+def _declare_services(entries):
+    """Take services the host declares: the session's, before anything runs, or one whose
+    description changed. Each gets a class made from its description; every kernel's object of a
+    changed one becomes an object of its new class, so the name it is held by reaches the new
+    methods, and a method held from the old class still calls under the old description, which the
+    host refuses for a method the new one lacks."""
+    global _SERVICES, _SESSION
+    served = {}
+    for entry in entries:
+        cls = _services_mod.generated(entry)
+        record = Binding(entry["name"], entry["description"],
+                         f"{cls.__module__}.{cls.__qualname__}", "service")
+        served[record.name] = _Served(record, cls, float(entry["deadline"]))
+    _SERVICES = types.MappingProxyType({**_SERVICES, **served})
+    _SESSION = types.MappingProxyType(
+        {**_SESSION, **{name: now.record for name, now in served.items()}}
+    )
+    for kernel in list(_kernels.values()):
+        for name, now in served.items():
+            obj = kernel.services.get(name)
+            if obj is not None:
+                obj.__class__ = now.cls
+        if not kernel.ended:
+            kernel.offer_session()
+
+
+def _service_call(obj, method, arguments, timeout, generation):
+    """Call `method`, by its exact name, of the service `obj` -- a kernel's object of it -- stands
+    for, with `arguments`, from that kernel, and return its result: what each method of the
+    object, `call` and `method` reach. The calling thread waits for the host's answer, and an
+    interrupt that reaches it tells the host to stop the call.
+
+    Refused here, with nothing sent: a call from another kernel's execution, which belongs on
+    that kernel's own object; one from an agent that was released; arguments that are not JSON
+    data (`TypeError`, or `ValueError` for a NaN); a `timeout` past the service's deadline; and a
+    line longer than the host reads."""
+    name, kernel = _services_mod._state(obj)
+    served = _SERVICES[name]
+    if kernel.ended:
+        raise RuntimeError(f"agent {kernel.agent!r} was released, and its object of service "
+                           f"{name!r} with it")
+    execution = _CURRENT.get()
+    if execution is not None and execution.kernel is not kernel:
+        raise TypeError(f"this object of service {name!r} is agent {kernel.agent!r}'s, and agent "
+                        f"{execution.kernel.agent!r} calls it: its own is "
+                        f"outrig.bindings[{name!r}]")
+    if arguments is None:
+        arguments = {}
+    elif not isinstance(arguments, dict):
+        raise TypeError(f"a service's arguments are a dict, not {type(arguments).__name__}")
+    if timeout is not None:
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout) or timeout <= 0):
+            raise ValueError(f"timeout is a positive number of seconds, not {timeout!r}")
+        if timeout > served.deadline:
+            raise ValueError(f"timeout={timeout!r} is past the {served.deadline:g} s deadline of "
+                             f"service {name!r}, which a timeout lowers and never raises")
+    line = {
+        "t": "service.call",
+        "agent": kernel.agent,
+        "id": next(_ids),
+        "exec": None if execution is None else execution.id,
+        "invocation": _invocation(),
+        "service": name,
+        "method": method,
+        "generation": generation,
+        # JSON text, which the host parses apart from the line: arguments its parser refuses --
+        # nested past its depth, say -- are then refused, rather than leaving the line unread
+        # and this thread waiting. A NaN raises `ValueError`, as it is no JSON.
+        "arguments": json.dumps(arguments, allow_nan=False, ensure_ascii=False),
+        "timeout": timeout,
+    }
+    encoded = _refuse_long(line, f"call of {name}.{method}",
+                           "pass less, or what the service can find the rest by",
+                           SERVICE_LINE_MAX, _encode_strict)
+    try:
+        answer = _await_host(line["id"], encoded, None)
+    except BaseException:
+        # Interrupted: the host stops the call, and its answer, when it comes, is dropped.
+        _notify({"t": "service.cancel", "agent": kernel.agent, "id": line["id"]})
+        raise
+    if answer.get("t") != "service":
+        raise RuntimeError(answer["error"]["message"])
+    error = answer.get("error")
+    if error is None:
+        # JSON text, read here rather than by the reader thread, so a result this interpreter
+        # cannot read raises in its caller.
+        try:
+            return json.loads(answer["ok"])
+        except (ValueError, RecursionError) as e:
+            raise ValueError(f"the result of {name}.{method} is JSON this interpreter cannot "
+                             f"read") from e
+    raise _services_mod.ServiceError(
+        error.get("message") or "",
+        outcome=error.get("outcome"),
+        service=name,
+        method=method,
+        call=error.get("call"),
+        category=error.get("category"),
+        reason=error.get("reason"),
+        path=error.get("path"),
+    )
 
 
 # ---------------------------------------------------------------------------- application code
@@ -6623,8 +6795,25 @@ def _resolve_binding(kernel, name):
     return kernel.bound(name)
 
 
+def _service_brief(key, name):
+    served = _SERVICES.get(name)
+    if served is None:
+        raise LookupError(f"facility {key!r} names service {name!r}, which the session does not "
+                          f"serve")
+    return served.record.type, served.record.description
+
+
+def _resolve_service(kernel, name):
+    if name not in _SERVICES:
+        raise LookupError(f"the session serves no service {name!r}")
+    return kernel.service(name)
+
+
 # Each kind of reference, by its name. A plain object needs none: it is itself.
-_KINDS = {"binding": _Kind(_resolve_binding, _binding_brief, True)}
+_KINDS = {
+    "binding": _Kind(_resolve_binding, _binding_brief, True),
+    "service": _Kind(_resolve_service, _service_brief, True),
+}
 # What a facility's key may not be, beyond what an input's may not: the package, and the instance.
 _FACILITY_RESERVED = frozenset({"outrig", "self"})
 
@@ -6640,6 +6829,8 @@ def _classified(key, value):
         return value
     if kind is HostedRoot:
         return _agents._reference("binding", object.__getattribute__(value, "_pool").binding)
+    if issubclass(kind, _services_mod.Service):
+        return _agents._reference("service", _services_mod._state(value)[0])
     if _rpyc is not None and issubclass(kind, _rpyc.core.netref.BaseNetref):
         raise TypeError(
             f"facility {key!r} is a proxy of an object a binding returned, which belongs to one "
@@ -7272,12 +7463,19 @@ def _route(line):
     if kind == "skills":
         _skills._declare(message["skills"])
         return
+    if kind == "services":
+        _declare_services(message["services"])
+        return
+    if kind == "service.described":
+        _declare_services([message["service"]])
+        return
     if kind in _OWNER_ROUTES:
         # The program on the host's, about its requests: no kernel of its own to address.
         _OWNER_ROUTES[kind](message)
         return
-    if kind == "skill":
-        # The answer to a request about a skill, for the thread still waiting for it.
+    if kind in ("skill", "service"):
+        # The answer to a request about a skill, or to a call of a service, for the thread still
+        # waiting for it.
         answers = _answers.pop(message.get("id"), None)
         if answers is not None:
             answers.put(message)

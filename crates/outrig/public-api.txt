@@ -1180,6 +1180,7 @@ pub outrig::harness::event::ExecStatus::Refused
 #[non_exhaustive] pub enum outrig::harness::event::FacilityKind
 pub outrig::harness::event::FacilityKind::Binding
 pub outrig::harness::event::FacilityKind::Object
+pub outrig::harness::event::FacilityKind::Service
 #[non_exhaustive] pub enum outrig::harness::event::HostedOutcome
 pub outrig::harness::event::HostedOutcome::Cancelled
 pub outrig::harness::event::HostedOutcome::Raised
@@ -1520,12 +1521,59 @@ pub outrig::harness::event::Payload::ModelWithheld::turn: u64
 pub outrig::harness::event::Payload::OutputUnattributed::text: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::RoundStarted
 pub outrig::harness::event::Payload::RoundStarted::round: u32
+#[non_exhaustive] pub outrig::harness::event::Payload::ServiceBound
+pub outrig::harness::event::Payload::ServiceBound::generation: u64
+pub outrig::harness::event::Payload::ServiceBound::kind: outrig::harness::event::ServiceKind
+pub outrig::harness::event::Payload::ServiceBound::methods: usize
+pub outrig::harness::event::Payload::ServiceBound::service: alloc::string::String
+pub outrig::harness::event::Payload::ServiceBound::unchecked: alloc::vec::Vec<alloc::string::String>
+#[non_exhaustive] pub outrig::harness::event::Payload::ServiceCallCancelSent
+pub outrig::harness::event::Payload::ServiceCallCancelSent::agent: alloc::string::String
+pub outrig::harness::event::Payload::ServiceCallCancelSent::call: outrig::harness::event::ServiceCallId
+pub outrig::harness::event::Payload::ServiceCallCancelSent::reason: outrig::harness::event::ServiceReason
+pub outrig::harness::event::Payload::ServiceCallCancelSent::service: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::ServiceCallDispatched
+pub outrig::harness::event::Payload::ServiceCallDispatched::agent: alloc::string::String
+pub outrig::harness::event::Payload::ServiceCallDispatched::call: outrig::harness::event::ServiceCallId
+pub outrig::harness::event::Payload::ServiceCallDispatched::method: alloc::string::String
+pub outrig::harness::event::Payload::ServiceCallDispatched::service: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::ServiceCallEnded
+pub outrig::harness::event::Payload::ServiceCallEnded::agent: alloc::string::String
+pub outrig::harness::event::Payload::ServiceCallEnded::body: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::ServiceCallEnded::bytes: core::option::Option<u64>
+pub outrig::harness::event::Payload::ServiceCallEnded::call: outrig::harness::event::ServiceCallId
+pub outrig::harness::event::Payload::ServiceCallEnded::category: core::option::Option<outrig::harness::ServiceErrorCategory>
+pub outrig::harness::event::Payload::ServiceCallEnded::detail: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::ServiceCallEnded::duration: core::time::Duration
+pub outrig::harness::event::Payload::ServiceCallEnded::execid: core::option::Option<outrig::harness::event::ExecId>
+pub outrig::harness::event::Payload::ServiceCallEnded::kind: outrig::harness::event::ServiceKind
+pub outrig::harness::event::Payload::ServiceCallEnded::method: alloc::string::String
+pub outrig::harness::event::Payload::ServiceCallEnded::outcome: outrig::harness::event::ServiceOutcome
+pub outrig::harness::event::Payload::ServiceCallEnded::reason: core::option::Option<outrig::harness::event::ServiceReason>
+pub outrig::harness::event::Payload::ServiceCallEnded::service: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::ServiceCallReceived
+pub outrig::harness::event::Payload::ServiceCallReceived::agent: alloc::string::String
+pub outrig::harness::event::Payload::ServiceCallReceived::arguments: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::ServiceCallReceived::call: outrig::harness::event::ServiceCallId
+pub outrig::harness::event::Payload::ServiceCallReceived::deadline: core::time::Duration
+pub outrig::harness::event::Payload::ServiceCallReceived::execid: core::option::Option<outrig::harness::event::ExecId>
+pub outrig::harness::event::Payload::ServiceCallReceived::generation: u64
+pub outrig::harness::event::Payload::ServiceCallReceived::invocation: core::option::Option<outrig::harness::event::InvocationId>
+pub outrig::harness::event::Payload::ServiceCallReceived::kind: outrig::harness::event::ServiceKind
+pub outrig::harness::event::Payload::ServiceCallReceived::method: alloc::string::String
+pub outrig::harness::event::Payload::ServiceCallReceived::service: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::ServiceDescribed
+pub outrig::harness::event::Payload::ServiceDescribed::changes: outrig::harness::event::ServiceChanges
+pub outrig::harness::event::Payload::ServiceDescribed::generation: u64
+pub outrig::harness::event::Payload::ServiceDescribed::service: alloc::string::String
+pub outrig::harness::event::Payload::ServiceDescribed::unchecked: alloc::vec::Vec<alloc::string::String>
 #[non_exhaustive] pub outrig::harness::event::Payload::SessionReport
 pub outrig::harness::event::Payload::SessionReport::bindings: core::option::Option<outrig::harness::BindingStop>
 pub outrig::harness::event::Payload::SessionReport::closed_by: outrig::harness::ClosedBy
 pub outrig::harness::event::Payload::SessionReport::executions: alloc::vec::Vec<outrig::harness::ExecutionOutcome>
 pub outrig::harness::event::Payload::SessionReport::hosted: alloc::vec::Vec<outrig::harness::HostedCall>
 pub outrig::harness::event::Payload::SessionReport::requests: alloc::vec::Vec<outrig::harness::RequestOutcome>
+pub outrig::harness::event::Payload::SessionReport::services: alloc::vec::Vec<outrig::harness::ServiceCall>
 pub outrig::harness::event::Payload::SessionReport::stopped: outrig::harness::Stopped
 pub outrig::harness::event::Payload::SessionReport::verdict: outrig::harness::Verdict
 #[non_exhaustive] pub outrig::harness::event::Payload::SessionState
@@ -1603,6 +1651,22 @@ pub outrig::harness::event::ReturnWhen::FirstException
 #[non_exhaustive] pub enum outrig::harness::event::Role
 pub outrig::harness::event::Role::Assistant
 pub outrig::harness::event::Role::User
+#[non_exhaustive] pub enum outrig::harness::event::ServiceKind
+pub outrig::harness::event::ServiceKind::Rust
+#[non_exhaustive] pub enum outrig::harness::event::ServiceOutcome
+pub outrig::harness::event::ServiceOutcome::Cancelled
+pub outrig::harness::event::ServiceOutcome::Raised
+pub outrig::harness::event::ServiceOutcome::Refused
+pub outrig::harness::event::ServiceOutcome::Returned
+pub outrig::harness::event::ServiceOutcome::Unknown
+#[non_exhaustive] pub enum outrig::harness::event::ServiceReason
+pub outrig::harness::event::ServiceReason::AdmissionClosed
+pub outrig::harness::event::ServiceReason::Closed
+pub outrig::harness::event::ServiceReason::Deadline
+pub outrig::harness::event::ServiceReason::Interrupted
+pub outrig::harness::event::ServiceReason::InvalidArguments
+pub outrig::harness::event::ServiceReason::ResultTooLarge
+pub outrig::harness::event::ServiceReason::UnknownMethod
 #[non_exhaustive] pub enum outrig::harness::event::SessionState
 pub outrig::harness::event::SessionState::Closing
 pub outrig::harness::event::SessionState::Executing
@@ -1757,6 +1821,15 @@ impl outrig::harness::event::RequestId
 pub fn outrig::harness::event::RequestId::get(self) -> u64
 impl core::fmt::Display for outrig::harness::event::RequestId
 pub fn outrig::harness::event::RequestId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct outrig::harness::event::ServiceCallId(_)
+impl outrig::harness::event::ServiceCallId
+pub fn outrig::harness::event::ServiceCallId::get(self) -> u64
+impl core::fmt::Display for outrig::harness::event::ServiceCallId
+pub fn outrig::harness::event::ServiceCallId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::event::ServiceChanges
+pub outrig::harness::event::ServiceChanges::added: alloc::vec::Vec<alloc::string::String>
+pub outrig::harness::event::ServiceChanges::changed: alloc::vec::Vec<alloc::string::String>
+pub outrig::harness::event::ServiceChanges::removed: alloc::vec::Vec<alloc::string::String>
 #[non_exhaustive] pub struct outrig::harness::event::SkillDiagnostic
 pub outrig::harness::event::SkillDiagnostic::code: alloc::string::String
 pub outrig::harness::event::SkillDiagnostic::message: alloc::string::String
@@ -1811,6 +1884,16 @@ pub outrig::harness::Progress::Started(outrig::harness::Step)
 #[non_exhaustive] pub enum outrig::harness::RoundOutcome
 pub outrig::harness::RoundOutcome::Ended(outrig::harness::RoundEnd)
 pub outrig::harness::RoundOutcome::NothingNew
+#[non_exhaustive] pub enum outrig::harness::ServiceErrorCategory
+pub outrig::harness::ServiceErrorCategory::Cancelled
+pub outrig::harness::ServiceErrorCategory::Failed
+pub outrig::harness::ServiceErrorCategory::InvalidArguments
+pub outrig::harness::ServiceErrorCategory::NotFound
+pub outrig::harness::ServiceErrorCategory::Other
+pub outrig::harness::ServiceErrorCategory::Refused
+pub outrig::harness::ServiceErrorCategory::Unavailable
+impl outrig::harness::ServiceErrorCategory
+pub fn outrig::harness::ServiceErrorCategory::as_str(self) -> &'static str
 #[non_exhaustive] pub enum outrig::harness::SessionEnd
 pub outrig::harness::SessionEnd::NotStarted(outrig::harness::Stopped)
 pub outrig::harness::SessionEnd::ShutDown(outrig::harness::ShutdownReport)
@@ -1867,6 +1950,16 @@ pub outrig::harness::BindingStop::group_empty: bool
 pub outrig::harness::BindingStop::killed: bool
 pub outrig::harness::BindingStop::names: alloc::vec::Vec<alloc::string::String>
 pub outrig::harness::BindingStop::survivors: alloc::vec::Vec<alloc::string::String>
+pub struct outrig::harness::CallContext
+impl outrig::harness::CallContext
+pub fn outrig::harness::CallContext::agent(&self) -> &str
+pub fn outrig::harness::CallContext::call(&self) -> outrig::harness::event::ServiceCallId
+pub fn outrig::harness::CallContext::cancelled(&self) -> impl core::future::future::Future<Output = ()> + core::marker::Send + '_
+pub fn outrig::harness::CallContext::deadline(&self) -> std::time::Instant
+pub fn outrig::harness::CallContext::execution(&self) -> core::option::Option<outrig::harness::event::ExecId>
+pub fn outrig::harness::CallContext::invocation(&self) -> core::option::Option<outrig::harness::event::InvocationId>
+pub fn outrig::harness::CallContext::is_cancelled(&self) -> bool
+pub fn outrig::harness::CallContext::service(&self) -> &str
 pub struct outrig::harness::Closed
 impl outrig::harness::Closed
 pub fn outrig::harness::Closed::by(&self) -> &outrig::harness::ClosedBy
@@ -1922,6 +2015,15 @@ pub outrig::harness::LogLoss::path: std::path::PathBuf
 pub outrig::harness::LogLoss::records: u64
 impl core::fmt::Display for outrig::harness::LogLoss
 pub fn outrig::harness::LogLoss::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::MethodDescription
+pub outrig::harness::MethodDescription::description: alloc::string::String
+pub outrig::harness::MethodDescription::extras: serde_json::map::Map<alloc::string::String, serde_json::value::Value>
+pub outrig::harness::MethodDescription::name: alloc::string::String
+pub outrig::harness::MethodDescription::params: serde_json::value::Value
+pub outrig::harness::MethodDescription::result: core::option::Option<serde_json::value::Value>
+impl outrig::harness::MethodDescription
+pub fn outrig::harness::MethodDescription::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, serde_json::value::Value) -> Self
+pub fn outrig::harness::MethodDescription::with_result(self, serde_json::value::Value) -> Self
 #[non_exhaustive] pub struct outrig::harness::OpenWait
 pub outrig::harness::OpenWait::agent: outrig::harness::event::Subject
 pub outrig::harness::OpenWait::execid: outrig::harness::event::ExecId
@@ -1951,6 +2053,37 @@ impl outrig::harness::RunningProgram
 pub fn outrig::harness::RunningProgram::interrupt(&self)
 pub fn outrig::harness::RunningProgram::terminate(&self)
 pub async fn outrig::harness::RunningProgram::wait(&mut self) -> core::result::Result<outrig::harness::ProgramExit, outrig::error::OutrigError>
+#[non_exhaustive] pub struct outrig::harness::ServiceCall
+pub outrig::harness::ServiceCall::agent: alloc::string::String
+pub outrig::harness::ServiceCall::call: outrig::harness::event::ServiceCallId
+pub outrig::harness::ServiceCall::category: core::option::Option<outrig::harness::ServiceErrorCategory>
+pub outrig::harness::ServiceCall::method: alloc::string::String
+pub outrig::harness::ServiceCall::outcome: outrig::harness::event::ServiceOutcome
+pub outrig::harness::ServiceCall::reason: core::option::Option<outrig::harness::event::ServiceReason>
+pub outrig::harness::ServiceCall::service: alloc::string::String
+#[non_exhaustive] pub struct outrig::harness::ServiceDescription
+pub outrig::harness::ServiceDescription::call_deadline: core::option::Option<core::time::Duration>
+pub outrig::harness::ServiceDescription::description: alloc::string::String
+pub outrig::harness::ServiceDescription::methods: alloc::vec::Vec<outrig::harness::MethodDescription>
+impl outrig::harness::ServiceDescription
+pub fn outrig::harness::ServiceDescription::new(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::harness::ServiceDescription::with_call_deadline(self, core::time::Duration) -> Self
+pub fn outrig::harness::ServiceDescription::with_method(self, outrig::harness::MethodDescription) -> Self
+#[non_exhaustive] pub struct outrig::harness::ServiceError
+pub outrig::harness::ServiceError::category: outrig::harness::ServiceErrorCategory
+pub outrig::harness::ServiceError::message: alloc::string::String
+impl outrig::harness::ServiceError
+pub fn outrig::harness::ServiceError::new(outrig::harness::ServiceErrorCategory, impl core::convert::Into<alloc::string::String>) -> Self
+impl core::error::Error for outrig::harness::ServiceError
+impl core::fmt::Display for outrig::harness::ServiceError
+pub fn outrig::harness::ServiceError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::ServicePolicy
+pub outrig::harness::ServicePolicy::call_deadline: core::time::Duration
+pub outrig::harness::ServicePolicy::cancel_grace: core::time::Duration
+pub outrig::harness::ServicePolicy::record_bodies: bool
+pub outrig::harness::ServicePolicy::result_max: usize
+impl core::default::Default for outrig::harness::ServicePolicy
+pub fn outrig::harness::ServicePolicy::default() -> Self
 pub struct outrig::harness::Session
 impl outrig::harness::Session
 pub fn outrig::harness::Session::application(&self) -> core::option::Option<&outrig::harness::ApplicationIdentity>
@@ -1981,6 +2114,8 @@ pub fn outrig::harness::SessionBuilder::progress(self, impl core::ops::function:
 pub fn outrig::harness::SessionBuilder::record_events(self) -> Self
 pub fn outrig::harness::SessionBuilder::repo_root(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn outrig::harness::SessionBuilder::secrets(self, impl outrig::config::Secrets + 'static) -> Self
+pub fn outrig::harness::SessionBuilder::serve(self, impl core::convert::Into<alloc::string::String>, alloc::sync::Arc<dyn outrig::harness::Service>) -> Self
+pub fn outrig::harness::SessionBuilder::service_policy(self, outrig::harness::ServicePolicy) -> Self
 pub fn outrig::harness::SessionBuilder::skill_source(self, impl core::convert::Into<alloc::string::String>, impl outrig::harness::SkillSource + 'static) -> Self
 pub async fn outrig::harness::SessionBuilder::start(self) -> core::result::Result<outrig::harness::Session, outrig::harness::SessionError>
 pub fn outrig::harness::SessionBuilder::subscribe(&mut self) -> outrig::harness::event::Subscription
@@ -1992,6 +2127,7 @@ pub outrig::harness::ShutdownReport::events: outrig::harness::EventDelivery
 pub outrig::harness::ShutdownReport::executions: alloc::vec::Vec<outrig::harness::ExecutionOutcome>
 pub outrig::harness::ShutdownReport::hosted: alloc::vec::Vec<outrig::harness::HostedCall>
 pub outrig::harness::ShutdownReport::requests: alloc::vec::Vec<outrig::harness::RequestOutcome>
+pub outrig::harness::ShutdownReport::services: alloc::vec::Vec<outrig::harness::ServiceCall>
 pub outrig::harness::ShutdownReport::stopped: outrig::harness::Stopped
 impl outrig::harness::ShutdownReport
 pub fn outrig::harness::ShutdownReport::verdict(&self) -> outrig::harness::Verdict
@@ -2024,6 +2160,9 @@ impl outrig::config::Secrets for outrig::config::EnvSecrets
 pub fn outrig::config::EnvSecrets::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
 impl<F> outrig::config::Secrets for F where F: core::ops::function::Fn(&str) -> core::option::Option<alloc::string::String> + core::marker::Send + core::marker::Sync
 pub fn F::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
+pub trait outrig::harness::Service: core::marker::Send + core::marker::Sync + 'static
+pub fn outrig::harness::Service::call(&self, &str, serde_json::value::Value, outrig::harness::CallContext) -> outrig::harness::ServiceFuture<'_>
+pub fn outrig::harness::Service::describe(&self) -> outrig::harness::ServiceDescription
 pub trait outrig::harness::SkillSource: core::marker::Send + core::marker::Sync
 pub fn outrig::harness::SkillSource::files(&self, &str) -> std::io::error::Result<alloc::vec::Vec<outrig::harness::SkillFile>>
 pub fn outrig::harness::SkillSource::read(&self, &str, &str) -> std::io::error::Result<alloc::vec::Vec<u8>>
@@ -2033,6 +2172,7 @@ pub fn outrig::harness::DirectorySource::files(&self, &str) -> std::io::error::R
 pub fn outrig::harness::DirectorySource::read(&self, &str, &str) -> std::io::error::Result<alloc::vec::Vec<u8>>
 pub fn outrig::harness::DirectorySource::skills(&self) -> std::io::error::Result<alloc::vec::Vec<alloc::string::String>>
 pub async fn outrig::harness::container_spec(&outrig::config::Config, &str, core::option::Option<&outrig::image::ImageTag>, &std::path::Path, std::path::PathBuf) -> core::result::Result<outrig::harness::ContainerSpec, outrig::error::OutrigError>
+pub type outrig::harness::ServiceFuture<'a> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<serde_json::value::Value, outrig::harness::ServiceError>> + core::marker::Send + 'a)>>
 pub mod outrig::image
 #[non_exhaustive] pub enum outrig::image::BuildOutput
 pub outrig::image::BuildOutput::Captured

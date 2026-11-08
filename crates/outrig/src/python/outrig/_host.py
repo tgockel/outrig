@@ -549,6 +549,23 @@ class HostedCall:
 
 
 @dataclasses.dataclass(frozen=True)
+class ServiceCall:
+    """A call of a service's method whose outcome came after a session's admission closed: its
+    `call` id, the `service`, the `method` by its exact name, the `agent` that made it, its
+    `outcome` -- `"returned"`, `"raised"`, `"refused"`, `"cancelled"` or `"unknown"` -- the
+    service's `category` for a `"raised"` one, and the `reason` for one of the last three, such as
+    `"admission_closed"` or `"closed"`; each `None` where there is none."""
+
+    call: int
+    service: str
+    method: str
+    agent: str
+    outcome: str
+    category: str | None
+    reason: str | None
+
+
+@dataclasses.dataclass(frozen=True)
 class RequestOutcome:
     """A request made of a child agent that was open when a session's admission closed: its
     `request` id, the `child` it was made of, the `channel` it was sent on -- `None` for a
@@ -607,14 +624,15 @@ class ShutdownReport:
     `verdict` is what it adds up to:
 
     - `"clean"`: everything the session started is stopped, and every outcome is known.
-    - `"stopped_with_unknown"`: everything is stopped, and some execution or hosted call was cut
-      off. Its outcome is unknown, never failed: its effect may stand.
+    - `"stopped_with_unknown"`: everything is stopped, and some execution, hosted call or service
+      call was cut off. Its outcome is unknown, never failed: its effect may stand.
     - `"not_proven_stopped"`: something could not be confirmed stopped, and may still be acting;
       the exit raised `ShutdownException`. Do not reuse what the session ran on.
 
     `closed_by`, a `ClosedBy`, is what closed admission; `stopped`, a `Stopped`, whether
     everything is proven stopped; `executions`, each execution running when admission closed;
-    `hosted`, each hosted call whose outcome came after admission closed; `requests`, each
+    `hosted`, each hosted call whose outcome came after admission closed; `services`, each
+    `ServiceCall` whose outcome came after it; `requests`, each
     `RequestOutcome`, a request made of a child agent that was open then; `bindings`, a
     `BindingStop`, how the process holding the bindings stopped, or `None` for a session with
     none; and `events`, an `EventDelivery`, how the session's events were delivered. It never
@@ -626,6 +644,7 @@ class ShutdownReport:
     stopped: Stopped
     executions: tuple[ExecutionOutcome, ...]
     hosted: tuple[HostedCall, ...]
+    services: tuple[ServiceCall, ...]
     requests: tuple[RequestOutcome, ...]
     bindings: BindingStop | None
     events: EventDelivery
@@ -648,6 +667,7 @@ def _report(raw, lost):
             ExecutionOutcome(id=row["execid"], status=row["status"]) for row in raw["executions"]
         ),
         hosted=tuple(HostedCall(**row) for row in raw["hosted"]),
+        services=tuple(ServiceCall(**row) for row in raw["services"]),
         requests=tuple(RequestOutcome(**row) for row in raw["requests"]),
         bindings=bindings,
         events=EventDelivery(

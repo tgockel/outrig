@@ -144,9 +144,11 @@ pub(crate) const OWNER: &str = "owner";
 pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The longest reply line read whole. The interpreter bounds everything it
-/// sends, and its largest reply -- an inventory of 200 names and types of up
-/// to 1000 characters each, JSON-escaped -- stays under 5 MiB. A longer line is
-/// something executed code wrote to the protocol descriptor.
+/// sends: its largest reply -- an inventory of 200 names and types of up to
+/// 1000 characters each, JSON-escaped -- stays under 5 MiB, and a call of a
+/// service is refused before it is sent past `SERVICE_LINE_MAX`, this bound's
+/// twin in `_interpreter.py`. A longer line is something executed code wrote to
+/// the protocol descriptor.
 const REPLY_LINE_MAX: usize = 16 << 20;
 
 /// The reply buffer's capacity kept between lines, so one large reply does
@@ -458,6 +460,8 @@ struct Table {
     children: Option<ChildLines>,
     /// Where the lines about skills go, once the session serves any.
     skills: Option<SkillLines>,
+    /// Where the lines about services go, once the session serves any.
+    services: Option<ServiceLines>,
     /// The writer's queue, held weakly, for the close's own line to the
     /// interpreter when no relay carries it.
     lines: Option<Lines>,
@@ -471,6 +475,11 @@ pub(crate) type ChildLines = Arc<dyn Fn(&str, Value) + Send + Sync>;
 /// skill's listing or one of its files, a notice of an import -- from
 /// whichever thread sent them, inside an execution or not.
 pub(crate) type SkillLines = Arc<dyn Fn(Value) + Send + Sync>;
+
+/// What hears the lines a kernel sends about services -- a call of a
+/// service's method, a notice that its caller was interrupted -- each naming
+/// a kernel the host opened.
+pub(crate) type ServiceLines = Arc<dyn Fn(Value) + Send + Sync>;
 
 /// What the host holds for one kernel.
 struct KernelState {
@@ -1017,6 +1026,12 @@ impl Interpreter {
     /// on. Until then each request is answered that the session serves none.
     pub(crate) fn attach_skills(&self, lines: SkillLines) {
         lock(&self.table).skills = Some(lines);
+    }
+
+    /// Hand each line a kernel sends about services to `lines`, from now on.
+    /// Until then each call is answered that the session serves none.
+    pub(crate) fn attach_services(&self, lines: ServiceLines) {
+        lock(&self.table).services = Some(lines);
     }
 
     /// Tell the interpreter the session's skills, before anything runs, as
@@ -2344,6 +2359,37 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
             Some(skills) => skills(value),
             None => {
                 if let Some(answer) = crate::harness::skills::unserved(&value) {
+                    lines.send(format!("{answer}\n"));
+                }
+            }
+        }
+        return;
+    }
+    // A line about services is the session's, and names the kernel whose
+    // agent made the call: one the host did not open is answered at once, as
+    // is any when nothing serves them, since the thread that sent it waits for
+    // its answer with no bound of its own.
+    if let Some(kind) = value["t"].as_str()
+        && kind.starts_with("service.")
+    {
+        // Its own statement, so the table is not locked while the hook runs.
+        let (services, opened) = {
+            let table = lock(table);
+            let opened = value["agent"]
+                .as_str()
+                .is_some_and(|agent| table.kernels.contains_key(agent));
+            (table.services.clone(), opened)
+        };
+        match services {
+            Some(services) if opened => services(value),
+            _ => {
+                if !opened {
+                    tracing::warn!(
+                        "refused a {kind} line from agent {}, whose kernel the host did not open",
+                        value["agent"]
+                    );
+                }
+                if let Some(answer) = crate::harness::services::unserved(&value, opened) {
                     lines.send(format!("{answer}\n"));
                 }
             }

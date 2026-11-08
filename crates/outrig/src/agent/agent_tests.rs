@@ -54,6 +54,7 @@ const BINDING_MODEL: &str = "claude-sonnet-5-5";
 /// A session that holds no binding and no skill.
 const NOTHING_HELD: Holdings<'static> = Holdings {
     bindings: &[],
+    services: &[],
     skills: &[],
     catalog: None,
 };
@@ -1029,6 +1030,7 @@ fn the_orientation_names_each_binding_and_says_a_call_blocks_the_loop() {
                 brief("repo", "The project's Git repository.", true),
                 brief("tasks", "The task tracker.", false),
             ],
+            services: &[],
             skills: &[],
             catalog: None,
         },
@@ -1168,6 +1170,7 @@ fn the_orientation_lists_skills_within_its_bounds_and_counts_the_rest() {
             None,
             Holdings {
                 bindings: &[],
+                services: &[],
                 skills,
                 catalog: None,
             },

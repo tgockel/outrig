@@ -8,7 +8,11 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use super::ClosedBy;
-use super::event::{AgentRequestId, ExecId, HostedOutcome, HostedReason, RequestEnd, RequestId};
+use super::ServiceErrorCategory;
+use super::event::{
+    AgentRequestId, ExecId, HostedOutcome, HostedReason, RequestEnd, RequestId, ServiceCallId,
+    ServiceOutcome, ServiceReason,
+};
 
 /// What [`Session::shutdown`](super::Session::shutdown) found. Read it before
 /// deciding anything about the work the session did: it is the first point at
@@ -27,6 +31,9 @@ pub struct ShutdownReport {
     /// in flight then, one the close refused or cancelled, one made after --
     /// and that outcome.
     pub hosted: Vec<HostedCall>,
+    /// Each call of a service's method whose outcome came after admission
+    /// closed -- one in flight then, one made after -- and that outcome.
+    pub services: Vec<ServiceCall>,
     /// How the process holding the session's bindings stopped, or `None` when the session had
     /// none.
     pub bindings: Option<BindingStop>,
@@ -40,7 +47,12 @@ pub struct ShutdownReport {
 impl ShutdownReport {
     /// What the report adds up to.
     pub fn verdict(&self) -> Verdict {
-        verdict(&self.stopped, &self.executions, &self.hosted)
+        verdict(
+            &self.stopped,
+            &self.executions,
+            &self.hosted,
+            &self.services,
+        )
     }
 }
 
@@ -48,13 +60,17 @@ pub(crate) fn verdict(
     stopped: &Stopped,
     executions: &[ExecutionOutcome],
     hosted: &[HostedCall],
+    services: &[ServiceCall],
 ) -> Verdict {
     let unknown = executions
         .iter()
         .any(|execution| execution.status == ExecutionStatus::Unknown)
         || hosted
             .iter()
-            .any(|call| call.outcome == HostedOutcome::Unknown);
+            .any(|call| call.outcome == HostedOutcome::Unknown)
+        || services
+            .iter()
+            .any(|call| call.outcome == ServiceOutcome::Unknown);
     match stopped {
         Stopped::NotProven { .. } => Verdict::NotProvenStopped,
         Stopped::Proven if unknown => Verdict::StoppedWithUnknown,
@@ -117,6 +133,28 @@ pub struct HostedCall {
     pub outcome: HostedOutcome,
     /// Why, for an outcome that has a reason; otherwise `None`.
     pub reason: Option<HostedReason>,
+}
+
+/// A call of a service's method whose outcome came after admission closed, and
+/// that outcome. Its events say the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct ServiceCall {
+    /// The call, as its `service.call.received` numbered it.
+    pub call: ServiceCallId,
+    /// The service whose method it called.
+    pub service: String,
+    /// The method, by its exact name.
+    pub method: String,
+    /// The agent whose code made it, as the interpreter's protocol names it.
+    pub agent: String,
+    /// How it ended.
+    pub outcome: ServiceOutcome,
+    /// What the service said went wrong, for a `raised` call; otherwise
+    /// `None`.
+    pub category: Option<ServiceErrorCategory>,
+    /// Why, for a `refused`, `cancelled` or `unknown` call; otherwise `None`.
+    pub reason: Option<ServiceReason>,
 }
 
 /// A request an agent made of a child -- a submission, or a request on one of

@@ -13,6 +13,7 @@ use super::lifecycle::Lifecycle;
 use super::report::{
     self, EventDelivery, ExecutionOutcome, ExecutionStatus, ShutdownReport, Stopped,
 };
+use super::services::Services;
 use super::skills::Catalog;
 use super::{Closed, ClosedBy, Failure, SessionError, UserChannel};
 use crate::Outrig;
@@ -60,6 +61,8 @@ pub struct Session {
     container_name: String,
     lifecycle: Arc<Lifecycle>,
     bindings: Bindings,
+    /// The services its owner gave, and their calls.
+    services: Services,
     /// The application code it runs, when its owner gave any.
     application: Option<ApplicationIdentity>,
     /// Every model call the session makes, whichever agent makes it.
@@ -87,7 +90,9 @@ impl Session {
     /// interpreter's admission is the session's, and its exit closes it. It
     /// has no primary agent until [`Session::build_primary`] builds one. Its
     /// agents' children are made from `setup`, under the limits its
-    /// configuration sets for its agent.
+    /// configuration sets for its agent, and told of `services` as of
+    /// `bindings`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: String,
         interpreter: Interpreter,
@@ -95,6 +100,7 @@ impl Session {
         container_name: String,
         lifecycle: Arc<Lifecycle>,
         bindings: Bindings,
+        services: Services,
         setup: ChildSetup,
     ) -> Self {
         lifecycle.attach(interpreter.gate());
@@ -124,6 +130,7 @@ impl Session {
                 workspace: setup.workspace,
                 windows: Windows::default(),
                 bindings: bindings.briefs(),
+                services: services.briefs(),
                 container: container_name.clone(),
             },
         );
@@ -135,6 +142,7 @@ impl Session {
             container_name,
             lifecycle,
             bindings,
+            services,
             application: None,
             ledger,
             children,
@@ -173,6 +181,7 @@ impl Session {
             workspace,
             Holdings {
                 bindings: &self.bindings.briefs(),
+                services: &self.services.briefs(),
                 skills: &catalog.briefs(),
                 catalog: Some(catalog),
             },
@@ -478,6 +487,7 @@ impl Session {
             container_name: _,
             lifecycle,
             mut bindings,
+            services,
             application: _,
             ledger: _,
             children,
@@ -493,19 +503,31 @@ impl Session {
         let gate = interpreter.gate();
         {
             // What the drain waits for: the executions running at the close,
-            // and the hosted calls the bindings process was sent.
+            // the hosted calls the bindings process was sent, and the calls of
+            // the session's services.
             let (gate, hosted) = (&gate, &bindings);
             let drained = move || async move {
                 gate.drained().await;
                 hosted.drained().await;
             };
-            if tokio::time::timeout_at(until, drained()).await.is_err() {
+            let all = async {
+                drained().await;
+                services.drained().await;
+            };
+            if tokio::time::timeout_at(until, all).await.is_err() {
+                // A service call is told first, so its reason is the close and
+                // not the interrupt its caller is about to get; it has its
+                // grace, and is then abandoned.
+                services.terminate();
                 // Interrupted first, which agent code can answer: a `finally`
                 // runs, the execution ends `error` rather than `unknown`, and a
                 // hosted call whose coroutine callback the interrupt wakes is
                 // answered with it, so the call ends `raised`.
                 interpreter.stop_live();
-                let _ = tokio::time::timeout(TERMINATE_GRACE, drained()).await;
+                let _ = tokio::join!(
+                    tokio::time::timeout(TERMINATE_GRACE, drained()),
+                    tokio::time::timeout(services.grace() + TERMINATE_GRACE, services.drained()),
+                );
             }
         }
         // After the drain, so a hosted call still running had its time, and
@@ -546,6 +568,7 @@ impl Session {
         // Last, once the interpreter has stopped too, so the calls it never
         // sent are in: nothing hosted is published after.
         let hosted = bindings.report();
+        let service_calls = services.report();
         let stopped = match failed.is_empty() {
             true => Stopped::Proven,
             false => Stopped::NotProven {
@@ -572,9 +595,10 @@ impl Session {
             stopped: stopped.clone(),
             executions: executions.clone(),
             hosted: hosted.clone(),
+            services: service_calls.clone(),
             bindings: binding_stop.clone(),
             requests: requests.clone(),
-            verdict: report::verdict(&stopped, &executions, &hosted),
+            verdict: report::verdict(&stopped, &executions, &hosted, &service_calls),
         });
         let log = events
             .close_after(Payload::SessionState {
@@ -588,6 +612,7 @@ impl Session {
             stopped,
             executions,
             hosted,
+            services: service_calls,
             bindings: binding_stop,
             requests,
             events: EventDelivery {
@@ -602,6 +627,12 @@ impl Session {
     #[cfg(test)]
     pub(crate) fn interpreter(&self) -> &Interpreter {
         &self.interpreter
+    }
+
+    /// The session's services, for a test.
+    #[cfg(test)]
+    pub(crate) fn services(&self) -> &Services {
+        &self.services
     }
 
     /// The session's primary agent, for a test of a session that has one.

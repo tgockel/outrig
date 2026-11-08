@@ -19,6 +19,30 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **A Rust service is a Python object.** `SessionBuilder::serve(name, Arc<dyn Service>)` binds a
+  `Service` -- `describe()`, giving a `ServiceDescription` whose `MethodDescription`s each name a
+  method exactly with a JSON Schema for its arguments, and `call(method, args, cx)`, answering by
+  value -- for agent Python to call with no bindings process and no RPyC. Every kernel gets an
+  object of a class generated from the description, a subclass of `outrig.Service`: a method per
+  described one with its signature and docstring rendered from the schema, `call(name, arguments,
+  timeout=)`, `method(name)` and `methods` by exact name, the global of its name where free and
+  `outrig.bindings[name]`, listed by `runtime.bindings` as `kind` `service`; a dict an agent class
+  is constructed with may hold one, `outrig.facility(name)` included, and the child's calls are its
+  own. The host checks each call's arguments against the method's schema (with `jsonschema`, draft
+  2020-12, comparing numbers exactly and loading nothing outside the schema), refusing them naming
+  the first failing JSON path; holds it to a deadline that `timeout=` may lower; tells it to stop
+  through `CallContext::cancelled` at the deadline, when its caller is interrupted, or when the
+  session's drain ends; and abandons one still running a grace later as `unknown`. A result larger
+  than `ServicePolicy::result_max` is refused. `ServicePolicy` (`SessionBuilder::service_policy`)
+  sets the deadline (600 s), the grace (5 s), the result's bound (16 MiB) and whether events preview
+  arguments and results (off). A call that returns no result raises `outrig.ServiceError` with its
+  `outcome`, `category`, `reason` and `path`. Each call is published as `service.call.received`,
+  `service.call.dispatched`, `service.call.cancel.sent` and `service.call.ended`, each service as
+  `service.bound` and `service.described` (`Payload::Service*`, `ServiceCallId`, `ServiceKind`,
+  `ServiceOutcome`, `ServiceReason`, `ServiceChanges`), and one that ended after the close in
+  `ShutdownReport::services` (`ServiceCall`), an `unknown` one making the verdict
+  `StoppedWithUnknown`. Agents are told each service beside the bindings, with the rule that a long
+  call hands back a ticket. `FacilityKind::Service` is new.
 - **Application code is provisioned before construction.** `SessionBuilder::application` takes
   an `ApplicationSpec` -- a directory (`ApplicationSpec::directory`) or the bytes of a tar of one
   (`ApplicationSpec::archive`), with the `requires` it imports and the `imports` to run at start,

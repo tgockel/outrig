@@ -43,9 +43,9 @@ Issues that bear on **host integrity** are in scope, for example:
   configured to, including through a podman default OutRig leaves in place, such as
   `--http-proxy`, or, under `outrig run-new`, through an MCP server's or a sidecar's environment:
   `run-new` starts neither, so no credential from those blocks reaches its container.
-- Agent code starting a container, a sidecar, an MCP server, or a binding. Those come from the
-  configuration, the operator, an embedder, or a host program's `inject`, never from the agent:
-  the agent cannot grow its own environment.
+- Agent code starting a container, a sidecar, an MCP server, a binding, or a service. Those come
+  from the configuration, the operator, an embedder, or a host program's `inject`, never from the
+  agent: the agent cannot grow its own environment.
 - The network interceptor failing to enforce a configured host:port allow/deny policy.
 - The network interceptor attaching to a container that holds `CAP_NET_ADMIN` -- `cap-add` of
   `NET_ADMIN`, or of `ALL` without `NET_ADMIN` in `cap-drop` -- since whatever it runs as root
@@ -83,7 +83,8 @@ Issues that bear on **host integrity** are in scope, for example:
   other than through the requests OutRig relays to it; a request to a binding or a live object
   running without being published as events; or one admitted after the session's owner closed
   admission. These checks are on the host so that nothing the container sends -- raw RPyC frames
-  included -- gets past them.
+  included -- gets past them. The same holds of a call of a service's method, and so does a call
+  reaching its service with arguments its method's schema refuses.
 
 ## Known boundaries (by design, not vulnerabilities)
 
@@ -134,6 +135,17 @@ Issues that bear on **host integrity** are in scope, for example:
   audits it. A live object it injects into its sessions (`session.inject`) acts with the
   program's authority, and every request an agent makes of it is published as a binding's is.
   Keep the program's imports, and the credentials it reads, outside paths an agent can write.
+- A **service** (`SessionBuilder::serve`, 0.3) is Rust the embedder runs on the host, with the
+  embedder's authority. Every method it describes is callable by every agent of the session, and
+  every call is published as events: binding the service is the grant, and a service that should
+  do less describes less. OutRig checks a call's arguments against the method's JSON Schema and
+  nothing else: a service resolves what it acts on from its own configuration rather than from an
+  argument naming it, and rechecks state when it acts. What a service puts in an error message or
+  a result reaches the agent's Python as written; OutRig adds nothing of its own and redacts
+  nothing of the service's. A call abandoned at its deadline or at the close is reported
+  `unknown`, since what it did before the abort stands, and a call blocking a thread runs on in
+  the embedder's process. A service written by whoever embeds OutRig is that embedder's trusted
+  code, not a vulnerability.
 - **Application code** (`SessionBuilder::application`, `outrig.Session(application=...)`, 0.3)
   runs in the container with the agent's authority, which is arbitrary execution there: it is the
   owner's code, trusted as the owner is. Its snapshot is mounted read-only so that the code the
@@ -144,8 +156,9 @@ Issues that bear on **host integrity** are in scope, for example:
   the application is given a reference to.
 - **Agents in one `outrig run-new` session are not isolated from each other.** They share one
   interpreter process, a thread each, so any agent's code can reach another's names, and every
-  agent can reach every binding. An agent class given `facilities=` is told of those alone, which
-  narrows what it is told and not what it can do. The grant is the session's, not one agent's.
+  agent can reach every binding and service. An agent class given `facilities=` is told of those
+  alone, which narrows what it is told and not what it can do. The grant is the session's, not
+  one agent's.
 - Hostname **deny** rules are best-effort against a hostile client. A container that resolves a
   name through the interceptor is bound to it and cannot shed that binding, but one that
   connects by address and asserts no name at all offers nothing to match against. Hostname deny

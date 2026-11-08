@@ -51,6 +51,7 @@ heck               = { workspace = true }
 http               = { workspace = true, features = ["std"] }
 ignore             = { workspace = true }
 jiff               = { workspace = true, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo"] }
+jsonschema         = { workspace = true }
 nix                = { workspace = true, features = ["user", "fs", "dir", "process", "signal", "net", "uio"] }
 rand               = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
 regex              = { workspace = true, features = ["std", "perf", "unicode"] }
@@ -90,6 +91,9 @@ ureq        = { workspace = true, features = ["rustls"] }
 [dev-dependencies]
 # `archive.rs`'s tests build a synthetic wheel to convert.
 miniz_oxide = { workspace = true, features = ["with-alloc"] }
+# `resolve-file` stands for an embedder that turns it on: the service schema
+# check must load no file even so.
+jsonschema = { workspace = true, features = ["resolve-file"] }
 # `resource` starts the interpreter under a memory ceiling of the test's choosing.
 nix      = { workspace = true, features = ["resource"] }
 reqwest  = { workspace = true, features = ["json", "rustls"] }

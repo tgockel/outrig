@@ -79,8 +79,9 @@ The interpreter belongs to the session rather than to one agent, so events about
 `output.unattributed`, `interpreter.diagnostic`, and `interpreter.exited` -- carry no `subject`,
 and neither do the session's own, `session.state` and `session.report`, those of its bindings,
 `binding.refused`, `binding.injected` and `binding.exited`, those of its application code,
-`application.provisioned` and `application.imported`, or what its skill sources hold,
-`skill.discovered`. A request to a binding is the agent's that made it, and so is the import of a
+`application.provisioned` and `application.imported`, what its skill sources hold,
+`skill.discovered`, or its services, `service.bound` and `service.described`. A request to a
+binding is the agent's that made it, and so is a call of a service's method and the import of a
 skill, which code outside every execution makes for no agent.
 
 A child agent, which an agent's code launches with `runtime.spawn`, is named `c1`, `c2`, and so on
@@ -101,10 +102,10 @@ does not give the number back.
 Inside `data`, an execution's `execid` and a message's `message` id come from one counter, which
 also numbers OutRig's own questions to the interpreter, so neither runs in sequence and a gap in
 them means nothing. Turns and calls are each counted from 0 on their own, and requests to
-bindings from 1. A request made of a child agent has a `request` id from the interpreter's own
-counter, which does not run in sequence either: the id its handle and the child's delivery of it
-carry in agent code. A skill invocation's `invocation` id comes from the same counter, and is its
-`Invocation`'s `id` in agent code.
+bindings and calls of services from 1, each by the host. A request made of a child agent has a
+`request` id from the interpreter's own counter, which does not run in sequence either: the id its
+handle and the child's delivery of it carry in agent code. A skill invocation's `invocation` id
+comes from the same counter, and is its `Invocation`'s `id` in agent code.
 
 ## Three categories
 
@@ -130,7 +131,10 @@ category says what it may hold.
   A request to a binding is recorded with a preview of each argument, built from what crossed by
   value and cut to 200 characters, 16 items of a container, and 3 levels deep; an object of the
   host's is named by its type and a reference number, never by its `repr`, which would run its
-  code.
+  code. A call of a service is recorded by what the host holds of it -- names, ids, outcome,
+  category, sizes, durations -- and never from the service's own state; its arguments and its
+  result are previewed only when the session's service policy records bodies, which it does not
+  by default, as their JSON cut to 1,024 characters.
 
 ## Model view
 
@@ -252,6 +256,9 @@ three times for one call before the rejection ends it.
     binding, outcome, reason}`, from its `hosted.ended`. One `unknown` makes the verdict
     `stopped_with_unknown`, as an execution's does; one `still_running` makes `stopped`
     `not_proven`, its reason naming the call.
+  - `services`: each call of a service's method that ended after the close, in the order they
+    ended, as `{call, service, method, agent, outcome, category, reason}`, from its
+    `service.call.ended`. One `unknown` makes the verdict `stopped_with_unknown`.
   - `bindings`: how the process holding the session's bindings stopped, as `{names,
     group_empty, killed, survivors, exited}`, or `null` when the session had none: the bindings
     it held, whether no process is left in its process group, whether `SIGKILL` was needed after
@@ -491,8 +498,10 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
   it, or as its parent runs -- `default-model` for the program's; `depth`, the main agent's and
   the program's children's being 1; `inputs`, each `{name, type, preview}`; `facilities`, what
   it was given to act through as the spawn found it, each `{name, kind, target, type}` --
-  `kind` `binding` or `object`, `target` the binding's own name or `null` for an object, `type`
-  the qualified name of the object's type -- or `null` when it sees the session's bindings; and
+  `kind` `binding`, `service` or `object`, `target` the binding's or the service's own name, or
+  `null` for an object, `type` the qualified name of the object's type -- a service's is the
+  class generated for it, `outrig.services.<name>` -- or `null` when it sees the session's
+  bindings and services; and
   `channels`, a request child's, each `{name, request, reply}`, its types as text. A change to
   an agent's facilities after its launch is not evented: nothing crosses when a dict changes.
 - `agent.request.sent` -- a request was made of the subject, a child: `request`; `channel`, or
@@ -619,6 +628,52 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
   `hosted.dispatched` may be one a gap lost.
 - `hosted.callback` -- a binding's library called a callable agent code passed it: `parent`, the
   request it was passed to; `agent`; `binding`.
+- `service.bound` -- a service the owner bound, as the session started: `service`, the name agents
+  reach it by; `kind`, `rust` for one an owner wrote; `methods`, how many it describes;
+  `generation`, 1; and `unchecked`, the methods whose argument schema did not compile, by exact
+  name, each called with its arguments unchecked.
+- `service.described` -- a service's description changed while the session ran: `service`;
+  `generation`, the new one's; `changes`, `{added, removed, changed}`, each a list of methods by
+  exact name; and `unchecked`, as `service.bound` has it. A call made from a method the new
+  description lacks is refused `unknown_method`.
+- `service.call.received` -- a call agent code made of a service's method, as it arrived, before
+  anything is decided about it. `call`, an id the host gives it, which the call's other events
+  carry, and the service its `CallContext`; `service`; `kind`; `method`, by its exact name;
+  `generation`, the description the caller's method came from; `agent`; `execid` and
+  `invocation`, as the interpreter said them, diagnostic context the agent's own code can change;
+  `deadline`, seconds the service has to answer it, from its receipt; and `arguments`, a preview,
+  or `null` unless the session's service policy records bodies.
+- `service.call.dispatched` -- `call`, `service`, `method`, `agent`: the service is about to be
+  called, published before it is. A call whose service is never called has none.
+- `service.call.cancel.sent` -- a dispatched call was told to stop, its cancellation token
+  triggered: `call`, `service`, `agent`, and `reason`: `deadline`, its deadline passed;
+  `interrupted`, its caller was interrupted; or `closed`, the session's drain ended with it
+  running. The first of these holds. The call has its grace to end before it is abandoned.
+- `service.call.ended` -- how a call ended: `call`, `service`, `kind`, `method`, `agent`,
+  `execid`; `outcome`; `category`, the service's own, for a `raised` call, else `null`; `reason`,
+  for an outcome that has one, else `null`; `detail`, the first failing JSON path of arguments
+  refused as invalid, or what a result refused as too large measured, else `null`; `bytes`, the
+  size of the result the service returned, as JSON, or `null`; `duration`, seconds from its
+  receipt; and `body`, a preview of the result, or `null` unless the session's service policy
+  records bodies. `outcome` is:
+  - `returned` -- the service was called and returned its result.
+  - `raised` -- the service was called and returned an error, whose `category` is
+    `invalid_arguments`, `not_found`, `refused`, `unavailable`, `failed`, `cancelled` or `other`.
+  - `refused` -- the service was never called: `admission_closed`, the session was closed to new
+    work; `unknown_method`, its description, as it stands, has no method of that name; or
+    `invalid_arguments`, the arguments did not match the method's schema. Or it was, and its
+    result was not handed over: `result_too_large`, larger as JSON than the policy lets a result
+    be -- the one refusal after a dispatch, whose `detail` says the service returned.
+  - `cancelled` -- the service was never called: `interrupted` or `closed` reached the call
+    before its dispatch.
+  - `unknown` -- the service was called, told to stop, and still running when its grace ended, so
+    it was abandoned: `deadline`, `interrupted` or `closed`. What it did is open, and nothing
+    calls it again.
+
+  That a service was never called is read from `refused` or `cancelled` alone, as for a request
+  to a binding. The family follows the rule for a new one: the agent as subject, one id the host
+  mints, the interpreter's ids said to be its claims, previews of by-value data only, and no
+  "attempt".
 
 **Totals.** What a session spent is the sum of its `model.attempt` usage, each `attempt_id`
 counted once, with a `model.usage.replaced` taking the place of its attempt's `null` and a

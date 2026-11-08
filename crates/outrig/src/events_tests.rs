@@ -11,8 +11,8 @@ use super::*;
 use crate::agent::rig_json;
 use crate::harness::event::*;
 use crate::harness::{
-    BindingStop, ClosedBy, ExecutionOutcome, ExecutionStatus, HostedCall, RequestOutcome, Stopped,
-    Verdict,
+    BindingStop, ClosedBy, ExecutionOutcome, ExecutionStatus, HostedCall, RequestOutcome,
+    ServiceCall, ServiceErrorCategory, Stopped, Verdict,
 };
 
 const SOURCE: &str = "/outrig/session/20260921T103000-a1b2";
@@ -243,6 +243,15 @@ fn each_event_has_exactly_its_data_fields() {
                     outcome: HostedOutcome::Refused,
                     reason: Some(HostedReason::AdmissionClosed),
                 }],
+                services: vec![ServiceCall {
+                    call: ServiceCallId::new(2),
+                    service: text("tracker"),
+                    method: text("file-issue"),
+                    agent: text("primary"),
+                    outcome: ServiceOutcome::Unknown,
+                    category: None,
+                    reason: Some(ServiceReason::Closed),
+                }],
                 bindings: Some(BindingStop {
                     names: vec![text("repo")],
                     group_empty: true,
@@ -264,6 +273,7 @@ fn each_event_has_exactly_its_data_fields() {
                 "stopped",
                 "executions",
                 "hosted",
+                "services",
                 "bindings",
                 "requests",
                 "verdict",
@@ -360,6 +370,96 @@ fn each_event_has_exactly_its_data_fields() {
             },
             "hosted.callback",
             &["parent", "agent", "binding"],
+        ),
+        (
+            Payload::ServiceBound {
+                service: text("tracker"),
+                kind: ServiceKind::Rust,
+                methods: 3,
+                generation: 1,
+                unchecked: vec![text("odd")],
+            },
+            "service.bound",
+            &["service", "kind", "methods", "generation", "unchecked"],
+        ),
+        (
+            Payload::ServiceDescribed {
+                service: text("tracker"),
+                generation: 2,
+                changes: ServiceChanges::default(),
+                unchecked: Vec::new(),
+            },
+            "service.described",
+            &["service", "generation", "changes", "unchecked"],
+        ),
+        (
+            Payload::ServiceCallReceived {
+                call: ServiceCallId::new(2),
+                service: text("tracker"),
+                kind: ServiceKind::Rust,
+                method: text("file-issue"),
+                generation: 1,
+                agent: text("primary"),
+                execid: Some(execid(3)),
+                invocation: None,
+                deadline: Duration::from_secs(600),
+                arguments: None,
+            },
+            "service.call.received",
+            &[
+                "call",
+                "service",
+                "kind",
+                "method",
+                "generation",
+                "agent",
+                "execid",
+                "invocation",
+                "deadline",
+                "arguments",
+            ],
+        ),
+        (
+            Payload::ServiceCallDispatched {
+                call: ServiceCallId::new(2),
+                service: text("tracker"),
+                method: text("file-issue"),
+                agent: text("primary"),
+            },
+            "service.call.dispatched",
+            &["call", "service", "method", "agent"],
+        ),
+        (
+            Payload::ServiceCallCancelSent {
+                call: ServiceCallId::new(2),
+                service: text("tracker"),
+                agent: text("primary"),
+                reason: ServiceReason::Deadline,
+            },
+            "service.call.cancel.sent",
+            &["call", "service", "agent", "reason"],
+        ),
+        (
+            Payload::ServiceCallEnded {
+                call: ServiceCallId::new(2),
+                service: text("tracker"),
+                kind: ServiceKind::Rust,
+                method: text("file-issue"),
+                agent: text("primary"),
+                execid: Some(execid(3)),
+                outcome: ServiceOutcome::Raised,
+                category: Some(ServiceErrorCategory::Unavailable),
+                reason: None,
+                detail: None,
+                bytes: None,
+                duration: Duration::from_millis(40),
+                body: None,
+            },
+            "service.call.ended",
+            &[
+                "call", "service", "kind", "method", "agent", "execid", "outcome", "category",
+                "reason", "detail", "bytes", "duration", "body",
+            ],
         ),
         (
             Payload::BindingRefused {
@@ -1175,6 +1275,15 @@ fn each_event_has_exactly_its_data_fields() {
                 "binding": "repo",
                 "outcome": "refused",
                 "reason": "admission_closed",
+            }],
+            "services": [{
+                "call": 2,
+                "service": "tracker",
+                "method": "file-issue",
+                "agent": "primary",
+                "outcome": "unknown",
+                "category": null,
+                "reason": "closed",
             }],
             "bindings": {
                 "names": ["repo"],

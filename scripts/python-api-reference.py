@@ -88,6 +88,7 @@ SECTIONS = [
             "Stopped",
             "ExecutionOutcome",
             "HostedCall",
+            "ServiceCall",
             "RequestOutcome",
             "BindingStop",
             "EventDelivery",
@@ -154,6 +155,9 @@ KERNEL_ONLY = {
     "Request": "declares a channel for `runtime.spawn`, which a program does not have.",
     "facility": "makes a reference, which `facilities=` refuses on the host.",
     "Facility": "what `outrig.facility` makes; each use of one raises `RuntimeError`.",
+    "Service": "the class of a service's object, which only a kernel holds.",
+    "ServiceError": "what a call of a service's method raises, which only a kernel makes.",
+    "ServiceMethod": "what a service's object lists of its methods, which only a kernel holds.",
 }
 
 # Never constructed by a program; their constructors take internals.

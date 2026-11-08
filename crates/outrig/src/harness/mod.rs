@@ -22,6 +22,11 @@
 //!   repository's config declared starts only once its [`Approver`] approves
 //!   that exact declaration; each starts before the interpreter and stops with
 //!   the session.
+//! - **Services.** Rust objects the owner gives
+//!   [`SessionBuilder::serve`], each describing its methods, which agent
+//!   Python calls through an object generated from the description: each call
+//!   checked against its method's schema, held to a deadline, cancellable,
+//!   evented, and reported as a hosted request is.
 //! - **Skills.** The instructions and Python each [`SkillSource`] given to
 //!   [`SessionBuilder::skill_source`] holds, the first source holding a name
 //!   serving it. Their metadata is read as the session starts, with no Python
@@ -54,6 +59,7 @@ mod error;
 pub mod event;
 pub(crate) mod lifecycle;
 mod report;
+pub(crate) mod services;
 mod session;
 pub(crate) mod skills;
 
@@ -67,7 +73,11 @@ pub use self::builder::{ContainerSpec, Progress, SessionBuilder, Step, container
 pub use self::error::{Closed, ClosedBy, Failure, SessionError};
 pub use self::report::{
     BindingStop, EventDelivery, ExecutionOutcome, ExecutionStatus, HostedCall, LogLoss,
-    RequestOutcome, ShutdownReport, Stopped, Verdict,
+    RequestOutcome, ServiceCall, ShutdownReport, Stopped, Verdict,
+};
+pub use self::services::{
+    CallContext, MethodDescription, Service, ServiceDescription, ServiceError,
+    ServiceErrorCategory, ServiceFuture, ServicePolicy,
 };
 pub use self::session::{Closer, RoundEnd, RoundOutcome, Session, StillRunning, Tasks};
 pub use self::skills::{DirectorySource, SkillFile, SkillSource};
@@ -79,6 +89,10 @@ pub use crate::python::host::{OpenWait, Waits};
 #[cfg(test)]
 #[path = "bindings_tests.rs"]
 mod bindings_tests;
+
+#[cfg(test)]
+#[path = "services_tests.rs"]
+pub(crate) mod services_tests;
 
 #[cfg(test)]
 #[path = "session_tests.rs"]

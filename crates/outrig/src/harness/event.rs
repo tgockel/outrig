@@ -160,6 +160,12 @@ id_type!(
     /// carries it.
     AgentInstanceId
 );
+id_type!(
+    /// One call agent code made of a service's method, for the life of the
+    /// session, counted from 1. Every event about the call carries it, and so
+    /// does the [`CallContext`](super::CallContext) its service is given.
+    ServiceCallId
+);
 
 /// Seconds, as the event log writes a duration.
 fn seconds<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
@@ -254,6 +260,9 @@ pub enum Payload {
         /// Each request to a binding that ended after the close, in the order
         /// they ended.
         hosted: Vec<super::HostedCall>,
+        /// Each call of a service's method that ended after the close, in the
+        /// order they ended.
+        services: Vec<super::ServiceCall>,
         /// How the process holding the session's bindings stopped, or `None`
         /// when the session had none.
         bindings: Option<super::BindingStop>,
@@ -1207,6 +1216,125 @@ pub enum Payload {
         /// The binding whose library called it.
         binding: String,
     },
+    /// A service the owner bound, as the session started: what agents reach as
+    /// `outrig.bindings[service]`, and how its methods were described.
+    #[non_exhaustive]
+    ServiceBound {
+        /// The name agents reach it by.
+        service: String,
+        /// What kind of service it is.
+        kind: ServiceKind,
+        /// How many methods it describes.
+        methods: usize,
+        /// Its description's generation, 1 at the start.
+        generation: u64,
+        /// The methods whose argument schema did not compile, by exact name:
+        /// each is called with its arguments unchecked.
+        unchecked: Vec<String>,
+    },
+    /// A service's description changed while the session ran: what agents are
+    /// told of it from now on.
+    #[non_exhaustive]
+    ServiceDescribed {
+        /// The name agents reach it by.
+        service: String,
+        /// The new description's generation.
+        generation: u64,
+        /// Which methods changed, by exact name.
+        changes: ServiceChanges,
+        /// The methods whose argument schema did not compile, by exact name.
+        unchecked: Vec<String>,
+    },
+    /// A call agent code made of a service's method, as it arrived: published
+    /// before anything is decided about it. `execid` and `invocation` are the
+    /// execution and the skill invocation it was made in, as the interpreter
+    /// said: diagnostic context, which the agent's own code can change.
+    #[non_exhaustive]
+    ServiceCallReceived {
+        /// The id OutRig gives it, which its other events carry.
+        call: ServiceCallId,
+        /// The service whose method it calls.
+        service: String,
+        /// What kind of service that is.
+        kind: ServiceKind,
+        /// The method, by its exact name.
+        method: String,
+        /// The generation of the description the caller's method came from.
+        generation: u64,
+        /// The agent whose code made it, as the interpreter's protocol names it.
+        agent: String,
+        /// The execution that made it, or `None`.
+        execid: Option<ExecId>,
+        /// The skill invocation it was made inside, or `None`.
+        invocation: Option<InvocationId>,
+        /// How long its service has to answer it, from its receipt.
+        #[serde(serialize_with = "seconds")]
+        deadline: Duration,
+        /// A preview of its arguments, cut to 1,024 characters, when the
+        /// session's service policy records bodies; otherwise `None`.
+        arguments: Option<String>,
+    },
+    /// A call's service is about to be called: published before it is.
+    #[non_exhaustive]
+    ServiceCallDispatched {
+        /// The call, as its `service.call.received` numbered it.
+        call: ServiceCallId,
+        /// The service whose method it calls.
+        service: String,
+        /// The method, by its exact name.
+        method: String,
+        /// The agent whose code made it.
+        agent: String,
+    },
+    /// A dispatched call was told to stop: its service's cancellation token
+    /// was triggered.
+    #[non_exhaustive]
+    ServiceCallCancelSent {
+        /// The call, as its `service.call.received` numbered it.
+        call: ServiceCallId,
+        /// The service whose method it calls.
+        service: String,
+        /// The agent whose code made it.
+        agent: String,
+        /// Why.
+        reason: ServiceReason,
+    },
+    /// How a call ended.
+    #[non_exhaustive]
+    ServiceCallEnded {
+        /// The call, as its `service.call.received` numbered it.
+        call: ServiceCallId,
+        /// The service whose method it calls.
+        service: String,
+        /// What kind of service that is.
+        kind: ServiceKind,
+        /// The method, by its exact name.
+        method: String,
+        /// The agent whose code made it.
+        agent: String,
+        /// The execution that made it, or `None`.
+        execid: Option<ExecId>,
+        /// How it ended.
+        outcome: ServiceOutcome,
+        /// What the service said went wrong, for a `raised` call; otherwise
+        /// `None`.
+        category: Option<super::ServiceErrorCategory>,
+        /// Why, for a `refused`, `cancelled` or `unknown` call; otherwise
+        /// `None`.
+        reason: Option<ServiceReason>,
+        /// The failing JSON path of arguments refused as invalid, or what a
+        /// result refused as too large measured; otherwise `None`.
+        detail: Option<String>,
+        /// The size of the result its service returned, as JSON, or `None`
+        /// when it returned none.
+        bytes: Option<u64>,
+        /// How long it took, from its receipt.
+        #[serde(serialize_with = "seconds")]
+        duration: Duration,
+        /// A preview of its result, cut to 1,024 characters, when the
+        /// session's service policy records bodies; otherwise `None`.
+        body: Option<String>,
+    },
 }
 
 impl Payload {
@@ -1285,6 +1413,12 @@ impl Payload {
             Payload::HostedDispatched { .. } => "hosted.dispatched",
             Payload::HostedEnded { .. } => "hosted.ended",
             Payload::HostedCallback { .. } => "hosted.callback",
+            Payload::ServiceBound { .. } => "service.bound",
+            Payload::ServiceDescribed { .. } => "service.described",
+            Payload::ServiceCallReceived { .. } => "service.call.received",
+            Payload::ServiceCallDispatched { .. } => "service.call.dispatched",
+            Payload::ServiceCallCancelSent { .. } => "service.call.cancel.sent",
+            Payload::ServiceCallEnded { .. } => "service.call.ended",
         }
     }
 
@@ -1303,13 +1437,19 @@ impl Payload {
             | Self::BindingExited { .. }
             | Self::ApplicationProvisioned { .. }
             | Self::ApplicationImported { .. }
-            | Self::SkillDiscovered { .. } => None,
+            | Self::SkillDiscovered { .. }
+            | Self::ServiceBound { .. }
+            | Self::ServiceDescribed { .. } => None,
             // An import is the agent's whose code made it, which may be none.
             Self::SkillImported { agent, .. } => agent.as_deref().map(Subject::agent),
             Self::HostedReceived { agent, .. }
             | Self::HostedDispatched { agent, .. }
             | Self::HostedEnded { agent, .. }
-            | Self::HostedCallback { agent, .. } => Some(Subject::agent(agent)),
+            | Self::HostedCallback { agent, .. }
+            | Self::ServiceCallReceived { agent, .. }
+            | Self::ServiceCallDispatched { agent, .. }
+            | Self::ServiceCallCancelSent { agent, .. }
+            | Self::ServiceCallEnded { agent, .. } => Some(Subject::agent(agent)),
             _ => Some(emitter.clone()),
         }
     }
@@ -1476,6 +1616,76 @@ pub enum HostedReason {
     /// The host program serving it was still running it when the session terminated, and
     /// nothing the engine owns could end it.
     StillRunning,
+}
+
+/// What kind of service a call reached: one an owner wrote in Rust, or one of
+/// the kinds OutRig ships.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ServiceKind {
+    /// A [`Service`](super::Service) the owner bound with
+    /// [`SessionBuilder::serve`](super::SessionBuilder::serve).
+    Rust,
+}
+
+/// How a call of a service's method ended: the five outcomes a hosted request
+/// has, so one rule reads both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ServiceOutcome {
+    /// Its service was called and returned a result.
+    Returned,
+    /// Its service was called and returned an error, whose category the
+    /// event's `category` is.
+    Raised,
+    /// Its service was never called, but for a result too large, which it
+    /// returned and its caller was not given: the reason says which.
+    Refused,
+    /// Its service was never called: its caller was interrupted, or the
+    /// session closed, before it was dispatched.
+    Cancelled,
+    /// Its service was called and abandoned -- told to stop, given its grace,
+    /// and aborted -- so what it did is open.
+    Unknown,
+}
+
+/// Why a call of a service's method was refused, cancelled, abandoned, or told
+/// to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ServiceReason {
+    /// The session was closed to new work.
+    AdmissionClosed,
+    /// The service's description, as it stands, has no method of that name.
+    UnknownMethod,
+    /// The arguments did not match the method's schema; `detail` is the
+    /// first failing JSON path.
+    InvalidArguments,
+    /// The result was larger, as JSON, than the session's policy lets one
+    /// cross; `detail` says how large.
+    ResultTooLarge,
+    /// The call's deadline passed.
+    Deadline,
+    /// Its caller was interrupted.
+    Interrupted,
+    /// The session's drain ended with it still running.
+    Closed,
+}
+
+/// The methods a service's new description added, removed and changed, each
+/// by exact name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct ServiceChanges {
+    /// Methods the old description did not have.
+    pub added: Vec<String>,
+    /// Methods the new description does not have.
+    pub removed: Vec<String>,
+    /// Methods both have, described differently.
+    pub changed: Vec<String>,
 }
 
 /// A tool a model call carries, as the provider is told of it.
@@ -1962,8 +2172,8 @@ pub struct InputBrief {
     pub preview: String,
 }
 
-/// What a facility an agent was given is: one of the session's bindings, or a
-/// plain Python object of the interpreter.
+/// What a facility an agent was given is: one of the session's bindings or
+/// services, or a plain Python object of the interpreter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
@@ -1974,6 +2184,9 @@ pub enum FacilityKind {
     /// A plain Python object, shared by the agents given it; a call on it
     /// crosses no boundary and is not evented.
     Object,
+    /// One of the session's services, which each agent's kernel reaches
+    /// through an object of its own, its calls attributed to that agent.
+    Service,
 }
 
 /// One facility a child was given, by the name it sees it under: its kind,
@@ -1986,11 +2199,11 @@ pub struct FacilityBrief {
     pub name: String,
     /// What it is.
     pub kind: FacilityKind,
-    /// The binding's name, which can differ from `name`; `None` for a plain
-    /// object.
+    /// The binding's or service's name, which can differ from `name`; `None`
+    /// for a plain object.
     pub target: Option<String>,
     /// The qualified name of its type: the binding's object's on the host,
-    /// or the plain object's.
+    /// the class generated for a service, or the plain object's.
     #[serde(rename = "type")]
     pub type_name: String,
 }

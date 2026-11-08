@@ -41,6 +41,7 @@ use super::history::Window;
 use super::instructions::Instructions;
 use crate::harness::bindings::Brief;
 use crate::harness::event::{FacilityBrief, FacilityKind, InputBrief};
+use crate::harness::services::ServiceBrief;
 use crate::harness::skills::{Catalog, SkillBrief};
 
 /// What every agent is told first: how it acts.
@@ -49,10 +50,11 @@ const ACT: &str = "You act on this project by writing Python. Your one tool, `su
                    only way to read a file, run a command, or change anything.\n\n";
 
 /// What a session holds for its primary agent besides the interpreter: its
-/// bindings and its skills, each in the session's order, and the catalog the
-/// skills are of, which a directive the user sends names one of.
+/// bindings, its services and its skills, each in the session's order, and the
+/// catalog the skills are of, which a directive the user sends names one of.
 pub(crate) struct Holdings<'a> {
     pub(crate) bindings: &'a [Brief],
+    pub(crate) services: &'a [ServiceBrief],
     pub(crate) skills: &'a [SkillBrief],
     pub(crate) catalog: Option<&'a Arc<Catalog>>,
 }
@@ -95,7 +97,10 @@ pub(crate) fn preamble(
     );
     text.push_str(&rest(
         workspace,
-        View::Session(holdings.bindings),
+        View::Session {
+            bindings: holdings.bindings,
+            services: holdings.services,
+        },
         window,
         "each time you are told messages are waiting",
     ));
@@ -129,10 +134,13 @@ const NOT_A_WAIT: &str = "A round's end is not a wait: nothing opens a round whe
 /// What an agent is told it acts through besides the interpreter.
 #[derive(Clone, Copy)]
 pub(crate) enum View<'a> {
-    /// The session's bindings, every one.
-    Session(&'a [Brief]),
+    /// The session's bindings and services, every one.
+    Session {
+        bindings: &'a [Brief],
+        services: &'a [ServiceBrief],
+    },
     /// The facilities its constructor gave it, or that it inherited from its
-    /// parent, and no other binding.
+    /// parent, and no other binding or service.
     Given(&'a [Given]),
 }
 
@@ -177,7 +185,9 @@ fn rest(workspace: Option<&Path>, view: View<'_>, window: Window, begins: &str) 
          OutRig gives you.",
     );
     match view {
-        View::Session(bindings) if !bindings.is_empty() => text.push_str(&hosted(bindings)),
+        View::Session { bindings, services } if !bindings.is_empty() || !services.is_empty() => {
+            text.push_str(&held(bindings, services));
+        }
         View::Given(given) if !given.is_empty() => text.push_str(&facilities(given)),
         _ => {}
     }
@@ -354,47 +364,96 @@ fn indented(schema: &str) -> String {
         .join("\n")
 }
 
-/// What the agent is told of the session's bindings, of which there is at
-/// least one: each by name and description, and how a hosted object is used,
-/// with the first one's name standing in for any of them.
-fn hosted(bindings: &[Brief]) -> String {
-    let mut text = String::from(
-        "\n\nThese names are objects held by processes on the host, outside this container, \
-         with the user's own authority there; use each as its library documents. Importing the \
-         same library here gives a local copy that knows nothing of them, and `help()` on that \
-         copy's classes describes the library without asking the host.\n",
-    );
-    for binding in bindings {
-        let _ = write!(
-            text,
-            "\n- `{}`: {}",
-            binding.name,
-            binding.description.trim()
+/// What the agent is told of the session's bindings and services, of which
+/// there is at least one: each by name and description, and how they are
+/// used, with the first one's name standing in for any of them.
+fn held(bindings: &[Brief], services: &[ServiceBrief]) -> String {
+    let mut text = String::new();
+    if !bindings.is_empty() {
+        text.push_str(
+            "\n\nThese names are objects held by processes on the host, outside this container, \
+             with the user's own authority there; use each as its library documents. Importing \
+             the same library here gives a local copy that knows nothing of them, and `help()` on \
+             that copy's classes describes the library without asking the host.\n",
         );
-        if binding.serialize {
-            text.push_str(" Runs one call at a time.");
+        for binding in bindings {
+            let _ = write!(
+                text,
+                "\n- `{}`: {}",
+                binding.name,
+                binding.description.trim()
+            );
+            if binding.serialize {
+                text.push_str(" Runs one call at a time.");
+            }
+        }
+    }
+    if !services.is_empty() {
+        let _ = writeln!(
+            text,
+            "\n\nThese names are services the host runs, outside this container: each is \
+             {SERVICE_IS}, and `help(name)` describes its methods."
+        );
+        for service in services {
+            let _ = write!(
+                text,
+                "\n- `{}`: {}",
+                service.name,
+                service.description.trim()
+            );
         }
     }
     text.push_str("\n\n");
-    text.push_str(&blocking(&bindings[0].name));
+    text.push_str(&rules(
+        bindings.first().map(|binding| binding.name.as_str()),
+        services.first().map(|service| service.name.as_str()),
+    ));
     text.push_str(
         " `runtime.bindings` lists them, and `outrig.bindings[name]` reaches each wherever its \
-         name holds something else: a binding never replaces a name your code bound before it \
-         came, nor a builtin.",
+         name holds something else: ",
     );
+    text.push_str(match services.is_empty() {
+        true => "a binding never replaces",
+        false => "none replaces",
+    });
+    text.push_str(" a name your code bound before it came, nor a builtin.");
     text
 }
 
-/// The rule about a hosted object that looking cannot teach, with `example`
-/// standing in for any of them.
-fn blocking(example: &str) -> String {
-    format!(
-        "Every attribute read, call, iteration step, `len`, `repr` and comparison on one is a \
-         request to the host, and it blocks your event loop until the host answers: no message \
-         arrives and no timer fires meanwhile. For a long call, `await \
-         asyncio.to_thread(lambda: {example}.f(x))` runs the whole expression on a worker thread \
-         and keeps the loop turning."
-    )
+/// What a service is, as an agent holding one is told.
+const SERVICE_IS: &str = "an object whose methods are calls to the host, by value -- the \
+                          arguments and the result are JSON data --";
+
+/// The rules about bindings and services that looking cannot teach, for an
+/// agent holding `binding` and `service`, the first of each, of which there is
+/// at least one: that a use of one blocks the event loop until the host
+/// answers, with the first standing in for any; and, with a service, that a
+/// long one hands back a ticket, which the mechanism cannot enforce.
+fn rules(binding: Option<&str>, service: Option<&str>) -> String {
+    let lead = match (binding, service) {
+        (Some(_), None) => {
+            "Every attribute read, call, iteration step, `len`, `repr` and comparison on one is a \
+             request to the host"
+        }
+        (Some(_), Some(_)) => {
+            "Every attribute read, call, iteration step, `len`, `repr` and comparison on a \
+             binding, and every call of a service's method, is a request to the host"
+        }
+        (None, _) => "Every call of a service's method is a request to the host",
+    };
+    let example = binding.or(service).unwrap_or_default();
+    let mut text = format!(
+        "{lead}, and it blocks your event loop until the host answers: no message arrives and no \
+         timer fires meanwhile. For a long call, `await asyncio.to_thread(lambda: {example}.f(x))` \
+         runs the whole expression on a worker thread and keeps the loop turning."
+    );
+    if service.is_some() {
+        text.push_str(
+            " A service's method returns a value at once, so one that starts long work hands back \
+             a ticket: wait for its completion with `runtime.wait`, never inside a call.",
+        );
+    }
+    text
 }
 
 /// What a child given facilities is told of them, of which there is at least
@@ -416,6 +475,13 @@ fn facilities(given: &[Given]) -> String {
                     text.push_str(" Runs one call at a time.");
                 }
             }
+            FacilityKind::Service => {
+                let _ = write!(
+                    text,
+                    "\n- `{}`, a service the host runs: {description}",
+                    brief.name
+                );
+            }
             _ => {
                 let _ = write!(
                     text,
@@ -429,12 +495,27 @@ fn facilities(given: &[Given]) -> String {
         }
     }
     text.push_str("\n\n");
-    if let Some(binding) = given.iter().find(|f| f.brief.kind == FacilityKind::Binding) {
+    let first = |kind| {
+        given
+            .iter()
+            .find(|f| f.brief.kind == kind)
+            .map(|f| f.brief.name.as_str())
+    };
+    let (binding, service) = (first(FacilityKind::Binding), first(FacilityKind::Service));
+    if binding.is_some() {
         text.push_str(
             "A binding is an object held by a process on the host, outside this container, with \
              the user's own authority there; use it as its library documents. ",
         );
-        text.push_str(&blocking(&binding.brief.name));
+    }
+    if service.is_some() {
+        let _ = write!(
+            text,
+            "A service is {SERVICE_IS} and `help(name)` describes its methods. "
+        );
+    }
+    if binding.is_some() || service.is_some() {
+        text.push_str(&rules(binding, service));
         text.push(' ');
     }
     if given.iter().any(|f| f.brief.kind == FacilityKind::Object) {
@@ -672,7 +753,10 @@ mod tests {
     fn preamble(brief: &ChildBrief<'_>, inputs: &[InputBrief]) -> String {
         child_preamble(
             None,
-            View::Session(&[]),
+            View::Session {
+                bindings: &[],
+                services: &[],
+            },
             Window::DEFAULT,
             "Name the capital.",
             inputs,
@@ -753,8 +837,89 @@ mod tests {
             type_name: "git.Repo".into(),
             serialize: true,
         }];
-        let session = told(View::Session(&session));
+        let session = told(View::Session {
+            bindings: &session,
+            services: &[],
+        });
         assert!(session.contains("- `repo`: The repository."), "{session}");
+    }
+
+    /// A session's services are listed beside its bindings, by name and description, with the
+    /// blocking rule said once for both and the ticket sentence; a child given a service is told
+    /// of it, and of the same rules, and one given none hears nothing of services.
+    #[test]
+    fn services_are_told_beside_bindings_with_the_blocking_rule_once() {
+        fn told(view: View<'_>) -> String {
+            child_preamble(
+                None,
+                view,
+                Window::DEFAULT,
+                "Review.",
+                &[],
+                &ChildBrief::Work,
+            )
+        }
+        let bindings = [Brief {
+            name: "repo".into(),
+            description: "The repository.".into(),
+            type_name: "git.Repo".into(),
+            serialize: false,
+        }];
+        let services = [ServiceBrief {
+            name: "tracker".into(),
+            description: "The issue tracker.".into(),
+        }];
+        let both = told(View::Session {
+            bindings: &bindings,
+            services: &services,
+        });
+        for said in [
+            "- `repo`: The repository.",
+            "These names are services the host runs",
+            "- `tracker`: The issue tracker.",
+            "and every call of a service's method, is a request to the host",
+            "hands back a ticket: wait for its completion with `runtime.wait`",
+            "none replaces a name your code bound",
+        ] {
+            assert!(both.contains(said), "{said}: {both}");
+        }
+        assert_eq!(both.matches("blocks your event loop").count(), 1, "{both}");
+
+        let alone = told(View::Session {
+            bindings: &[],
+            services: &services,
+        });
+        assert!(
+            alone.contains("Every call of a service's method is a request to the host"),
+            "{alone}"
+        );
+        assert!(
+            alone.contains("`await asyncio.to_thread(lambda: tracker.f(x))`"),
+            "{alone}"
+        );
+        assert!(!alone.contains("objects held by processes"), "{alone}");
+
+        let given_one = told(View::Given(&[given(
+            "svc",
+            FacilityKind::Service,
+            "outrig.services.tracker",
+            "The issue tracker.",
+        )]));
+        for said in [
+            "- `svc`, a service the host runs: The issue tracker.",
+            "A service is an object whose methods are calls to the host",
+            "`await asyncio.to_thread(lambda: svc.f(x))`",
+            "hands back a ticket",
+        ] {
+            assert!(given_one.contains(said), "{said}: {given_one}");
+        }
+        let given_none = told(View::Given(&[given(
+            "task",
+            FacilityKind::Object,
+            "app.Task",
+            "",
+        )]));
+        assert!(!given_none.contains("service"), "{given_none}");
     }
 
     #[test]

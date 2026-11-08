@@ -106,7 +106,6 @@ phase.
 
 | Task      | What it settles                                     |
 | --------- | ----------------------------------------------------|
-| `0003-44` | A Rust service is a Python object                   |
 | `0003-45` | The instance is the child's `self`                  |
 | `0003-46` | An owner constructs the root in its kernel          |
 | `0003-47` | Instructions are composed from contributions        |
