@@ -28,14 +28,22 @@ keeps one root, so `outrig ls` finds the same sessions from any directory, and a
 sets `session-root` is rejected at load. See
 [Reference -> Config](../reference/config.md#top-level).
 
+Because `ls`, `logs`, `discard`, and `clean` need this one key and nothing else from the file, a
+global config that does not load does not stop them: outrig takes `session-root` out of it, warns
+that nothing else it sets is in effect, and carries on. `outrig run` reads the whole file and
+still refuses it. Only a root the damaged file states outright is used -- one plain string,
+nothing the parser had to repair, and the only mention of the key in the file. If the damage
+reaches the `session-root` declaration, or the file names the key anywhere else, the session
+commands stop too -- better than quietly listing, or cleaning, some other directory.
+
 ## Layout under the root
 
-Each session is a subdirectory of the root, named by session id (a UTC timestamp plus four
+Each session is a subdirectory of the root, named by session id (a UTC timestamp plus eight
 random hex digits -- sortable, unambiguous across concurrent runs):
 
 ```
 ~/.local/share/outrig/sessions/
-└── 20260501T134412-3f2a/
+└── 20260501T134412-3f2ad11c/
     ├── session.json              # id, timestamps, containers, image, exit status
     ├── outrig-enter              # launcher for view = "primary" sidecars, if any start
     ├── report.html               # the event log as a page, once you have rendered it
@@ -49,6 +57,11 @@ random hex digits -- sortable, unambiguous across concurrent runs):
         └── subagent-audit/       # transcripts of the subagents "audit" launched
             └── subagent-scan.log
 ```
+
+outrig makes an auto-allocated session's directory itself and fails if the name is taken, so two
+launches never share one: a launch whose id the root already holds draws another. Sessions
+recorded by outrig 0.2.2 and earlier have four hex digits where these have eight, and read the
+same.
 
 `session.json` names every container the session owns: `container_name` for the primary,
 plus `sidecar_container_names` when the config declares
@@ -68,8 +81,8 @@ it:
 
 ```
 ~/.local/share/outrig/sessions/
-├── 20260501T134412-3f2a/        # auto-allocated, real directory
-└── 20260501T141907-9b1c -> /tmp/my-debug-run/    # explicit --session-dir, symlink
+├── 20260501T134412-3f2ad11c/        # auto-allocated, real directory
+└── 20260501T141907-9b1c42f3 -> /tmp/my-debug-run/    # explicit --session-dir, symlink
 ```
 
 This means you can launch with a known path and read `session.json`, `logs/`, etc. directly
@@ -95,10 +108,10 @@ List sessions newest-first:
 
 ```sh
 $ outrig ls
-ID                     STARTED              DURATION  IMAGE      EXIT
-20260501T141907-9b1c   2026-05-01 14:19:07  0m44s     coding     0   -> /tmp/my-debug-run
-20260501T134412-3f2a   2026-05-01 13:44:12  2m18s     coding     0
-20260430T091203-44d2   2026-04-30 09:12:03  6m02s     planning   1
+ID                         STARTED              DURATION  IMAGE      EXIT
+20260501T141907-9b1c42f3   2026-05-01 14:19:07  0m44s     coding     0   -> /tmp/my-debug-run
+20260501T134412-3f2ad11c   2026-05-01 13:44:12  2m18s     coding     0
+20260430T091203-44d2ca73   2026-04-30 09:12:03  6m02s     planning   1
 ```
 
 `EXIT` is the outrig process exit code, not the agent's "did it succeed" signal -- there's no
@@ -117,7 +130,7 @@ An entry that can't be read -- a truncated write, or a schema outrig no longer u
 -- costs only its own row. `outrig ls` reports it on stderr and lists everything else:
 
 ```
-[outrig] skipping 20260430T091203-44d2: session.json at ...: missing field `image_tag`
+[outrig] skipping 20260430T091203-44d2ca73: session.json at ...: missing field `image_tag`
 ```
 
 If nothing in the root parsed, the notice says `no readable sessions (N skipped)` rather
@@ -140,7 +153,7 @@ $ outrig ls --session-root /var/lib/outrig/sessions
 Print one server's captured stderr by session id:
 
 ```sh
-$ outrig logs 20260501T134412-3f2a fs
+$ outrig logs 20260501T134412-3f2ad11c fs
 [mcp-server-filesystem] starting; root=/workspace
 [mcp-server-filesystem] tools/list: 3 tools advertised
 [mcp-server-filesystem] tools/call: list_directory({"path": "/workspace"})
@@ -157,8 +170,8 @@ $ outrig logs --session-dir /tmp/my-debug-run fs
 Omit the server name to get a directory listing of available logs:
 
 ```sh
-$ outrig logs 20260501T134412-3f2a
-[outrig] logs for session 20260501T134412-3f2a:
+$ outrig logs 20260501T134412-3f2ad11c
+[outrig] logs for session 20260501T134412-3f2ad11c:
   fs       (1.2 KiB)
   shell    (3.4 KiB)
 ```
@@ -169,7 +182,7 @@ by its path under `logs/`.
 Follow a still-running session's log:
 
 ```sh
-$ outrig logs 20260501T141907-9b1c shell --follow
+$ outrig logs 20260501T141907-9b1c42f3 shell --follow
 [shell-mcp-command] starting
 [shell-mcp-command] exec: cargo check
 warning: unused import: `std::collections::HashMap`
@@ -180,7 +193,8 @@ warning: unused import: `std::collections::HashMap`
 ```
 
 `--follow` (`-f`) tails the file with `tail -F`-style behavior: continues when the file rotates,
-returns when EOF is reached and no further writes are expected.
+and returns on its own once the session's record shows it has ended -- there is nothing left to
+write. Ctrl-C ends it earlier, same as any other command.
 
 When network audit or filter mode is enabled, `logs/network.jsonl` contains one Zeek
 `conn.log`-style JSON object per outbound TCP connection and one per name lookup. It is not
@@ -197,13 +211,16 @@ The log uses Zeek field names where OutRig has equivalent data: `ts` is Unix epo
 the sniffed application (`http`, `ssl`, `ssh`, or `-`), `duration` is seconds, and
 `orig_bytes` / `resp_bytes` count bytes sent and received by the container. OutRig-specific
 metadata is namespaced under `outrig.*`, including `outrig.action`, `outrig.rule`,
-`outrig.host`, and `outrig.host_source`. The last of those is `resolved` when the name in
-`outrig.host` is one the interceptor validated for that address and `asserted` when the
-container merely claimed it -- only a resolved name can have granted a hostname allow rule. A
-connection that a hostname `allow` entry granted may therefore show an `asserted` host: the name
-that earned the grant is a resolved one, which can be the name shown or another the container
-resolved to that address. `outrig.rule` says which entry decided, so read it against the policy;
-see [Reference -> Config](../reference/config.md#what-a-hostname-rule-matches). A
+`outrig.host`, `outrig.host_source`, and `outrig.resolved`. `outrig.host_source` is `resolved`
+when the name in `outrig.host` is one the interceptor validated for that address and `asserted`
+when the container merely claimed it -- only a resolved name can have granted a hostname allow
+rule. A connection that a hostname `allow` entry granted may therefore show an `asserted` host,
+and `outrig.resolved` is where the name that earned the grant is: a list of every name the
+interceptor had validated for `id.resp_h` when the connection was decided, which can include the
+name shown in `outrig.host` or others the container resolved to that address. It is left out when
+there were none. `outrig.rule` says which entry decided, so read it against the policy and
+`outrig.resolved`; see
+[Reference -> Config](../reference/config.md#what-a-hostname-rule-matches). A
 connection refused because its container already had 256 open through the interceptor is recorded
 with `outrig.action` `deny` and `outrig.rule` `connection-limit`. One that reached the
 interceptor's own listener without being redirected there -- a process in the container
@@ -211,6 +228,14 @@ connecting straight to the listener's port, which the redirect leaves alone beca
 loopback -- is closed on arrival and recorded with `outrig.action` `deny` and `outrig.rule`
 `not-redirected`. Its only destination is the listener itself, which the interceptor would
 otherwise dial from the host's network namespace.
+
+A connection the policy allowed whose upstream connect then failed -- refused, no route, or no
+answer within 20 seconds -- is closed and recorded with the decision as made, zero byte counts,
+and `outrig.error` saying why: `upstream connect failed: Connection refused (os error 111)`, or
+`upstream connect failed: timed out after 20s`. Where the dial went to a different address than
+`id.resp_h`, as it does for the host under pasta, the message names it after `via`. `conn_state`
+is `S0` as for any record with no response bytes, so `outrig.error` is what tells such a
+connection from one that opened and moved nothing, which has none.
 
 A name lookup is recorded as the UDP exchange with the interceptor's DNS listener that it is:
 `proto` is `udp`, `service` is `dns`, `id.resp_p` is 53, and `outrig.host` is the name the
@@ -352,17 +377,17 @@ Delete a session's directory -- `session.json`, `logs/`, `outrig-enter`, a rende
 `report.html`, and anything else in it:
 
 ```sh
-$ outrig discard 20260430T091203-44d2 --yes
-[outrig] removed ~/.local/share/outrig/sessions/20260430T091203-44d2
+$ outrig discard 20260430T091203-44d2ca73 --yes
+[outrig] removed ~/.local/share/outrig/sessions/20260430T091203-44d2ca73
 ```
 
 For sessions whose root entry is a symlink, discard removes both the real directory at the
 symlink target and the symlink itself:
 
 ```sh
-$ outrig discard 20260501T141907-9b1c --yes
+$ outrig discard 20260501T141907-9b1c42f3 --yes
 [outrig] removed /tmp/my-debug-run
-[outrig] removed ~/.local/share/outrig/sessions/20260501T141907-9b1c (symlink)
+[outrig] removed ~/.local/share/outrig/sessions/20260501T141907-9b1c42f3 (symlink)
 ```
 
 You can also point at a session directory directly, or at its symlink under the root, which
@@ -377,8 +402,20 @@ directory starts new or empty, so everything in it is the session's. A symlink i
 unlinked, never followed. Versions before 0.2.2 let a session start in a directory that already
 held other files, and discarding one of those sessions removes them too.
 
-A session that's still running can't be discarded; outrig refuses with an error pointing at the
-running container.
+A session that's still running can't be discarded; outrig refuses with an error pointing at what
+is holding it. Two things count as running, and either is enough: the process that launched the
+session still holds its session directory, or the container named in the record is up. The first
+is what protects a session whose container does not exist yet -- a cold image build takes
+minutes, and until it finishes the record looks exactly like a session that ended without
+writing an `ended_at`. The hold is released once the session's record is finalized, and the
+kernel releases it however the launching process dies, so a record left behind by a killed
+`outrig run` stays discardable.
+
+The check runs once before the `[y/N]` prompt and once more right before the record is removed,
+so a container someone starts while the prompt is open is still caught. The second look narrows
+the window between "running" being checked and the record going away to the time between that
+look and the removal; it does not close it -- nothing stops a container from starting the instant
+after.
 
 ## `outrig clean`
 
@@ -388,8 +425,8 @@ window, previews the sessions it will remove, then asks once before deleting:
 ```sh
 $ outrig clean
 [outrig] will remove 2 sessions older than 30d:
-  20260401T134412-3f2a  ended 2026-04-01 13:46:30  /tmp/old-a
-  20260402T091203-44d2  ended 2026-04-02 09:18:54  /tmp/old-b
+  20260401T134412-3f2a1720  ended 2026-04-01 13:46:30  /tmp/old-a
+  20260402T091203-44d26334  ended 2026-04-02 09:18:54  /tmp/old-b
 Clean 2 sessions? [y/N]:
 ```
 
@@ -411,7 +448,14 @@ $ outrig clean --older-than 30d --yes
 remove the session directory, while sessions created with `--session-dir` remove both the
 symlink target and the symlink under the session root, each directory whole. Running sessions
 are skipped so cleanup doesn't race a live `outrig run`, `outrig run-new`, or `outrig mcp`
-writer.
+writer -- by the same two-part test `discard` uses, so a short `--older-than` cannot sweep up a
+session that is still building its image.
+
+That test runs once to build the preview and once more right before each record's removal, so a
+session whose container starts while the `Clean ...? [y/N]:` prompt is open is kept rather than
+removed, and reported the way a session the preview itself caught is. As with `discard`, the
+second look only narrows the gap between "running" being checked and the record going away; it
+cannot close it.
 
 A record outrig cannot read is not shown to you, so `--yes` does not remove it: `clean` names
 it and leaves it. Add `--unreadable` to have it previewed and removed with the rest, aged by the
@@ -422,23 +466,33 @@ that one.
 Alongside the record walk, `outrig clean` sweeps for *stray containers*: podman containers
 carrying the `org.outrig.session` label whose session record no longer exists (a lost record,
 a SIGKILLed outrig, a failed `--rm`). Stopped strays older than the cutoff are removed with
-`podman rm -f` and appear in the same preview/confirmation; running labeled containers are
+`podman rm` and appear in the same preview/confirmation; running labeled containers are
 never removed, only reported:
 
 ```sh
 $ outrig clean --older-than 7d
 [outrig] will remove 1 session older than 7d:
-  20260401T134412-3f2a  ended 2026-04-01 13:46:30  /tmp/old-a
+  20260401T134412-3f2a1720  ended 2026-04-01 13:46:30  /tmp/old-a
 [outrig] will remove 1 stray container older than 7d (no session record):
-  outrig-20260330T101500-88aa-tools  sidecar tools, session 20260330T101500-88aa
+  outrig-20260330T101500-88aa84ff-tools  sidecar tools, session 20260330T101500-88aa84ff
 Clean 1 session and 1 stray container? [y/N]:
 ```
 
+A stray whose creation time cannot be read has no age to compare with the cutoff, so `clean`
+reports it under `skipped labeled containers with no creation time` and leaves it alone.
+
 Each `[outrig] removed container <name>` line is a claim about that container, checked by
-re-reading the container list rather than inferred from the batched `podman rm -f`'s exit
+re-reading the container list rather than inferred from the batched `podman rm`'s exit
 status -- one status for every name in the batch cannot say which of them went away. A name the
 batch skipped is retried on its own; one that is still there afterwards is reported as
-`could not remove container <name>`, and a sweep that ends with any of those exits `1`.
+`could not remove container <name>: <reason>`, with podman's own explanation, and a sweep that
+ends with any of those exits `1`.
+
+The removal is not forced, because the listing that chose the strays is older than the moment of
+removal by as long as the prompt stays open. A stray someone started in that window is live
+(running or paused) when `clean` acts, and podman refuses to remove a live container without
+`-f`; `clean` keeps it and reports `kept container <name>: it is running or paused`. That is the
+guarantee holding, not a failure, so it does not change the exit status.
 
 A third sweep, `--build-containers`, is available for the buildah *working containers* an
 interrupted build can leave behind. It is off by default and is the one sweep outrig cannot

@@ -15,7 +15,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::config::{
-    MCP_CALL_TIMEOUT_SECS_CEILING, McpServerSpec, is_valid_mcp_server_name,
+    MCP_CALL_TIMEOUT_SECS_CEILING, McpServerSpec, check_env_keys, is_valid_mcp_server_name,
     mcp_call_timeout_secs_in_range, mcp_command_is_empty,
 };
 use crate::container::Container;
@@ -135,6 +135,14 @@ pub enum EmbeddedImageConfigError {
     ArgsInLabel { server: String },
 
     #[error(
+        "mcp server {server:?} env key {key:?} is not an environment variable name; \
+         podman reads each entry as `KEY=value`, so a key holding `=` sets a shorter \
+         name with the rest of itself in the value, and an empty one is refused when \
+         the engine runs; write a name matching ^[A-Za-z_][A-Za-z0-9_]*$"
+    )]
+    EnvKeyInvalid { server: String, key: String },
+
+    #[error(
         "mcp server {server:?} call-timeout-secs must be between 1 and {max} seconds; \
          got {value}"
     )]
@@ -186,6 +194,14 @@ pub enum StandaloneImageTomlError {
     ArgsInLabel { server: String },
 
     #[error(
+        "mcp server {server:?} env key {key:?} is not an environment variable name; \
+         podman reads each entry as `KEY=value`, so a key holding `=` sets a shorter \
+         name with the rest of itself in the value, and an empty one is refused when \
+         the engine runs; write a name matching ^[A-Za-z_][A-Za-z0-9_]*$"
+    )]
+    EnvKeyInvalid { server: String, key: String },
+
+    #[error(
         "mcp server {server:?} call-timeout-secs must be between 1 and {max} seconds; \
          got {value}"
     )]
@@ -211,9 +227,7 @@ pub fn parse_standalone_image_toml(
 pub async fn read_standalone_image_mcp(
     container: &Container,
 ) -> Result<BTreeMap<String, McpServerSpec>> {
-    let labels =
-        crate::image::read_image_labels(container.image_tag(), container.transcript().as_ref())
-            .await?;
+    let labels = container.image_labels().await?;
     standalone_mcp_from_labels(&labels)
 }
 
@@ -321,12 +335,33 @@ fn to_json_label<T: serde::Serialize>(key: &str, value: &T) -> Result<String> {
 /// missing label is an empty map, a malformed one is a hard error. Sidecar
 /// planning uses this to materialize label-declared servers before any
 /// sidecar container exists.
+///
+/// A tag is a pointer and a pull moves it, so this answers for whatever the
+/// tag names *now*. That is what a caller deciding what to start wants, since
+/// the launch that follows resolves the same tag. Once a container is running,
+/// what it will serve is declared by the image it started from, and
+/// [`read_embedded_mcp_of`] is the read for that.
 pub async fn read_embedded_mcp(
     tag: &crate::image::ImageTag,
     transcript: Option<&crate::process::Transcript>,
 ) -> Result<BTreeMap<String, McpServerSpec>> {
     let labels = crate::image::read_image_labels(tag, transcript).await?;
     embedded_mcp_from_labels(tag.as_str(), &labels)
+}
+
+/// [`read_embedded_mcp`] for a container that is already running: the label is
+/// read off the image that container was started from, by the engine's id for
+/// it, so a pull that has since moved the tag cannot change the answer.
+///
+/// This is the read for a borrowed container (`outrig mcp --attach`), which may
+/// have been started long enough ago for its tag to have been re-pointed, and
+/// for any other container outrig holds a handle to. Errors name the handle's
+/// tag, which is what the caller asked for; the id names nothing a user wrote.
+pub async fn read_embedded_mcp_of(
+    container: &Container,
+) -> Result<BTreeMap<String, McpServerSpec>> {
+    let labels = container.image_labels().await?;
+    embedded_mcp_from_labels(container.image_tag().as_str(), &labels)
 }
 
 /// The MCP table a running container will actually serve: the servers
@@ -360,9 +395,12 @@ pub(crate) async fn merged_mcp_with_source(
     config_mcp: &BTreeMap<String, McpServerSpec>,
     config_source: McpDeclarationSource,
 ) -> Result<BTreeMap<String, McpServerSpecWithSource>> {
-    let labels =
-        crate::image::read_image_labels(container.image_tag(), container.transcript().as_ref())
-            .await?;
+    // By image id, not by `container.image_tag()`: the tag is what the
+    // container was asked for and a pull can move it, and what this container
+    // will actually serve is declared by the image it is running.
+    let labels = container.image_labels().await?;
+    // The error still names the tag, which is what the caller asked for and
+    // what they can act on; the id names nothing a user wrote down.
     let image_mcp = embedded_mcp_from_labels(container.image_tag().as_str(), &labels)?;
     Ok(merge_mcp_with_source(image_mcp, config_mcp, config_source))
 }
@@ -499,6 +537,15 @@ fn parse_mcp_table(
             });
         }
     }
+    // After the per-server rules above, so a label whose server is also
+    // malformed in some other way is reported by that rule first, as it was
+    // before keys were checked at all.
+    if let Some((server, key)) = check_env_keys(&mcp) {
+        return Err(EmbeddedImageConfigError::EnvKeyInvalid {
+            server: server.to_string(),
+            key: key.to_string(),
+        });
+    }
     Ok(mcp)
 }
 
@@ -611,6 +658,12 @@ impl TryFrom<StandaloneImageTomlRaw> for StandaloneImageToml {
                     max: MCP_CALL_TIMEOUT_SECS_CEILING,
                 });
             }
+        }
+        if let Some((server, key)) = check_env_keys(&mcp) {
+            return Err(StandaloneImageTomlError::EnvKeyInvalid {
+                server: server.to_string(),
+                key: key.to_string(),
+            });
         }
 
         Ok(Self {
@@ -1014,6 +1067,31 @@ mod tests {
         }
     }
 
+    /// A label is read off an image the repo only names, so its `env` keys are
+    /// held to the same grammar a config file's are: `"A=B"` would otherwise
+    /// reach podman as `--env A=B=c` and set `A`.
+    #[test]
+    fn parse_mcp_table_refuses_an_env_key_that_is_not_a_variable_name() {
+        for key in ["A=B", "", "my-key", "K*"] {
+            let json = serde_json::json!({"build": {"command": ["cargo-mcp"], "env": {key: "v"}}});
+            let err = parse_mcp_table(&json.to_string()).unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    EmbeddedImageConfigError::EnvKeyInvalid { server, key: k }
+                        if server == "build" && k == key
+                ),
+                "{key:?}: {err:?}"
+            );
+        }
+
+        let ok = parse_mcp_table(
+            r#"{"build": {"command": ["cargo-mcp"], "env": {"http_proxy": "http://p:3128"}}}"#,
+        )
+        .expect("a lower-case key is a key");
+        assert_eq!(ok["build"].env()["http_proxy"].to_raw(), "http://p:3128");
+    }
+
     #[test]
     fn embedded_mcp_missing_label_is_empty() {
         let mcp =
@@ -1296,6 +1374,36 @@ mod tests {
         let labels = standalone_config_to_labels(&cfg).expect("stamp labels");
         let read = parse_mcp_table(&labels[LABEL_MCP]).expect("read the label back");
         assert_eq!(read["build"].call_timeout_secs(), Some(1800));
+    }
+
+    /// `outrig image build` refuses a key before it stamps the label, as it
+    /// refuses an out-of-range deadline: an image whose label every runtime
+    /// would then refuse is not worth building.
+    #[test]
+    fn standalone_image_toml_refuses_an_env_key_that_is_not_a_variable_name() {
+        let err = parse_standalone_image_toml(
+            r#"
+            [image]
+            ref = "rust-dev"
+
+            [mcp]
+            build = { command = ["cargo-mcp"], env = { "A=B" = "c" } }
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StandaloneImageTomlError::EnvKeyInvalid { server, key }
+                    if server == "build" && key == "A=B"
+            ),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains(r#"env key "A=B" is not an environment variable name"#),
+            "{err}"
+        );
     }
 
     fn env_ref(var: &str) -> EnvValue {

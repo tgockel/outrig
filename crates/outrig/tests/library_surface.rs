@@ -17,6 +17,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use outrig::config::{Config, EnvValue, McpServerSpec, ResolvedEnvValue};
+use outrig::container::{
+    Container, ContainerCreateOptions, ContainerLaunchSpec, PrimaryView, sidecar,
+};
+use outrig::image::ImageTag;
 use outrig::{
     CapabilityProfile, CapabilitySpec, EmbeddedMcpPolicy, ExecOptions, LaunchSpec, MountAccess,
     MountSpec, NetworkAction, NetworkMode, NetworkPolicy, Outrig, SecuritySpec, SidecarSpec,
@@ -169,15 +173,18 @@ fn fs_command(path: &str) -> Vec<String> {
 /// Container names carrying the given `org.outrig.sidecar` label, running
 /// or exited.
 fn sidecar_containers_labeled(sidecar: &str) -> Vec<String> {
+    podman_ps_names(&format!("label=org.outrig.sidecar={sidecar}"))
+}
+
+/// Names of every container made from `tag`, running or not.
+fn containers_of_image(tag: &str) -> Vec<String> {
+    podman_ps_names(&format!("ancestor={tag}"))
+}
+
+/// Names of the containers a `podman ps -a --filter` selects.
+fn podman_ps_names(filter: &str) -> Vec<String> {
     let output = std::process::Command::new("podman")
-        .args([
-            "ps",
-            "-a",
-            "--filter",
-            &format!("label=org.outrig.sidecar={sidecar}"),
-            "--format",
-            "{{.Names}}",
-        ])
+        .args(["ps", "-a", "--filter", filter, "--format", "{{.Names}}"])
         .output()
         .expect("podman ps");
     String::from_utf8_lossy(&output.stdout)
@@ -697,6 +704,133 @@ async fn primary_view_sidecar_from_library_sees_the_primary_filesystem() {
     );
 }
 
+/// Run a `view = "primary"` sidecar that `add_sidecar` would refuse, and hand
+/// back what happened to its payload. It is built below that validation, the
+/// way a caller holding a [`ContainerLaunchSpec`] can, so the launcher's own
+/// behavior can be seen without the config rules standing in front of it.
+///
+/// `configure` edits the sidecar's launch spec -- the knob under test. Stock
+/// Alpine is both containers: the payload is its own `busybox` with `args` after
+/// it (`/bin/sh` would canonicalize to `/bin/busybox` and so reach busybox as
+/// `argv[0]` = `busybox`, which reads its first argument as the applet), and the
+/// launcher's `--entrypoint` replaces whatever the image declares. `args` replace
+/// the image's `CMD` and reach the payload bare, in the primary's coordinates, so
+/// `/proc/self/status` is the fresh procfs the launcher mounted and not a path
+/// under the graft. The caller holds `E2E_LOCK`.
+async fn run_view_sidecar_below_validation(
+    configure: impl FnOnce(&mut ContainerLaunchSpec),
+    args: &[&str],
+) -> std::process::Output {
+    const ALPINE: &str = "docker.io/library/alpine:latest";
+    ensure_image(ALPINE);
+    let image = ImageTag::new(ALPINE);
+
+    let mut primary = Container::start(&image, ContainerLaunchSpec::default())
+        .await
+        .expect("start the primary");
+    primary
+        .bootstrap_user()
+        .await
+        .expect("bootstrap the primary's user");
+
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let mut launch = ContainerLaunchSpec::default();
+    launch.primary_view = Some(PrimaryView::new(
+        primary.selector(),
+        primary.pid().await.expect("the primary's pid"),
+        outrig::container::enter::materialize(session_dir.path())
+            .expect("materialize the launcher"),
+        primary.home_dir().expect("the primary's home"),
+    ));
+    configure(&mut launch);
+    let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    let sidecar = Container::create_initialized(
+        ContainerCreateOptions::new(image, launch, format!("{}-sidecar", primary.name()))
+            .with_args(sidecar::entrypoint_create_args(
+                SidecarView::Primary,
+                &["/bin/busybox".to_string()],
+                &[],
+                &args,
+                primary.container_workspace(),
+                Some((primary.uid(), primary.gid())),
+            )),
+    )
+    .await
+    .expect("create the view sidecar below the validation");
+
+    let output = std::process::Command::new("podman")
+        .args(["start", "--attach"])
+        .arg(sidecar.selector())
+        .output()
+        .expect("spawn podman start");
+
+    primary
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop the primary");
+    output
+}
+
+/// The launcher puts the payload under `no_new_privs` itself, whatever the
+/// container was started with (#398; see `drop_privileges` in the launcher).
+/// With the container's flag off, `NoNewPrivs: 1` can only be the launcher's,
+/// and the kernel's own record of it is what the payload prints.
+#[tokio::test]
+async fn primary_view_payload_is_under_no_new_privs_without_the_containers_flag() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let output = run_view_sidecar_below_validation(
+        |launch| launch.no_new_privileges = false,
+        &["grep", "-E", "^(NoNewPrivs|CapEff)", "/proc/self/status"],
+    )
+    .await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the payload failed: {:?}\nstdout: {stdout}\nstderr: {stderr}",
+        output.status,
+    );
+    // Every other line the payload could print is the kernel's, so match the
+    // whole `name:<tab>value` rather than a suffix a different field might share.
+    assert!(
+        stdout.contains("NoNewPrivs:\t1"),
+        "the launcher should set no_new_privs on the payload itself, got: {stdout}",
+    );
+    assert!(
+        stdout.contains("CapEff:\t0000000000000000"),
+        "the payload should hold no effective capability, got: {stdout}",
+    );
+}
+
+/// `setns(CLONE_NEWNS)` needs `CAP_SYS_CHROOT` beside `CAP_SYS_ADMIN`, and
+/// podman's default set is where the sidecar gets it -- so a `cap-drop` of it
+/// fails the launch there. Config validation refuses that `cap-drop` now; this
+/// is what a caller that bypasses it sees, and the hint must name the
+/// capability that is missing rather than only the ones that are not (#398).
+#[tokio::test]
+async fn primary_view_launcher_without_sys_chroot_names_it() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let output = run_view_sidecar_below_validation(
+        |launch| launch.capabilities.cap_drop.push("SYS_CHROOT".to_string()),
+        &["true"],
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a launcher without CAP_SYS_CHROOT cannot join the primary's mount namespace",
+    );
+    assert!(
+        stderr.contains("setns(CLONE_NEWNS): Operation not permitted")
+            && stderr.contains("CAP_SYS_CHROOT"),
+        "the launcher should fail at the setns and name the missing capability, got: {stderr}",
+    );
+}
+
 /// `view = "primary"` with a **glibc** sidecar against a primary carrying a
 /// *differently versioned* glibc -- the pairing that caught `outrig-enter`
 /// exec'ing the wrong dynamic loader.
@@ -1033,7 +1167,9 @@ async fn primary_view_sidecar_without_dac_override_masks_an_unreadable_ld_so_pre
 /// with `Error loading shared library liblzma.so.5`. The primary has the
 /// library only in `/opt/pmark`, which its path file names, and nowhere the
 /// loader's built-in directories reach. Were the primary's path file read, the
-/// loader would find the library there and `xz` would start instead.
+/// loader would find the library there and `xz` would start instead. The
+/// launcher now settles the payload's libraries itself (task 0003-01), so the
+/// failure is its own message naming the library, not the loader's.
 #[tokio::test]
 async fn primary_view_musl_sidecar_does_not_read_the_primarys_library_path_file() {
     let _guard = E2E_LOCK.lock().await;
@@ -1087,9 +1223,11 @@ async fn primary_view_musl_sidecar_does_not_read_the_primarys_library_path_file(
         .expect_err("a library only the primary's path file names must not be found");
     let stderr = std::fs::read_to_string(session_dir.path().join("logs/pathfile.stderr"))
         .expect("the server's stderr file");
+    // The launcher refuses before the exec, since the sidecar has no copy the
+    // loader could use -- the primary's, which its path file names, is not one.
     assert!(
-        stderr.contains("Error loading shared library liblzma.so.5"),
-        "the payload should fail to find liblzma.so.5, got: {stderr:?}",
+        stderr.contains("DT_NEEDED liblzma.so.5 (needed by /usr/bin/xz) is not in the sidecar"),
+        "the launch should name the missing liblzma.so.5, got: {stderr:?}",
     );
 
     assert_eq!(
@@ -1098,6 +1236,90 @@ async fn primary_view_musl_sidecar_does_not_read_the_primarys_library_path_file(
         "a failed add should leave no container"
     );
     outrig.shutdown().await.expect("shutdown");
+}
+
+/// What the three #595 escapes have in common: the sidecar's own `liblzma.so.5`
+/// is only reachable through something the loader resolves after the setns --
+/// an absolute symlink, or a directory its own musl path file names -- and the
+/// primary holds a *different* copy of the library in the same place, or none.
+/// `xz` must start on the sidecar's copy; `--no-such-option` makes a start show
+/// on stderr.
+async fn primary_view_own_library_case(label: &str, sidecar_dockerfile: &str) {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let primary_tag = format!(
+        "localhost/outrig-library-surface-view-{label}-primary-{}:latest",
+        std::process::id(),
+    );
+    // The primary's lookalike must not be what the payload runs on: it has no
+    // `liblzma.so.5` in the loader's reach, only a decoy in `/opt/hidden`.
+    build_image_from_dockerfile(
+        &primary_tag,
+        "FROM docker.io/library/alpine:latest\n\
+         RUN mkdir -p /opt/hidden && echo decoy > /opt/hidden/liblzma.so.5\n",
+    );
+    let sidecar_tag = format!(
+        "localhost/outrig-library-surface-view-{label}-sidecar-{}:latest",
+        std::process::id(),
+    );
+    build_image_from_dockerfile(&sidecar_tag, sidecar_dockerfile);
+
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let spec = LaunchSpec::from_image(
+        primary_tag,
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    );
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+    // `xz` is not an MCP server, so the add fails either way; stderr says how far
+    // the payload got.
+    let _ = outrig
+        .add_sidecar(
+            SidecarSpec::from_image(label, sidecar_tag.as_str())
+                .with_view(SidecarView::Primary)
+                .with_entrypoint_server(label, ["--no-such-option"]),
+        )
+        .await;
+    let stderr = std::fs::read_to_string(session_dir.path().join(format!("logs/{label}.stderr")))
+        .expect("the server's stderr file");
+    assert!(
+        stderr.contains("unrecognized option"),
+        "xz should start on the sidecar's own liblzma.so.5, got: {stderr:?}",
+    );
+    outrig.shutdown().await.expect("shutdown");
+}
+
+/// #595 case 1: the library is an absolute symlink inside the sidecar.
+#[tokio::test]
+async fn primary_view_sidecar_library_behind_an_absolute_symlink_is_found() {
+    primary_view_own_library_case(
+        "abslink",
+        "FROM docker.io/library/alpine:latest\n\
+         RUN apk add --no-cache xz \
+         && mkdir /opt/real \
+         && mv /usr/lib/liblzma.so.5.* /opt/real/ \
+         && rm /usr/lib/liblzma.so.5 \
+         && ln -s /opt/real/$(ls /opt/real) /usr/lib/liblzma.so.5\n\
+         ENTRYPOINT [\"/usr/bin/xz\"]\n",
+    )
+    .await;
+}
+
+/// #595 case 3: the library is only in a directory the sidecar's own musl path
+/// file names, over a primary whose same-named file in that directory is a decoy.
+#[tokio::test]
+async fn primary_view_sidecar_library_named_by_its_own_path_file_is_found() {
+    primary_view_own_library_case(
+        "ownpath",
+        "FROM docker.io/library/alpine:latest\n\
+         RUN apk add --no-cache xz \
+         && mkdir /opt/hidden \
+         && mv /usr/lib/liblzma.so.5* /opt/hidden/ \
+         && echo /opt/hidden:/lib:/usr/local/lib:/usr/lib > /etc/ld-musl-$(uname -m).path\n\
+         ENTRYPOINT [\"/usr/bin/xz\"]\n",
+    )
+    .await;
 }
 
 /// A `view = "primary"` sidecar whose `ENTRYPOINT` names a program no `PATH`
@@ -1871,6 +2093,67 @@ async fn failed_add_sidecar_leaves_session_usable() {
     outrig.shutdown().await.expect("shutdown");
 }
 
+/// A dropped `add_sidecar` leaves the session as a failed one does: the
+/// container is gone and so is its interceptor attachment, so the same spec can
+/// be added again. The attachment used to outlive the dropped future, and every
+/// retry was refused as already attached until `shutdown`.
+#[tokio::test]
+async fn dropped_add_sidecar_leaves_its_name_free_under_the_interceptor() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let tag = format!(
+        "localhost/outrig-library-surface-dropped-add-{}:latest",
+        std::process::id(),
+    );
+    build_fixture_image(&tag);
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let spec = LaunchSpec::from_image(
+        tag.clone(),
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    )
+    .with_workspace(outrig::WorkspaceSpec::new(host_ws.path(), "/workspace"))
+    .with_network_mode(NetworkMode::Audit);
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    // A server that never answers `initialize` holds the add in its connect.
+    let hang = || {
+        SidecarSpec::from_image("slow", tag.as_str())
+            .with_server("hang", vec!["sleep".to_string(), "infinity".to_string()])
+    };
+    let first = tokio::time::timeout(Duration::from_secs(15), outrig.add_sidecar(hang())).await;
+    assert!(
+        first.is_err(),
+        "the first add must be dropped mid-connect: {first:?}"
+    );
+
+    // The dropped add's container is removed in the background.
+    for _ in 0..100 {
+        if sidecar_containers_labeled("slow").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        sidecar_containers_labeled("slow"),
+        Vec::<String>::new(),
+        "the dropped add should leave no container"
+    );
+
+    // The retry reaches the connect again (and is dropped there) instead of
+    // being refused at the attach.
+    let second = tokio::time::timeout(Duration::from_secs(15), outrig.add_sidecar(hang())).await;
+    assert!(
+        second.is_err(),
+        "the retry must reach the connect, not be refused: {second:?}"
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn added_sidecar_egress_obeys_network_policy() {
     let _guard = E2E_LOCK.lock().await;
@@ -1951,6 +2234,113 @@ async fn added_sidecar_egress_obeys_network_policy() {
         "network log should attribute the added sidecar's denied egress to \
          its container:\n{log}"
     );
+}
+
+/// An image that sets an `ENTRYPOINT` -- which `containers.md` asks nobody to
+/// do, and which podman gives `sleep infinity` as its arguments -- runs it the
+/// moment the primary starts. Under interception the primary is held until the
+/// interceptor is attached, so what the entrypoint reaches for first is
+/// already under policy (#395).
+///
+/// The entrypoint's only action is one request to a listener on the host, whose
+/// port it reads from the workspace. The request has to be one that *completes*
+/// if nothing stands in its way: a target that never answers keeps retransmitting
+/// its SYN, and the redirect that is installed later catches the retransmission,
+/// so even a primary that started too early would be recorded. Started before
+/// the interceptor attached, this request is answered by the listener, unseen;
+/// started after, the deny-all policy refuses it before any upstream connection
+/// is made, and writes a record naming the primary.
+#[tokio::test]
+async fn the_primarys_entrypoint_egress_obeys_network_policy() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let tag = format!(
+        "localhost/outrig-library-surface-primary-entrypoint-{}:latest",
+        std::process::id(),
+    );
+    build_image_with_entrypoint(
+        &tag,
+        "docker.io/library/alpine:latest",
+        &[
+            "/bin/sh",
+            "-c",
+            "wget -T 5 -qO- \"http://host.containers.internal:$(cat /workspace/port)/\" \
+             >/dev/null 2>&1; exec \"$@\"",
+            "entrypoint",
+        ],
+    );
+
+    let fixture = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("bind fixture listener");
+    fixture
+        .set_nonblocking(true)
+        .expect("fixture listener nonblocking");
+    let port = fixture.local_addr().expect("fixture listener addr").port();
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    std::fs::write(host_ws.path().join("port"), port.to_string()).expect("write port");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let log_dir = session_dir.path().join("logs");
+
+    let policy = NetworkPolicy::builder()
+        .default_action(NetworkAction::Deny)
+        .allow_host_port("github.com", 443)
+        .build()
+        .expect("policy builds");
+    let spec = LaunchSpec::from_image(tag.clone(), BTreeMap::new(), log_dir.clone())
+        .with_workspace(outrig::WorkspaceSpec::new(host_ws.path(), "/workspace"))
+        .with_network_filter(policy);
+
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    let primaries = containers_of_image(&tag);
+    assert_eq!(
+        primaries.len(),
+        1,
+        "expected one primary container: {primaries:?}"
+    );
+    let primary = &primaries[0];
+
+    // The entrypoint runs when the primary is released, which is before
+    // `launch` returns but not necessarily before its one request has been
+    // decided, so wait for the record rather than for the shutdown to flush it.
+    let log_path = log_dir.join("network.jsonl");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let record = loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let found = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["id.resp_p"].as_u64() == Some(u64::from(port)));
+        if let Some(record) = found {
+            break record;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no record of the entrypoint's request to port {port} in {}:\n{log}",
+            log_path.display(),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        record["outrig.container"].as_str(),
+        Some(primary.as_str()),
+        "the entrypoint's request is the primary's: {record:#?}"
+    );
+    assert_eq!(
+        record["outrig.action"].as_str(),
+        Some("deny"),
+        "deny-all refuses the entrypoint's request: {record:#?}"
+    );
+    // Refused before the upstream was dialed: nothing connected. A connect
+    // that completed would be queued on the listener whether or not anything
+    // ever called `accept`.
+    match fixture.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("the entrypoint's request reached the host listener: {other:?}"),
+    }
+
+    outrig.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]

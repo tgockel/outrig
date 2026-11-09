@@ -87,7 +87,7 @@ Two complementary approaches.
 **Tool-call traces via `--verbose`:**
 
 ```sh
-$ outrig run --verbose 2> trace.log
+$ OUTRIG_LOG=info outrig run --verbose 2> trace.log
 > add unit tests for parse_config
 ...
 > ^D
@@ -95,7 +95,9 @@ $ less trace.log
 ```
 
 `trace.log` contains every buildah/podman invocation, every MCP tool call with its arguments, and
-every assistant turn delineator.
+every assistant turn delineator. The `OUTRIG_LOG=info` matters: the default filter holds the
+agent library's per-turn lines at `warn`, and those are the turn delineators. A set `OUTRIG_LOG`
+replaces the default, so `info` brings them back.
 
 **git as the source of truth for filesystem changes:**
 

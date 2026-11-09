@@ -1287,8 +1287,14 @@ async fn a_graceful_child_writing_invalid_utf8_still_finishes() {
 /// [`Owned::keepalive`] still holds open would block instead. The property
 /// under test is the one that matters either way: the drain does not stop
 /// before its stream ends.
+///
+/// It also hands back what it read. The record failing is not the stream's
+/// failure, and a drain that returned `Err` here discarded the bytes of a
+/// command that had already run.
 #[tokio::test(flavor = "current_thread")]
 async fn a_failing_transcript_does_not_stop_the_drain() {
+    // The drain warns once about the transcript. See `TRACING_CALLSITES`.
+    let _emitting = emitting().await;
     let transcript = Transcript::create(Path::new("/dev/full"), false)
         .await
         .expect("a transcript whose every write fails");
@@ -1311,17 +1317,89 @@ async fn a_failing_transcript_does_not_stop_the_drain() {
         ),
     )
     .await
-    .expect("the drain stopped reading and never returned");
+    .expect("the drain stopped reading and never returned")
+    .expect("a transcript that failed is not the stream's failure");
 
-    assert!(
-        drained.is_err(),
-        "a transcript that failed every write should still be reported"
+    assert_eq!(
+        drained,
+        b"a line of output\n".repeat(200),
+        "the drain kept everything the stream carried"
     );
     tokio::time::timeout(Duration::from_secs(20), pump)
         .await
         .expect("the writer was left blocked on a stream nobody was draining")
         .expect("the pump task panicked")
         .expect("the writer must have been able to finish");
+}
+
+/// The command is what succeeded, and what a caller reads is the command's
+/// result: `podman stop` exiting 0 is `Done` and `podman run -d` exiting 0 is
+/// a container, whatever the `-v` transcript could or could not hold.
+///
+/// Both transcript writes fail here -- the `$` echo and the lines -- and the
+/// two are reported where they happen, each stream once and the echo once,
+/// instead of in place of the output.
+#[test]
+fn a_transcript_that_cannot_be_written_does_not_fail_a_successful_command() {
+    let (output, warned) = with_captured_tracing_at(tracing::Level::WARN, async {
+        let transcript = Transcript::create(Path::new("/dev/full"), false)
+            .await
+            .expect("a transcript whose every write fails");
+        let cmd = Cmd::new("/bin/sh").args(["-c", "echo out; echo err 1>&2"]);
+        let logged = super::run_capture_logged(cmd.clone(), "test", Some(&transcript))
+            .await
+            .expect("the command succeeded, so the call does");
+        let until = super::try_capture_logged_until(
+            cmd,
+            "test",
+            Some(&transcript),
+            Termination::Kill,
+            std::future::pending(),
+        )
+        .await
+        .expect("the stoppable capture is the same call");
+        (logged, until)
+    });
+
+    for output in [&output.0, &output.1] {
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
+    }
+    assert!(
+        warned.contains("the transcript could not be written"),
+        "the record coming up short should be said, got: {warned:?}"
+    );
+}
+
+/// The other half: a command that failed is reported as the command that
+/// failed -- its exit code and stderr -- and not as the transcript's `ENOSPC`,
+/// which would hide the one thing the caller can act on.
+#[test]
+fn a_transcript_that_cannot_be_written_does_not_replace_a_commands_own_failure() {
+    let (outcome, _) = with_captured_tracing_at(tracing::Level::WARN, async {
+        let transcript = Transcript::create(Path::new("/dev/full"), false)
+            .await
+            .expect("a transcript whose every write fails");
+        super::run_capture_logged(
+            Cmd::new("/bin/sh").args(["-c", "echo nope 1>&2; exit 3"]),
+            "test",
+            Some(&transcript),
+        )
+        .await
+    });
+
+    match outcome.expect_err("the command failed") {
+        OutrigError::Process {
+            exit_code,
+            stderr_tail,
+            ..
+        } => {
+            assert_eq!(exit_code, Some(3));
+            assert!(stderr_tail.contains("nope"), "tail was: {stderr_tail:?}");
+        }
+        other => panic!("expected the command's own failure, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1632,4 +1710,90 @@ fn the_debug_trace_shows_the_stand_in() {
     });
     result.expect("the command succeeds");
     assert_shown_not_hidden("the debug trace", &captured);
+}
+
+/// A build's `RUN` step writing a huge run with no newline in it must not be
+/// buffered whole: the captured path has nothing to keep it for (`keep_stdout
+/// = false`, no transcript), so [`capture_stream`] takes the chunked path
+/// (`Tee::is_idle`) rather than growing one line to the length of the write.
+/// Regression for the hazard a line-buffered drain has here: `head -c 256MiB
+/// /dev/zero` with no `\n` in it at all would hold the whole write in `line`
+/// before the loop ever got to trim it.
+///
+/// The bound checked is the process's **peak** RSS (`VmHWM`), not its RSS
+/// after the call: a `Vec` that grew to 256 MiB and was then dropped can
+/// leave the resident set looking small again, while the peak the kernel
+/// recorded along the way is the thing an embedder's memory ceiling actually
+/// sees. `VmHWM` only grows, so the delta across the call is a lower bound on
+/// how big anything the call allocated got -- this test caught the
+/// regression against the pre-chunking `capture_stream` with a 267 MiB jump,
+/// comfortably outside the ceiling asserted below.
+#[tokio::test]
+async fn a_newline_free_captured_stream_drains_in_bounded_memory() {
+    const CHILD: &str = "OUTRIG_TEST_BOUNDED_DRAIN";
+
+    // `VmHWM` is the whole process's, so the drain is measured in a process of
+    // its own: here every other test in this binary runs beside it, and one
+    // that allocates meanwhile -- the Python payload's unpacking, say -- would
+    // read as this drain's growth.
+    if std::env::var_os(CHILD).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "process::process_tests::a_newline_free_captured_stream_drains_in_bounded_memory",
+                "--exact",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the child measuring the drain failed ({:?}): {stdout}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
+    let _emitting = emitting().await;
+    let written: usize = 256 * 1024 * 1024;
+    let script = format!("head -c {written} /dev/zero");
+    let before_kb = process_peak_rss_kb();
+
+    let output = super::run_capture_logged_terminating(
+        Cmd::new("/bin/sh").args(["-c", &script]),
+        "test",
+        None,
+        Termination::Kill,
+        false,
+    )
+    .await
+    .expect("exit 0");
+
+    assert!(output.stdout.is_empty(), "the discarded path keeps nothing");
+
+    let after_kb = process_peak_rss_kb();
+    let grew_kb = after_kb.saturating_sub(before_kb);
+    let ceiling_kb = 32 * 1024; // 32 MiB: generous against 256 MiB written.
+    assert!(
+        grew_kb < ceiling_kb,
+        "peak RSS grew by {grew_kb} KiB draining {written} bytes -- a line-buffered drain would \
+         have grown it by nearly the whole write"
+    );
+}
+
+/// This process's peak resident set (`VmHWM`), in KiB, from
+/// `/proc/self/status`. Monotonic for the process's life, so a delta across
+/// a call is a lower bound on what that call allocated.
+fn process_peak_rss_kb() -> usize {
+    let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .expect("VmHWM line present")
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .expect("VmHWM is an integer")
 }

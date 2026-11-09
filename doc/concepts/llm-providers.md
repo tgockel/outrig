@@ -179,7 +179,7 @@ runtime fallback: a model call that fails against candidate one is retried again
 and outrig says so as it happens.
 
 ```text
-[outrig] model opus-5-bedrock failed (HTTP 429); trying opus-5-anthropic
+[outrig] model opus-5-bedrock failed (HTTP 429 Too Many Requests); trying opus-5-anthropic
 ```
 
 A move happens when a candidate's own retry loop has given up -- so everything under
@@ -602,6 +602,16 @@ Both retries happen beneath a single model call, which is what keeps them safe. 
 model -> tool -> model loop, and retrying the *round* would re-run container tool calls that
 already happened. Tools run between model calls, never inside one, so replaying either an
 HTTP request or a model call replays exactly that and nothing observable.
+
+In `outrig run`, every line above is printed by a layer beneath the agent, so when the call
+belongs to a subagent it carries that subagent's label, in the column its tool-call traces use:
+
+```text
+[outrig]   [audit] model opus-5-bedrock failed (HTTP 429 Too Many Requests); trying opus-5-anthropic
+```
+
+Without it a fan-out's retries and chain moves arrive among the parent's traces naming no one.
+The primary agent's lines are unlabeled, as they have always been.
 
 If the budget or the attempts do run out, the round ends and the REPL prompts again. The
 conversation keeps the tool calls the round had already run, with their results, and is

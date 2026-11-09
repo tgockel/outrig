@@ -131,6 +131,16 @@ Since only the global config can set it, `outrig run` and the session commands (
 (on `outrig run`/`logs`/`discard`) instead points at one specific session directory. See
 [Sessions](https://tgockel.github.io/outrig/usage/sessions.html).
 
+Because those four commands need `session-root` and nothing else in the file, a global config
+that fails to load does not stop them: outrig re-reads it for that one key, warns that nothing
+else it sets is in effect, and carries on. `run`, `run-new`, `mcp`, and `build` read the whole
+file and still refuse it. That degraded read takes only a root the damaged file states outright
+-- one plain string, nothing the parser had to repair, and declared once as the file's *text*
+has it, since a syntax error can stop the parser's recovery before a second declaration below
+it. If the file might be declaring a root and no such value can be read, the session commands
+stop too, rather than fall back to one the operator did not choose. See the
+[CLI reference](https://tgockel.github.io/outrig/reference/cli.html).
+
 `tool-call-max` is the default maximum number of tool calls in one round: one prompt and the
 agent's work on it, which `outrig run` calls a turn. The compiled-in default is `50`; config may
 set any value from `1` through `2000`.
@@ -238,6 +248,20 @@ closed as soon as it is accepted and recorded with `outrig.action = "deny"` and 
 "not-redirected"`, in either mode. If either mode is requested and setup fails, the session fails
 before MCP servers launch.
 
+Nothing from the image runs. The only program either mode enters into a container is the host's
+`nft`, and only into its network namespace; the resolver rewrite is outrig's own code acting on a
+descriptor a forked child opens inside the container's user and mount namespaces. So an image
+with no shell intercepts like any other. What a container does have to supply is the existing,
+writable `/etc` the user bootstrap already asks of it (see
+[Containers](../concepts/containers.md#dont-set-up-a-user-in-the-dockerfile), where the `sleep`
+a minimal base also needs is described), and even that only where the resolver was not baked in
+at create time: the primary under either mode, and every entrypoint-stdio sidecar, is created
+with `--dns` naming the listener, so no file of theirs is touched, while a sidecar whose servers
+are `podman exec`'d into it has its `/etc/resolv.conf` rewritten at attach and put back at
+detach. A resolver that cannot be read, written, or created -- a dangling symlink, something
+that is not a regular file, no `/etc` to create it in -- fails the attach with a refusal naming
+the container and what it needs.
+
 Either mode refuses a container that holds `NET_ADMIN`. `CAP_NET_ADMIN` in a container's own
 network namespace is control of its nftables, so a root process in that container could delete the
 redirect table and leave no record. A container holds it when its `cap-add` lists `NET_ADMIN` --
@@ -249,7 +273,9 @@ launch, a sidecar follows its `on-failure` (`warn` drops it, `abort` ends the se
 not let a container change its netfilter, so the nested-runtime recipe in
 [Containers](../concepts/containers.md) runs under either mode. A container that needs
 `NET_ADMIN` runs under `mode = "default"`, or `--network default`, which installs nothing to
-remove. A container outrig did not start is not inspected.
+remove. A container outrig did not start (`Container::attach`) has no launch for the check above
+to read, so it is asked directly: `podman inspect`'s effective capabilities, which also catches
+`--privileged` and anything a host's `containers.conf` grants on its own.
 
 Lookups are forwarded to the host's own resolvers: the `nameserver` entries in the host's
 `/etc/resolv.conf`, in order. Forwarding happens in the host's network namespace, so a loopback
@@ -405,7 +431,11 @@ Consequences worth planning for:
 
 Client-asserted names are still recorded. An audit record carries the best known name in
 `outrig.host` and says where it came from in `outrig.host_source`, which is `resolved` for a
-name the interceptor validated and `asserted` for one the client claimed.
+name the interceptor validated and `asserted` for one the client claimed. Because only a
+resolved name can satisfy an `allow` entry, `outrig.resolved` lists every name the interceptor
+had validated for the destination address when the connection was decided. Where `outrig.host`
+shows the client's claim, the name that earned the grant is one of them. It is left out when
+there were none.
 
 > **Changed in 0.2.0.** Before this release a client-supplied `Host:` or SNI satisfied a
 > hostname `allow` entry on its own, so an allowlist permitted more than it appeared to. The
@@ -1081,6 +1111,9 @@ access         = "read-write"
 - `mounts[*].access` (string, optional, default: `"read-only"`): either
   `"read-only"` or `"read-write"`.
 
+No path here may contain `:`, which is how podman separates the fields of a bind mount -- see
+[Validation rules](#validation-rules).
+
 A repo config may not declare a `host-path` (primary, extra, or sidecar mount) that covers your home
 directory or one above it, or -- read-write -- the global config file, its directory, or a
 directory its path passes through (a symlink or missing component there could be swapped to
@@ -1274,9 +1307,10 @@ Injection is all-or-nothing because a half-injected set is a broken config -- yo
 `[images.outrig-default]` beside outrig's `[sidecars.outrig-default-fs]` would leave that
 block's `args` unreachable, which is a hard error for every command in the repo.
 
-**Without the `outrig-enter` launcher.** `view = "primary"` needs the launcher, which is only
-embedded when outrig was built with the `<arch>-unknown-linux-musl` target. Without it the
-built-in degrades rather than failing: `fs` switches to `workspace = "rw"`, giving the same
+**Without the `outrig-enter` launcher.** `view = "primary"` needs the launcher, which outrig
+builds for the `<arch>-unknown-linux-musl` target or, without that target, statically for the
+build machine's own target. Only when neither build works is it missing, and then the built-in
+degrades rather than failing: `fs` switches to `workspace = "rw"`, giving the same
 file tools over a bind mount, and `shell` is dropped. A shell has no honest degraded form --
 a bind-mounted sidecar sees none of the primary's toolchain, so it would report a different
 environment than the one you have.
@@ -1490,11 +1524,14 @@ capability-profile = "no-net-raw"
   sidecar against the *primary container's* filesystem view -- its rootfs and every mount, at
   the primary's paths -- via the `outrig-enter` launcher, so an off-the-shelf MCP image serves
   the primary's files without the primary image carrying that tool. Entrypoint-stdio only, and
-  mutually exclusive with `workspace` (the view already holds the workspace) and with
-  `capability-profile = "drop-all"` (the view needs the mount capabilities). It grants
-  `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` in the primary's user namespace -- a real posture
-  change; see [Trust Model](../concepts/mcp-trust-model.md) and `SECURITY.md`. The same key
-  exists on the inline [`[images.<name>.mcp]`](#imagesnamemcp) one-liner form.
+  mutually exclusive with `workspace` (the view already holds the workspace), with
+  `capability-profile = "drop-all"` and any `cap-drop` of `ALL`, `SYS_ADMIN`, `SYS_PTRACE`,
+  `SYS_CHROOT`, `SETUID` or `SETGID` (the launcher needs all five), and with
+  `no-new-privileges = false` (the launcher puts the payload under `no_new_privs` itself, so the
+  key could not do what it says). It grants `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` in the primary's
+  user namespace -- a real posture change; see [Trust Model](../concepts/mcp-trust-model.md) and
+  `SECURITY.md`. The same key exists on the inline [`[images.<name>.mcp]`](#imagesnamemcp)
+  one-liner form.
 - `start` (string, optional, default: `"auto"`): `"auto"` starts with the session; `"manual"`
   declares a sidecar that starts only when asked -- `/sidecar add <name>` in the REPL, or
   `Outrig::add_sidecar` / `LaunchSpec::with_sidecar` from the library API. Until then its
@@ -1539,6 +1576,14 @@ build = { command = ["cargo-mcp"], env = {
   ALSO_LIT   = "prefix-${X}-suffix", # literal -- embedded substitution is not supported
 } }
 ```
+
+The key on the left is held to `^[A-Za-z_][A-Za-z0-9_]*$`, which is the wider of the two
+grammars on this line: a key names a variable *inside* the container, where `http_proxy` is
+ordinary, while a `${VAR}` reference names one in your own environment. podman and buildah read
+each entry as `KEY=value` and split it at the first `=`, so a key holding one -- `"A=B" = "c"`
+-- would set `A` to `B=c`, and an empty key is refused by the engine itself; both are refused
+when the config loads, naming the key and the file. The same rule holds a `build-args` key, an
+`org.outrig.mcp` label's `env` key, a standalone `image.toml`'s, and a `--env` key you type.
 
 The reference form is exactly `"${VAR}"`, where `VAR` matches `^[A-Z_][A-Z0-9_]*$` -- the
 same syntax `api-key` accepts. Anything else is treated as a literal and passed through
@@ -1586,8 +1631,8 @@ A proxy key that references the variable of its own name, such as
 `HTTPS_PROXY = "${HTTPS_PROXY}"`, is passed by name all the same: podman and buildah already
 have that value and read proxies as they find them. No other key on the list is, even
 self-referenced, because the engine may rewrite its own copy first -- buildah makes a relative
-`TMPDIR` absolute. A key that is not a plain variable name (`^[A-Za-z_][A-Za-z0-9_]*$`) keeps
-its value on the command line too. To keep a secret off it, give the secret a key outside these.
+`TMPDIR` absolute. To keep a secret off it, give the secret a key outside these -- a key is
+yours to choose, and the server reads whichever name you set.
 
 outrig cannot redact what the server, or a build step, prints itself.
 
@@ -1655,10 +1700,16 @@ concatenated `workspace.mounts` list can hold entries with different base direct
 | `--config <path>`            | `<path>`'s parent directory            |
 | `~/.outrig/config.toml`      | that file's directory (`~/.outrig/`)   |
 | `--global-config <path>`     | `<path>`'s parent directory            |
+| `--volume` (no file at all)  | the current directory                  |
 
 A `--config` path that ends in `.agents/outrig/config.toml` is that repo's own config and takes the
 first row; any other takes the second. See
 [Reference -> CLI](https://tgockel.github.io/outrig/reference/cli.html#global-flags).
+
+The last row is not a config file: `outrig run --volume` and `outrig mcp --volume` add a mount
+that no file declared, and the base that gives a typed path its meaning is the directory it was
+typed in -- the one the shell itself would resolve it against. The repo root is not that
+directory for a `--volume` passed from a subdirectory of the repo.
 
 A binding's `{ path = "..." }` arguments are the one exception: a relative one always
 resolves against the repository's root, whichever file declared it, so a global binding's
@@ -1856,9 +1907,27 @@ refused, after the warning that says why. Some things are never set aside:
 - a table header with an unquoted `.` in a name, such as `[models.opus-4.7]`, which is refused
   with a hint to quote it: `[models."opus-4.7"]`.
 
-`outrig mcp self`'s `validate_config` tool returns the same warnings beside its errors. An
-`org.outrig.mcp` image label and an `image.toml`, which no config load reads, still refuse an
-unknown key.
+`outrig mcp self`'s `validate_config` tool returns the same warnings beside its errors. It
+checks a fragment as a repo config unless it is passed `scope = "global"`, so the global-only
+keys below are refused in the file that may not set them. An `org.outrig.mcp` image label and an
+`image.toml`, which no config load reads, still refuse an unknown key.
+
+What a file *is* refused for names that file, as a warning does. A load reads up to two of them
+-- the global config, and the repo config or a `--config` file -- and the fault is described in
+words that fit either one, so the file comes first:
+
+```text
+error: ci/outrig.toml: TOML parse error at line 2, column 14
+  |
+2 | [images.named
+  |              ^
+unclosed table, expected `]`
+```
+
+The same holds for a rule only the repo side is held to, such as `ci/outrig.toml: repo config
+may set [network].mode only; [network].default belongs in global config`. A rule of the merged
+config -- a model naming a provider neither file declares -- names no file: both halves are
+equally answerable for it.
 
 ## Validation rules
 
@@ -1934,6 +2003,15 @@ image-config in the merged config but does not require agent/model/provider wiri
   because the label is read off the image rather than from a config file. A server the config
   declares by name replaces the label's entry whole and is not held here, and `outrig image
   build` does not hold the `image.toml` it is pointed at.
+- Every `env` key on an MCP entry and every `build-args` key must match
+  `^[A-Za-z_][A-Za-z0-9_]*$`. podman and buildah read each entry as `KEY=value`, so a key
+  holding `=` sets a shorter name with the rest of itself at the head of the value, and an
+  empty key is refused by the engine as it runs -- after the image is acquired, naming neither
+  the key nor the file. Every image-config is checked, whoever declared it: a key grants no
+  access to your environment, so unlike a `${VAR}` reference it is not a question of trust.
+  The same grammar holds an `org.outrig.mcp` label's `env` key and a standalone `image.toml`'s
+  -- `outrig image build` refuses one before stamping the label, and a session refuses a label
+  that carries one -- and a `--env KEY=VALUE` you type, refused by argument parsing.
 - Every server name in `[images.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its image-config.
 - Every `command` array must be non-empty.
@@ -1955,13 +2033,20 @@ image-config in the merged config but does not require agent/model/provider wiri
 - Each `[images.<name>]` must set exactly one of: `image-name`, or `dockerfile` + `context`.
   Setting both shapes, neither, `image-name` with `build-args`, or only one of
   `dockerfile`/`context` without the other is an error.
-- `image-name` must not be empty.
+- `image-name` must not be empty or whitespace-only. A reference that is nothing but blanks
+  names no image, and left to podman it fails at launch as `image not known`, naming neither
+  the key nor the file; a sidecar's `image` has always been held to the trimmed test, and now
+  both are.
 - A build-from-Dockerfile `[images.<name>]` block key must be a valid container image
   repository component -- lowercase letters and digits, separated by one `.`, one or two `_`,
   or a run of `-` (`^[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*$`), the separators podman accepts -- and
   at most 237 characters, because it becomes the built image's repository and buildah refuses
   one over 255 once it prepends `docker.io/library/`. Image-name configs are exempt: their block
   key is just a label.
+- Every `[security]` rule below holds for a `[sidecars.<sc>.security]` block as well as an
+  `[images.<name>.security]` one -- a sidecar reuses the whole block. A sidecar's failure is
+  reported against the sidecar, `sidecar "tools": `devices` entry ... must be an absolute
+  path`, rather than against an image config named `sidecars.tools`, which does not exist.
 - Every `[images.<name>.security].capability-profile`, if set, must be one of
   `default`, `no-net-raw`, or `drop-all`.
 - Every capability name in `cap-drop` or `cap-add` must be non-empty and match
@@ -2002,6 +2087,15 @@ image-config in the merged config but does not require agent/model/provider wiri
   `.`, the repo root.
 - `workspace.container-path` and every `workspace.mounts[*].container-path` must be absolute and
   must not be `/`; a mount's left unset is its resolved host path.
+- No bind-mount path may contain `:` -- `workspace.host-path`, `workspace.container-path`, and
+  both halves of every `workspace.mounts[*]` and `[sidecars.<sc>.mounts][*]` entry. Podman reads
+  a bind mount as `<host>:<container>[:<options>]`, so a path carrying one becomes a fourth
+  field it refuses at launch, after the image is acquired and naming neither the key nor the
+  file. This rule is about the path as written. A relative path that spells no `:` but resolves
+  through a directory whose name has one is refused when a session starts, not here: it is a
+  fact about this machine, and attaching to an existing container (`outrig mcp --attach`)
+  mounts nothing and is unaffected. There is no escape for one in either case; a host directory
+  whose name contains `:` cannot be mounted.
 - Extra workspace mount `container-path` values must be unique, including no collision with the
   primary workspace `container-path` -- its host path, when the config declares a binding.
   Container paths are compared after folding `.` and `..`, so `/workspace/../workspace`

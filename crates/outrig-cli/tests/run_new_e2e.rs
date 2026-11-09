@@ -2650,6 +2650,48 @@ async fn a_gitpython_binding_is_used_as_plain_code() {
     );
 }
 
+/// A binding handed the path of a repo config's mount, through a symlink, names files the agent
+/// can open: the mount is bound from where the link led when it was checked, and appears in the
+/// container at the path the config declared (#604).
+#[tokio::test]
+async fn a_binding_handed_a_linked_mount_names_files_the_agent_can_open() {
+    let outside = tempfile::tempdir().expect("a directory outside the repo");
+    let (real, link) = (outside.path().join("real"), outside.path().join("link"));
+    std::fs::create_dir(&real).expect("create the directory");
+    std::fs::write(real.join("note.txt"), "read through the link").expect("write the note");
+    std::os::unix::fs::symlink(&real, &link).expect("link the directory");
+    let (addr, mut requests) = start_mock_http(vec![
+        submit("toolu_1", "print(open(str(notes / 'note.txt')).read())"),
+        text_reply("noted"),
+    ])
+    .await;
+    let link = link.to_str().expect("a UTF-8 path");
+    let repo = repo_with(
+        addr,
+        &format!("[[workspace.mounts]]\nhost-path = {link:?}\ncontainer-path = {link:?}\n"),
+    );
+    let global = global_config(repo.path());
+    append(
+        &global,
+        &format!(
+            "[bindings.notes]\ndescription = \"The notes.\"\nfactory = \"pathlib:Path\"\n\
+             args = [{{ path = {link:?} }}]\n"
+        ),
+    );
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::with_global(repo.path(), sessions.path(), &global, &[]);
+    session.type_line("read the note").await;
+    wait_for(&session.stderr, "noted", TEST_TIMEOUT).await;
+    session.type_line("/quit").await;
+    let (status, _, stderr) = session.exit(false).await;
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(
+        tool_result(&recorded[1], "toolu_1").trim(),
+        "read through the link"
+    );
+}
+
 // ------------------------------------------------------------------------------ on a terminal
 
 const ROWS: u16 = 30;

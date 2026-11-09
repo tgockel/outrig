@@ -1,13 +1,15 @@
 //! CLI-owned repo, config, and cache path policy.
 
-use std::io::Write as _;
-use std::os::unix::fs::MetadataExt as _;
+use std::fs::{self, File, Permissions};
+use std::io::{ErrorKind, Write as _};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use directories::{BaseDirs, ProjectDirs};
+use nix::libc;
 use tempfile::NamedTempFile;
 
-use outrig::config::{Config, ConfigSource, MountAccess};
+use outrig::config::{Config, ConfigSource, MountAccess, Workspace};
 use outrig::error::{IoPathExt, OutrigError, Result};
 
 const REPO_CONFIG_REL: &str = ".agents/outrig/config.toml";
@@ -40,9 +42,24 @@ pub(crate) fn find_repo_root_from(cwd: &Path) -> Result<PathBuf> {
 fn find_repo_root_with(cwd: &Path, uid: u32) -> Result<PathBuf> {
     let mut cur = cwd;
     loop {
-        if cur.join(REPO_CONFIG_REL).is_file() {
-            refuse_foreign_repo_config(cur, uid)?;
-            return Ok(cur.to_path_buf());
+        let config = cur.join(REPO_CONFIG_REL);
+        match fs::metadata(&config) {
+            Ok(meta) if meta.is_file() => {
+                refuse_foreign_repo_config(cur, uid)?;
+                return Ok(cur.to_path_buf());
+            }
+            // A `.agents/` or `.agents/outrig/` that is a file rather than a
+            // directory, or a `config.toml` that is a directory: not the
+            // config this is looking for, so the walk goes on, same as a
+            // missing entry.
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {}
+            // Anything else -- a directory in the path the user cannot
+            // search, say -- says nothing about whether the config is there,
+            // so it is not treated as absent: `is_file()` collapsed it to
+            // `false` and let the walk continue past a config it could not
+            // examine, landing on one further up or none at all (#829).
+            Err(e) => return Err(e).path_ctx("stat", config),
         }
         match cur.parent() {
             Some(parent) => cur = parent,
@@ -128,15 +145,103 @@ pub(crate) fn write_atomic_all(files: &[(&Path, &str)]) -> Result<()> {
 
 /// `contents` in a synced temp file in `path`'s directory, created if
 /// missing. Dropped instead of persisted, the temp file is removed.
+///
+/// The rename keeps the temp file's mode, so it is set here before any
+/// content is written. A new target gets `0666` under the umask, as `open(2)`
+/// would create it; a bare `NamedTempFile` is `0600`, which would hide a
+/// checked-in `Dockerfile` from the group. An existing target keeps its own
+/// mode and access ACL, so a forced rewrite resets nothing the user chose --
+/// and the temp file starts `0600`, never broader than the target, so nobody
+/// can open it in the window before it takes the target's mode and keep a
+/// descriptor to what is written next.
 fn stage(path: &Path, contents: &str) -> Result<NamedTempFile> {
     let parent = path.parent().ok_or_else(|| {
         OutrigError::Configuration(format!("path has no parent: {}", path.display()))
     })?;
     std::fs::create_dir_all(parent).path_ctx("create directory", parent)?;
-    let mut tmp = NamedTempFile::new_in(parent)?;
+    let mut tmp = match std::fs::metadata(path) {
+        Ok(existing) => {
+            let tmp = NamedTempFile::new_in(parent)?;
+            // A new file takes its directory's group, which can be a broader one
+            // than the target's: the group is part of who the mode and ACL grant
+            // to, so it is restored first, and a rewrite that cannot is refused.
+            if existing.gid() != tmp.as_file().metadata()?.gid() {
+                nix::unistd::fchown(tmp.as_file(), None, Some(existing.gid().into()))
+                    .map_err(std::io::Error::from)?;
+            }
+            copy_access_acl(path, tmp.as_file())?;
+            tmp.as_file().set_permissions(existing.permissions())?;
+            tmp
+        }
+        Err(_) => tempfile::Builder::new()
+            .permissions(Permissions::from_mode(0o666))
+            .tempfile_in(parent)?,
+    };
     tmp.write_all(contents.as_bytes())?;
     tmp.as_file().sync_all()?;
     Ok(tmp)
+}
+
+/// Give `dst` the access ACL of `src`, or none when `src` has none. A file
+/// created under a directory with a default ACL inherits its named entries,
+/// which would grant readers `src` never had once a `chmod` unmasks them.
+/// Filesystems without ACLs have nothing to copy.
+fn copy_access_acl(src: &Path, dst: &File) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::io::{Error, ErrorKind};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const ACL: &std::ffi::CStr = c"system.posix_acl_access";
+    let no_acl = |e: &Error| matches!(e.raw_os_error(), Some(libc::ENODATA | libc::ENOTSUP));
+    let src = CString::new(src.as_os_str().as_bytes())
+        .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+    // The ACL can change size between the query and the read, so a read that
+    // finds it grown asks again.
+    let acl = loop {
+        // SAFETY: `src` and `ACL` are NUL-terminated; a null buffer of length 0
+        // asks for the size.
+        let size = unsafe { libc::getxattr(src.as_ptr(), ACL.as_ptr(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            break Err(Error::last_os_error());
+        }
+        let mut acl = vec![0u8; size as usize];
+        // SAFETY: as above, and `acl` is writable for the length passed.
+        let len = unsafe {
+            libc::getxattr(src.as_ptr(), ACL.as_ptr(), acl.as_mut_ptr().cast(), acl.len())
+        };
+        if len >= 0 {
+            acl.truncate(len as usize);
+            break Ok(acl);
+        }
+        let err = Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ERANGE) {
+            break Err(err);
+        }
+    };
+    let fd = dst.as_raw_fd();
+    let err = match acl {
+        Ok(acl) => {
+            // SAFETY: `fd` is open, `ACL` is NUL-terminated, and `acl` is
+            // readable for the length passed.
+            let rc = unsafe {
+                libc::fsetxattr(fd, ACL.as_ptr(), acl.as_ptr().cast(), acl.len(), 0)
+            };
+            return if rc == 0 { Ok(()) } else { Err(Error::last_os_error()) };
+        }
+        Err(err) => err,
+    };
+    if !no_acl(&err) {
+        return Err(err);
+    }
+    // SAFETY: `fd` is open and `ACL` is NUL-terminated.
+    if unsafe { libc::fremovexattr(fd, ACL.as_ptr()) } != 0 {
+        let err = Error::last_os_error();
+        if !no_acl(&err) {
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 /// The repo config a command reads, and the repo it runs against.
@@ -248,11 +353,20 @@ pub(crate) fn resolve_repo_config_optional(
 /// stays relative to wherever it is later opened from.
 fn explicit_repo_config(path: &Path, cwd: &Path) -> Result<RepoConfig> {
     let file: PathBuf = cwd.join(path).components().collect();
-    if !file.is_file() {
-        return Err(OutrigError::Configuration(format!(
-            "--config {} is not an existing file",
-            path.display()
-        )));
+    match fs::metadata(&file) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Err(not_an_existing_file(path)),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            return Err(not_an_existing_file(path));
+        }
+        // A `stat` that failed for another reason (a directory it may not
+        // search, say) says nothing about whether the file is there.
+        Err(e) => {
+            return Err(OutrigError::Configuration(format!(
+                "--config {} cannot be read: {e}",
+                path.display()
+            )));
+        }
     }
     if file.ends_with(REPO_CONFIG_REL) {
         let root = file.ancestors().nth(3).expect("an absolute path ending in \
@@ -263,6 +377,13 @@ fn explicit_repo_config(path: &Path, cwd: &Path) -> Result<RepoConfig> {
         root: repo_root_or_cwd(cwd)?,
         file: Some(file),
     })
+}
+
+fn not_an_existing_file(path: &Path) -> OutrigError {
+    OutrigError::Configuration(format!(
+        "--config {} is not an existing file",
+        path.display()
+    ))
 }
 
 /// The repo found from `cwd`, else `cwd` when there is none. A config the walk
@@ -308,6 +429,76 @@ fn refuse_home_workspace_with(workspace: &Path, home: &Path, repo_root: &Path) -
          to mount it on purpose",
         workspace.display()
     )))
+}
+
+/// Refuse a workspace whose *resolved* host path contains `:`, podman's bind-mount
+/// field separator.
+///
+/// Config validation refuses a `:` in a `host-path` as written, which is a
+/// config error wherever the config is read. This is the other half: a path
+/// that spells none can still resolve through a directory whose name has one
+/// -- the repo root for the built-in `.`, or the declaring file's directory
+/// for a relative value -- and the resolved path is what becomes the `-v`.
+///
+/// It lives here, and not in validation, because it is a fact about this
+/// launch rather than about the config: `outrig mcp --attach` borrows a
+/// running container and serializes no mount at all, so a session started
+/// from such a directory is none of its business. Every launch that does
+/// mount asks, before the image is acquired, so the diagnostic arrives in
+/// place of podman's -- which would come after the build and name neither the
+/// workspace nor the directory the colon is in.
+///
+/// Why that path is the workspace is read off `workspace`, not guessed: a
+/// declared `host-path` is the config's pick and is named with the file that
+/// declared it, since telling its author to run from somewhere else would be
+/// advice that cannot work -- a file-relative value resolves against that
+/// file's directory wherever outrig is invoked from. Only an undeclared
+/// workspace is outrig's own pick, and only it gets the
+/// [`implicit_workspace_origin`] explanation and the cwd advice that follows
+/// from it.
+pub(crate) fn refuse_workspace_field_separator(
+    resolved: &Path,
+    workspace: &Workspace,
+    repo_root: &Path,
+) -> Result<()> {
+    if !resolved.as_os_str().as_encoded_bytes().contains(&b':') {
+        return Ok(());
+    }
+    let (origin, help) = match workspace.declared_host_path() {
+        // Declared. Validation already refused a `:` this value spelled, so
+        // the colon is in what it resolved *through*: the directory of the
+        // file that declared it, or the repo root when nothing did.
+        Some(declared) => (
+            format!(
+                "[workspace] host-path {}{} resolves there",
+                declared.display(),
+                declared_in_clause(workspace.config_source())
+            ),
+            "help: podman offers no way to escape one, so point [workspace] host-path at a \
+             directory whose path has none",
+        ),
+        // Undeclared, so the path is outrig's own pick and the cwd is one of
+        // the two things that can have made it.
+        None => (
+            implicit_workspace_origin(repo_root),
+            "help: podman offers no way to escape one, so run outrig from a directory whose \
+             path has no `:`, or declare [workspace] host-path pointing at one",
+        ),
+    };
+    Err(OutrigError::Configuration(format!(
+        "refusing to mount {} as the workspace: its path contains `:`, which podman reads \
+         as the field separator of a `-v <host>:<container>[:<options>]` value, so the mount \
+         would be refused at launch; {origin}\n{help}",
+        resolved.display()
+    )))
+}
+
+/// ` declared in <file>` for a diagnostic, or nothing when no config file
+/// declared the value: a `--volume`, or one a library caller built.
+fn declared_in_clause(source: Option<&ConfigSource>) -> String {
+    source.map_or_else(String::new, |source| {
+        format!(" declared in {}", source.config_path().display())
+    })
 }
 
 /// What made `repo_root` the workspace when no config declared one, for a
@@ -410,7 +601,7 @@ impl GlobalConfigReach {
 /// outrig's own pick -- the repo root, or the current directory -- so the caller
 /// asks only when `[workspace] host-path` is declared nowhere: the global
 /// config's own is the operator's choice, and a repo's is judged by
-/// [`refuse_repo_declared_mounts`].
+/// [`pin_repo_declared_mounts`].
 pub(crate) fn refuse_workspace_covering_global_config(
     workspace: &Path,
     repo_root: &Path,
@@ -432,6 +623,53 @@ pub(crate) fn refuse_workspace_covering_global_config(
     )))
 }
 
+/// Refuse an extra mount whose *resolved* host path contains `:`.
+///
+/// The companion to [`refuse_workspace_field_separator`], and there for the
+/// same reason: config validation refuses a `:` an entry spelled, but a
+/// relative `host-path` resolves against the directory of the file that
+/// declared it (or the repo root), and it is the resolved path that becomes
+/// the `-v`. Both the primary workspace's extra mounts and every sidecar's
+/// are checked, since one builder renders them all.
+///
+/// Named as resolved, which is where the colon is, with the entry as written
+/// beside it so the line to edit is identifiable.
+pub(crate) fn refuse_mount_field_separators(cfg: &Config, repo_root: &Path) -> Result<()> {
+    let workspace = cfg.workspace.mounts.iter().map(|m| ("mount".to_string(), m));
+    let sidecars = cfg.sidecars.iter().flat_map(|(name, sc)| {
+        sc.mounts
+            .iter()
+            .map(move |m| (format!("sidecar {name:?} mount"), m))
+    });
+    for (what, mount) in workspace.chain(sidecars) {
+        let resolved = mount.resolved_host_path(repo_root);
+        if !resolved.as_os_str().as_encoded_bytes().contains(&b':') {
+            continue;
+        }
+        // A `--volume` carries no file. Its own parser splits on `:`, so the
+        // colon is in what the path resolved through.
+        let declared = declared_in_clause(mount.config_source());
+        return Err(OutrigError::Configuration(format!(
+            "refusing {what} host-path {}{declared}: it resolves to {}, which contains `:` \
+             -- podman reads that as the field separator of a `-v \
+             <host>:<container>[:<options>]` value, so the mount would be refused at launch\n\
+             help: podman offers no way to escape one; point it at a path with no `:` in it",
+            mount.host_path().display(),
+            resolved.display()
+        )));
+    }
+    Ok(())
+}
+
+/// A repo-declared mount [`pin_repo_declared_mounts`] validated: the
+/// canonical host path the guard saw, which is what the launch now binds.
+#[derive(Debug, Clone)]
+pub(crate) struct PinnedMount {
+    what: String,
+    host: PathBuf,
+    source: PathBuf,
+}
+
 /// Refuse a repo-declared host path that reaches the operator's own files. The
 /// repo config sits in the read-write workspace, so an agent can edit it for
 /// the next session; a repo `[workspace] host-path`, `[[workspace.mounts]]` or
@@ -442,33 +680,51 @@ pub(crate) fn refuse_workspace_covering_global_config(
 /// global-declared entry is the operator's own choice, and a hand-built one
 /// (`--volume`) carries no source. Neither does an undeclared workspace, which is
 /// outrig's own pick: [`refuse_workspace_covering_global_config`] asks about it.
-pub(crate) fn refuse_repo_declared_mounts(
-    cfg: &Config,
+///
+/// What passes is *pinned*: each checked entry's host path is replaced by the
+/// canonical path the check saw, so a symlink the agent swaps afterwards
+/// cannot redirect the bind (#604). A component that is replaced outright
+/// is what [`recheck_pinned_mounts`] catches, just before the container starts.
+///
+/// The pin changes where a directory is mounted from, never where the
+/// container shows it. A mount whose config left out its container path
+/// appears at its host path as written, so that path is declared before the
+/// host path is pinned. So is the workspace's when the pin moves it, the
+/// config has a binding, and `starts_bindings` says the launch starts the
+/// config's bindings, which put the workspace at its host path. The harness
+/// accepts a container path that resolves on the host to the directory
+/// mounted there, so a binding handed the path as written names files the
+/// agent can open.
+pub(crate) fn pin_repo_declared_mounts(
+    cfg: &mut Config,
     repo_root: &Path,
     global_cfg: Option<&Path>,
-) -> Result<()> {
+    starts_bindings: bool,
+) -> Result<Vec<PinnedMount>> {
     let home = BaseDirs::new().map(|d| d.home_dir().to_path_buf());
-    refuse_repo_declared_mounts_with(cfg, repo_root, home.as_deref(), global_cfg)
+    pin_repo_declared_mounts_with(cfg, repo_root, home.as_deref(), global_cfg, starts_bindings)
 }
 
-/// [`refuse_repo_declared_mounts`] against an explicit `home` (`None` skips the
+/// [`pin_repo_declared_mounts`] against an explicit `home` (`None` skips the
 /// home rule). Paths are compared canonicalized, as in
 /// [`refuse_home_workspace_with`].
-fn refuse_repo_declared_mounts_with(
-    cfg: &Config,
+fn pin_repo_declared_mounts_with(
+    cfg: &mut Config,
     repo_root: &Path,
     home: Option<&Path>,
     global_cfg: Option<&Path>,
-) -> Result<()> {
+    starts_bindings: bool,
+) -> Result<Vec<PinnedMount>> {
     let home = home.map(canonical_or_normalized);
     let global = global_cfg.map(GlobalConfigReach::of);
-    let check = |what: &str,
-                 source: Option<&ConfigSource>,
-                 host: PathBuf,
-                 access: MountAccess|
-     -> Result<()> {
+    let mut pinned = Vec::new();
+    let mut check = |what: &str,
+                     source: Option<&ConfigSource>,
+                     host: PathBuf,
+                     access: MountAccess|
+     -> Result<Option<PathBuf>> {
         let Some(source) = source.filter(|s| !matches!(s, ConfigSource::Global { .. })) else {
-            return Ok(());
+            return Ok(None);
         };
         let host = canonical_or_normalized(&host);
         let reason = if home.as_ref().is_some_and(|h| h.starts_with(&host)) {
@@ -477,8 +733,18 @@ fn refuse_repo_declared_mounts_with(
             && let Some(why) = global.as_ref().and_then(|g| g.rewritable_through(&host))
         {
             why
+        } else if host.to_str().is_none() {
+            // The bind is serialized through `display()`, which would name a
+            // different directory than the one checked.
+            "it resolves to a path that is not valid UTF-8, which cannot be bound faithfully"
+                .to_string()
         } else {
-            return Ok(());
+            pinned.push(PinnedMount {
+                what: what.to_string(),
+                host: host.clone(),
+                source: source.config_path(),
+            });
+            return Ok(Some(host));
         };
         Err(OutrigError::Configuration(format!(
             "refusing {what} {} declared in {}: {reason}, so an agent could edit files \
@@ -489,30 +755,83 @@ fn refuse_repo_declared_mounts_with(
             source.config_path().display()
         )))
     };
-    let workspace = &cfg.workspace;
-    check(
+    let bound = starts_bindings && !cfg.bindings.is_empty();
+    let workspace = &mut cfg.workspace;
+    if let Some(host) = check(
         "workspace host-path",
         workspace.config_source(),
         workspace.resolved_host_path(repo_root),
         MountAccess::ReadWrite,
-    )?;
-    for m in &workspace.mounts {
-        check(
+    )? {
+        // Only a moved path: with every binding refused, the harness leaves
+        // the workspace at `/workspace`, and one the pin did not move stays.
+        let shown = lexical(&workspace.resolved_host_path(repo_root));
+        if bound && workspace.declared_container_path().is_none() && shown != host {
+            workspace.set_container_path(shown);
+        }
+        workspace.set_host_path(host);
+    }
+    for m in &mut workspace.mounts {
+        if let Some(host) = check(
             "mount",
             m.config_source(),
             m.resolved_host_path(repo_root),
             m.access(),
-        )?;
+        )? {
+            m.set_container_path(m.resolved_container_path(repo_root));
+            m.set_host_path(host);
+        }
     }
-    for (name, sc) in &cfg.sidecars {
+    for (name, sc) in &mut cfg.sidecars {
         let what = format!("sidecar {name:?} mount");
-        for m in &sc.mounts {
-            check(
+        for m in &mut sc.mounts {
+            if let Some(host) = check(
                 &what,
                 m.config_source(),
                 m.resolved_host_path(repo_root),
                 m.access(),
-            )?;
+            )? {
+                m.set_container_path(m.resolved_container_path(repo_root));
+                m.set_host_path(host);
+            }
+        }
+    }
+    Ok(pinned)
+}
+
+/// `path` with `.` and `..` resolved textually, as the harness places a
+/// directory in the container.
+fn lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut resolved = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::CurDir => {}
+            c => resolved.push(c),
+        }
+    }
+    resolved
+}
+
+/// Refuse a launch whose pinned mount no longer resolves to the path the guard
+/// validated. Run right before the container starts, after the image work that
+/// can take minutes: a symlink swap is already defeated by the pin, but an
+/// agent replacing a parent directory is seen here.
+pub(crate) fn recheck_pinned_mounts(pinned: &[PinnedMount]) -> Result<()> {
+    for p in pinned {
+        let now = canonical_or_normalized(&p.host);
+        if now != p.host {
+            return Err(OutrigError::Configuration(format!(
+                "refusing {} {} declared in {}: it now resolves to {}, so a component of it \
+                 was replaced after it was checked",
+                p.what,
+                p.host.display(),
+                p.source.display(),
+                now.display()
+            )));
         }
     }
     Ok(())
@@ -651,6 +970,135 @@ mod tests {
         assert_eq!(left, ["blocker", "first"]);
     }
 
+    /// What [`write_atomic_follows_the_umask_and_keeps_an_existing_mode`]
+    /// runs in a child process with its own umask: write `fresh` (new) and
+    /// `existing` (a `0640` file) under `$OUTRIG_UMASK_DIR`. Does nothing
+    /// otherwise.
+    #[test]
+    fn umask_child_writes_files() {
+        let Some(dir) = std::env::var_os("OUTRIG_UMASK_DIR").map(PathBuf::from) else {
+            return;
+        };
+        write_atomic_all(&[(&dir.join("fresh"), "new"), (&dir.join("existing"), "new")]).unwrap();
+    }
+
+    /// #405: a written file follows the umask like any other the user
+    /// creates, and a forced rewrite keeps the mode the file already had. The
+    /// writes run in a child whose umask is its own: the umask is
+    /// process-wide, and other tests in this binary create files (and set it)
+    /// concurrently.
+    #[test]
+    fn write_atomic_follows_the_umask_and_keeps_an_existing_mode() {
+        use std::os::unix::process::CommandExt as _;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        for (umask, fresh) in [(0o077, 0o600), (0o022, 0o644), (0o002, 0o664)] {
+            let tmp = tempdir().unwrap();
+            let existing = tmp.path().join("existing");
+            fs::write(&existing, "old").unwrap();
+            fs::set_permissions(&existing, Permissions::from_mode(0o640)).unwrap();
+
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "paths::tests::umask_child_writes_files"])
+                .env("OUTRIG_UMASK_DIR", tmp.path());
+            // SAFETY: `umask` is async-signal-safe, as `pre_exec` requires.
+            unsafe {
+                child.pre_exec(move || {
+                    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(umask));
+                    Ok(())
+                });
+            }
+            assert!(child.status().unwrap().success());
+
+            assert_eq!(mode(&tmp.path().join("fresh")), fresh, "umask {umask:o}");
+            assert_eq!(mode(&existing), 0o640, "umask {umask:o}");
+            assert_eq!(fs::read_to_string(&existing).unwrap(), "new");
+        }
+    }
+
+    /// An existing file's access ACL is what the rewrite has, not what the
+    /// directory's default ACL would hand a new file: no named entry appears
+    /// that the target never had.
+    #[test]
+    fn a_rewrite_does_not_inherit_the_directory_default_acl() {
+        let tmp = tempdir().unwrap();
+        let existing = tmp.path().join("existing");
+        fs::write(&existing, "old").unwrap();
+        fs::set_permissions(&existing, Permissions::from_mode(0o640)).unwrap();
+        let set = std::process::Command::new("setfacl")
+            .args(["-d", "-m", "u:1:r"])
+            .arg(tmp.path())
+            .status();
+        if !set.is_ok_and(|s| s.success()) {
+            return; // no setfacl, or a filesystem without ACLs
+        }
+
+        write_atomic(&existing, "new").unwrap();
+
+        let acl = std::process::Command::new("getfacl")
+            .arg("-nc")
+            .arg(&existing)
+            .output()
+            .unwrap();
+        assert!(acl.status.success(), "getfacl failed");
+        let acl = String::from_utf8(acl.stdout).unwrap();
+        assert!(!acl.contains("user:1:"), "{acl}");
+        assert_eq!(fs::metadata(&existing).unwrap().permissions().mode() & 0o777, 0o640);
+    }
+
+    /// An ACL past the old fixed buffer (600 named users is over 4096 bytes)
+    /// is copied whole, not a reason to refuse the rewrite.
+    #[test]
+    fn a_rewrite_copies_an_acl_larger_than_4096_bytes() {
+        let tmp = tempdir().unwrap();
+        let existing = tmp.path().join("existing");
+        fs::write(&existing, "old").unwrap();
+        let users = (1000..1600).map(|u| format!("u:{u}:r")).collect::<Vec<_>>();
+        let set = std::process::Command::new("setfacl")
+            .args(["-m", &users.join(",")])
+            .arg(&existing)
+            .status();
+        if !set.is_ok_and(|s| s.success()) {
+            return; // no setfacl, or a filesystem without ACLs
+        }
+        let getfacl = |p: &Path| {
+            let out = std::process::Command::new("getfacl")
+                .arg("-nc")
+                .arg(p)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "getfacl failed");
+            out.stdout
+        };
+        let before = getfacl(&existing);
+
+        write_atomic(&existing, "new").unwrap();
+
+        assert_eq!(getfacl(&existing), before);
+    }
+
+    /// The group is part of who a rewrite's mode grants to: the temp file
+    /// would take the directory's, so the target's own is put back.
+    #[test]
+    fn a_rewrite_keeps_the_existing_files_group() {
+        let own = nix::unistd::getegid();
+        let Some(other) = nix::unistd::getgroups()
+            .unwrap()
+            .into_iter()
+            .find(|g| *g != own)
+        else {
+            return; // no supplementary group to give the file
+        };
+        let tmp = tempdir().unwrap();
+        let existing = tmp.path().join("existing");
+        fs::write(&existing, "old").unwrap();
+        std::os::unix::fs::chown(&existing, None, Some(other.as_raw())).unwrap();
+
+        write_atomic(&existing, "new").unwrap();
+
+        assert_eq!(fs::metadata(&existing).unwrap().gid(), other.as_raw());
+    }
+
     #[test]
     fn find_repo_root_missing_returns_documented_error() {
         let tmp = tempdir().unwrap();
@@ -694,6 +1142,57 @@ mod tests {
 
         let bare = tmp.path().join("a");
         fs::create_dir_all(bare.join(".agents")).unwrap();
+        let nested = bare.join("b/c");
+        fs::create_dir_all(&nested).unwrap();
+
+        let root = find_repo_root_from(&nested).unwrap();
+        assert_eq!(root, tmp.path());
+    }
+
+    /// #829: `.agents/outrig/` the user cannot search must stop the walk
+    /// rather than be read as absent -- a config further up, or none, picked
+    /// silently in place of one the walk never examined.
+    #[test]
+    fn find_repo_root_reports_a_config_it_cannot_examine() {
+        let tmp = tempdir().unwrap();
+        write_repo_config(tmp.path()); // a config further up, of the caller's own
+        let proj = tmp.path().join("proj");
+        let agents = proj.join(".agents").join("outrig");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("config.toml"), b"# fixture
+").unwrap();
+        let nested = proj.join("sub");
+        fs::create_dir_all(&nested).unwrap();
+        fs::set_permissions(&agents, Permissions::from_mode(0o000)).unwrap();
+        // A superuser searches any directory, so there is nothing to see.
+        let searchable = fs::metadata(agents.join("config.toml")).is_ok();
+
+        let result = find_repo_root_from(&nested);
+
+        fs::set_permissions(&agents, Permissions::from_mode(0o755)).unwrap();
+        if searchable {
+            return;
+        }
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, OutrigError::Path { op: "stat", path, .. } if *path == agents.join("config.toml")),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("Permission denied"), "{err}");
+    }
+
+    /// A regular file named `.agents` is not the directory the config lives
+    /// in, but it is not absence either: the walk goes on past it rather
+    /// than erroring or stopping short.
+    #[test]
+    fn find_repo_root_skips_a_agents_entry_that_is_a_regular_file() {
+        let tmp = tempdir().unwrap();
+        write_repo_config(tmp.path());
+
+        let bare = tmp.path().join("a");
+        fs::create_dir_all(&bare).unwrap();
+        fs::write(bare.join(".agents"), b"not a directory
+").unwrap();
         let nested = bare.join("b/c");
         fs::create_dir_all(&nested).unwrap();
 
@@ -819,6 +1318,40 @@ mod tests {
         }
     }
 
+    /// A `--config` whose `stat` fails for a reason other than absence is not
+    /// "not an existing file": that sends the user looking for a file that is
+    /// there. The error names the path and the cause instead.
+    #[test]
+    fn explicit_config_that_cannot_be_examined_reports_why() {
+        let repo = tempdir().unwrap();
+        write_repo_config(repo.path());
+        let locked = repo.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        let file = locked.join("outrig.toml");
+        fs::write(&file, b"# fixture\n").unwrap();
+        fs::set_permissions(&locked, Permissions::from_mode(0o000)).unwrap();
+        // A superuser searches any directory, so there is nothing to see.
+        let searchable = fs::metadata(&file).is_ok();
+
+        let errs: Vec<_> = [resolve_repo_config, resolve_repo_config_optional]
+            .map(|resolve| resolve(Some(&file), repo.path()))
+            .into();
+        fs::set_permissions(&locked, Permissions::from_mode(0o755)).unwrap();
+        if searchable {
+            return;
+        }
+        for err in errs {
+            let msg = err.unwrap_err().to_string();
+            assert!(
+                msg.starts_with(&format!(
+                    "configuration: --config {} cannot be read: ",
+                    file.display()
+                )) && msg.contains("Permission denied"),
+                "{msg}"
+            );
+        }
+    }
+
     /// Without the flag, nothing changes: the walk up decides, and a run or
     /// mcp session with nothing to find is config-less in the working
     /// directory.
@@ -926,7 +1459,7 @@ mod tests {
         assert!(!got.starts_with(root.join("cache")));
     }
 
-    /// `refuse_repo_declared_mounts_with` for a repo config, under `root`,
+    /// `pin_repo_declared_mounts_with` for a repo config, under `root`,
     /// declaring one mount of `host`, against a `global` config path and no
     /// home rule. The refusal's text, if there is one.
     fn refusal(root: &Path, host: &Path, access: &str, global: &Path) -> Option<String> {
@@ -942,10 +1475,140 @@ mod tests {
             ),
         )
         .unwrap();
-        let cfg = Config::load_unvalidated(&repo, None).unwrap();
-        refuse_repo_declared_mounts_with(&cfg, &repo, None, Some(global))
+        let mut cfg = Config::load_unvalidated(&repo, None).unwrap();
+        pin_repo_declared_mounts_with(&mut cfg, &repo, None, Some(global), false)
             .err()
             .map(|e| e.to_string())
+    }
+
+    /// A repo config declaring one read-write mount of `host`, loaded under
+    /// `root`, and the pin of it against a global config path.
+    fn pin(root: &Path, host: &Path, global: &Path) -> (Config, Vec<PinnedMount>) {
+        let repo = root.join("repo");
+        let file = repo_config_path(&repo);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            &file,
+            format!(
+                "[[workspace.mounts]]\nhost-path = \"{}\"\ncontainer-path = \"/g\"\n",
+                host.display()
+            ),
+        )
+        .unwrap();
+        let mut cfg = Config::load_unvalidated(&repo, None).unwrap();
+        let pinned =
+            pin_repo_declared_mounts_with(&mut cfg, &repo, None, Some(global), false).unwrap();
+        (cfg, pinned)
+    }
+
+    /// Pinning installs the canonical bytes, and the bind renders them through
+    /// `display()`: a target whose name is not UTF-8 would be mounted as its
+    /// U+FFFD spelling, which a repo can make a link to home. Refused.
+    #[test]
+    fn a_repo_mount_resolving_to_a_non_utf8_path_is_refused() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let odd = root.join(OsStr::from_bytes(b"odd\xff"));
+        fs::create_dir_all(&odd).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&odd, &link).unwrap();
+        let global = root.join("conf/outrig/config.toml");
+
+        let err = refusal(&root, &link, "read-only", &global).expect("non-UTF-8 target");
+        assert!(err.contains("not valid UTF-8"), "{err}");
+    }
+
+    /// The path the guard validated is the path that is mounted: a symlink
+    /// swapped after the check cannot redirect it, and a replaced component
+    /// is refused at start (#604).
+    #[test]
+    fn a_pinned_repo_mount_survives_a_symlink_swap_and_refuses_a_replaced_parent() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let (safe, other) = (root.join("safe"), root.join("other"));
+        fs::create_dir_all(&safe).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&safe, &link).unwrap();
+        let global = root.join("conf/outrig/config.toml");
+
+        let (cfg, pinned) = pin(&root, &link, &global);
+        let repo = root.join("repo");
+        assert_eq!(cfg.workspace.mounts[0].resolved_host_path(&repo), safe);
+        recheck_pinned_mounts(&pinned).unwrap();
+
+        // The symlink now points elsewhere; the pin still names `safe`.
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert_eq!(cfg.workspace.mounts[0].resolved_host_path(&repo), safe);
+        recheck_pinned_mounts(&pinned).unwrap();
+
+        // The pinned directory itself is replaced by a link elsewhere.
+        fs::remove_dir(&safe).unwrap();
+        std::os::unix::fs::symlink(&other, &safe).unwrap();
+        let err = recheck_pinned_mounts(&pinned).unwrap_err().to_string();
+        assert!(err.contains(&other.display().to_string()), "{err}");
+    }
+
+    /// The pin moves where a directory is mounted from, never where the
+    /// container shows it: a mount stays at the container path its config gave
+    /// or defaulted to, and so, in a launch that starts bindings, does a
+    /// workspace the pin moved.
+    #[test]
+    fn a_pinned_mount_appears_where_the_config_put_it() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let [ws, data, more] = ["ws", "data", "more"].map(|name| root.join(name));
+        let [ws_link, data_link, more_link] =
+            ["ws-link", "data-link", "more-link"].map(|name| root.join(name));
+        for (real, link) in [(&ws, &ws_link), (&data, &data_link), (&more, &more_link)] {
+            fs::create_dir_all(real).unwrap();
+            std::os::unix::fs::symlink(real, link).unwrap();
+        }
+        let repo = root.join("repo");
+        let file = repo_config_path(&repo);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let global = root.join("conf/outrig/config.toml");
+        let binding = "[bindings.x]\ndescription = \"d\"\nfactory = \"m:f\"\n";
+        let pinned = |workspace: &Path, binding: &str, starts_bindings: bool| {
+            fs::write(
+                &file,
+                format!(
+                    "[workspace]\nhost-path = \"{0}\"\n\
+                     [[workspace.mounts]]\nhost-path = \"{1}\"\ncontainer-path = \"{1}\"\n\
+                     [[workspace.mounts]]\nhost-path = \"{2}\"\n{binding}",
+                    workspace.display(),
+                    data_link.display(),
+                    more_link.display()
+                ),
+            )
+            .unwrap();
+            let mut cfg = Config::load_unvalidated(&repo, None).unwrap();
+            pin_repo_declared_mounts_with(&mut cfg, &repo, None, Some(&global), starts_bindings)
+                .unwrap();
+            cfg.workspace
+        };
+
+        // The workspace is at `/workspace` in a launch that ignores bindings
+        // or with no binding to start; one the pin did not move is left to
+        // the harness.
+        for (written, binding, starts_bindings, shown) in [
+            (&ws_link, binding, true, Some(ws_link.as_path())),
+            (&ws_link, binding, false, None),
+            (&ws_link, "", true, None),
+            (&ws, binding, true, None),
+        ] {
+            let workspace = pinned(written, binding, starts_bindings);
+            assert_eq!(workspace.resolved_host_path(&repo), ws);
+            assert_eq!(workspace.declared_container_path(), shown);
+            let mounts = [(&data, &data_link), (&more, &more_link)];
+            for (mount, (real, link)) in workspace.mounts.iter().zip(mounts) {
+                assert_eq!(mount.resolved_host_path(&repo), *real);
+                assert_eq!(mount.declared_container_path(), Some(link.as_path()));
+            }
+        }
     }
 
     /// How a refusal names a directory the global config path is looked up
@@ -1013,6 +1676,111 @@ mod tests {
         let err = refusal(&root, &links, "read-write", &links.join("config.toml"))
             .expect("the symlink's directory");
         assert!(err.contains(&looked_up_through(&links)), "{err}");
+    }
+
+    /// A workspace resolving through a directory whose name carries `:` is
+    /// refused for a launch that mounts: podman would read it as the field
+    /// separator of the `-v` value and refuse the container after the image
+    /// was acquired. Undeclared, the path is outrig's own pick, so the
+    /// refusal says which default chose it and what to do about that (#365).
+    #[test]
+    fn an_undeclared_workspace_resolving_through_a_colon_is_refused() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("a:b");
+        fs::create_dir_all(&root).unwrap();
+
+        let implicit = Config::load_from_str("").unwrap().workspace;
+        let err = refuse_workspace_field_separator(&root, &implicit, &root)
+            .expect_err("the colon");
+        let err = err.to_string();
+        assert!(err.contains(&root.display().to_string()), "{err}");
+        assert!(err.contains("`:`"), "{err}");
+        assert!(err.contains("no repo config was found"), "names the default: {err}");
+        assert!(err.contains("run outrig from a directory"), "advises the cwd: {err}");
+
+        let clean = tmp.path().join("clean");
+        fs::create_dir_all(&clean).unwrap();
+        refuse_workspace_field_separator(&clean, &implicit, &clean)
+            .expect("no colon, nothing to refuse");
+    }
+
+    /// A *declared* `host-path` is the config's pick, not outrig's, and a
+    /// relative one resolves against the directory of the file that declared
+    /// it -- so where outrig was invoked from has nothing to do with it. The
+    /// refusal names that file and the key, and advises an edit rather than a
+    /// `cd` that could not help.
+    #[test]
+    fn a_declared_workspace_resolving_through_a_colon_names_its_file() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("a:b").join("repo");
+        let file = repo_config_path(&repo);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(repo.join("proj")).unwrap();
+        fs::write(&file, "[workspace]\nhost-path = \"proj\"\n").unwrap();
+        let cfg = Config::load_unvalidated(&repo, None).unwrap();
+        // Nothing the file spelled holds a `:`, so validation passes it.
+        cfg.validate(Some(&repo)).expect("the entry itself is clean");
+        let resolved = cfg.workspace.resolved_host_path(&repo);
+
+        let err = refuse_workspace_field_separator(&resolved, &cfg.workspace, &repo)
+            .expect_err("the resolved colon");
+        let err = err.to_string();
+        assert!(err.contains(&resolved.display().to_string()), "{err}");
+        assert!(err.contains("host-path proj"), "names the key as written: {err}");
+        assert!(err.contains(&file.display().to_string()), "names the file: {err}");
+        assert!(
+            !err.contains("no repo config was found") && !err.contains("run outrig from"),
+            "neither claims the cwd chose it nor advises a cd: {err}"
+        );
+    }
+
+    /// The same question for the extra mounts, which resolve against the
+    /// directory of the file that declared them. The refusal names the entry
+    /// as written, the path it resolved to, and that file.
+    #[test]
+    fn a_mount_resolving_through_a_colon_is_refused() {
+        let tmp = tempdir().unwrap();
+        // The colon is in the repo root, which the entry resolves against.
+        let repo = tmp.path().join("a:b").join("repo");
+        let file = repo_config_path(&repo);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::write(
+            &file,
+            "[[workspace.mounts]]\nhost-path = \"docs\"\ncontainer-path = \"/docs\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_unvalidated(&repo, None).unwrap();
+        // The entry itself spells no colon, so config validation passes it.
+        cfg.validate(Some(&repo)).expect("nothing a config file said is malformed");
+
+        let err = refuse_mount_field_separators(&cfg, &repo).expect_err("the resolved colon");
+        let err = err.to_string();
+        assert!(err.contains("\"docs\"") || err.contains("docs"), "names the entry: {err}");
+        assert!(
+            err.contains(&repo.join("docs").display().to_string()),
+            "names what it resolved to: {err}"
+        );
+        assert!(err.contains(&file.display().to_string()), "names the file: {err}");
+        assert!(err.contains("`:`"), "{err}");
+    }
+
+    /// Only the resolved path is this rule's business, so a mount that
+    /// resolves cleanly passes however the repo root is spelled.
+    #[test]
+    fn a_mount_resolving_clean_is_not_refused() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let file = repo_config_path(&repo);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::write(
+            &file,
+            "[[workspace.mounts]]\nhost-path = \"docs\"\ncontainer-path = \"/docs\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_unvalidated(&repo, None).unwrap();
+        refuse_mount_field_separators(&cfg, &repo).expect("no colon anywhere");
     }
 
     /// The refusal says which default put the workspace there: a repo config

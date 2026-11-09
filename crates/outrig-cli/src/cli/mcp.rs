@@ -96,6 +96,7 @@ pub struct McpArgs {
 
     /// Mount an extra host directory into the container. Repeatable. Format
     /// `HOST:CONTAINER[:ro|rw]` (default read-only; the host dir must exist).
+    /// A relative host path resolves against the current directory.
     #[arg(long = "volume", global = true, value_name = "HOST:CONTAINER[:ro|rw]", action = ArgAction::Append, value_parser = parse_volume)]
     pub volume: Vec<CliVolume>,
 }
@@ -177,13 +178,15 @@ async fn serve(
         watcher,
         used_builtin_default,
         mut signals,
+        session_lock,
         cfg: _,
         session: _,
         repo_root: _,
     } = setup;
     // Nothing between here and `teardown` may return early: `teardown` is
-    // the only thing that finalizes the session record.
-    let mut runtime = SessionRuntime::new(watcher, network, containers);
+    // the only thing that finalizes the session record -- and the only thing
+    // that releases the claim saying this session is live.
+    let mut runtime = SessionRuntime::new(watcher, network, containers, session_lock);
 
     let primary_died = runtime.watcher.as_ref().map(|w| w.primary_died());
     let outcome: Result<i32> = serve_inner(
@@ -216,6 +219,7 @@ async fn show_merged(setup: SessionSetup) -> Result<i32> {
         network,
         mcp_plan,
         watcher,
+        session_lock,
         cfg: _,
         image_cfg_name: _,
         image_tag: _,
@@ -228,7 +232,7 @@ async fn show_merged(setup: SessionSetup) -> Result<i32> {
 
     let outcome = signals.race(write_merged_mcp(&mcp_plan)).await.map(|()| 0);
     session_setup::teardown(
-        SessionRuntime::new(watcher, network, containers),
+        SessionRuntime::new(watcher, network, containers, session_lock),
         &store,
         &sid,
         &outcome,
@@ -420,24 +424,27 @@ async fn serve_http_transport(
 ) -> Result<i32> {
     let ct = CancellationToken::new();
     let session_manager = Arc::new(LocalSessionManager::default());
-    let router = streamable_http_router(proxy, listen, ct.child_token(), session_manager.clone());
 
     let outcome = match listen {
         ListenAddr::Tcp(addr) => {
+            // Bind before the router is built: the config pins its allowed
+            // Origins to the port this ends up on, which `--listen 127.0.0.1:0`
+            // does not know until the kernel has picked one.
             let listener = tokio::net::TcpListener::bind(addr).await?;
-            let local_addr = listener.local_addr()?;
-            if let Some(warning) = listen_exposure_warning(&ListenAddr::Tcp(local_addr)) {
+            let bound = ListenAddr::Tcp(listener.local_addr()?);
+            if let Some(warning) = listen_exposure_warning(&bound) {
                 eprintln!("{warning}");
             }
-            eprintln!(
-                "[outrig] listen: {}",
-                listen_endpoint(&ListenAddr::Tcp(local_addr))
-            );
+            eprintln!("[outrig] listen: {}", listen_endpoint(&bound));
+            let router =
+                streamable_http_router(proxy, &bound, ct.child_token(), session_manager.clone());
             let shutdown = http_shutdown(ct.clone());
             let server = axum::serve(listener, router).with_graceful_shutdown(shutdown);
             wait_for_http_shutdown(server, ct, monitor, signals).await
         }
         ListenAddr::Unix(path) => {
+            let router =
+                streamable_http_router(proxy, listen, ct.child_token(), session_manager.clone());
             serve_unix_http_transport(router, path, ct, monitor, signals).await
         }
     };
@@ -455,10 +462,7 @@ async fn serve_unix_http_transport(
     signals: &mut Signals,
 ) -> Result<i32> {
     prepare_unix_socket(path)?;
-    let listener = tokio::net::UnixListener::bind(path)?;
-    let _cleanup = UnixSocketCleanup {
-        path: path.to_path_buf(),
-    };
+    let (listener, _cleanup) = bind_unix_listener(path)?;
     eprintln!("[outrig] listen: unix:{}", path.display());
     let shutdown = http_shutdown(ct.clone());
     let server = axum::serve(listener, router).with_graceful_shutdown(shutdown);
@@ -479,28 +483,95 @@ async fn serve_unix_http_transport(
     )
 }
 
-fn streamable_http_router(
-    proxy: ProxyServer,
+/// Mount the MCP service at `/mcp`.
+///
+/// Generic over the handler so a test can drive the same router -- the same
+/// `Host`/`Origin` gate in front of it -- without a container behind it.
+/// Production always passes a [`ProxyServer`].
+fn streamable_http_router<S>(
+    handler: S,
     listen: &ListenAddr,
     ct: CancellationToken,
     session_manager: Arc<LocalSessionManager>,
-) -> axum::Router {
+) -> axum::Router
+where
+    S: rmcp::ServerHandler + Clone + Send + 'static,
+{
     let service = StreamableHttpService::new(
-        move || Ok(proxy.clone()),
+        move || Ok(handler.clone()),
         session_manager,
         streamable_http_config(listen, ct),
     );
     axum::Router::new().nest_service("/mcp", service)
 }
 
+/// The transport's browser defenses for one listen address.
+///
+/// Two headers, two jobs. `Host` is what stops DNS rebinding: a name that
+/// resolves to the loopback address only carries a request this far if the
+/// name is one of ours, so a loopback bind keeps rmcp's loopback allowlist and
+/// anything else -- a public bind, a Unix socket, both reached under names
+/// outrig cannot enumerate -- turns it off.
+///
+/// `Origin` is what stops a page in a browser from driving the listener, and
+/// the MCP transport spec says a local server MUST check it. rmcp's default is
+/// an empty allowlist, which means *no* validation, so every `Origin` passed.
+/// Nothing today turns that into a drive-by tool call: rmcp demands
+/// `Content-Type: application/json` on POST, which puts a CORS preflight in
+/// front of the request that the service answers with 405. But that is one
+/// rmcp change away from being false, and the header is free to check, so it
+/// is checked here (#372).
+///
+/// Validation is enforced on every address, including the ones whose allowlist
+/// is empty: an empty *enforced* list rejects every request that carries an
+/// `Origin` at all. A request without the header still passes, which is what
+/// every non-browser MCP client sends -- `Origin` is a browser's word for the
+/// page that asked, and rmcp's own HTTP client does not set one. So the rule
+/// costs nothing to an editor, a CLI, or a script, and a page is refused.
+///
+/// A loopback listener allows exactly the origins that name itself, port and
+/// all, so a same-origin fetch to its own endpoint works. Every other origin,
+/// loopback or not, is not ours: a page on `http://localhost:3000` is a
+/// different origin from this endpoint, and allowing it would mean allowing
+/// whatever else answers on a port we do not serve.
 fn streamable_http_config(
     listen: &ListenAddr,
     ct: CancellationToken,
 ) -> StreamableHttpServerConfig {
-    let config = StreamableHttpServerConfig::default().with_cancellation_token(ct);
+    let config = StreamableHttpServerConfig::default()
+        .with_cancellation_token(ct)
+        .with_allowed_origins(self_origins(listen))
+        .enforce_origin_validation();
     match listen {
         ListenAddr::Tcp(addr) if addr.ip().is_loopback() => config,
         ListenAddr::Tcp(_) | ListenAddr::Unix(_) => config.disable_allowed_hosts(),
+    }
+}
+
+/// The browser origins that name this listener itself.
+///
+/// Only a loopback TCP bind has any: the three spellings rmcp's `Host`
+/// allowlist accepts, each carrying the port actually bound -- an entry
+/// without a port would match the same host on *any* port, which is a
+/// different server. The address must therefore be the bound one, not the
+/// requested one, or `--listen 127.0.0.1:0` would pin port 0.
+///
+/// A public bind and a Unix socket get none. Their endpoint is reached under a
+/// name outrig never learns -- whatever a reverse proxy publishes, or no URL
+/// at all -- so there is no origin to recognize, and the empty list means
+/// "refuse every `Origin`". A proxy that fronts browser traffic validates the
+/// header itself; forwarding it here is asking to be refused.
+fn self_origins(listen: &ListenAddr) -> Vec<String> {
+    match listen {
+        ListenAddr::Tcp(addr) if addr.ip().is_loopback() => {
+            let port = addr.port();
+            vec![
+                format!("http://localhost:{port}"),
+                format!("http://127.0.0.1:{port}"),
+                format!("http://[::1]:{port}"),
+            ]
+        }
+        ListenAddr::Tcp(_) | ListenAddr::Unix(_) => Vec::new(),
     }
 }
 
@@ -630,6 +701,22 @@ fn listen_exposure_warning(listen: &ListenAddr) -> Option<String> {
     }
 }
 
+/// Mode the listening socket is published with: owner-only, because the
+/// socket's filesystem permissions are the whole access boundary for a
+/// `unix:` listener -- everything that connects reaches the container's tool
+/// surface, and v1 has no authentication behind it.
+#[cfg(unix)]
+const UNIX_SOCKET_MODE: u32 = 0o600;
+
+/// Clear the listen path, refusing rather than displacing a listener that is
+/// still serving it.
+///
+/// `bind(2)` fails on an existing path, so a socket left by a process that
+/// died has to be removed before a new one can take the name. A socket a live
+/// process is still accepting on looks exactly the same on disk, and removing
+/// that one does not stop it: it keeps running, holding its container, reached
+/// by nothing, while this process answers under the name its clients hold.
+/// Only a connection tells the two apart.
 #[cfg(unix)]
 fn prepare_unix_socket(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent()
@@ -643,11 +730,8 @@ fn prepare_unix_socket(path: &Path) -> Result<()> {
         .into());
     }
 
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => {
-            std::fs::remove_file(path).path_ctx("remove", path)?;
-            Ok(())
-        }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => clear_stale_unix_socket(path),
         Ok(_) => Err(OutrigError::Configuration(format!(
             "unix listen path exists and is not a socket: {}",
             path.display()
@@ -656,6 +740,208 @@ fn prepare_unix_socket(path: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).path_ctx("stat", path).map_err(Into::into),
     }
+}
+
+/// Remove a socket file nothing is listening on, and refuse every other
+/// answer.
+///
+/// The probe is a connection, which is what a client would have done anyway,
+/// and only one of its outcomes clears the path: `ECONNREFUSED`, the kernel's
+/// answer for a socket whose listener is gone. A connect that succeeds proves
+/// someone is accepting -- the peer sees a connection that opens and closes
+/// with no request on it, which its HTTP server drops.
+///
+/// Every other outcome leaves the question open and is refused, because the
+/// cost of guessing wrong is a running instance silently cut off from its
+/// clients, where the cost of refusing is a message. `EAGAIN` is the sharp
+/// one: a live listener whose backlog is full answers with it, so it means
+/// *more* likely to be serving, not less. The path going missing between the
+/// stat and the probe is the one benign case -- there is nothing left to
+/// remove.
+///
+/// The socket is deliberately nonblocking. A blocking `connect(2)` to a
+/// listener that has stopped accepting with a full backlog waits forever, and
+/// it would wait here on the runtime thread, after the container and backing
+/// MCPs are already up and before anything is watching for a signal -- so
+/// SIGINT could not advance teardown, the installed handlers restarting the
+/// syscall rather than interrupting it. A timeout around a blocking connect
+/// would not help: the thread stays in the syscall regardless. For a Unix
+/// socket a nonblocking `connect(2)` resolves in the same call, so this
+/// returns an answer without ever waiting.
+///
+/// This is a check, not a lock. Two `outrig mcp` processes racing for the same
+/// path can both find it free, and one then binds a name the other is about to
+/// remove. It closes the case the report describes -- a second instance
+/// launched against a path an established one is already serving.
+#[cfg(unix)]
+fn clear_stale_unix_socket(path: &Path) -> Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+
+    let addr = errno_ctx(UnixAddr::new(path), "address", path)?;
+    let probe = errno_ctx(
+        socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+            None,
+        ),
+        "socket",
+        path,
+    )?;
+
+    match connect(std::os::fd::AsRawFd::as_raw_fd(&probe), &addr) {
+        Ok(()) => Err(OutrigError::Configuration(format!(
+            "unix listen socket is already served by a running process: {}\n  \
+             stop it, or pass --listen with another path",
+            path.display()
+        ))
+        .into()),
+        Err(Errno::ECONNREFUSED) => {
+            std::fs::remove_file(path).path_ctx("remove", path)?;
+            Ok(())
+        }
+        Err(Errno::ENOENT) => Ok(()),
+        // `EAGAIN`/`EINPROGRESS` mean a listener is there and not taking this
+        // connection now; everything else (`EACCES`, `EPERM`, ...) means the
+        // probe never got an answer at all.
+        Err(e) => Err(OutrigError::Configuration(format!(
+            "unix listen path {} holds a socket that could not be reached ({}), so whether a \
+             process is still serving it is unknown; outrig will not replace it",
+            path.display(),
+            std::io::Error::from(e)
+        ))
+        .into()),
+    }
+}
+
+/// Bind and listen on `path` with a socket only this user can connect to.
+///
+/// The mode is set on the socket before it is given a name, so the name never
+/// exists under a wider one: `bind(2)` publishes the socket's own mode minus
+/// the process umask, where `tokio::net::UnixListener::bind` -- which creates
+/// the socket itself, mode `0777` -- publishes whatever the umask happens to
+/// leave, `0775` under the common `002`.
+///
+/// Under any ordinary umask that lands exactly on [`UNIX_SOCKET_MODE`] and
+/// nothing further is done. A umask masking an owner bit (`0200`, `0400`)
+/// leaves a socket this user cannot connect to, and only that case is
+/// repaired, by [`restore_socket_mode`].
+#[cfg(unix)]
+fn bind_unix_listener(path: &Path) -> Result<(tokio::net::UnixListener, UnixSocketCleanup)> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    use nix::sys::socket::{
+        AddressFamily, Backlog, SockFlag, SockType, UnixAddr, bind, listen, socket,
+    };
+    use nix::sys::stat::{Mode, fchmod};
+
+    let addr = errno_ctx(UnixAddr::new(path), "address", path)?;
+    // `SOCK_NONBLOCK` is what `UnixListener::from_std` requires of the socket
+    // it adopts; `SOCK_CLOEXEC` keeps the listener out of the `podman exec`
+    // children the backing MCP servers run as.
+    let sock = errno_ctx(
+        socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+            None,
+        ),
+        "socket",
+        path,
+    )?;
+    errno_ctx(
+        fchmod(sock.as_fd(), Mode::from_bits_truncate(UNIX_SOCKET_MODE)),
+        "chmod",
+        path,
+    )?;
+
+    errno_ctx(bind(sock.as_raw_fd(), &addr), "bind", path)?;
+    // The name exists from here on, so own its removal before anything else
+    // can fail.
+    let cleanup = UnixSocketCleanup {
+        path: path.to_path_buf(),
+    };
+    errno_ctx(listen(&sock, Backlog::MAXCONN), "listen", path)?;
+    restore_socket_mode(path)?;
+
+    let listener = tokio::net::UnixListener::from_std(std::os::unix::net::UnixListener::from(sock))
+        .path_ctx("listen", path)?;
+    Ok((listener, cleanup))
+}
+
+/// Put back owner bits the umask took off the socket just bound at `path`,
+/// touching nothing that is not still that socket.
+///
+/// The entry cannot be chmod'd by name. `chmod(2)` follows symlinks and
+/// re-resolves the path, so in a directory another user can write -- `/tmp`
+/// without its sticky bit, a shared runtime directory -- they can swap the
+/// entry between `bind(2)` and this call and have outrig apply `0600` to a
+/// file of their choosing, stripping the execute and search bits off a
+/// binary or a directory for good. The socket's own mode does not prevent
+/// that: what is replaced is the directory entry, not the inode.
+///
+/// So the inode is pinned first, with `O_PATH | O_NOFOLLOW`, which resolves
+/// the entry once and refuses to walk a symlink, and the mode is applied
+/// through that handle via `/proc/self/fd`. A swap is then visible rather
+/// than exploitable -- the pinned inode is a symlink or a regular file
+/// instead of a socket -- and is refused. (`fchmod` on the listening
+/// descriptor is not the same operation: a Unix socket's fd and its directory
+/// entry are different inodes, so it would change the mode nothing consults.)
+///
+/// The common case does no work at all: under any umask leaving the owner
+/// bits alone the socket is already [`UNIX_SOCKET_MODE`] and this returns
+/// after the stat. Nothing here ever widens a mode.
+#[cfg(unix)]
+fn restore_socket_mode(path: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use nix::fcntl::{OFlag, open};
+    use nix::sys::stat::{Mode, fstat};
+
+    let pinned = errno_ctx(
+        open(
+            path,
+            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ),
+        "open",
+        path,
+    )?;
+    let stat = errno_ctx(fstat(&pinned), "stat", path)?;
+
+    if !matches!(
+        nix::sys::stat::SFlag::from_bits_truncate(stat.st_mode) & nix::sys::stat::SFlag::S_IFMT,
+        nix::sys::stat::SFlag::S_IFSOCK
+    ) {
+        return Err(OutrigError::Configuration(format!(
+            "unix listen path {} stopped being the socket outrig just bound there; \
+             something else is writing that directory, so outrig will not touch it",
+            path.display()
+        ))
+        .into());
+    }
+
+    if stat.st_mode & 0o777 == UNIX_SOCKET_MODE {
+        return Ok(());
+    }
+
+    // The pinned inode, not the name: a second swap cannot redirect this.
+    let by_fd = PathBuf::from(format!("/proc/self/fd/{}", pinned.as_raw_fd()));
+    std::fs::set_permissions(&by_fd, std::fs::Permissions::from_mode(UNIX_SOCKET_MODE))
+        .path_ctx("chmod", path)
+        .map_err(Into::into)
+}
+
+/// A raw `errno` rendered the way every other filesystem failure here is: the
+/// operation and the path it was operating on.
+#[cfg(unix)]
+fn errno_ctx<T>(result: nix::Result<T>, op: &'static str, path: &Path) -> Result<T> {
+    result
+        .map_err(std::io::Error::from)
+        .path_ctx(op, path)
+        .map_err(Into::into)
 }
 
 #[cfg(unix)]
@@ -1088,6 +1374,193 @@ named  = { sidecar = "serve" }
         assert_eq!(render_merged_mcp(&SessionMcpPlan::default()), "[mcp]\n");
     }
 
+    /// A handler with nothing behind it: every method is rmcp's default. The
+    /// `Origin` gate runs in the transport, ahead of any dispatch, so what the
+    /// handler would answer does not enter into it -- and a test that reaches
+    /// the handler at all has proven the request was let through.
+    #[derive(Clone)]
+    struct BareHandler;
+
+    impl rmcp::ServerHandler for BareHandler {}
+
+    /// The bound endpoint of an `outrig mcp --listen 127.0.0.1:0` server,
+    /// configured exactly as production configures it. The server is a task;
+    /// it stops when `ct` is cancelled.
+    async fn serve_loopback(ct: CancellationToken) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let bound = ListenAddr::Tcp(listener.local_addr().expect("local addr"));
+        let endpoint = listen_endpoint(&bound);
+        let router = streamable_http_router(
+            BareHandler,
+            &bound,
+            ct.child_token(),
+            Arc::new(LocalSessionManager::default()),
+        );
+        let shutdown = http_shutdown(ct);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown)
+                .await;
+        });
+        endpoint
+    }
+
+    /// An `initialize` POST, carrying `origin` when one is given.
+    async fn post_initialize(
+        client: &reqwest::Client,
+        endpoint: &str,
+        origin: Option<&str>,
+    ) -> reqwest::StatusCode {
+        let mut request = client
+            .post(endpoint)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": { "name": "outrig-test", "version": "1.0.0" }
+                    }
+                })
+                .to_string(),
+            );
+        if let Some(origin) = origin {
+            request = request.header("Origin", origin);
+        }
+        request.send().await.expect("POST initialize").status()
+    }
+
+    /// The MCP transport spec says a local HTTP server MUST validate `Origin`.
+    /// rmcp's default allowlist is empty, which disables the check rather than
+    /// failing it closed, so every origin reached the proxy -- a page's
+    /// included, the moment anything upstream relaxes the content-type rule
+    /// that currently forces a preflight. A page claiming an origin that is
+    /// not this endpoint is now refused before dispatch (#372).
+    #[tokio::test]
+    async fn a_listener_refuses_a_cross_origin_page_and_serves_a_client_that_sends_no_origin() {
+        let ct = CancellationToken::new();
+        let endpoint = serve_loopback(ct.clone()).await;
+        let client = reqwest::Client::new();
+
+        // Every non-browser MCP client -- an editor, a CLI, rmcp's own HTTP
+        // transport -- sends no `Origin` at all, and must go on working.
+        assert!(
+            post_initialize(&client, &endpoint, None).await.is_success(),
+            "a request with no Origin is not a browser's and must be served"
+        );
+
+        // Same-origin: the page is this endpoint's own.
+        let self_origin = endpoint
+            .strip_suffix("/mcp")
+            .expect("endpoint ends in /mcp")
+            .to_string();
+        assert!(
+            post_initialize(&client, &endpoint, Some(&self_origin))
+                .await
+                .is_success(),
+            "a page served by this listener is same-origin: {self_origin}"
+        );
+
+        for origin in [
+            "http://evil.example",
+            "https://evil.example",
+            // Loopback is not a trust boundary: a page on another local port
+            // is as cross-origin as one on the internet.
+            "http://localhost:3000",
+            "null",
+        ] {
+            assert_eq!(
+                post_initialize(&client, &endpoint, Some(origin)).await,
+                reqwest::StatusCode::FORBIDDEN,
+                "cross-origin {origin} should be refused"
+            );
+        }
+
+        ct.cancel();
+    }
+
+    /// A listener whose endpoint outrig cannot name -- a public bind behind
+    /// whatever a reverse proxy publishes, a Unix socket with no URL at all --
+    /// has no origin of its own, and the empty allowlist is enforced rather
+    /// than waved through: every `Origin` is refused, while the header-free
+    /// requests real clients send still pass.
+    #[tokio::test]
+    async fn a_public_bind_refuses_every_origin_and_still_serves_header_free_clients() {
+        let ct = CancellationToken::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        // Configured as a public bind (no `Host` allowlist, no self origin)
+        // but bound on loopback, which is what the test can reach.
+        let public = ListenAddr::Tcp(format!("0.0.0.0:{port}").parse().expect("socket addr"));
+        let router = streamable_http_router(
+            BareHandler,
+            &public,
+            ct.child_token(),
+            Arc::new(LocalSessionManager::default()),
+        );
+        let shutdown = http_shutdown(ct.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown)
+                .await;
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+
+        let client = reqwest::Client::new();
+        assert!(
+            post_initialize(&client, &endpoint, None).await.is_success(),
+            "a request with no Origin must be served"
+        );
+        let own_address = format!("http://127.0.0.1:{port}");
+        assert_eq!(
+            post_initialize(&client, &endpoint, Some(&own_address)).await,
+            reqwest::StatusCode::FORBIDDEN,
+            "a listener outrig cannot name recognizes no origin as its own"
+        );
+
+        ct.cancel();
+    }
+
+    /// The origins a loopback listener recognizes as itself carry the port it
+    /// is actually on. `--listen 127.0.0.1:0` asks the kernel for a port, so
+    /// the list has to be derived from the bound address: derived from the
+    /// requested one it would name port 0, which is no endpoint at all.
+    #[test]
+    fn a_loopback_listeners_self_origins_name_its_bound_port() {
+        let bound = ListenAddr::Tcp("127.0.0.1:7331".parse().expect("socket addr"));
+        assert_eq!(
+            self_origins(&bound),
+            vec![
+                "http://localhost:7331".to_string(),
+                "http://127.0.0.1:7331".to_string(),
+                "http://[::1]:7331".to_string(),
+            ]
+        );
+    }
+
+    /// A public bind and a Unix socket are reached under names outrig never
+    /// learns, so neither has an origin of its own to allow. The empty list is
+    /// enforced rather than ignored, which is the whole point: it refuses
+    /// every `Origin` instead of passing every one.
+    #[test]
+    fn a_listener_outrig_cannot_name_has_no_self_origin() {
+        assert!(
+            self_origins(&ListenAddr::Tcp(
+                "0.0.0.0:7331".parse().expect("socket addr")
+            ))
+            .is_empty()
+        );
+        assert!(self_origins(&ListenAddr::Unix(PathBuf::from("/tmp/outrig.sock"))).is_empty());
+    }
+
     #[test]
     fn listen_exposure_warning_only_for_non_loopback_tcp() {
         let loopback = ListenAddr::Tcp("127.0.0.1:7331".parse().expect("socket addr"));
@@ -1101,5 +1574,222 @@ named  = { sidecar = "serve" }
 
         let unix = ListenAddr::Unix(PathBuf::from("/tmp/outrig.sock"));
         assert!(listen_exposure_warning(&unix).is_none());
+    }
+
+    /// A path whose socket nothing answers on is the ordinary case -- a prior
+    /// `outrig mcp` that was killed -- and the new listener takes the name.
+    #[tokio::test]
+    async fn a_socket_nothing_listens_on_is_cleared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+
+        // Bound, never listened on, and the listener dropped: the file stays,
+        // and connecting to it is refused exactly as it is for a socket whose
+        // process is gone.
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
+        assert!(path.exists(), "the socket file outlives its listener");
+
+        prepare_unix_socket(&path).expect("a socket with no listener is cleared");
+        assert!(!path.exists(), "the stale socket should have been removed");
+    }
+
+    /// A listener that has stopped accepting and filled its backlog answers a
+    /// connect with `EAGAIN` rather than refusing it. A blocking probe waits
+    /// for that one forever, on the runtime thread, with the container and
+    /// backing MCPs already up and no signal handler yet able to advance
+    /// teardown -- so the probe is nonblocking, and `EAGAIN` is read as the
+    /// evidence of a live server that it is.
+    #[tokio::test]
+    async fn a_listener_with_a_full_backlog_is_refused_rather_than_waited_on() {
+        use nix::sys::socket::{
+            AddressFamily, Backlog, SockFlag, SockType, UnixAddr, bind, listen, socket,
+        };
+        use std::os::fd::AsRawFd as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+
+        // The smallest backlog the kernel will take, and nothing ever accepts.
+        let addr = UnixAddr::new(&path).expect("addr");
+        let server = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("socket");
+        bind(server.as_raw_fd(), &addr).expect("bind");
+        listen(&server, Backlog::new(0).expect("backlog")).expect("listen");
+
+        // Fill it: one queued connection is enough to make the next `EAGAIN`.
+        // These are nonblocking for the same reason the probe is -- a blocking
+        // connect here would hang this test on the very syscall it is about.
+        let _queued: Vec<_> = (0..2)
+            .map(|_| {
+                let client = socket(
+                    AddressFamily::Unix,
+                    SockType::Stream,
+                    SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+                    None,
+                )
+                .expect("client socket");
+                let _ = nix::sys::socket::connect(client.as_raw_fd(), &addr);
+                client
+            })
+            .collect();
+
+        // The assertion is as much that this returns at all as what it says.
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking({
+                let path = path.clone();
+                move || prepare_unix_socket(&path)
+            }),
+        )
+        .await
+        .expect("the probe must not block on a listener that never accepts")
+        .expect("probe task");
+
+        let err = probe.expect_err("a listener that is not accepting still holds the path");
+        assert!(
+            err.to_string().contains("outrig will not replace it"),
+            "an unanswered probe must refuse rather than clear: {err}"
+        );
+        assert!(path.exists(), "the live listener's socket must still be there");
+    }
+
+    /// The fault from #374: a second `outrig mcp --listen unix:<same path>`
+    /// used to unlink the first one's socket and bind its own. The first kept
+    /// running -- container and backing MCPs alive -- reachable by nothing,
+    /// and its clients were silently rehomed onto the second.
+    #[tokio::test]
+    async fn a_socket_a_live_process_serves_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+
+        let err = prepare_unix_socket(&path).expect_err("a served socket must not be displaced");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("already served by a running process"),
+            "error should name the cause: {rendered}"
+        );
+        assert!(
+            rendered.contains("--listen"),
+            "error should say what to do instead: {rendered}"
+        );
+        assert!(
+            path.exists(),
+            "the live listener's socket must still be there"
+        );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn a_listen_path_that_is_not_a_socket_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("regular-file");
+        std::fs::write(&path, b"not a socket").expect("write");
+
+        let err = prepare_unix_socket(&path).expect_err("a regular file must be refused");
+        assert!(
+            err.to_string().contains("is not a socket"),
+            "{}",
+            err.to_string()
+        );
+        assert!(path.exists(), "the file must be left alone");
+    }
+
+    #[tokio::test]
+    async fn a_free_listen_path_needs_no_clearing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        prepare_unix_socket(&dir.path().join("outrig.sock")).expect("an unused path is ready");
+
+        let missing = dir.path().join("nope").join("outrig.sock");
+        let err = prepare_unix_socket(&missing).expect_err("a missing parent must be refused");
+        assert!(
+            err.to_string().contains("parent directory does not exist"),
+            "{}",
+            err.to_string()
+        );
+    }
+
+    /// The socket's permissions are the only thing standing between a
+    /// `unix:` listener and the container's tool surface, so they do not get
+    /// to follow the umask. `UnixListener::bind` creates the socket `0777`
+    /// and publishes `0777 & !umask` -- `0775` under the common `002`, which
+    /// hands every group member the tools (#374).
+    #[tokio::test]
+    async fn the_listen_socket_is_owner_only_whatever_the_umask_is() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use nix::sys::stat::{Mode, umask};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+
+        // Process-global, so it is restored before anything is asserted.
+        let previous = umask(Mode::empty());
+        let bound = bind_unix_listener(&path);
+        umask(previous);
+        let (listener, _cleanup) = bound.expect("bind");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, UNIX_SOCKET_MODE, "socket mode is {mode:o}, want 0600");
+
+        // Owner-only is not the same as unusable: this user still connects.
+        let client = std::os::unix::net::UnixStream::connect(&path).expect("connect");
+        listener.accept().await.expect("accept");
+        drop(client);
+    }
+
+    /// `chmod(2)` by name re-resolves the path and follows symlinks. In a
+    /// directory another user can write -- `/tmp` without its sticky bit --
+    /// they can swap the entry between `bind(2)` and the chmod and have
+    /// outrig apply `0600` to a file of their choosing, stripping the search
+    /// bits off a directory or the execute bit off a binary for good. The
+    /// mode goes through a handle pinned with `O_NOFOLLOW` instead, so a swap
+    /// is refused rather than followed.
+    #[tokio::test]
+    async fn a_swapped_listen_entry_is_refused_rather_than_chmodded() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+
+        // The file an attacker would be aiming at: a directory nothing should
+        // take the search bits off.
+        let victim = dir.path().join("victim");
+        std::fs::create_dir(&victim).expect("victim dir");
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // Stand where `bind` leaves the path, then swap the entry for a link
+        // at the victim -- what a writable parent directory allows.
+        std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        std::fs::remove_file(&path).expect("unlink");
+        std::os::unix::fs::symlink(&victim, &path).expect("symlink");
+
+        let err = restore_socket_mode(&path).expect_err("a swapped entry must be refused");
+        assert!(
+            err.to_string().contains("stopped being the socket"),
+            "error should name what happened: {err}"
+        );
+
+        let mode = std::fs::metadata(&victim).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the victim's mode must be untouched, is {mode:o}");
+    }
+
+    /// The listener owns the name it bound: dropping it takes the socket file
+    /// with it, so the next run finds a free path rather than a stale one.
+    #[tokio::test]
+    async fn dropping_the_listener_removes_its_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+
+        let (listener, cleanup) = bind_unix_listener(&path).expect("bind");
+        assert!(path.exists());
+        drop(listener);
+        drop(cleanup);
+        assert!(!path.exists(), "the socket file should be gone");
     }
 }

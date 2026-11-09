@@ -142,7 +142,7 @@ async fn observed(cwd: &Path, verb: &str, flags: &[&str]) -> (Option<i32>, Strin
 
     let normalize = |s: &str| {
         let s = s.replace(arg(sessions.path()), "<root>");
-        let s = Regex::new(r"\d{8}T\d{6}-[0-9a-f]{4}")
+        let s = Regex::new(r"\d{8}T\d{6}-[0-9a-f]{4}(?:[0-9a-f]{4})?")
             .expect("regex")
             .replace_all(&s, "<sid>")
             .into_owned();

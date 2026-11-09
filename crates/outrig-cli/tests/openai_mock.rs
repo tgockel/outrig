@@ -25,7 +25,7 @@ use rig::completion::message::{AssistantContent, AssistantMessage};
 use serde_json::{Value, json};
 
 use outrig::config::Config;
-use outrig_cli::llm::RigAgent;
+use outrig_cli::llm::{RigAgent, TurnStop};
 use outrig_cli::session_tool;
 
 use common::{CannedResponse, FIXED_TOOL, FixedTool, drain_recorded, start_mock_http};
@@ -304,4 +304,33 @@ async fn a_json_tool_result_reaches_the_model_as_written() {
             "the model reads what the tool returned, byte for byte",
         );
     }
+}
+
+/// A `200` that rig makes no completion of ends the turn naming the finish
+/// reason its body gave: the endpoint's client keeps the body for the model's
+/// retry layer to read (#742).
+#[tokio::test]
+async fn a_reply_rig_rejects_is_named_by_its_finish_reason() {
+    let var = "OUTRIG_TEST_OPENAI_FINISH_REASON";
+    let (addr, _requests) = start_mock_http(vec![CannedResponse::ok(json!({
+        "id": "chatcmpl-mock",
+        "object": "chat.completion",
+        "created": 0,
+        "model": MODEL,
+        "choices": [{ "index": 0, "finish_reason": "content_filter" }],
+    }))])
+    .await;
+    let agent = mock_agent(addr, var, "gpt").await;
+
+    let end = agent
+        .run_turn("Hi.", &mut Vec::new())
+        .await
+        .expect("a failed call ends the turn");
+    let Some(TurnStop::EndpointFailed(reason)) = &end.stopped else {
+        panic!("a choice with no message is no reply: {end:?}");
+    };
+    assert!(
+        reason.contains("finish reason content_filter: "),
+        "{reason}"
+    );
 }

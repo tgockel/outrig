@@ -78,9 +78,10 @@ below. `/etc/shadow` gets no entry -- nothing in outrig authenticates as this us
 `useradd` would write is a locked password.
 
 After bootstrap, every `podman exec` outrig issues -- to start MCP servers, to run anything else
--- uses `--user=$(id -u):$(id -g)` and `HOME=/home/<user>`. Files written under `/workspace`
-therefore appear with your UID/GID on the host. The image itself needs no user setup and no user
-tooling: any base image works, including one with no `useradd`, `groupadd`, or `getent` at all.
+-- uses `--user=$(id -u):$(id -g)` and `HOME=/home/<user>` (below, for root). Files written under
+`/workspace` therefore appear with your UID/GID on the host. The image itself needs no user setup
+and no user tooling: any base image works, including one with no `useradd`, `groupadd`, or
+`getent` at all.
 
 The collision dance handles the case where the image already has a group or user at your UID/GID
 (common for `1000:1000` -- the typical first non-root user in many distros). When that happens,
@@ -99,12 +100,42 @@ borrowed with `outrig mcp --attach` keeps its entry as it is. The name has to wo
 directory under `/home`: an entry named `.`, `..`, or anything with a `/` in it fails the
 bootstrap with an error naming the entry, and nothing is written or created.
 
-A `/home/<user>` the image already has is reused too, and `chown`ed to you, as long as it is a
-directory. Unlike `mkdir -p`, anything else there -- a file, a FIFO, or a symlink, even one to a
-directory -- fails the bootstrap with an error naming the path. Taking it anyway would hand every
-tool a `$HOME` it can't write under, and a symlink would redirect the `chown` to whatever it
-points at. `/home` itself may be a symlink to a directory; only the last component is held to
-this.
+A `/home/<user>` the image already has is reused too, as long as it is a directory, and `chown`ed
+to you unless it is yours already, so a read-only mount of your own directory there is fine. (A
+user or group that is the kernel's overflow id, 65534 unless the host changed it, cannot tell its
+own directory from one that belongs to someone the container has no mapping for, which reads as
+that id too, so for those the `chown` is always tried.)
+Unlike `mkdir -p`, anything else there -- a file, a FIFO, or a symlink, even one to a directory --
+fails the bootstrap with an error naming the path. Taking it anyway would hand every tool a
+`$HOME` it can't write under, and a symlink would redirect the `chown` to whatever it points at.
+`/home` itself may be a symlink to a directory; only the last component is held to this.
+
+Running outrig as root (uid 0, for example `sudo outrig run`) is the exception to the home rules
+above. The entry at uid 0 is normally the image's own `root`, whose home is where the
+Dockerfile's `RUN` steps left root's dotfiles and toolchains: `/root` in nearly every base image.
+That entry keeps its home, nothing in the file is rewritten, and every exec gets that home as
+`HOME` instead of `/home/root`. The directory is created if it is missing, and handed to root
+unless it is root's already, so a tools directory mounted read-only over `/root` is used as it
+is. A root home that is a file or a symlink fails the bootstrap the same way as any other.
+
+Root's home is `/root` instead in three cases. An image with no uid-0 entry gets one naming
+`/root`. An entry whose home is not a plain absolute path below `/` -- empty, relative, `/`
+itself, with a `.`, `..` or empty part (`//`, a trailing `/`), or not UTF-8 -- is pointed at
+`/root`, as a reused entry's home is pointed at `/home/<name>`. And so is an entry that podman
+planted rather than the image: for an image with no root account, podman's `--user` handling
+appends one, to the container's own `/etc/passwd`, naming the working directory, which is your
+checkout for the primary container and the image's `WORKDIR` for one with no workspace. As root's
+home the first would put root's caches in your repository, and either would have the bootstrap
+`chown` a directory of yours, or one you mounted there, to root. outrig takes the entry for
+podman's when `podman diff` lists `/etc/passwd` among the container's changes, and a diff it cannot
+read counts as a change. It asks before the bootstrap opens the file, which copies it into the
+container's layer whether or not anything is written. So an image's own root home is kept in a
+container outrig has just started, even when it is the image's `WORKDIR`; but a container
+bootstrapped before -- one borrowed with `outrig mcp --attach` after a session started it -- reads
+as changed already, and root's home there is `/root`. The same goes for a home inside the
+checkout, however its path is spelled: a `container-path` of `/var/../root` is `/root`, and that
+is where podman mounts it. When the checkout is mounted at `/root` itself there is no `/root` to
+use, and root's home is `/home/<name>`.
 
 ## What's mounted, what isn't
 
@@ -150,6 +181,8 @@ Extra `workspace.mounts` entries are for supporting directories: sibling repos, 
 SDK checkouts, model artifacts, or caches. A relative host path resolves against the repo root
 when the repo config declares it, and beside the file that declares it otherwise -- the global
 config, or a `--config` file kept outside `.agents/outrig/`; a leading `~` is your home directory.
+A `--volume` on the command line is declared in no file, so its relative host path resolves
+against the directory you ran outrig from, as your shell would read it.
 See [path resolution](../reference/config.md#path-resolution). Their container paths must be
 absolute, cannot be `/`, and must not duplicate the primary workspace or another extra mount.
 Exact duplicates fail during config validation instead of relying on podman mount ordering.
@@ -160,6 +193,13 @@ appear in the container at their host paths instead, so a path the agent's code 
 the binding's library reads on the host name the same file. A declared `container-path` must then
 be that host path, or the config is refused. In any session, an extra mount's `container-path`
 may be left unset, and is then its host path.
+
+No path in a bind mount may contain `:`, host or container, here or on a sidecar: podman reads
+a mount as `<host>:<container>[:<options>]`, so a `:` in a path makes a fourth field it refuses
+at launch -- long after the config was read, naming neither the key nor the file. Config
+validation refuses what a config spelled, and a session that would mount a path *resolving*
+through such a directory -- a repo root with a `:` in its name, say -- is refused as it starts.
+There is no escaping form: a host directory whose name contains `:` cannot be mounted.
 
 Extra mounts default to `access = "read-only"`. Use `access = "read-write"` only when the agent
 really should mutate that host directory, such as a scratch cache under `/var/tmp`.
@@ -212,7 +252,9 @@ lookup, to `<session_dir>/logs/network.jsonl`. Audit mode is allow-and-log only:
 and every lookup is still allowed, but records include the best known host, destination IP and
 port, transport, service, byte counts, and duration. HTTPS remains opaque except for TLS SNI.
 URL, method, status, and body inspection are deferred. The interceptor carries TCP and DNS over
-UDP/53; any other datagram leaves by podman's default route and is not recorded.
+UDP/53; any other datagram leaves by podman's default route and is not recorded. It is attached
+to the primary before the primary's own process runs, so the traffic of an image `ENTRYPOINT` is
+recorded like any other's (see [Containers](containers.md#dont-set-an-entrypoint)).
 
 Filter mode uses the same interceptor and audit log, then applies global host/port policy
 before opening upstream TCP connections:
@@ -230,7 +272,9 @@ choose `network.mode`, but cannot set `default`, `allow`, or `deny`. Where both 
 entry wins over an allow entry, and a connection neither matches uses `default`. A denied
 connection is closed immediately and still writes a `network.jsonl` record with
 `outrig.action = "deny"` and zero byte counts, so the audit log is the place to diagnose
-network policy failures.
+network policy failures. An allowed connection whose upstream connect fails -- refused, no route,
+no answer -- is recorded as allowed, with zero byte counts and `outrig.error` saying why, which
+tells a host that could not be reached from one the policy stopped.
 
 Entries match TCP connections. Anything else the container sends -- UDP to any port but 53,
 which is how QUIC and so HTTP/3 travel, ICMP, any other transport -- matches no entry and takes

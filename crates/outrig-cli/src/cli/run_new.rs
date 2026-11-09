@@ -55,10 +55,11 @@ use crate::cli::session_setup::{ProgressSpan, Say};
 use crate::cli::signals::{EndSignal, Signals, session_ending_line};
 use crate::error::{CliError, OutrigError, Result};
 use crate::paths::{
-    RepoConfig, default_session_root, refuse_home_workspace, refuse_repo_declared_mounts,
-    refuse_workspace_covering_global_config,
+    PinnedMount, RepoConfig, default_session_root, pin_repo_declared_mounts,
+    recheck_pinned_mounts, refuse_home_workspace, refuse_mount_field_separators,
+    refuse_workspace_covering_global_config, refuse_workspace_field_separator,
 };
-use crate::session::{self, Session, SessionId, SessionStore, resolve_session_root};
+use crate::session::{self, Session, SessionId, SessionLock, SessionStore, resolve_session_root};
 
 use self::converse::{Conversed, Frontend, Interrupts};
 use self::output::{Failures, Output};
@@ -154,8 +155,10 @@ pub async fn execute(
     }
     // A workspace no config declared is outrig's pick, and outrig never picks
     // the home directory or one above it, nor one that contains the global
-    // config; and a repo config may not mount either -- the rules `run`
-    // applies.
+    // config; a repo config may not mount either, and what it mounts is bound
+    // at the path checked here; and a `:` that a clean path resolves through
+    // is refused before podman would split on it -- the rules `run` applies
+    // (#609, #445, #604, #365).
     let workspace: PathBuf = cfg
         .workspace
         .resolved_host_path(&repo_root)
@@ -165,7 +168,10 @@ pub async fn execute(
         refuse_home_workspace(&workspace, &repo_root)?;
         refuse_workspace_covering_global_config(&workspace, &repo_root, global_cfg_path)?;
     }
-    refuse_repo_declared_mounts(&cfg, &repo_root, global_cfg_path)?;
+    refuse_workspace_field_separator(&workspace, &cfg.workspace, &repo_root)?;
+    refuse_mount_field_separators(&cfg, &repo_root)?;
+    // `run-new` starts the config's bindings.
+    let pinned_mounts = pin_repo_declared_mounts(&mut cfg, &repo_root, global_cfg_path, true)?;
 
     // What the session needs from outside, given before it starts: the
     // terminal sees each submission through a subscription of its own, and
@@ -221,9 +227,10 @@ pub async fn execute(
     let mut signals = Signals::install()?;
     // Asked now, while a terminal cannot yet have hung up; see [`Terminals`].
     let terminals = Terminals::now();
-    let sid = SessionId::new();
     // Held until this returns: the directory is this invocation's from here.
-    let (_reserved, log_dir) = reserve_session_dir(&store, &sid, args.session_dir.as_deref())?;
+    let reserved = reserve_session_dir(&store, SessionId::new, args.session_dir.as_deref())?;
+    let sid = reserved.sid.clone();
+    let log_dir = reserved.log_dir.clone();
 
     let mut session = Session {
         id: sid.clone(),
@@ -235,7 +242,7 @@ pub async fn execute(
         image_config_name: Some(image_cfg_name.clone()),
         agent_name: agent_name.clone(),
         working_dir: repo_root.clone(),
-        session_dir: PathBuf::new(), // set by `create` below
+        session_dir: reserved.dir.clone(),
         exit_code: None,
         link_target: None,
     };
@@ -262,6 +269,7 @@ pub async fn execute(
                 image_cfg_name: &image_cfg_name,
                 image_cfg,
                 repo_root: &repo_root,
+                pinned_mounts: &pinned_mounts,
                 log_dir,
                 record: &mut session,
                 say: &say,
@@ -273,7 +281,7 @@ pub async fn execute(
     // Written only now, once the container runs under the name recorded. A
     // session that failed to start is recorded too, and at once finalized, so
     // it is never a live record without a container.
-    if let Err(e) = store.create_prepared(&sid, args.session_dir.as_deref(), &mut session) {
+    if let Err(e) = store.write_reserved(&session, args.session_dir.is_some()) {
         let Ok(running) = started else {
             out.finish(tokio::time::sleep(REPORT_GRACE)).await;
             return Err(e);
@@ -636,8 +644,25 @@ fn image_config_name(
     Ok((name, injection.applied))
 }
 
-/// Take the session's directory for this invocation, and create its `logs/`,
-/// which the launch writes to before the record exists.
+/// What [`reserve_session_dir`] took for this invocation, all of it held until
+/// the invocation returns.
+struct Reserved {
+    sid: SessionId,
+    /// The session's directory, resolved for a `--session-dir`.
+    dir: PathBuf,
+    log_dir: PathBuf,
+    /// One `run-new` at a time in the directory.
+    _flock: Flock<File>,
+    /// The session's claim as a live one (#366), so `clean` and `discard`
+    /// leave it alone before its record or its container exists. The flock
+    /// above does not do that: on Linux it is invisible to the OFD lock
+    /// [`session::owner_is_live`] probes with.
+    _owner: Option<SessionLock>,
+}
+
+/// Take the session's directory for this invocation, under an id from `draw`
+/// that is claimed under the root, and create its `logs/`, which the launch
+/// writes to before the record exists.
 ///
 /// The record is written only once the interpreter is up, so until then the
 /// directory is claimed by an exclusive lock on the directory itself. Without
@@ -647,43 +672,84 @@ fn image_config_name(
 /// a second invocation fails at once, having written nothing. The kernel
 /// drops it with the process, so a killed invocation leaves nothing stale.
 ///
-/// `explicit` is held to the rule `run`'s follows -- created if absent, refused
-/// unless empty -- here rather than when the record is written, so a bad
-/// `--session-dir` fails before anything starts.
+/// `explicit` is held to the rule `run`'s follows -- a directory, not inside
+/// the root (#429), created if absent, refused unless empty -- here rather
+/// than when the record is written, so a bad `--session-dir` fails before
+/// anything starts. The id is claimed here too, by `<root>/<id>` as
+/// [`SessionStore::claim_id`] makes it, and drawn again while it is taken
+/// (#382): claimed after the start, a link the root refused would leave the
+/// start's logs in an unregistered directory that a retry could not use
+/// (#431). A failure here undoes what this made -- an auto directory, or
+/// `explicit`'s `logs/` and the directories created for it -- so the root
+/// keeps no entry for a session that never started, and a retry finds
+/// `explicit` as it was. A refusal over the lock undoes nothing: the directory
+/// is the other invocation's.
 fn reserve_session_dir(
     store: &SessionStore,
-    sid: &SessionId,
+    draw: impl FnMut() -> SessionId,
     explicit: Option<&Path>,
-) -> Result<(Flock<File>, PathBuf)> {
-    let dir = match explicit {
-        // Created now if absent, so there is a directory to lock; whether it
-        // may be used is decided under the lock.
-        Some(dir) => {
-            if !dir.exists() {
-                std::fs::create_dir_all(dir).path_ctx("create directory", dir)?;
-            }
-            dir.to_path_buf()
-        }
+) -> Result<Reserved> {
+    let (sid, dir, flock) = match explicit {
         None => {
-            let dir = store.symlink_path(sid);
-            std::fs::create_dir_all(&dir).path_ctx("create directory", &dir)?;
-            dir
+            let sid = store.claim_id(draw, None)?;
+            let dir = store.symlink_path(&sid);
+            // The directory is this invocation's claim, made just now, so a
+            // failure removes it.
+            let flock = lock_session_dir(&dir)
+                .and_then(|flock| create_logs(&dir).map(|()| flock))
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_dir(&dir);
+                })?;
+            (sid, dir, flock)
+        }
+        Some(explicit) => {
+            let existing = store.prepare_explicit_dir(explicit)?;
+            let flock = lock_session_dir(explicit)?;
+            // Checked under the lock, so two invocations cannot both find it
+            // free -- and linked under it, so the one refused never links to a
+            // directory that is not its own (#430).
+            session::refuse_unless_empty(explicit)?;
+            let dir = std::fs::canonicalize(explicit).path_ctx("resolve", explicit)?;
+            // `logs/` before the link, so nothing is left to fail once the id
+            // is claimed.
+            let sid = create_logs(&dir)
+                .and_then(|()| store.claim_id(draw, Some(&dir)))
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_dir(dir.join(session::LOGS_DIR));
+                    session::remove_created(&dir, &existing);
+                })?;
+            (sid, dir, flock)
         }
     };
-    let handle = File::open(&dir).path_ctx("open", &dir)?;
-    let reserved = Flock::lock(handle, FlockArg::LockExclusiveNonblock).map_err(|(_, e)| {
+    let owner = session::claim_owner(&dir);
+    let log_dir = dir.join(session::LOGS_DIR);
+    Ok(Reserved {
+        sid,
+        dir,
+        log_dir,
+        _flock: flock,
+        _owner: owner,
+    })
+}
+
+/// Create `dir`'s `logs/`.
+fn create_logs(dir: &Path) -> Result<()> {
+    let log_dir = dir.join(session::LOGS_DIR);
+    std::fs::create_dir_all(&log_dir).path_ctx("create directory", &log_dir)?;
+    Ok(())
+}
+
+/// `dir`, locked for this `run-new` alone; refused at once, not waited for,
+/// when another holds it.
+fn lock_session_dir(dir: &Path) -> Result<Flock<File>> {
+    let handle = File::open(dir).path_ctx("open", dir)?;
+    Flock::lock(handle, FlockArg::LockExclusiveNonblock).map_err(|(_, e)| {
         OutrigError::Configuration(format!(
             "session directory {} is in use by another `outrig run-new` ({e})",
             dir.display()
         ))
-    })?;
-    // Checked under the lock, so two invocations cannot both find it free.
-    if let Some(explicit) = explicit {
-        session::prepare_explicit_dir(explicit)?;
-    }
-    let log_dir = dir.join("logs");
-    std::fs::create_dir_all(&log_dir).path_ctx("create directory", &log_dir)?;
-    Ok((reserved, log_dir))
+        .into()
+    })
 }
 
 struct Start<'a> {
@@ -692,6 +758,8 @@ struct Start<'a> {
     image_cfg_name: &'a str,
     image_cfg: &'a ImageConfig,
     repo_root: &'a Path,
+    /// The repo-declared mounts `cfg` binds, as checked before the start.
+    pinned_mounts: &'a [PinnedMount],
     log_dir: PathBuf,
     /// Filled in with the image tag and the container name as each is learned.
     record: &'a mut Session,
@@ -708,6 +776,7 @@ async fn start(args: Start<'_>) -> Result<harness::Session> {
         image_cfg_name,
         image_cfg,
         repo_root,
+        pinned_mounts,
         log_dir,
         record,
         say,
@@ -737,6 +806,9 @@ async fn start(args: Start<'_>) -> Result<harness::Session> {
     ));
     record.image_tag = image.tag.to_string();
 
+    // The image work above can take minutes, and the repo is writable by a
+    // concurrent session: look again at what the guard validated (#604).
+    recheck_pinned_mounts(pinned_mounts)?;
     let (spec, skipped) =
         launch_spec(cfg, image_cfg_name, &image.tag, repo_root, log_dir, &record.id).await?;
     if !skipped.is_empty() {
@@ -829,6 +901,13 @@ mod tests {
     #[test]
     fn only_a_controlling_terminal_that_closed_has_hung_up() {
         let pty = nix::pty::openpty(None, None).expect("a pty");
+        // `openpty` leaves both ends inheritable, and a process another test
+        // starts meanwhile -- this binary's tests re-run it as a child, and
+        // spawn others -- would hold the master open past the drop below.
+        for fd in [&pty.master, &pty.slave] {
+            nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))
+                .expect("close-on-exec");
+        }
         let slave = File::from(pty.slave);
         let all = || [&slave as &dyn Stream, &slave, &slave];
         let controlling = Terminals::of(all(), |_| true);
@@ -844,6 +923,12 @@ mod tests {
         assert!(!on_a_pipe.hung_up([&write, &write, &write]), "a pipe");
 
         drop(pty.master);
+        // Still, one forked before that and not yet exec'd holds a copy until
+        // it does: the hangup lands once every copy of the master is closed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !controlling.hung_up(all()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(controlling.hung_up(all()), "a hung-up controlling terminal");
         assert!(
             !unrelated.hung_up(all()),
@@ -1076,6 +1161,13 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
         );
     }
 
+    /// The ids a test hands out, in turn.
+    fn ids(ids: &[&str]) -> impl FnMut() -> SessionId {
+        let mut ids: Vec<SessionId> = ids.iter().map(|id| SessionId::from(id.to_string())).collect();
+        ids.reverse();
+        move || ids.pop().expect("an id left to draw")
+    }
+
     /// The rule `run`'s `--session-dir` follows: a directory that is not there
     /// yet is created, with its parents, and one that holds anything is
     /// refused -- a record by what it is, anything else by name.
@@ -1083,35 +1175,129 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
     fn a_session_dir_is_created_if_absent_and_must_be_empty() {
         let root = tempfile::tempdir().expect("a root");
         let store = SessionStore::new(root.path().to_path_buf());
-        let sid = SessionId::from("sid".to_string());
-        let missing = root.path().join("missing/nested");
-        let (_reserved, log_dir) =
-            reserve_session_dir(&store, &sid, Some(&missing)).expect("an absent dir is created");
-        assert_eq!(log_dir, missing.join("logs"));
-        assert!(log_dir.is_dir());
+        let elsewhere = tempfile::tempdir().expect("outside the root");
+        let missing = elsewhere.path().join("missing/nested");
+        let reserved = reserve_session_dir(&store, ids(&["explicit"]), Some(&missing))
+            .expect("an absent dir is created");
+        assert_eq!(reserved.log_dir, missing.join("logs"));
+        assert!(reserved.log_dir.is_dir());
+        assert_eq!(
+            std::fs::read_link(root.path().join("explicit")).expect("the id's link"),
+            std::fs::canonicalize(&missing).expect("the dir"),
+            "the id is claimed by its link before anything starts"
+        );
 
         let used = tempfile::tempdir().expect("a used dir");
         std::fs::write(used.path().join("session.json"), "{}").expect("a record");
-        let err = reserve_session_dir(&store, &sid, Some(used.path()))
-            .expect_err("a dir with a record is refused")
+        let err = reserve_session_dir(&store, ids(&["used"]), Some(used.path()))
+            .err()
+            .expect("a dir with a record is refused")
             .to_string();
         assert!(err.contains("holds an earlier session's record"), "{err}");
 
         let notes = tempfile::tempdir().expect("a dir of notes");
         std::fs::write(notes.path().join("notes.md"), "mine").expect("a note");
-        let err = reserve_session_dir(&store, &sid, Some(notes.path()))
-            .expect_err("a dir with anything in it is refused")
+        let err = reserve_session_dir(&store, ids(&["notes"]), Some(notes.path()))
+            .err()
+            .expect("a dir with anything in it is refused")
             .to_string();
         assert!(err.contains("is not empty (it holds notes.md)"), "{err}");
         assert!(
             !notes.path().join("logs").exists(),
             "a refused dir gets nothing"
         );
+        assert!(
+            !root.path().join("used").exists() && !root.path().join("notes").exists(),
+            "nor an id under the root"
+        );
 
-        let (_reserved, log_dir) =
-            reserve_session_dir(&store, &sid, None).expect("the default layout");
-        assert_eq!(log_dir, root.path().join("sid").join("logs"));
-        assert!(log_dir.is_dir());
+        let reserved =
+            reserve_session_dir(&store, ids(&["sid"]), None).expect("the default layout");
+        assert_eq!(reserved.log_dir, root.path().join("sid").join("logs"));
+        assert!(reserved.log_dir.is_dir());
+    }
+
+    /// A directory at or under the root would be listed twice, once through
+    /// its link (#429): refused before anything is made.
+    #[test]
+    fn a_session_dir_inside_the_root_is_refused() {
+        let root = tempfile::tempdir().expect("a root");
+        let store = SessionStore::new(root.path().to_path_buf());
+        let inside = root.path().join("mine");
+        let err = reserve_session_dir(&store, ids(&["sid"]), Some(&inside))
+            .err()
+            .expect("inside the root")
+            .to_string();
+        assert!(err.contains("is inside the session root"), "{err}");
+        assert!(!inside.exists(), "and nothing was made for it");
+    }
+
+    /// An id another session holds is drawn again, for an explicit directory
+    /// as for the default layout (#382), and nothing is made under the taken
+    /// one.
+    #[test]
+    fn a_taken_id_is_drawn_again() {
+        let root = tempfile::tempdir().expect("a root");
+        let store = SessionStore::new(root.path().to_path_buf());
+        std::fs::create_dir(root.path().join("taken")).expect("another session's");
+
+        let reserved =
+            reserve_session_dir(&store, ids(&["taken", "free"]), None).expect("drawn again");
+        assert_eq!(reserved.sid.as_str(), "free");
+        assert_eq!(
+            std::fs::read_dir(root.path().join("taken"))
+                .expect("still there")
+                .count(),
+            0,
+            "the taken one is left as it was"
+        );
+
+        let dir = tempfile::tempdir().expect("a session dir");
+        let reserved = reserve_session_dir(&store, ids(&["taken", "other"]), Some(dir.path()))
+            .expect("drawn again");
+        assert_eq!(reserved.sid.as_str(), "other");
+        assert!(root.path().join("other").is_symlink());
+    }
+
+    /// A claim the root refuses for a reason other than a taken id undoes the
+    /// directories this made for the session, and leaves the ones that were
+    /// there (#431).
+    #[test]
+    fn a_refused_claim_undoes_what_it_made() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let root = scratch.path().join("root");
+        std::fs::write(&root, "not a directory").expect("a root that cannot hold sessions");
+        let store = SessionStore::new(root);
+        let fresh = scratch.path().join("fresh/nested");
+        reserve_session_dir(&store, ids(&["sid"]), Some(&fresh))
+            .err()
+            .expect("the root cannot be made");
+        assert!(
+            !scratch.path().join("fresh").exists(),
+            "what the reservation made is gone"
+        );
+        assert!(scratch.path().is_dir(), "and what was there stays");
+    }
+
+    /// A `--session-dir` the session cannot write to is refused before the
+    /// root links to it, and is left as it was found.
+    #[test]
+    fn an_unwritable_session_dir_is_refused_before_it_is_linked() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("a root");
+        let store = SessionStore::new(root.path().to_path_buf());
+        let dir = tempfile::tempdir().expect("a session dir");
+        let mode = |mode| std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(dir.path(), mode(0o555)).expect("read-only");
+        if nix::unistd::access(dir.path(), nix::unistd::AccessFlags::W_OK).is_ok() {
+            return; // root writes regardless of the mode
+        }
+        let refused = reserve_session_dir(&store, ids(&["sid"]), Some(dir.path()));
+        std::fs::set_permissions(dir.path(), mode(0o755)).expect("writable again");
+        refused.err().expect("logs/ cannot be made");
+        let entries = |dir: &Path| std::fs::read_dir(dir).expect("readable").count();
+        assert_eq!(entries(root.path()), 0, "the root links to nothing");
+        assert_eq!(entries(dir.path()), 0, "the directory is as it was");
     }
 
     /// Two invocations naming one directory: the first holds it until it
@@ -1122,13 +1308,12 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
         let root = tempfile::tempdir().expect("a root");
         let store = SessionStore::new(root.path().to_path_buf());
         let dir = tempfile::tempdir().expect("a session dir");
-        let first = SessionId::from("first".to_string());
-        let second = SessionId::from("second".to_string());
 
-        let held = reserve_session_dir(&store, &first, Some(dir.path())).expect("free");
+        let held = reserve_session_dir(&store, ids(&["first"]), Some(dir.path())).expect("free");
         std::fs::remove_dir(dir.path().join("logs")).expect("the first made logs/");
-        let err = reserve_session_dir(&store, &second, Some(dir.path()))
-            .expect_err("held by the first")
+        let err = reserve_session_dir(&store, ids(&["second"]), Some(dir.path()))
+            .err()
+            .expect("held by the first")
             .to_string();
         assert!(err.contains("is in use by another `outrig run-new`"), "{err}");
         assert!(
@@ -1137,6 +1322,6 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
         );
 
         drop(held);
-        reserve_session_dir(&store, &second, Some(dir.path())).expect("free again");
+        reserve_session_dir(&store, ids(&["second"]), Some(dir.path())).expect("free again");
     }
 }

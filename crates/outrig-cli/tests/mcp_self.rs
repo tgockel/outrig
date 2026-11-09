@@ -175,6 +175,38 @@ async fn mcp_self_serves_docs_schema_suggestions_and_validators() {
             "expected invalid mcp server-name error: {config}",
         );
 
+        // The repo config is what an `[images.<name>]` block goes in, and the
+        // keys describing the operator's machine are refused there -- over the
+        // wire, with no `scope` sent, which is the call an authoring client
+        // makes.
+        let repo_only: Value = call_json(
+            &service,
+            "validate_config",
+            serde_json::json!({
+                "toml": "[network]\nmode = \"filter\"\nallow = [\"github.com:443\"]\n"
+            }),
+        )
+        .await;
+        assert_eq!(repo_only["valid"], false, "{repo_only}");
+        assert_eq!(
+            repo_only["errors"][0]["code"], "repo_config_invalid",
+            "{repo_only}"
+        );
+
+        let global_scope: Value = call_json(
+            &service,
+            "validate_config",
+            serde_json::json!({
+                "toml": "[network]\nmode = \"filter\"\nallow = [\"github.com:443\"]\n",
+                "scope": "global"
+            }),
+        )
+        .await;
+        assert_eq!(
+            global_scope["valid"], true,
+            "the global config is where that belongs: {global_scope}"
+        );
+
         let image_toml: Value = call_json(
             &service,
             "validate_image_toml",

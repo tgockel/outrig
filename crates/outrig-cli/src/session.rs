@@ -12,19 +12,27 @@
 //! Either way the record is `session.json`, `logs/`, and -- for a session with
 //! a `view = "primary"` sidecar -- `outrig-enter`. Removal deletes the whole
 //! directory, which holds nothing that is not the session's.
+//!
+//! A record on disk does not mean a session is running, and `ended_at: None`
+//! does not either -- a launch killed outright leaves one of those forever.
+//! What says a session is live is [`SessionLock`]: the launching process
+//! claims the session directory as it creates it and holds the claim until
+//! the record is finalized, and `clean` and `discard` ask [`owner_is_live`]
+//! before removing anything. See [`claim_owner`] for why that is a lock on
+//! the directory and not a file in it.
 
 use std::fs;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use nix::fcntl::{FcntlArg, fcntl};
+use nix::libc;
 use serde::{Deserialize, Serialize};
 
-use crate::paths::{
-    default_session_root, load_global_or_empty, report_config_warnings, resolve_global_config,
-};
-use outrig::config::Config;
 use crate::error::{CliError, Result};
+use crate::paths::{default_session_root, report_config_warnings, resolve_global_config};
+use outrig::config::Config;
 use outrig::error::{IoPathExt, OutrigError};
 
 const SESSION_JSON: &str = "session.json";
@@ -32,9 +40,22 @@ const SESSION_JSON: &str = "session.json";
 /// stderr, `network.jsonl`, transcripts -- goes under it.
 pub(crate) const LOGS_DIR: &str = "logs";
 
-/// Stable, sortable session id. Format: `yyyymmddTHHMMSS-rrrr` (UTC, four
-/// hex digits of randomness). Lexicographic order matches chronological
-/// order modulo collisions, so listings can sort by string.
+/// How many ids [`SessionStore::create_fresh`] and [`SessionStore::claim_id`]
+/// draw before they give up. Two launches in one second draw the same id once
+/// in 2^32; a run of collisions is something holding the names, not chance
+/// (#382).
+pub const SESSION_ID_DRAWS: u32 = 8;
+
+/// Stable, sortable session id. Format: `yyyymmddTHHMMSS-rrrrrrrr` (UTC, eight
+/// hex digits of randomness; before #382 it was four, and sessions from then
+/// keep those names). Lexicographic order matches chronological order modulo
+/// collisions, so listings can sort by string.
+///
+/// Two sessions under one root cannot share an id because
+/// [`SessionStore::create`] makes the directory of that name, which fails when
+/// it exists. The randomness is what keeps a draw from colliding in the cases
+/// that does not cover: two roots, which share podman's container names, and a
+/// `--session-dir` launch, which fails at its link instead of drawing again.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub String);
 
@@ -46,9 +67,7 @@ impl SessionId {
         let ts = Zoned::now()
             .with_time_zone(jiff::tz::TimeZone::UTC)
             .strftime("%Y%m%dT%H%M%S");
-        let mut buf = [0u8; 2];
-        rand::rng().fill_bytes(&mut buf);
-        Self(format!("{ts}-{:02x}{:02x}", buf[0], buf[1]))
+        Self(format!("{ts}-{:08x}", rand::rng().next_u32()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -56,11 +75,12 @@ impl SessionId {
     }
 
     /// The start time `name` encodes, when it has the shape [`SessionId::new`]
-    /// gives: `None` for anything else, which is how a directory that is not
-    /// a session's is told from one whose record is lost.
+    /// gives, or gave before #382 with four hex digits: `None` for anything
+    /// else, which is how a directory that is not a session's is told from
+    /// one whose record is lost.
     pub fn started_at(name: &str) -> Option<SystemTime> {
         let (ts, rand) = name.split_once('-')?;
-        if rand.len() != 4 || !rand.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !matches!(rand.len(), 4 | 8) || !rand.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         let civil = jiff::civil::DateTime::strptime("%Y%m%dT%H%M%S", ts).ok()?;
@@ -253,57 +273,193 @@ impl SessionStore {
     /// and the in-memory `Session` matches what got persisted. Returns the
     /// same path for convenience.
     ///
-    /// An explicit directory is created if absent and refused unless empty, so
-    /// that nothing in it predates the session (see [`prepare_explicit_dir`]).
+    /// An explicit directory is held to [`prepare_explicit_dir`] and
+    /// [`refuse_unless_empty`], so that nothing in it predates the session.
     /// Writing the record claims the directory: of two launches given one at
-    /// once, the second to write is refused.
+    /// once, the second to write is refused. Linking it under the root is what
+    /// registers that claim; a launch whose root the link fails under undoes the
+    /// write first, so an unregistered record is not left for `ls`, `clean`, and
+    /// `discard <id>` to miss and a retry into the same directory to be refused
+    /// over (#431).
+    ///
+    /// Without one, creating `<root>/<sid>` is the claim: when anything at all
+    /// is already there under that name, the result is
+    /// [`CliError::SessionIdTaken`] and nothing is written (#382).
+    ///
+    /// The [`SessionLock`] alongside the path is the caller's claim on the
+    /// session as a *live* one, and it lasts exactly as long as the value is
+    /// held: a caller that drops it at once has a record `clean` and
+    /// `discard` may remove from under it before its container exists (#366).
+    /// Every launch holds it until teardown has finalized the record; the
+    /// tests that only want a record on disk drop it.
+    ///
+    /// [`prepare_explicit_dir`]: Self::prepare_explicit_dir
     pub fn create(
         &self,
         sid: &SessionId,
         explicit_dir: Option<&Path>,
         session: &mut Session,
-    ) -> Result<PathBuf> {
-        // Before the root is created, so a root nested inside the explicit
-        // directory is not taken for something already there.
-        if let Some(dir) = explicit_dir {
-            prepare_explicit_dir(dir)?;
-        }
-        self.create_prepared(sid, explicit_dir, session)
-    }
-
-    /// [`create`](Self::create) for an explicit directory the caller already
-    /// held to [`prepare_explicit_dir`], and has written in since: `run-new`
-    /// creates `logs/` there, under a lock of its own, before the session has
-    /// a record to write.
-    pub fn create_prepared(
-        &self,
-        sid: &SessionId,
-        explicit_dir: Option<&Path>,
-        session: &mut Session,
-    ) -> Result<PathBuf> {
-        fs::create_dir_all(&self.root).path_ctx("create directory", &self.root)?;
-
+    ) -> Result<(PathBuf, Option<SessionLock>)> {
         let actual_dir = match explicit_dir {
             Some(dir) => {
+                let existing = self.prepare_explicit_dir(dir)?;
+                refuse_unless_empty(dir)?;
+                fs::create_dir_all(&self.root).path_ctx("create directory", &self.root)?;
                 let canon = fs::canonicalize(dir).path_ctx("resolve", dir)?;
                 session.session_dir = canon.clone();
                 claim_session_json(&canon, session)?;
-                let link = self.root.join(&sid.0);
-                std::os::unix::fs::symlink(&canon, &link).path_ctx("symlink", &link)?;
+                let link = self.symlink_path(sid);
+                std::os::unix::fs::symlink(&canon, &link)
+                    .inspect_err(|_| {
+                        // The write above claimed the directory; a launch that
+                        // cannot register under the root undoes it rather than
+                        // leave a record `ls`, `clean`, and `discard <id>` cannot
+                        // find -- one that then refuses a retry into the same
+                        // directory because of it (#431).
+                        let _ = fs::remove_file(canon.join(SESSION_JSON));
+                        remove_created(&canon, &existing);
+                    })
+                    .path_ctx("symlink", &link)?;
                 canon
             }
             None => {
-                // Replacing, not claiming, until #382 makes the `create_dir`
-                // of a fresh id the claim.
-                let dir = self.root.join(&sid.0);
+                fs::create_dir_all(&self.root).path_ctx("create directory", &self.root)?;
+                // The claim: `create_dir` fails on anything already under the
+                // name -- a directory another launch drew the same id for, or a
+                // `--session-dir` link, dangling or not -- where `create_dir_all`
+                // would take the directory or follow the link, and the write
+                // below would replace the record there (#382).
+                let dir = self.symlink_path(sid);
+                match fs::create_dir(&dir) {
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Err(CliError::SessionIdTaken(dir));
+                    }
+                    created => created.path_ctx("create directory", &dir)?,
+                }
                 session.session_dir = dir.clone();
-                fs::create_dir_all(&dir).path_ctx("create directory", &dir)?;
                 write_session_json_atomic(&dir, session)?;
                 dir
             }
         };
 
-        Ok(actual_dir)
+        // After the record, so the claim covers a directory that is already
+        // the session's: taken before it, the explicit-directory checks above
+        // could still turn this launch away, and a claim outliving them by
+        // even a moment would read as a live owner of a directory this
+        // process does not own.
+        let lock = claim_owner(&actual_dir);
+        Ok((actual_dir, lock))
+    }
+
+    /// [`SessionStore::create`] under an id from `draw`, drawing again while the
+    /// id drawn is taken, up to [`SESSION_ID_DRAWS`] times (#382); the last
+    /// [`CliError::SessionIdTaken`] is the result when they all are. The record
+    /// comes from `session_for` once per id, so everything in it that names the
+    /// id names the one claimed.
+    ///
+    /// An explicit directory is never redrawn: its record is in the directory by
+    /// the time the link under the root finds the id taken, so it fails there
+    /// instead of reporting a taken id -- `create` undoes the write first, so
+    /// the failure leaves the directory as it found it (#431). A launch draws
+    /// with [`SessionId::new`]; a test can draw ids it has already taken.
+    pub fn create_fresh(
+        &self,
+        mut draw: impl FnMut() -> SessionId,
+        explicit_dir: Option<&Path>,
+        mut session_for: impl FnMut(&SessionId) -> Session,
+    ) -> Result<(Session, PathBuf, Option<SessionLock>)> {
+        let mut draws = 1;
+        loop {
+            let sid = draw();
+            let mut session = session_for(&sid);
+            match self.create(&sid, explicit_dir, &mut session) {
+                Err(CliError::SessionIdTaken(_)) if draws < SESSION_ID_DRAWS => draws += 1,
+                created => return created.map(|(dir, lock)| (session, dir, lock)),
+            }
+        }
+    }
+
+    /// Hold `dir`, a `--session-dir`, to what can be checked before anything is
+    /// written, then create it, with any missing parents: it may be nothing but
+    /// a directory, and not at or under the session root. Returns the longest
+    /// prefix of `dir`, resolved, that was already there, for
+    /// [`remove_created`] to stop at. Whether it is empty is
+    /// [`refuse_unless_empty`]'s, which `run-new` asks under a lock.
+    ///
+    /// The root is compared before either side is created: a directory at or
+    /// under it would get its own entry there once the root exists, on top of
+    /// the `<root>/<sid>` link made for it -- `list` reading the directory and
+    /// the link as two sessions for the one record (#429). [`canonicalize_prefix`]
+    /// resolves each side as far as it exists, so neither has to yet.
+    pub fn prepare_explicit_dir(&self, dir: &Path) -> Result<PathBuf> {
+        if dir.exists() && !dir.is_dir() {
+            return Err(OutrigError::Configuration(format!(
+                "--session-dir {} exists and is not a directory",
+                dir.display()
+            ))
+            .into());
+        }
+        let (logical, existing) = canonicalize_prefix(dir).path_ctx("resolve", dir)?;
+        let (root, _) = canonicalize_prefix(&self.root).path_ctx("resolve", &self.root)?;
+        // By whole components, and true of the root itself.
+        if logical.starts_with(&root) {
+            return Err(OutrigError::Configuration(format!(
+                "--session-dir {} is inside the session root {}; omit --session-dir, \
+                 or name a directory outside it",
+                dir.display(),
+                self.root.display(),
+            ))
+            .into());
+        }
+        fs::create_dir_all(dir).path_ctx("create directory", dir)?;
+        Ok(existing)
+    }
+
+    /// Claim `<root>/<id>` for a session whose record comes later -- `run-new`
+    /// claims before its start, so nothing it starts can be stranded by a claim
+    /// refused after: as a link to `target`, an explicit directory already
+    /// resolved, or else as the session's own directory. Either fails on
+    /// anything already under the name, and a taken id is drawn again from
+    /// `draw`, up to [`SESSION_ID_DRAWS`] times in all (#382); the last
+    /// [`CliError::SessionIdTaken`] is the result when every one is.
+    pub fn claim_id(
+        &self,
+        mut draw: impl FnMut() -> SessionId,
+        target: Option<&Path>,
+    ) -> Result<SessionId> {
+        fs::create_dir_all(&self.root).path_ctx("create directory", &self.root)?;
+        let mut entry = PathBuf::new();
+        for _ in 0..SESSION_ID_DRAWS {
+            let sid = draw();
+            entry = self.symlink_path(&sid);
+            let (claimed, op) = match target {
+                Some(target) => (std::os::unix::fs::symlink(target, &entry), "symlink"),
+                None => (fs::create_dir(&entry), "create directory"),
+            };
+            match claimed {
+                Ok(()) => return Ok(sid),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e).path_ctx(op, &entry).map_err(CliError::from),
+            }
+        }
+        Err(CliError::SessionIdTaken(entry))
+    }
+
+    /// Write the record of a session whose `<root>/<id>` [`claim_id`] made, into
+    /// `session.session_dir`, which is already there: exclusively for an
+    /// explicit directory, as [`create`](Self::create)'s write is, since a `run`
+    /// given the same directory takes none of `run-new`'s locks. When that write
+    /// fails the link is removed, so no entry under the root names a session
+    /// that no record describes.
+    ///
+    /// [`claim_id`]: Self::claim_id
+    pub fn write_reserved(&self, session: &Session, explicit: bool) -> Result<()> {
+        if !explicit {
+            return write_session_json_atomic(&session.session_dir, session);
+        }
+        claim_session_json(&session.session_dir, session).inspect_err(|_| {
+            let _ = fs::remove_file(self.symlink_path(&session.id));
+        })
     }
 
     /// Update `ended_at` + `exit_code` on a session that's already on disk.
@@ -341,11 +497,37 @@ impl SessionStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
             Err(e) => return Err(e).path_ctx("read directory", &self.root).map_err(CliError::from),
         };
+        let entries: Vec<fs::DirEntry> = entries.collect::<std::io::Result<_>>()?;
+
+        // Canonical targets of every symlink directly under the root, so a
+        // plain directory that one of them also resolves to -- left by a
+        // `--session-dir` under the root before `create` refused that
+        // (#429) -- is not read as a second, unlinked session below: the
+        // link's row covers it.
+        let link_targets: std::collections::HashSet<PathBuf> = entries
+            .iter()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let meta = fs::symlink_metadata(&path).ok()?;
+                if !meta.file_type().is_symlink() {
+                    return None;
+                }
+                let target = fs::read_link(&path).ok()?;
+                let resolved = path.parent().map_or_else(|| target.clone(), |p| p.join(&target));
+                fs::canonicalize(&resolved).ok()
+            })
+            .collect();
+
         for entry in entries {
-            let entry = entry?;
             let Some((resolved, link_target)) = resolve_entry(&entry.path())? else {
                 continue;
             };
+            if link_target.is_none()
+                && fs::canonicalize(&resolved).is_ok_and(|canon| link_targets.contains(&canon))
+            {
+                // Covered by a link elsewhere under the root; see above.
+                continue;
+            }
             match read_session_json(&resolved.join(SESSION_JSON)) {
                 Ok(mut session) => {
                     session.link_target = link_target;
@@ -478,21 +660,12 @@ impl SessionStore {
     }
 }
 
-/// Hold `dir`, a `--session-dir`, to the rule a session's explicit directory
-/// follows: created if absent, with any missing parents, and refused unless
-/// empty, naming an earlier session's record or the first entry it finds.
-/// These checks are the policy and the messages for a directory that is
-/// plainly taken; writing the record is the claim that holds when two
-/// launches pass them together.
-pub fn prepare_explicit_dir(dir: &Path) -> Result<()> {
-    if dir.exists() && !dir.is_dir() {
-        return Err(OutrigError::Configuration(format!(
-            "--session-dir {} exists and is not a directory",
-            dir.display()
-        ))
-        .into());
-    }
-    fs::create_dir_all(dir).path_ctx("create directory", dir)?;
+/// Refuse `dir`, a `--session-dir`, unless it is empty, so that nothing in it
+/// predates the session: an earlier session's record is named as one, and
+/// anything else by the first name it holds. These checks are the policy and
+/// the messages for a directory that is plainly taken; writing the record is
+/// the claim that holds when two launches pass them together.
+pub fn refuse_unless_empty(dir: &Path) -> Result<()> {
     if dir.join(SESSION_JSON).exists() {
         return Err(OutrigError::Configuration(format!(
             "--session-dir {} holds an earlier session's record; discard that \
@@ -510,6 +683,18 @@ pub fn prepare_explicit_dir(dir: &Path) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+/// Undo what [`SessionStore::prepare_explicit_dir`] created for `dir`, now
+/// resolved: remove it and each parent above it, stopping at `existing`, the
+/// prefix that was there before, so nothing older goes with them (#431). A
+/// directory that is not empty stays, and so does everything above it.
+pub fn remove_created(dir: &Path, existing: &Path) {
+    for created in dir.ancestors().take_while(|path| *path != existing) {
+        if fs::remove_dir(created).is_err() {
+            break;
+        }
+    }
 }
 
 /// Remove the session directory `dir` and everything in it. All of it is the
@@ -560,6 +745,98 @@ fn dir_names(dir: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// Canonicalize `path`, which may not exist yet: resolve the longest existing
+/// prefix, symlinks included, and apply whatever comes after it lexically.
+/// Returns `(logical, existing_prefix)`: `logical` is the full path -- the
+/// resolved prefix plus whatever of `path` is not there yet, applied as
+/// written -- and is what [`SessionStore::create`] compares against the
+/// session root for containment before either one is necessarily on disk
+/// (#429). `existing_prefix` is just the part of that confirmed against the
+/// real filesystem, equal to `logical` exactly when `path` names something
+/// already there -- including a `path` that only gets there by canceling a
+/// missing name with a later `..`, which a plain `path.exists()` cannot
+/// confirm, since the kernel refuses to resolve `..` past a name that is not
+/// there to begin with. `create` reads prior existence this way rather than
+/// with `path.exists()` so that undoing a directory it made itself, on a
+/// link that then fails, never takes a same-named directory that predates
+/// the call with it (#431).
+///
+/// A relative `path` is anchored to the current directory first, the same
+/// base `fs::create_dir_all` and friends resolve it against: without this, a
+/// bare name like `new-run` would have no existing ancestor of its own to
+/// climb to.
+///
+/// Walks `path`'s components forward, growing `resolved` -- always a real,
+/// fully symlink-resolved path -- one at a time for as long as each next
+/// name exists on disk (`fs::canonicalize` on `resolved` plus that one name,
+/// so a symlink is followed exactly as the kernel would). The first name
+/// that is not there ends that growth; from there on, `missing` holds the
+/// rest lexically, and a `..` among it cancels the pending name nearest to
+/// it -- the last one still in `missing`, or, once `missing` empties again,
+/// one already folded into `resolved` -- which is sound because nothing
+/// `missing` names can be a symlink sending `..` elsewhere, and `resolved`
+/// has no symlink left in it to do that either, every one already having
+/// been followed on the way there. A name is tried against the real
+/// filesystem again the moment `missing` empties, even after an earlier one
+/// did not exist: `missing/../alias/...` resolves `alias`, symlink and all,
+/// exactly as it would with no `missing` in front of it, and a `..` right
+/// after it goes to *its* real parent, not lexically back to where `missing`
+/// was (caught in review of #429, alongside a path with more than one
+/// trailing `..` landing outside the session root entirely, which an earlier
+/// version of this walk -- shrinking the whole suffix backward instead of
+/// growing `resolved` forward -- misjudged as inside it). `resolved` at the
+/// end of the walk, before `missing` -- empty or not -- is appended onto it
+/// for `logical`, is `existing_prefix`.
+fn canonicalize_prefix(path: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
+    let anchored;
+    let start: &Path = if path.is_absolute() {
+        path
+    } else {
+        anchored = std::env::current_dir()?.join(path);
+        &anchored
+    };
+
+    let mut parts = start.components();
+    let mut resolved = match parts.next() {
+        Some(root @ Component::RootDir) => PathBuf::from(root.as_os_str()),
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} has no root to resolve from", path.display()),
+            ));
+        }
+    };
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+
+    for comp in parts {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(name) if missing.is_empty() => {
+                match fs::canonicalize(resolved.join(name)) {
+                    Ok(canon) => resolved = canon,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        missing.push(name.to_os_string());
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Component::Normal(name) => missing.push(name.to_os_string()),
+            Component::ParentDir => {
+                if missing.pop().is_none() {
+                    resolved.pop();
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+
+    let existing_prefix = resolved.clone();
+    for part in missing {
+        resolved.push(part);
+    }
+    Ok((resolved, existing_prefix))
+}
+
 /// Resolve a path under the session root. `Ok(None)` when the entry is
 /// neither a symlink nor a directory (foreign content -- skipped by callers).
 /// For a symlink, returns `(target, Some(target))`; for a dir,
@@ -580,6 +857,111 @@ fn resolve_entry(path: &Path) -> Result<Option<(PathBuf, Option<PathBuf>)>> {
         Ok(Some((path.to_path_buf(), None)))
     } else {
         Ok(None)
+    }
+}
+
+/// A live owner's claim on a session directory, held from the moment the
+/// record is written -- or, for `run-new`, the directory is reserved -- until
+/// it is finalized.
+///
+/// The claim is an [OFD] read lock on the session directory itself, taken
+/// through a `File` this value owns. Nothing is written: a lock *file* left
+/// behind by a killed process would read as a live owner forever. A lock on
+/// the directory does not outlive its owner -- the kernel drops it when the
+/// last descriptor holding it closes, which includes the process dying by any
+/// means, SIGKILL included.
+///
+/// It is the directory rather than `session.json` because every update to the
+/// record ([`SessionStore::finalize`], [`SessionStore::set_sidecar_containers`])
+/// renames a fresh file over it. The lock would stay with the replaced inode
+/// and a prober opening the current `session.json` would find nothing.
+///
+/// The descriptor is close-on-exec (every `std::fs` open is), so none of the
+/// podman children a session spawns inherits the lock and outlives outrig
+/// still holding it.
+///
+/// [OFD]: https://man7.org/linux/man-pages/man2/fcntl.2.html#Open_file_description_locks
+#[derive(Debug)]
+pub struct SessionLock {
+    /// Held only to keep the open file description -- and with it the lock --
+    /// alive. Dropping this releases the claim.
+    _dir: fs::File,
+}
+
+/// Describe a whole-file lock of `kind`, as both the claim and the probe want
+/// it: `l_whence`/`l_start`/`l_len` of `SEEK_SET`/0/0 is "the entire file".
+fn whole_file_lock(kind: libc::c_short) -> libc::flock {
+    libc::flock {
+        l_type: kind,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    }
+}
+
+/// Claim `dir` for this process until the returned [`SessionLock`] is dropped,
+/// so that [`owner_is_live`] answers `true` for it meanwhile.
+///
+/// `None` when the claim could not be taken: a filesystem with no OFD locks
+/// (some network mounts), or a directory this process cannot open. A session
+/// then runs exactly as it did before locking existed -- unprotected during
+/// the window before its container starts -- rather than refusing to launch
+/// over a liveness hint. A *read* lock because a directory can only be opened
+/// read-only, and `F_WRLCK` on such a descriptor is `EBADF`; the probe asks
+/// for a write lock, which a read lock is enough to block.
+pub fn claim_owner(dir: &Path) -> Option<SessionLock> {
+    let file = fs::File::open(dir)
+        .inspect_err(|e| {
+            tracing::debug!(
+                target: "outrig::cli::session",
+                "session directory {} could not be opened to claim: {e}",
+                dir.display()
+            );
+        })
+        .ok()?;
+    let lock = whole_file_lock(libc::F_RDLCK as libc::c_short);
+    fcntl(&file, FcntlArg::F_OFD_SETLK(&lock))
+        .inspect_err(|e| {
+            tracing::debug!(
+                target: "outrig::cli::session",
+                "session directory {} could not be claimed: {e}",
+                dir.display()
+            );
+        })
+        .ok()?;
+    Some(SessionLock { _dir: file })
+}
+
+/// Whether a live process holds `dir` through [`claim_owner`] -- the session
+/// is being launched, is running, or is being torn down, whether or not its
+/// container exists yet.
+///
+/// `false` whenever the question cannot be answered: a directory that is gone,
+/// or a filesystem that does not implement these locks, where no claim was
+/// taken either. The caller's own check on the recorded container still
+/// stands; this only widens what counts as live, so an unanswerable probe
+/// leaves the behavior that was there before it.
+pub fn owner_is_live(dir: &Path) -> bool {
+    let Ok(file) = fs::File::open(dir) else {
+        return false;
+    };
+    // `F_OFD_GETLK` reports a conflicting lock without taking one, so a probe
+    // can never itself hold a directory up -- and it reports locks held by
+    // *this* process through another descriptor too, unlike the POSIX
+    // process-associated locks, which is what lets a test hold a claim and
+    // probe it in one process.
+    let mut probe = whole_file_lock(libc::F_WRLCK as libc::c_short);
+    match fcntl(&file, FcntlArg::F_OFD_GETLK(&mut probe)) {
+        Ok(_) => probe.l_type != libc::F_UNLCK as libc::c_short,
+        Err(e) => {
+            tracing::debug!(
+                target: "outrig::cli::session",
+                "session directory {} could not be probed for a live owner: {e}",
+                dir.display()
+            );
+            false
+        }
     }
 }
 
@@ -606,6 +988,9 @@ pub fn resolve_session_root(flag: Option<&Path>, cfg: &Config, default: &Path) -
 /// default location to look in, falls through to the XDG default.
 /// `global_override` is `--global-config` as given, resolved only without
 /// `flag`: given the flag, the global config is neither read nor checked.
+///
+/// A global config that does not load at all is not necessarily fatal here --
+/// see [`session_root_from_global`].
 pub fn resolve_session_root_for_cli(
     flag: Option<&Path>,
     global_override: Option<&Path>,
@@ -613,9 +998,59 @@ pub fn resolve_session_root_for_cli(
     if let Some(p) = flag {
         return Ok(p.to_path_buf());
     }
-    let global = load_global_or_empty(resolve_global_config(global_override)?.as_deref())?;
-    report_config_warnings(&global);
-    Ok(global.session_root.unwrap_or_else(default_session_root))
+    let global = resolve_global_config(global_override)?;
+    Ok(session_root_from_global(global.as_deref())?.unwrap_or_else(default_session_root))
+}
+
+/// `session-root` as the global config at `path` declares it, or `None` for
+/// the default -- including when there is no global config to read.
+///
+/// The whole-file read comes first and is what succeeds normally, warnings and
+/// all. When it fails, this falls back to
+/// [`Config::salvage_global_session_root`], which reads that one key, and
+/// warns that the rest of the file was not read (#384).
+///
+/// The fallback is for these four commands alone. They need one key out of a
+/// file shared by every outrig on the machine, and a repo config mid-edit used
+/// to be enough to stop them; now a *global* config mid-edit is not either.
+/// Nothing else degrades: `run`, `mcp`, and `build` read the file for
+/// everything in it -- providers, models, `[network]`, `[repo].env-allow` --
+/// and still refuse a file they cannot load, which is also why the warning
+/// says the error is still there to fix.
+///
+/// Both failures are reported with the error [`Config::load_global`] gave,
+/// never the salvage's: the whole-file read is the one that looked at the
+/// whole file, so it is the one with something to say about it.
+fn session_root_from_global(path: Option<&Path>) -> Result<Option<PathBuf>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let error = match Config::load_global(path) {
+        Ok(global) => {
+            report_config_warnings(&global);
+            return Ok(global.session_root);
+        }
+        Err(error) => error,
+    };
+    // The salvage's own `Err` is it refusing to guess, not a second diagnosis
+    // of the file, so the whole-file error is what the user is shown.
+    let Ok(salvaged) = Config::salvage_global_session_root(path) else {
+        return Err(error.into());
+    };
+    // Which of the two is said depends on what was salvaged, because they are
+    // different facts about where this command is about to look: a root the
+    // damaged file still names, or the default, which is very likely not where
+    // the sessions are.
+    let took = match &salvaged {
+        Some(root) => format!("only its session-root, {}, was taken from it", root.display()),
+        None => "no session-root could be read from it, so the default is in use".to_string(),
+    };
+    eprintln!(
+        "[outrig] warning: the global config {} could not be read in full: {took}. Nothing \
+         else it sets is in effect here, and `outrig run` still refuses it:\n{error}",
+        path.display()
+    );
+    Ok(salvaged)
 }
 
 /// `2026-05-01 14:19:07` (UTC). Display-only; the on-disk format is

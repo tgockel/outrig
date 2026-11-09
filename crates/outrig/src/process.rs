@@ -797,6 +797,18 @@ async fn write_to_stderr(bytes: &[u8]) -> std::io::Result<()> {
     stderr.flush().await
 }
 
+/// Say that `prefix`'s transcript could not be written. A transcript is a
+/// record of a command, not part of what the command did: a full disk or a
+/// closed stderr under `-v` leaves the record short, and the command's own
+/// outcome -- which may already have changed the engine's state -- stands.
+pub(crate) fn warn_transcript_failed(prefix: &str, e: &std::io::Error) {
+    tracing::warn!(
+        target: "outrig::process",
+        "[{prefix}] the transcript could not be written, so it is incomplete; the command's \
+         result is unaffected: {e}"
+    );
+}
+
 /// Where a captured command's lines go besides the caller's buffer.
 ///
 /// A transcript records every line it is given and, under `-v`, mirrors it
@@ -822,13 +834,24 @@ impl Tee {
         }
     }
 
+    /// True when nothing is listening -- [`Tee::line`] would be a no-op
+    /// either way. [`capture_stream`] uses this to skip line-splitting
+    /// entirely when there is also nothing to retain: the only reason it
+    /// buffers a line at all is to hand `line` something to render.
+    fn is_idle(&self) -> bool {
+        self.transcript.is_none() && !self.live_stderr
+    }
+
     /// `[prefix] line` to every sink that is on.
     ///
-    /// A transcript failure is returned: the caller asked for a record and
-    /// did not get one. A live failure is dropped: the view is best-effort,
-    /// and neither the drain nor the command stops over it.
+    /// A transcript failure is returned, so the caller can say the record is
+    /// incomplete -- [`capture_stream`] and the `$` echo do, through
+    /// [`warn_transcript_failed`], and go on: the record is a side effect of
+    /// the command, never part of its result. A live failure is dropped: the
+    /// view is best-effort, and neither the drain nor the command stops over
+    /// it.
     async fn line(&self, prefix: &'static str, line: &str) -> std::io::Result<()> {
-        if self.transcript.is_none() && !self.live_stderr {
+        if self.is_idle() {
             return Ok(());
         }
         let rendered = render_line(prefix, line);
@@ -938,8 +961,10 @@ async fn try_capture_tee_until(
     keep_stdout: bool,
     stop: impl Future<Output = ()>,
 ) -> Result<Output> {
-    if let Some(t) = &tee.transcript {
-        t.line(prefix, &format!("$ {}", cmd.render())).await?;
+    if let Some(t) = &tee.transcript
+        && let Err(e) = t.line(prefix, &format!("$ {}", cmd.render())).await
+    {
+        warn_transcript_failed(prefix, &e);
     }
 
     // The `-v` transcript is opt-in and file-backed; this pair is what makes a
@@ -1290,6 +1315,17 @@ impl BoundedStderrTail {
 /// Drain `stream` through `tee`, retaining the last `retain` bytes: `None`
 /// keeps nothing, `Some(usize::MAX)` everything. A bounded buffer is trimmed
 /// back to the limit at twice its size, so the copying stays amortized.
+///
+/// With no tee listening ([`Tee::is_idle`]), nothing needs a line to render,
+/// so the read goes through [`drain_stream_chunks`] instead: fixed
+/// [`STREAM_READ_CHUNK`]-sized reads rather than [`AsyncBufReadExt::read_until`]
+/// hunting for the next `\n`. A build's `RUN` step can write gigabytes with no
+/// newline in it at all (`head -c 1G /dev/zero`, a progress bar using `\r`),
+/// and `read_until` buffers the whole run between newlines before this loop
+/// sees a byte of it -- unbounded by `retain`, since `retain` only trims what
+/// is kept *after* a line completes. A session's own stdout/stderr stays
+/// isolated either way: this is a captured pipe to the child, never the
+/// embedder's descriptor.
 async fn capture_stream<R>(
     stream: R,
     prefix: &'static str,
@@ -1299,14 +1335,20 @@ async fn capture_stream<R>(
 where
     R: AsyncRead + Unpin,
 {
+    if tee.is_idle() {
+        return drain_stream_chunks(stream, retain).await;
+    }
+
     let mut reader = BufReader::new(stream);
     let mut line = Vec::new();
     let mut captured = Vec::new();
-    // Reported once the stream is drained, never in place of draining it. A
-    // transcript on a full disk used to end this loop with the child still
-    // writing, which for a child whose read end this module holds open is a
-    // stall rather than an error -- see the drain in [`run_streamed`].
-    let mut tee_failed = None;
+    // Reported once, never in place of draining. A transcript on a full disk
+    // used to end this loop with the child still writing, which for a child
+    // whose read end this module holds open is a stall rather than an error
+    // -- see the drain in [`run_streamed`]. Nor is it this function's error:
+    // the captured bytes are the command's, and a record that came up short
+    // does not take them back; see [`warn_transcript_failed`].
+    let mut tee_failed = false;
     loop {
         line.clear();
         let n = reader.read_until(b'\n', &mut line).await?;
@@ -1319,21 +1361,48 @@ where
                 captured.drain(..captured.len() - limit);
             }
         }
-        if tee_failed.is_none() {
+        if !tee_failed {
             let rendered = String::from_utf8_lossy(&line);
             let rendered = rendered.trim_end_matches(['\r', '\n']);
             if let Err(e) = tee.line(prefix, rendered).await {
-                tee_failed = Some(e);
+                warn_transcript_failed(prefix, &e);
+                tee_failed = true;
             }
         }
     }
     if let Some(limit) = retain.filter(|limit| captured.len() > *limit) {
         captured.drain(..captured.len() - limit);
     }
-    match tee_failed {
-        Some(e) => Err(e),
-        None => Ok(captured),
+    Ok(captured)
+}
+
+/// [`capture_stream`]'s path for a stream nothing renders a line from: plain
+/// fixed-size reads, so a single run with no newline in it costs
+/// [`STREAM_READ_CHUNK`] rather than its own length. Retention trims exactly
+/// as [`capture_stream`]'s does, just against a chunk instead of a line.
+async fn drain_stream_chunks<R>(stream: R, retain: Option<usize>) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = stream;
+    let mut captured = Vec::new();
+    let mut chunk = [0_u8; STREAM_READ_CHUNK];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        if let Some(limit) = retain {
+            captured.extend_from_slice(&chunk[..n]);
+            if captured.len() / 2 > limit {
+                captured.drain(..captured.len() - limit);
+            }
+        }
     }
+    if let Some(limit) = retain.filter(|limit| captured.len() > *limit) {
+        captured.drain(..captured.len() - limit);
+    }
+    Ok(captured)
 }
 
 fn render_arg(arg: &OsStr) -> String {

@@ -891,14 +891,18 @@ fn start_error(e: OutrigError) -> SessionError {
 }
 
 /// `spec`, rewritten for a session with bindings: every directory it mounts
-/// appears in the container at its host path, so a path the agent writes and
-/// a path the library reads name one file.
+/// appears in the container at a path that names it on the host, so a path the
+/// agent writes and a path the library reads name one file. That is its host
+/// path, or a path that resolves to it there: a repository's mount is bound
+/// from where its declared path led when it was checked, and appears at the
+/// declared path (#604).
 ///
 /// The workspace's container path becomes its host path, unless `config`
-/// declared another, which is an error naming the key. A `LaunchSpec` cannot
-/// say whether its container path was declared -- one from the configuration
-/// holds `/workspace` when none was -- so the configuration decides. A mount
-/// whose container path is not its host path is an error.
+/// declared one, which must name the same directory or is an error naming the
+/// key. A `LaunchSpec` cannot say whether its container path was declared --
+/// one from the configuration holds `/workspace` when none was -- so the
+/// configuration decides. A mount whose container path does not name its host
+/// directory is an error.
 fn same_paths(config: &Config, spec: &mut LaunchSpec) -> Result<(), OutrigError> {
     let differs = |key: String, container: &Path, host: &Path, declared_in| {
         ConfigValidationError::BindingContainerPath {
@@ -910,21 +914,22 @@ fn same_paths(config: &Config, spec: &mut LaunchSpec) -> Result<(), OutrigError>
     };
     if let Some(workspace) = &mut spec.workspace {
         let host = lexical(&workspace.host);
-        if let Some(declared) = config.workspace.declared_container_path()
-            && lexical(declared) != host
-        {
-            let declared_in = config.workspace.declared_in();
-            Err(differs(
-                "workspace.container-path".into(),
-                declared,
-                &host,
-                declared_in,
-            ))?;
-        }
-        workspace.container = host;
+        workspace.container = match config.workspace.declared_container_path() {
+            None => host,
+            Some(declared) if names_on_host(declared, &host) => lexical(declared),
+            Some(declared) => {
+                let declared_in = config.workspace.declared_in();
+                Err(differs(
+                    "workspace.container-path".into(),
+                    declared,
+                    &host,
+                    declared_in,
+                ))?
+            }
+        };
     }
     for mount in &spec.mounts {
-        if lexical(&mount.container) != lexical(&mount.host) {
+        if !names_on_host(&mount.container, &mount.host) {
             let key = format!(
                 "the container path of the mount of {}",
                 mount.host.display()
@@ -933,6 +938,17 @@ fn same_paths(config: &Config, spec: &mut LaunchSpec) -> Result<(), OutrigError>
         }
     }
     Ok(())
+}
+
+/// Whether `container`, read on the host, names the directory at `host`: the
+/// same path, or one that resolves to the same directory.
+fn names_on_host(container: &Path, host: &Path) -> bool {
+    let container = lexical(container);
+    container == lexical(host)
+        || matches!(
+            (container.canonicalize(), host.canonicalize()),
+            (Ok(c), Ok(h)) if c == h
+        )
 }
 
 /// What the container binds read-only beside the payload, under OutRig's own
@@ -1020,4 +1036,69 @@ pub async fn container_spec(
         .await?
         .with_embedded_mcp_policy(EmbeddedMcpPolicy::Ignore);
     Ok(ContainerSpec { spec, left_out })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::config::{MountAccess, Workspace};
+    use crate::{MountSpec, WorkspaceSpec};
+
+    /// A container path that resolves on the host to the directory mounted
+    /// there names it, as the host path does: a repository's mount is bound
+    /// from where its declared path led (#604) and appears at the declared
+    /// path. A container path that names another directory is refused, and so
+    /// is one with a `..` after a symlink that the host resolves to the
+    /// mounted directory: the container resolves `..` textually.
+    #[test]
+    fn a_container_path_resolving_to_the_mounted_directory_names_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let [real, other, link] = ["real", "other", "link"].map(|name| root.join(name));
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let spec = |mounted: &Path| {
+            LaunchSpec::from_image("img:latest", BTreeMap::new(), root.join("logs"))
+                .with_workspace(WorkspaceSpec::new(&real, "/workspace"))
+                .with_mount(MountSpec::new(&real, mounted, MountAccess::ReadOnly))
+        };
+        let declaring = |container: &Path| {
+            let mut config = Config::default();
+            config.workspace = Workspace::new(&real, container);
+            config
+        };
+
+        let mut linked = spec(&link);
+        same_paths(&declaring(&link), &mut linked).unwrap();
+        assert_eq!(linked.workspace.expect("a workspace").container, link);
+        let mut undeclared = spec(&link);
+        same_paths(&Config::default(), &mut undeclared).unwrap();
+        assert_eq!(undeclared.workspace.expect("a workspace").container, real);
+
+        let key = |result: Result<(), OutrigError>| match result {
+            Err(OutrigError::ConfigValidation(ConfigValidationError::BindingContainerPath {
+                key,
+                ..
+            })) => key,
+            other => panic!("{other:?}"),
+        };
+        let refused = same_paths(&declaring(&other), &mut spec(&link));
+        assert_eq!(key(refused), "workspace.container-path");
+        let mount = format!("the container path of the mount of {}", real.display());
+        assert_eq!(
+            key(same_paths(&Config::default(), &mut spec(&other))),
+            mount
+        );
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::create_dir(root.join("inner")).unwrap();
+        std::os::unix::fs::symlink(root.join("inner"), root.join("sub/up")).unwrap();
+        let around = root.join("sub/up/../real");
+        assert_eq!(
+            key(same_paths(&Config::default(), &mut spec(&around))),
+            mount
+        );
+    }
 }

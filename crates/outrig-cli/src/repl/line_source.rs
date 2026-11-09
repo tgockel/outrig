@@ -128,10 +128,11 @@ impl<RD: AsyncBufRead + Unpin> LineSource for StreamSource<RD> {
 ///
 /// An enum rather than a `Box<dyn LineSource>` for the reason
 /// [`AutoPrompt`](crate::init::prompt::AutoPrompt) is one: `async fn`-in-trait
-/// is not dyn-compatible. Forwarding by hand gives one concrete type, no
-/// allocation, and no type erasure.
+/// is not dyn-compatible. Forwarding by hand gives one concrete type and no
+/// type erasure. The editor is boxed only for its size, several times the
+/// stream reader's; it is built once per session.
 pub(crate) enum AutoSource {
-    Editor(EditorSource),
+    Editor(Box<EditorSource>),
     Stream(StreamSource<BufReader<Stdin>>),
 }
 
@@ -157,7 +158,7 @@ impl LineSource for AutoSource {
 /// otherwise -- which is what keeps `echo "..." | outrig run` working.
 pub(crate) fn auto() -> AutoSource {
     match EditorSource::try_new() {
-        Some(editor) => AutoSource::Editor(editor),
+        Some(editor) => AutoSource::Editor(Box::new(editor)),
         None => AutoSource::Stream(StreamSource::new(BufReader::new(tokio::io::stdin()))),
     }
 }

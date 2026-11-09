@@ -15,7 +15,7 @@
 //! only checks cross-references, MCP server-name shape, and disk-existence of
 //! config-declared paths.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -26,9 +26,11 @@ use super::{
     Agent, ApiStyle, Binding, CHILDREN_MAX_CEILING, Config, EnvValue, HOST_GRACE_SECS_CEILING,
     ImageConfig, ImageSourceRef, LlmProvider, MCP_CALL_TIMEOUT_SECS_CEILING,
     MODEL_CONCURRENCY_MAX_CEILING, McpServerSpec, Model, ModelSourceRef, NetworkMode,
-    REQUEST_TIMEOUT_SECS_CEILING, REQUESTS_MAX_CEILING, RETRY_BUDGET_SECS_CEILING,
-    SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT,
-    TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES, lexical, normalize_capability_name,
+    PRIMARY_VIEW_ADDED_CAPS, PRIMARY_VIEW_DEFAULT_CAPS, REQUEST_TIMEOUT_SECS_CEILING,
+    REQUESTS_MAX_CEILING, RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING,
+    SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES,
+    TOOL_RESULT_MAX_FLOOR_BYTES, canonical_capability_name, is_env_key, lexical,
+    normalize_capability_name,
 };
 
 /// Renders the trailing `(declared in <file>)` note, or nothing when the entry
@@ -208,9 +210,20 @@ pub enum ConfigValidationError {
         declared_in: Option<PathBuf>,
     },
 
-    // No `declared_in` on these two: only `host-path` records the file it came
-    // from, and `container-path` is inherited from the global config apart
-    // from it.
+    #[error(
+        "workspace host-path {path:?} must not contain `:`{}; {}",
+        declared_in_clause(declared_in),
+        BIND_MOUNT_COLON_DETAIL
+    )]
+    #[non_exhaustive]
+    WorkspaceHostFieldSeparator {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
+
+    // No `declared_in` on these three: only `host-path` records the file it
+    // came from, and `container-path` is inherited from the global config
+    // apart from it.
     #[error("workspace container-path {path:?} must be absolute")]
     #[non_exhaustive]
     WorkspaceContainerNotAbsolute { path: PathBuf },
@@ -219,8 +232,16 @@ pub enum ConfigValidationError {
     #[non_exhaustive]
     WorkspaceContainerRoot {},
 
-    // The five below restate `MountRuleViolation` in workspace terms, so their
-    // `declared_in` means exactly what the variant it is mapped from means.
+    #[error(
+        "workspace container-path {path:?} must not contain `:`; {}",
+        BIND_MOUNT_COLON_DETAIL
+    )]
+    #[non_exhaustive]
+    WorkspaceContainerFieldSeparator { path: PathBuf },
+
+    // The seven below restate `MountRuleViolation` in workspace terms, so
+    // their `declared_in` means exactly what the variant it is mapped from
+    // means.
     #[error(
         "workspace mount host-path {path:?} does not exist{}",
         declared_in_clause(declared_in)
@@ -277,6 +298,28 @@ pub enum ConfigValidationError {
     )]
     #[non_exhaustive]
     WorkspaceMountHostDuplicate {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "workspace mount host-path {path:?} must not contain `:`{}; {}",
+        declared_in_clause(declared_in),
+        BIND_MOUNT_COLON_DETAIL
+    )]
+    #[non_exhaustive]
+    WorkspaceMountHostFieldSeparator {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "workspace mount container-path {path:?} must not contain `:`{}; {}",
+        declared_in_clause(declared_in),
+        BIND_MOUNT_COLON_DETAIL
+    )]
+    #[non_exhaustive]
+    WorkspaceMountContainerFieldSeparator {
         path: PathBuf,
         declared_in: Option<PathBuf>,
     },
@@ -488,6 +531,37 @@ pub enum ConfigValidationError {
         declared_in: Option<PathBuf>,
     },
 
+    // As with the two above, the key comes from a config file and prints with
+    // `{:?}`: it is exactly the keys that are not variable names that land
+    // here, and one could otherwise carry a control character to the terminal.
+    #[error(
+        "image {image:?} build-arg key {key:?} is not an environment variable name{}; {}",
+        declared_in_clause(declared_in),
+        ENV_KEY_DETAIL
+    )]
+    #[non_exhaustive]
+    BuildArgKeyInvalid {
+        image: String,
+        key: String,
+        /// The config file that declared the image, or `None` when unrecorded.
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "image {image:?} mcp server {server:?} env key {key:?} is not an environment \
+         variable name{}; {}",
+        declared_in_clause(declared_in),
+        ENV_KEY_DETAIL
+    )]
+    #[non_exhaustive]
+    McpEnvKeyInvalid {
+        image: String,
+        server: String,
+        key: String,
+        /// The config file that declared the image, or `None` when unrecorded.
+        declared_in: Option<PathBuf>,
+    },
+
     #[error(
         "model {model:?} (style={style}) must set 'identifier' (the string sent \
          to the provider API)"
@@ -508,6 +582,18 @@ pub enum ConfigValidationError {
     SidecarMount {
         sidecar: String,
         violation: MountRuleViolation,
+    },
+
+    /// A `[sidecars.<name>.security]` rule, carried whole rather than restated:
+    /// a sidecar reuses the image blocks' `[security]` rules, and this is the
+    /// variant that lets its message open with `sidecar` instead of borrowing
+    /// the `image {image:?}` variants above and naming a block that does not
+    /// exist. The image-config side keeps those variants, so this is additive.
+    #[error("sidecar {sidecar:?}: {violation}")]
+    #[non_exhaustive]
+    SidecarSecurity {
+        sidecar: String,
+        violation: SecurityRuleViolation,
     },
 
     #[error(
@@ -592,10 +678,30 @@ pub enum ConfigValidationError {
 
     #[error(
         "sidecar {sidecar:?} sets view = \"primary\" with capability-profile = \
-         \"drop-all\"; joining the primary's namespaces needs CAP_SYS_ADMIN and \
-         CAP_SYS_PTRACE, which drop-all removes"
+         \"drop-all\"; the launcher needs {}, which drop-all removes",
+        primary_view_capability_list()
     )]
     SidecarViewDropsCaps { sidecar: String },
+
+    // `capability` is the entry as podman reads it (upper case, no `CAP_`), so
+    // a `"cap_sys_chroot"` from a hand-built spec reads the same as the config
+    // spelling would. `ALL` is a possible value: it is `drop-all` in the list.
+    #[error(
+        "sidecar {sidecar:?} sets view = \"primary\" with {capability:?} in cap-drop; the \
+         launcher needs {} to join the primary's mount namespace and become the session \
+         user, which dropping it removes",
+        primary_view_capability_list()
+    )]
+    #[non_exhaustive]
+    SidecarViewCapDrop { sidecar: String, capability: String },
+
+    #[error(
+        "sidecar {sidecar:?} sets view = \"primary\" with no-new-privileges = false; the \
+         launcher puts the payload under no_new_privs itself, so that nothing it starts can \
+         regain the capabilities the join needed, and this key cannot turn that off"
+    )]
+    #[non_exhaustive]
+    SidecarViewNoNewPrivsOff { sidecar: String },
 
     #[error(
         "image {image:?} sidecar {sidecar:?} sets view = \"primary\" but hosts \
@@ -707,6 +813,14 @@ impl ConfigValidationError {
         }
     }
 }
+
+/// Why a key that is not a variable name is refused here rather than by the
+/// engine. Both `*KeyInvalid` messages end with it, so the two tables say the
+/// same thing.
+const ENV_KEY_DETAIL: &str = "podman and buildah read each entry as \
+     `KEY=value`, so a key holding `=` sets a shorter name with the rest of \
+     itself in the value, and an empty one is refused when the engine runs; \
+     write a name matching ^[A-Za-z_][A-Za-z0-9_]*$";
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ValidationOptions<'a> {
@@ -820,6 +934,7 @@ pub(super) fn validate_with_options(
             })?;
         }
         validate_image_security(image_name, image)?;
+        validate_env_keys(image_name, image)?;
         validate_repo_env_refs(cfg, image_name, image)?;
 
         for (server_name, spec) in image.mcp() {
@@ -1131,6 +1246,69 @@ fn validate_repo_env_refs(
     Ok(())
 }
 
+/// Hold every `env` and `build-args` key of an image-config to the variable
+/// name grammar, before anything renders one into a `KEY=value` argument.
+///
+/// podman and buildah split each such argument at its first `=`, so a key
+/// holding one names a shorter variable and leaves the rest of itself at the
+/// head of the value: `"A=B" = "c"` set `A` to `B=c`, which is a typo that
+/// configured something. An empty key reached podman as `--env =x` and failed
+/// the first server connect with the engine's own message, naming neither the
+/// key nor the file. Both are refused when the config loads instead.
+///
+/// The grammar is [`is_env_key`]'s, which is also what decides whether a
+/// resolved `${VAR}` may be passed to the engine by name: a key outside it
+/// kept its value on the command line, so this rule makes that fallback
+/// unreachable from a config file rather than removing it -- a hand-built
+/// `ExecOptions` still reaches it.
+///
+/// Every image-config is checked, whoever declared it: a key is misread the
+/// same way wherever it was written, and unlike a `${VAR}` reference it grants
+/// no access to the operator's environment. `declared_in` names the file when
+/// the entry records one.
+fn validate_env_keys(image_name: &str, image: &ImageConfig) -> Result<(), ConfigValidationError> {
+    for key in image.build_args.keys() {
+        if !is_env_key(key) {
+            return Err(ConfigValidationError::BuildArgKeyInvalid {
+                image: image_name.to_string(),
+                key: key.clone(),
+                declared_in: image.declared_in(),
+            });
+        }
+    }
+    for (server, spec) in &image.mcp {
+        if let Some(key) = first_invalid_env_key(spec) {
+            return Err(ConfigValidationError::McpEnvKeyInvalid {
+                image: image_name.to_string(),
+                server: server.clone(),
+                key: key.to_string(),
+                declared_in: image.declared_in(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The first key of `spec`'s `env` that is not a variable name, in key order.
+fn first_invalid_env_key(spec: &McpServerSpec) -> Option<&str> {
+    spec.env()
+        .keys()
+        .map(String::as_str)
+        .find(|key| !is_env_key(key))
+}
+
+/// The first `env` key of `mcp` that is not a variable name, with the server
+/// that declared it, in server then key order.
+///
+/// The two paths that read MCP servers from outside a config file -- an
+/// image's `org.outrig.mcp` label and a standalone `image.toml` -- hold their
+/// tables to the same grammar through this, framing the pair in their own
+/// errors, so one rule decides for everything that becomes `--env` arguments.
+pub(crate) fn check_env_keys(mcp: &BTreeMap<String, McpServerSpec>) -> Option<(&str, &str)> {
+    mcp.iter()
+        .find_map(|(server, spec)| first_invalid_env_key(spec).map(|key| (server.as_str(), key)))
+}
+
 fn validate_network_policy(cfg: &Config) -> Result<(), ConfigValidationError> {
     cfg.network
         .policy()
@@ -1142,27 +1320,102 @@ fn validate_image_security(
     image_name: &str,
     image: &ImageConfig,
 ) -> Result<(), ConfigValidationError> {
-    validate_security(image_name, image.security())
+    check_security(image.security())
+        .map_err(|violation| image_security_error(image_name, violation))
 }
 
-/// Validate a `[security]` block. `scope` names the owning block in errors --
-/// the image-config name, or `<image>.sidecars.<sc>` for a sidecar block.
-fn validate_security(
-    scope: &str,
-    security: &super::ContainerSecurity,
-) -> Result<(), ConfigValidationError> {
-    let drops = validate_capability_list(scope, "cap-drop", &security.cap_drop)?;
-    let adds = validate_capability_list(scope, "cap-add", &security.cap_add)?;
+/// Restate a [`SecurityRuleViolation`] as the per-image variant that has
+/// carried it since before the rule enum existed. The image-config side of the
+/// surface is unchanged by design: `[images.<name>]` errors are what a 0.2
+/// consumer already matches on, and a patch release may not take those fields
+/// away. Only the sidecar side is new, as
+/// [`ConfigValidationError::SidecarSecurity`].
+fn image_security_error(
+    image_name: &str,
+    violation: SecurityRuleViolation,
+) -> ConfigValidationError {
+    let image = image_name.to_string();
+    match violation {
+        SecurityRuleViolation::CapabilityNameEmpty { field } => {
+            ConfigValidationError::CapabilityNameEmpty { image, field }
+        }
+        SecurityRuleViolation::CapabilityNameInvalid { field, capability } => {
+            ConfigValidationError::CapabilityNameInvalid {
+                image,
+                field,
+                capability,
+            }
+        }
+        SecurityRuleViolation::CapabilityNameDuplicate { field, capability } => {
+            ConfigValidationError::CapabilityNameDuplicate {
+                image,
+                field,
+                capability,
+            }
+        }
+        SecurityRuleViolation::CapabilityDropAddConflict { capability } => {
+            ConfigValidationError::CapabilityDropAddConflict { image, capability }
+        }
+        SecurityRuleViolation::DevicePathEmpty {} => {
+            ConfigValidationError::DevicePathEmpty { image }
+        }
+        SecurityRuleViolation::DevicePathRelative { device } => {
+            ConfigValidationError::DevicePathRelative { image, device }
+        }
+        SecurityRuleViolation::DevicePathMalformed { device, detail } => {
+            ConfigValidationError::DevicePathMalformed {
+                image,
+                device,
+                detail,
+            }
+        }
+        SecurityRuleViolation::DevicePathDuplicate { device } => {
+            ConfigValidationError::DevicePathDuplicate { image, device }
+        }
+        SecurityRuleViolation::UnmaskPathEmpty {} => {
+            ConfigValidationError::UnmaskPathEmpty { image }
+        }
+        SecurityRuleViolation::UnmaskPathRelative { path } => {
+            ConfigValidationError::UnmaskPathRelative { image, path }
+        }
+        SecurityRuleViolation::UnmaskPathListSeparator { path } => {
+            ConfigValidationError::UnmaskPathListSeparator { image, path }
+        }
+        SecurityRuleViolation::UnmaskPathDuplicate { path } => {
+            ConfigValidationError::UnmaskPathDuplicate { image, path }
+        }
+        SecurityRuleViolation::UnmaskAllNotCanonical { path } => {
+            ConfigValidationError::UnmaskAllNotCanonical { image, path }
+        }
+        SecurityRuleViolation::UnmaskAllNotAlone {} => {
+            ConfigValidationError::UnmaskAllNotAlone { image }
+        }
+        SecurityRuleViolation::UnmaskPathBadGlob { path, detail } => {
+            ConfigValidationError::UnmaskPathBadGlob {
+                image,
+                path,
+                detail,
+            }
+        }
+    }
+}
+
+/// Validate a `[security]` block against rules that name no owning block, so
+/// the caller can frame the failure as the block it came from. Every rule here
+/// applies identically to an `[images.<name>.security]` and a
+/// `[sidecars.<sc>.security]`: a sidecar reuses the whole block.
+fn check_security(security: &super::ContainerSecurity) -> Result<(), SecurityRuleViolation> {
+    let drops = check_capability_list("cap-drop", &security.cap_drop)?;
+    let adds = check_capability_list("cap-add", &security.cap_add)?;
 
     if let Some(capability) = drops.intersection(&adds).next() {
-        return Err(ConfigValidationError::CapabilityDropAddConflict {
-            image: scope.to_string(),
+        return Err(SecurityRuleViolation::CapabilityDropAddConflict {
             capability: capability.clone(),
         });
     }
 
-    validate_device_list(scope, &security.devices)?;
-    validate_unmask_list(scope, &security.unmask)
+    check_device_list(&security.devices)?;
+    check_unmask_list(&security.unmask)
 }
 
 /// Shape-check the `devices` list. Whether the node exists is deliberately not
@@ -1171,35 +1424,30 @@ fn validate_security(
 ///
 /// An entry is podman's `--device` value, `<host>[:<container>][:<perms>]`,
 /// and the shape check refuses only what podman refuses at launch. This is
-/// the opposite of `validate_unmask_list`'s treatment of `:` on purpose:
+/// the opposite of `check_unmask_list`'s treatment of `:` on purpose:
 /// podman splits an `unmask` value into several paths, but the colons of a
 /// `--device` value separate the parts of one device.
-fn validate_device_list(scope: &str, devices: &[String]) -> Result<(), ConfigValidationError> {
+fn check_device_list(devices: &[String]) -> Result<(), SecurityRuleViolation> {
     let mut seen = BTreeSet::new();
 
     for device in devices {
         if device.trim().is_empty() {
-            return Err(ConfigValidationError::DevicePathEmpty {
-                image: scope.to_string(),
-            });
+            return Err(SecurityRuleViolation::DevicePathEmpty {});
         }
         let fields: Vec<&str> = device.split(':').collect();
         if !Path::new(fields[0]).is_absolute() {
-            return Err(ConfigValidationError::DevicePathRelative {
-                image: scope.to_string(),
+            return Err(SecurityRuleViolation::DevicePathRelative {
                 device: device.clone(),
             });
         }
         if let Err(detail) = check_device_suffix(&fields[1..]) {
-            return Err(ConfigValidationError::DevicePathMalformed {
-                image: scope.to_string(),
+            return Err(SecurityRuleViolation::DevicePathMalformed {
                 device: device.clone(),
                 detail: detail.to_string(),
             });
         }
         if !seen.insert(device.clone()) {
-            return Err(ConfigValidationError::DevicePathDuplicate {
-                image: scope.to_string(),
+            return Err(SecurityRuleViolation::DevicePathDuplicate {
                 device: device.clone(),
             });
         }
@@ -1256,14 +1504,12 @@ fn check_device_suffix(rest: &[&str]) -> Result<(), &'static str> {
 /// - A malformed glob is a no-op, not an error: podman logs `syntax error in
 ///   pattern` and creates the container with the path still masked, so the
 ///   failure surfaces later as an unrelated-looking one.
-fn validate_unmask_list(scope: &str, unmask: &[String]) -> Result<(), ConfigValidationError> {
+fn check_unmask_list(unmask: &[String]) -> Result<(), SecurityRuleViolation> {
     let mut seen = BTreeSet::new();
 
     for path in unmask {
         if path.trim().is_empty() {
-            return Err(ConfigValidationError::UnmaskPathEmpty {
-                image: scope.to_string(),
-            });
+            return Err(SecurityRuleViolation::UnmaskPathEmpty {});
         }
         // Unlike `devices`, where `:` joins the parts of one device, podman
         // splits an unmask value on it. Checked before the absolute-path rule:
@@ -1271,43 +1517,28 @@ fn validate_unmask_list(scope: &str, unmask: &[String]) -> Result<(), ConfigVali
         // absolute paths, so the rule below would wave it through into an
         // argument podman then splits back into several.
         if path.contains(':') {
-            return Err(ConfigValidationError::UnmaskPathListSeparator {
-                image: scope.to_string(),
-                path: path.clone(),
-            });
+            return Err(SecurityRuleViolation::UnmaskPathListSeparator { path: path.clone() });
         }
         if path.eq_ignore_ascii_case(UNMASK_ALL) {
             if path != UNMASK_ALL {
-                return Err(ConfigValidationError::UnmaskAllNotCanonical {
-                    image: scope.to_string(),
-                    path: path.clone(),
-                });
+                return Err(SecurityRuleViolation::UnmaskAllNotCanonical { path: path.clone() });
             }
             if unmask.len() > 1 {
-                return Err(ConfigValidationError::UnmaskAllNotAlone {
-                    image: scope.to_string(),
-                });
+                return Err(SecurityRuleViolation::UnmaskAllNotAlone {});
             }
         } else {
             if !Path::new(path).is_absolute() {
-                return Err(ConfigValidationError::UnmaskPathRelative {
-                    image: scope.to_string(),
-                    path: path.clone(),
-                });
+                return Err(SecurityRuleViolation::UnmaskPathRelative { path: path.clone() });
             }
             if let Err(detail) = check_glob_syntax(path) {
-                return Err(ConfigValidationError::UnmaskPathBadGlob {
-                    image: scope.to_string(),
+                return Err(SecurityRuleViolation::UnmaskPathBadGlob {
                     path: path.clone(),
                     detail,
                 });
             }
         }
         if !seen.insert(path.clone()) {
-            return Err(ConfigValidationError::UnmaskPathDuplicate {
-                image: scope.to_string(),
-                path: path.clone(),
-            });
+            return Err(SecurityRuleViolation::UnmaskPathDuplicate { path: path.clone() });
         }
     }
 
@@ -1534,6 +1765,22 @@ pub(crate) fn check_entrypoint_hosting(
     Ok(())
 }
 
+/// Everything `outrig-enter` needs of the capability set: what OutRig adds and
+/// what podman's default set provides.
+fn primary_view_capabilities() -> impl Iterator<Item = &'static str> {
+    PRIMARY_VIEW_ADDED_CAPS
+        .into_iter()
+        .chain(PRIMARY_VIEW_DEFAULT_CAPS)
+}
+
+/// [`primary_view_capabilities`] as the `CAP_`-prefixed names a message gives.
+fn primary_view_capability_list() -> String {
+    primary_view_capabilities()
+        .map(|name| format!("CAP_{name}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The `view = "primary"` exclusions that hold however a sidecar was declared.
 /// Shared with the library facade so a hand-built [`SidecarSpec`] is rejected
 /// by this code, with this text, rather than by a parallel copy of it.
@@ -1544,6 +1791,8 @@ pub(crate) fn check_view_exclusions(
     view: super::SidecarView,
     workspace: super::SidecarWorkspaceAccess,
     capability_profile: super::CapabilityProfile,
+    cap_drop: &[String],
+    no_new_privileges: bool,
 ) -> Result<(), ConfigValidationError> {
     if view != super::SidecarView::Primary {
         return Ok(());
@@ -1559,6 +1808,26 @@ pub(crate) fn check_view_exclusions(
     // config is contradictory rather than silently re-added.
     if capability_profile == super::CapabilityProfile::DropAll {
         return Err(ConfigValidationError::SidecarViewDropsCaps {
+            sidecar: sidecar_name.to_string(),
+        });
+    }
+    // So does an explicit drop of one the launcher needs, or `ALL`, which is
+    // `drop-all` spelled in the list. Left alone, the sidecar starts and the
+    // launcher dies on whichever syscall needed it first.
+    if let Some(capability) = cap_drop
+        .iter()
+        .filter_map(|entry| canonical_capability_name(entry))
+        .find(|name| name == "ALL" || primary_view_capabilities().any(|cap| cap == name))
+    {
+        return Err(ConfigValidationError::SidecarViewCapDrop {
+            sidecar: sidecar_name.to_string(),
+            capability,
+        });
+    }
+    // The launcher sets `no_new_privs` on the payload whatever the container
+    // was started with, so the opt-out would do nothing but read as if it did.
+    if !no_new_privileges {
+        return Err(ConfigValidationError::SidecarViewNoNewPrivsOff {
             sidecar: sidecar_name.to_string(),
         });
     }
@@ -1629,14 +1898,20 @@ fn validate_sidecar(
     check_sidecar_name(sidecar_name)?;
     check_sidecar_image(sidecar_name, &sidecar.image)?;
 
-    let scope = format!("sidecars.{sidecar_name}");
-    validate_security(&scope, &sidecar.security)?;
+    check_security(&sidecar.security).map_err(|violation| {
+        ConfigValidationError::SidecarSecurity {
+            sidecar: sidecar_name.to_string(),
+            violation,
+        }
+    })?;
 
     check_view_exclusions(
         sidecar_name,
         sidecar.view,
         sidecar.workspace,
         sidecar.security.capability_profile,
+        &sidecar.security.cap_drop,
+        sidecar.security.no_new_privileges,
     )?;
 
     // The workspace mount (when enabled) reuses the session's container path,
@@ -1653,31 +1928,25 @@ fn validate_sidecar(
     })
 }
 
-fn validate_capability_list(
-    image_name: &str,
+fn check_capability_list(
     field: &'static str,
     capabilities: &[String],
-) -> Result<BTreeSet<String>, ConfigValidationError> {
+) -> Result<BTreeSet<String>, SecurityRuleViolation> {
     let mut seen = BTreeSet::new();
 
     for capability in capabilities {
         let Some(normalized) = normalize_capability_name(capability) else {
             if super::capability_name_without_prefix(capability).is_empty() {
-                return Err(ConfigValidationError::CapabilityNameEmpty {
-                    image: image_name.to_string(),
-                    field,
-                });
+                return Err(SecurityRuleViolation::CapabilityNameEmpty { field });
             }
-            return Err(ConfigValidationError::CapabilityNameInvalid {
-                image: image_name.to_string(),
+            return Err(SecurityRuleViolation::CapabilityNameInvalid {
                 field,
                 capability: capability.clone(),
             });
         };
 
         if !seen.insert(normalized.clone()) {
-            return Err(ConfigValidationError::CapabilityNameDuplicate {
-                image: image_name.to_string(),
+            return Err(SecurityRuleViolation::CapabilityNameDuplicate {
                 field,
                 capability: normalized,
             });
@@ -1687,14 +1956,36 @@ fn validate_capability_list(
     Ok(seen)
 }
 
-/// Hold the primary `host-path` to the rule [`check_mount_list`] applies to
-/// every extra mount: when a repo root is known, it must exist and be a
-/// directory. Podman refuses a bind source that is missing, but only at
-/// `podman run`, and without naming the key or the file that declared it.
+/// Hold the primary `host-path` to the rules [`check_mount_list`] applies to
+/// every extra mount: it must carry no `:`, and -- when a repo root is known
+/// -- must exist and be a directory. Podman refuses a bind source that is
+/// missing, or a `-v` value a `:` gave a fourth field, but only at `podman
+/// run`, and without naming the key or the file that declared it.
+///
+/// The `:` rule is applied to the path *as declared* and not to what it
+/// resolves to, which is the one place this differs from the extra mounts. An
+/// undeclared `host-path` resolves to the repo root -- outrig's own pick, the
+/// current directory when no config was found -- so a `:` there is a fact
+/// about where the user is standing rather than anything a config said. A
+/// session that mounts it is still refused, by the caller that knows whether
+/// this launch mounts anything at all: `outrig mcp --attach` borrows a
+/// running container and serializes no `-v`, and it used to be able to do
+/// that from such a directory. See `refuse_workspace_field_separator` in the
+/// CLI, which holds the resolved path to this rule for every launch that is
+/// not an attach.
 fn validate_workspace_host_path(
     cfg: &Config,
     repo_root: Option<&Path>,
 ) -> Result<(), ConfigValidationError> {
+    // Structural, so it runs with or without a repo root, as the
+    // container-path rules do: a `:` here malforms the `-v` value whatever it
+    // resolves against.
+    if has_field_separator(cfg.workspace.host_path()) {
+        return Err(ConfigValidationError::WorkspaceHostFieldSeparator {
+            path: cfg.workspace.host_path().to_path_buf(),
+            declared_in: cfg.workspace.declared_in(),
+        });
+    }
     let Some(root) = repo_root else {
         return Ok(());
     };
@@ -1711,14 +2002,22 @@ fn validate_workspace_host_path(
 }
 
 /// Hold the primary `container-path` to the shape [`check_mount_list`] asks of
-/// every extra mount: absolute, and not `/`. Podman refuses a relative one only
-/// once it creates the container, after the image is built; it takes `/`, and
-/// the workspace then covers the image's whole root filesystem. Structural, so
-/// it runs with or without a repo root.
+/// every extra mount: absolute, free of podman's `-v` field separator, and not
+/// `/`. Podman refuses a relative one only once it creates the container,
+/// after the image is built; it takes `/`, and the workspace then covers the
+/// image's whole root filesystem. Structural, so it runs with or without a
+/// repo root.
 fn validate_workspace_container_path(cfg: &Config) -> Result<(), ConfigValidationError> {
     let path = cfg.workspace.container_path();
     if !path.is_absolute() {
         return Err(ConfigValidationError::WorkspaceContainerNotAbsolute {
+            path: path.to_path_buf(),
+        });
+    }
+    // Before the root check, as in `check_mount_list`: a path that carries one
+    // is malformed as a whole, and folding it would report the fold instead.
+    if has_field_separator(path) {
+        return Err(ConfigValidationError::WorkspaceContainerFieldSeparator {
             path: path.to_path_buf(),
         });
     }
@@ -1806,8 +2105,113 @@ fn check_workspace_mounts(
             MountRuleViolation::HostNotDirectory { path, declared_in } => {
                 ConfigValidationError::WorkspaceMountHostNotDirectory { path, declared_in }
             }
+            MountRuleViolation::HostFieldSeparator { path, declared_in } => {
+                ConfigValidationError::WorkspaceMountHostFieldSeparator { path, declared_in }
+            }
+            MountRuleViolation::ContainerFieldSeparator { path, declared_in } => {
+                ConfigValidationError::WorkspaceMountContainerFieldSeparator { path, declared_in }
+            }
         },
     )
+}
+
+/// Scope-agnostic `[security]` rule violation. The image-config caller maps it
+/// onto the per-image variants of [`ConfigValidationError`] that predate this
+/// type; a sidecar's is carried whole by
+/// [`ConfigValidationError::SidecarSecurity`]. Splitting the rule from the
+/// block it failed in is what lets a sidecar's error say `sidecar`, where it
+/// used to borrow the image variants and read `image "sidecars.<name>"`.
+///
+/// `Display` is the rule alone, with no owner prefix, so each caller supplies
+/// the one its block wants: `image "coding": ` or `sidecar "tools": `.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum SecurityRuleViolation {
+    #[error("`{field}` capability name must not be empty")]
+    #[non_exhaustive]
+    CapabilityNameEmpty { field: &'static str },
+
+    #[error(
+        "`{field}` capability {capability:?} must match \
+         ^[A-Z0-9_]+$ after optional CAP_ stripping"
+    )]
+    #[non_exhaustive]
+    CapabilityNameInvalid {
+        field: &'static str,
+        capability: String,
+    },
+
+    #[error("`{field}` capability {capability:?} is declared more than once")]
+    #[non_exhaustive]
+    CapabilityNameDuplicate {
+        field: &'static str,
+        capability: String,
+    },
+
+    #[error("capability {capability:?} is listed in both `cap-drop` and `cap-add`")]
+    #[non_exhaustive]
+    CapabilityDropAddConflict { capability: String },
+
+    #[error("`devices` entry must not be empty")]
+    #[non_exhaustive]
+    DevicePathEmpty {},
+
+    #[error("`devices` entry {device:?} must be an absolute path")]
+    #[non_exhaustive]
+    DevicePathRelative { device: String },
+
+    #[error(
+        "`devices` entry {device:?} is malformed: {detail}; expected \
+         `<host-path>[:<container-path>][:<permissions>]`"
+    )]
+    #[non_exhaustive]
+    DevicePathMalformed { device: String, detail: String },
+
+    #[error("`devices` entry {device:?} is declared more than once")]
+    #[non_exhaustive]
+    DevicePathDuplicate { device: String },
+
+    #[error("`unmask` entry must not be empty")]
+    #[non_exhaustive]
+    UnmaskPathEmpty {},
+
+    #[error("`unmask` entry {path:?} must be an absolute path or `ALL`")]
+    #[non_exhaustive]
+    UnmaskPathRelative { path: String },
+
+    #[error(
+        "`unmask` entry {path:?} must not contain `:`; podman splits an \
+         unmask value on it, so declare one path per entry"
+    )]
+    #[non_exhaustive]
+    UnmaskPathListSeparator { path: String },
+
+    #[error("`unmask` entry {path:?} is declared more than once")]
+    #[non_exhaustive]
+    UnmaskPathDuplicate { path: String },
+
+    #[error(
+        "`unmask` entry {path:?} must be spelled `ALL`; podman only lifts \
+         the read-only paths for that exact casing, so {path:?} would leave `/sys/fs/cgroup` \
+         read-only while looking like a full unmask"
+    )]
+    #[non_exhaustive]
+    UnmaskAllNotCanonical { path: String },
+
+    #[error(
+        "`unmask` must be exactly [\"ALL\"] when it lists `ALL`; podman \
+         applies the full unmask only when `ALL` comes first, and every other entry is \
+         redundant beside it"
+    )]
+    #[non_exhaustive]
+    UnmaskAllNotAlone {},
+
+    #[error(
+        "`unmask` entry {path:?} {detail}; podman logs a pattern syntax \
+         error and leaves the path masked instead of failing the launch"
+    )]
+    #[non_exhaustive]
+    UnmaskPathBadGlob { path: String, detail: &'static str },
 }
 
 /// Scope-agnostic mount-list rule violation. The workspace caller maps it
@@ -1876,13 +2280,64 @@ pub enum MountRuleViolation {
         path: PathBuf,
         declared_in: Option<PathBuf>,
     },
+
+    #[error(
+        "host-path {path:?} must not contain `:`{}; {}",
+        declared_in_clause(declared_in),
+        BIND_MOUNT_COLON_DETAIL
+    )]
+    #[non_exhaustive]
+    HostFieldSeparator {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "container-path {path:?} must not contain `:`{}; {}",
+        declared_in_clause(declared_in),
+        BIND_MOUNT_COLON_DETAIL
+    )]
+    #[non_exhaustive]
+    ContainerFieldSeparator {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
+}
+
+/// Why a `:` in a bind-mount path is refused here rather than at launch. Every
+/// `*FieldSeparator` message ends with it, so the two scopes say the same
+/// thing.
+const BIND_MOUNT_COLON_DETAIL: &str = "podman reads a `-v` value as \
+     `<host>:<container>[:<options>]`, so a path carrying one becomes a \
+     fourth field the engine refuses at launch";
+
+/// Whether a path carries podman's `-v` field separator.
+///
+/// Checked on both halves of every bind mount, and on the primary workspace,
+/// because [`append_bind_mount`] renders them into one colon-joined value:
+/// `<host>:<container>:<options>`. A path with a `:` makes that four fields,
+/// which podman refuses -- after the image is acquired and naming neither the
+/// key nor the file. It is a shape error, not an injection: the options podman
+/// would act on live only in the third field, and a path cannot reach it
+/// without pushing the real options further right, where podman stops reading.
+///
+/// A host path that happens to exist with a `:` in its name is unreachable by
+/// this route, and podman offers no escape for one in a `-v`; the `--mount`
+/// form would take it. Refusing it is what lets a diagnostic name the key and
+/// the file.
+///
+/// [`append_bind_mount`]: crate::container
+fn has_field_separator(path: &Path) -> bool {
+    path.as_os_str().as_encoded_bytes().contains(&b':')
 }
 
 /// An absolute in-container path with `.` and `..` folded by component, the way
 /// podman cleans a destination before it compares them. `..` at the root stays
 /// at the root. Lexical: there is no filesystem to resolve against, and
-/// `Path` equality alone never folds `..`.
-fn fold_container_path(path: &Path) -> PathBuf {
+/// `Path` equality alone never folds `..`. A relative path folds as if it were
+/// absolute, so an empty one is `/`: a caller that treats empty as "none" says
+/// so before it folds.
+pub(crate) fn fold_container_path(path: &Path) -> PathBuf {
     let mut folded = PathBuf::from("/");
     for component in path.components() {
         match component {
@@ -1897,7 +2352,8 @@ fn fold_container_path(path: &Path) -> PathBuf {
 }
 
 /// Shared rules for any bind-mount list: absolute container paths, never `/`,
-/// no duplicates (including against `reserved` paths already claimed by the
+/// neither half *as declared* carrying podman's `-v` field separator, no
+/// duplicates (including against `reserved` paths already claimed by the
 /// owning block), and -- when a repo root is known -- host paths that exist
 /// and are directories.
 fn check_mount_list(
@@ -1909,6 +2365,26 @@ fn check_mount_list(
         // Per entry, not per list: the list may be a concatenation of two files.
         let declared_in = mount.declared_in();
 
+        // Both halves, as declared: a `:` makes the rendered `-v` value a
+        // different shape rather than a different path, so the entry is
+        // malformed whatever it points at. Structural, like the container
+        // rules below -- checked here even with no repo root, since the rule
+        // is about the spelling and not about what is on disk. An undeclared
+        // container path is the host path, so the host half covers it.
+        if let Some(container) = mount.declared_container_path()
+            && has_field_separator(container)
+        {
+            return Err(MountRuleViolation::ContainerFieldSeparator {
+                path: container.to_path_buf(),
+                declared_in,
+            });
+        }
+        if has_field_separator(mount.host_path()) {
+            return Err(MountRuleViolation::HostFieldSeparator {
+                path: mount.host_path().to_path_buf(),
+                declared_in,
+            });
+        }
         // An undeclared container path is the host path, which can only be
         // judged once it can be resolved.
         if let Some(container) = mount.known_container_path(repo_root) {
@@ -1932,6 +2408,13 @@ fn check_mount_list(
 
         if let Some(root) = repo_root {
             let resolved = mount.resolved_host_path(root);
+            // Deliberately no `:` check on the resolved path, for the reason
+            // `validate_workspace_host_path` gives: what a clean path resolves
+            // *through* is a fact about this machine and this launch, not
+            // about the config, and a launch that serializes no mount at all
+            // (`outrig mcp --attach`) must not be stopped by it. The CLI's
+            // `refuse_mount_field_separators` holds the resolved paths to the
+            // rule for every launch that does mount.
             if !resolved.exists() {
                 return Err(MountRuleViolation::HostMissing {
                     path: mount.host_path().to_path_buf(),
@@ -2528,7 +3011,11 @@ fn validate_image_source(
             });
         }
         let name = image.image_name().unwrap();
-        if name.is_empty() {
+        // Trimmed, as `check_sidecar_image` holds a sidecar's `image` to: a
+        // ref of nothing but blanks names no image either way, and left to
+        // podman it surfaces at launch as `image not known`, naming neither
+        // the key nor the file that declared it.
+        if name.trim().is_empty() {
             return Err(ConfigValidationError::ImageNameEmpty {
                 image: image_name.to_string(),
             });

@@ -7,8 +7,20 @@
 //! container, which a label-filtered listing would miss. The label sweep
 //! catches *stray* containers -- ones carrying `org.outrig.session` whose
 //! session record is gone (lost record, SIGKILLed outrig, failed `--rm`) --
-//! and `podman rm -f`s the stopped ones older than the cutoff in one
-//! invocation. Running containers are never removed, labeled or not.
+//! and `podman rm`s the stopped ones older than the cutoff in one
+//! invocation. Running containers are never removed, labeled or not -- the
+//! removal is not forced, so one that started after the listing is refused by
+//! podman at the moment of removal and reported as kept -- and
+//! neither is one whose creation time cannot be read: with no age to measure
+//! against the cutoff, it is reported instead.
+//!
+//! The running check behind the session-store walk's refusal runs twice: once
+//! for the preview, built from the listing above, and once more right before
+//! each record's removal, since the prompt between them can wait indefinitely
+//! and nothing else asks again. A container started in that window is caught
+//! by the second look and the record is kept, the way a container the preview
+//! itself saw already is; the look narrows the remaining window to the gap
+//! between it and the removal, and cannot close it.
 //!
 //! `--build-containers` adds a third sweep, off by default and answered from
 //! its own listings. Separate for a reason beyond tidiness: buildah working
@@ -17,7 +29,7 @@
 //! they have no way to reason about. See [`crate::cli::build_containers`]
 //! for why it is opt-in.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -85,8 +97,29 @@ pub struct LabeledContainer {
     pub name: String,
     pub session_label: String,
     pub sidecar_label: Option<String>,
+    /// Running **or paused**: either is a live container that `podman rm`
+    /// refuses and `clean` must not remove.
     pub running: bool,
-    pub created: SystemTime,
+    /// `None` when the row's `Created` is not a readable time: absent, neither
+    /// an integer nor an RFC 3339 string, or at or before the epoch. Such a
+    /// container is reported and left alone: an unknown age cannot clear a
+    /// cutoff, and the container may be seconds old.
+    pub created: Option<SystemTime>,
+}
+
+/// A stray the removal hook left in place, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    pub name: String,
+    /// Podman refused it because it is running or paused, as against a removal
+    /// that failed. The listing that selected it called it stopped, so this is
+    /// a container someone started after `clean` looked.
+    pub running: bool,
+    /// What podman said when it was asked for this name on its own and
+    /// declined -- a dependent container holding a user namespace, say -- so a
+    /// failure is reported with its reason. `None` for a running container,
+    /// whose refusal is expected, and for a removal that exited zero.
+    pub detail: Option<String>,
 }
 
 pub async fn execute(
@@ -110,7 +143,7 @@ pub async fn execute(
     };
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut stderr = tokio::io::stderr();
-    execute_with(
+    let result = execute_with(
         &mut stderr,
         stdin,
         &store,
@@ -119,14 +152,23 @@ pub async fn execute(
         running,
         labeled,
         build,
-        podman_remove_force_batch,
+        podman_remove_batch,
         buildah_remove_batch,
+        refresh_running,
     )
-    .await
+    .await;
+    // tokio's stderr hands each write to a blocking-pool thread and returns
+    // before it lands; only `flush` waits for it. `dispatch` shuts this
+    // command's runtime down right after this future resolves, and shutdown
+    // runs only the blocking pool's *mandatory* tasks, dropping the rest --
+    // a write no worker thread has picked up yet is lost (#759). Flushed on
+    // both paths, so the lines written before an error still arrive.
+    let _ = stderr.flush().await;
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_with<E, R, D, DFut, B, BFut>(
+pub async fn execute_with<E, R, D, DFut, B, BFut, L, LFut>(
     stderr: &mut E,
     stdin: R,
     store: &SessionStore,
@@ -137,6 +179,7 @@ pub async fn execute_with<E, R, D, DFut, B, BFut>(
     build: Vec<BuildContainer>,
     mut remove_containers: D,
     mut remove_build_containers: B,
+    mut recheck_running: L,
 ) -> Result<i32>
 where
     E: AsyncWrite + Unpin,
@@ -144,9 +187,15 @@ where
     // Returns the subset of `names` still in the store afterwards -- see the
     // call site for why the batch's exit status cannot answer that.
     D: FnMut(Vec<String>) -> DFut,
-    DFut: Future<Output = Result<Vec<String>>>,
+    DFut: Future<Output = Result<Vec<Kept>>>,
     B: FnMut(Vec<String>) -> BFut,
     BFut: Future<Output = Result<()>>,
+    // The second look a record removal takes right before it runs: a fresh
+    // read of which container names are running, taken only when there is a
+    // record removal to protect. `now` and `running` above are the one look
+    // the preview is built from; this is the one the removal is.
+    L: FnMut() -> LFut,
+    LFut: Future<Output = Result<BTreeSet<String>>>,
 {
     let listing = store.list()?;
     // `--session` narrows both sweeps together, which is the only way the
@@ -181,7 +230,14 @@ where
         if !older_than(session, args.older_than, now) {
             continue;
         }
-        if running.contains(&session.container_name) {
+        // Either answer means live. `owner_is_live` is what covers a launch
+        // whose container does not exist yet -- a cold image build takes
+        // minutes, and a cutoff shorter than one used to sweep the record out
+        // from under it (#366); `running` covers the record whose owner died
+        // without finalizing and left its container up.
+        if session::owner_is_live(&session.session_dir)
+            || running.contains(&session.container_name)
+        {
             skipped_running.push(session.clone());
             continue;
         }
@@ -230,7 +286,7 @@ where
         if !aged || args.session.as_deref().is_some_and(|id| id != skipped.entry) {
             continue;
         }
-        if running.contains(&skipped.container_name()) {
+        if session::owner_is_live(&skipped.dir) || running.contains(&skipped.container_name()) {
             unreadable_running.push(skipped);
         } else if args.unreadable && !skipped.container_known() {
             // The record never got as far as naming its container, and an
@@ -255,7 +311,7 @@ where
         .map(|s| s.entry.as_str())
         .filter(|entry| !target_ids.contains(entry))
         .collect();
-    let (stray_targets, stray_running) = classify_strays(
+    let (mut stray_targets, stray_running, stray_undatable) = classify_strays(
         &sessions,
         &target_ids,
         &unreadable,
@@ -269,6 +325,7 @@ where
 
     write_skipped_running(
         stderr,
+        "[outrig] skipped running sessions:\n",
         &skipped_running,
         &dangling_running,
         &unreadable_running,
@@ -276,7 +333,18 @@ where
     .await?;
     write_unreadable_left(stderr, &unreadable_left, &retention).await?;
     write_unreadable_unsure(stderr, &unreadable_unsure, &retention).await?;
-    write_stray_running(stderr, &stray_running).await?;
+    write_stray_skipped(
+        stderr,
+        "[outrig] skipped running labeled containers (no session record):\n",
+        &stray_running,
+    )
+    .await?;
+    write_stray_skipped(
+        stderr,
+        "[outrig] skipped labeled containers with no creation time (no session record):\n",
+        &stray_undatable,
+    )
+    .await?;
     write_build_undatable(stderr, &build_undatable).await?;
 
     if targets.is_empty()
@@ -319,8 +387,33 @@ where
         return Ok(0);
     }
 
+    // Nothing between the preview's listing and this moment has looked at the
+    // containers again -- the prompt can wait indefinitely, and `--yes` only
+    // closes the length of that wait, not the gap it still leaves. A record
+    // target whose container started in that window is read here as live,
+    // the same as one the preview itself caught, and kept rather than
+    // removed; `--unreadable` records and dangling links get the same look.
+    // Skipped when there is nothing a removal could race, so a run with
+    // nothing but strays or build containers still needs no podman call here.
+    let running_now = if targets.is_empty() && dangling_targets.is_empty() && unreadable_targets.is_empty()
+    {
+        BTreeSet::new()
+    } else {
+        recheck_running().await?
+    };
+
     let mut removed = 0usize;
+    let mut kept_running = Vec::new();
+    let mut dangling_kept_running = Vec::new();
+    let mut unreadable_kept_running = Vec::new();
+
     for target in &targets {
+        if session::owner_is_live(&target.dir)
+            || running_now.contains(&target.session.container_name)
+        {
+            kept_running.push(target.session.clone());
+            continue;
+        }
         store.remove_by_id(&target.session.id)?;
         removed += 1;
 
@@ -334,12 +427,21 @@ where
     }
 
     for link in &dangling_targets {
+        if running_now.contains(&link.container_name()) {
+            dangling_kept_running.push(*link);
+            continue;
+        }
         let (gone, msg) = super::unlink_dangling_report(store, link)?;
         removed += usize::from(gone);
         stderr.write_all(msg.as_bytes()).await?;
     }
 
     for skipped in &unreadable_targets {
+        if session::owner_is_live(&skipped.dir) || running_now.contains(&skipped.container_name())
+        {
+            unreadable_kept_running.push(*skipped);
+            continue;
+        }
         store.remove_by_id(&skipped.id())?;
         removed += 1;
         let dir_msg = format!("[outrig] removed {}\n", skipped.dir.display());
@@ -351,7 +453,51 @@ where
         }
     }
 
-    // One `podman rm -f` for every stray. Guard the empty case -- `podman rm
+    // Not an error: a session whose container is up when this looks is
+    // exactly the one the sweep promised to leave alone, whichever moment it
+    // started running in. The exit status stays 0 for these -- `kept` below,
+    // for a stray `podman rm` skipped or refused, is the failure case.
+    write_skipped_running(
+        stderr,
+        "[outrig] kept (container is now running):\n",
+        &kept_running,
+        &dangling_kept_running,
+        &unreadable_kept_running,
+    )
+    .await?;
+
+    // `classify_strays` ran before the second look, on the assumption (then
+    // correct) that every id in `target_ids` was going to lose its record
+    // this run -- which is what makes a labeled sidecar sharing that id a
+    // stray rather than a container a surviving record still owns. A session
+    // or `--unreadable` record the second look just retained breaks that
+    // assumption after the fact, so its labeled containers have to come back
+    // out of `stray_targets` before the batch below ever sees them: their
+    // record is still there, and a sidecar beside a surviving record is not
+    // stray.
+    let retained_ids: BTreeSet<&str> = kept_running
+        .iter()
+        .map(|s| s.id.as_str())
+        .chain(unreadable_kept_running.iter().map(|s| s.entry.as_str()))
+        .collect();
+    let retained_strays: Vec<LabeledContainer> = if retained_ids.is_empty() {
+        Vec::new()
+    } else {
+        let (keep, strays): (Vec<_>, Vec<_>) = stray_targets
+            .into_iter()
+            .partition(|c| retained_ids.contains(c.session_label.as_str()));
+        stray_targets = strays;
+        keep
+    };
+    write_stray_skipped(
+        stderr,
+        "[outrig] kept containers whose session record is still there \
+         (session started during the prompt):\n",
+        &retained_strays,
+    )
+    .await?;
+
+    // One `podman rm` for every stray. Guard the empty case -- `podman rm
     // -f` with no names is an error.
     //
     // The per-container outcome comes from a re-read, not from the batch's
@@ -361,21 +507,36 @@ where
     // self-perpetuating: the container this claimed to remove joins the next
     // sweep's batch and is skipped again. A line saying a container was
     // removed is now a claim about that container.
-    let kept: BTreeSet<String> = if stray_targets.is_empty() {
-        BTreeSet::new()
+    //
+    // Not forced, because the listing that selected these is older than this
+    // moment -- by the length of the prompt -- and a container started since
+    // is running. `podman rm` refuses a running container when it acts, which
+    // is the only time that can be checked; `-f` would stop and delete it.
+    let kept: BTreeMap<String, Kept> = if stray_targets.is_empty() {
+        BTreeMap::new()
     } else {
         remove_containers(stray_targets.iter().map(|s| s.name.clone()).collect())
             .await?
             .into_iter()
+            .map(|k| (k.name.clone(), k))
             .collect()
     };
     for stray in &stray_targets {
-        let verb = if kept.contains(&stray.name) {
-            "could not remove"
-        } else {
-            "removed"
+        let msg = match kept.get(&stray.name) {
+            Some(k) if k.running => format!(
+                "[outrig] kept container {}: it is running or paused\n",
+                stray.name
+            ),
+            Some(Kept {
+                detail: Some(detail),
+                ..
+            }) => format!(
+                "[outrig] could not remove container {}: {detail}\n",
+                stray.name
+            ),
+            Some(_) => format!("[outrig] could not remove container {}\n", stray.name),
+            None => format!("[outrig] removed container {}\n", stray.name),
         };
-        let msg = format!("[outrig] {verb} container {}\n", stray.name);
         stderr.write_all(msg.as_bytes()).await?;
     }
     // `kept` is what the removal hook reports still present, so it is a subset
@@ -403,7 +564,14 @@ where
     stderr.write_all(summary.as_bytes()).await?;
     // Reporting the failure is not enough on its own: a script that checks the
     // exit code would otherwise read a partial sweep as a complete one.
-    Ok(if kept.is_empty() { 0 } else { 1 })
+    //
+    // A running container that was refused is not a failure: the sweep did
+    // what it promised, which is to leave running containers alone.
+    Ok(if kept.values().any(|k| !k.running) {
+        1
+    } else {
+        0
+    })
 }
 
 pub fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
@@ -444,13 +612,16 @@ struct CleanTarget {
     dir: PathBuf,
 }
 
-/// Split labeled containers into `(removable strays, running strays)`.
+/// Split labeled containers into `(removable, running, undatable)` strays.
 /// A stray is a labeled container with no *surviving* session record -- a
 /// record being removed this run counts as gone, so a failed `--rm` and its
 /// record clean up together. `unreadable` names entries that exist on disk but
 /// couldn't be parsed; they survive too, so their containers are record-backed
 /// rather than stray. Running containers are never removable, and stopped
-/// strays must be older than the cutoff (podman `Created` time).
+/// strays must be older than the cutoff (podman `Created` time). A stopped
+/// stray with no readable `Created` is `undatable`, never removable: the
+/// cutoff is what keeps a sweep off a container made a moment ago, and a
+/// container that cannot be measured against it is reported instead.
 fn classify_strays(
     sessions: &[Session],
     removed_ids: &BTreeSet<&str>,
@@ -458,7 +629,11 @@ fn classify_strays(
     labeled: Vec<LabeledContainer>,
     older_than: Duration,
     now: SystemTime,
-) -> (Vec<LabeledContainer>, Vec<LabeledContainer>) {
+) -> (
+    Vec<LabeledContainer>,
+    Vec<LabeledContainer>,
+    Vec<LabeledContainer>,
+) {
     let surviving_ids: BTreeSet<&str> = sessions
         .iter()
         .map(|s| s.id.as_str())
@@ -467,21 +642,25 @@ fn classify_strays(
         .collect();
     let mut removable = Vec::new();
     let mut running = Vec::new();
+    let mut undatable = Vec::new();
     for container in labeled {
         if surviving_ids.contains(container.session_label.as_str()) {
             continue; // the record walk owns record-backed containers
         }
         if container.running {
             running.push(container);
-        } else if now
-            .duration_since(container.created)
-            .map(|age| age >= older_than)
-            .unwrap_or(false)
-        {
-            removable.push(container);
+        } else if let Some(created) = container.created {
+            if now
+                .duration_since(created)
+                .is_ok_and(|age| age >= older_than)
+            {
+                removable.push(container);
+            }
+        } else {
+            undatable.push(container);
         }
     }
-    (removable, running)
+    (removable, running, undatable)
 }
 
 fn older_than(session: &Session, cutoff: Duration, now: SystemTime) -> bool {
@@ -493,6 +672,7 @@ fn older_than(session: &Session, cutoff: Duration, now: SystemTime) -> bool {
 
 async fn write_skipped_running<E>(
     stderr: &mut E,
+    header: &str,
     skipped: &[Session],
     dangling: &[&DanglingLink],
     unreadable: &[&SkippedSession],
@@ -504,9 +684,7 @@ where
         return Ok(());
     }
 
-    stderr
-        .write_all(b"[outrig] skipped running sessions:\n")
-        .await?;
+    stderr.write_all(header.as_bytes()).await?;
     for session in skipped {
         let line = format!("  {}  {}\n", session.id, session.container_name);
         stderr.write_all(line.as_bytes()).await?;
@@ -709,16 +887,19 @@ fn clean_summary(sessions: usize, strays: usize, builds: usize) -> String {
     }
 }
 
-async fn write_stray_running<E>(stderr: &mut E, strays: &[LabeledContainer]) -> Result<()>
+/// `header`, then one line per stray that is skipped rather than removed.
+async fn write_stray_skipped<E>(
+    stderr: &mut E,
+    header: &str,
+    strays: &[LabeledContainer],
+) -> Result<()>
 where
     E: AsyncWrite + Unpin,
 {
     if strays.is_empty() {
         return Ok(());
     }
-    stderr
-        .write_all(b"[outrig] skipped running labeled containers (no session record):\n")
-        .await?;
+    stderr.write_all(header.as_bytes()).await?;
     for stray in strays {
         let line = format!("  {}  session {}\n", stray.name, stray.session_label);
         stderr.write_all(line.as_bytes()).await?;
@@ -849,59 +1030,95 @@ fn format_retention(duration: Duration) -> String {
     }
 }
 
-/// `podman rm -f <name>...` for every stray in one invocation, returning the
-/// names that are **still there** afterwards -- clean should report a
+/// `podman rm <name>...` for every stray in one invocation, returning the
+/// ones that are **still there** afterwards -- clean should report a
 /// container it could not remove rather than claiming success, and the
 /// invocation's own exit status cannot tell it which those are. Callers guard
-/// the empty case (`podman rm -f` with no names is an error).
+/// the empty case (`podman rm` with no names is an error).
 ///
-/// A failing batch is still an error: that is a removal that did not run, as
-/// against one that ran and did not take.
-async fn podman_remove_force_batch(names: Vec<String>) -> Result<Vec<String>> {
-    engine::remove_batch("podman", &["rm", "-f"], names.clone()).await?;
+/// Not `-f`: this runs on a listing taken before the user answered the
+/// prompt, so a stray may be running by now, and podman refuses a running
+/// container without `-f` at the moment of removal. That refusal makes the
+/// batch exit non-zero after removing the rest, so the exit status is not
+/// consulted at all -- the re-read is the outcome. A failure to run podman
+/// still propagates.
+async fn podman_remove_batch(names: Vec<String>) -> Result<Vec<Kept>> {
+    engine::try_remove_batch("podman", &["rm"], names.clone()).await?;
     let mut left = still_present(&names).await?;
     // A name the batch skipped is not a name podman refuses: asked for it on
     // its own, it removes it at once. So the batch stays the common path and
     // the survivors are retried one at a time, which is also the shape that
     // can attribute a failure -- a batch reports one exit status for every
     // name in it, which is how skipping went unnoticed in the first place.
+    // A running survivor is not retried: it was refused, and would be again.
     //
     // Best-effort: a name that will not go away is reported by the caller
     // rather than failing the whole sweep, because the rest of it did work.
-    if !left.is_empty() {
-        for name in &left {
-            let _ = engine::remove_batch("podman", &["rm", "-f"], vec![name.clone()]).await;
+    let retry: Vec<String> = left
+        .iter()
+        .filter(|k| !k.running)
+        .map(|k| k.name.clone())
+        .collect();
+    if !retry.is_empty() {
+        // Asked on its own, podman's stderr is about this name alone, so it
+        // can be attached to it.
+        let mut reasons = BTreeMap::new();
+        for name in &retry {
+            let said = engine::try_remove_batch("podman", &["rm"], vec![name.clone()]).await?;
+            if !said.is_empty() {
+                reasons.insert(name.clone(), said);
+            }
         }
-        left = still_present(&left).await?;
+        left = still_present(&names).await?;
+        for k in left.iter_mut().filter(|k| !k.running) {
+            k.detail = reasons.remove(&k.name);
+        }
     }
     Ok(left)
 }
 
-/// Which of `names` podman still has. Reuses the sweep's own listing call
-/// rather than adding a second way to read the store -- it is one more `podman
-/// ps` and no new parsing *code*, though it does re-parse every row on the
-/// host to answer a membership test over `names`. Only the labeled half is
-/// consulted: a stray is a container carrying `org.outrig.session`, so a name
-/// absent from that list is gone as far as this sweep can ever act on it.
+/// The running set, read again. The second look a record removal takes
+/// right before it runs, narrowing the window the preview's own listing
+/// leaves open between the prompt and the unlink to the gap between this
+/// call and that unlink -- it cannot close it, since nothing stops a third
+/// party starting the container the instant after. One more `podman ps -a`,
+/// same shape as the preview's; only the running set matters here; the
+/// labeled rows are not this call's concern.
+async fn refresh_running() -> Result<BTreeSet<String>> {
+    let (_labeled, running) = list_all_containers().await?;
+    Ok(running)
+}
+
+/// Which of `names` podman still has, and whether each is running or paused. Reuses the
+/// sweep's own listing call rather than adding a second way to read the store
+/// -- it is one more `podman ps` and no new parsing *code*, though it does
+/// re-parse every row on the host to answer a membership test over `names`.
+/// Only the labeled half is consulted: a stray is a container carrying
+/// `org.outrig.session`, so a name absent from that list is gone as far as
+/// this sweep can ever act on it.
 ///
 /// `plan/next/clean-verify-above-the-seam.md` has the cheaper shape -- podman's
 /// own `rm` output already names what it removed -- and why it is not taken
 /// here.
-async fn still_present(names: &[String]) -> Result<Vec<String>> {
+async fn still_present(names: &[String]) -> Result<Vec<Kept>> {
     let (labeled, _running) = list_all_containers().await?;
-    let present: BTreeSet<&str> = labeled.iter().map(|c| c.name.as_str()).collect();
-    Ok(names
+    Ok(labeled
         .iter()
-        .filter(|name| present.contains(name.as_str()))
-        .cloned()
+        .filter(|c| names.contains(&c.name))
+        .map(|c| Kept {
+            name: c.name.clone(),
+            running: c.running,
+            detail: None,
+        })
         .collect())
 }
 
 /// `podman ps -a --format json`, decoded into the labeled-container rows (the
 /// stray-sweep input) plus the set of *all* running container names (the
 /// record-walk running check). Unfiltered so an attach session's borrowed,
-/// outrig-unlabeled primary still shows up in the running set. Rows missing the
-/// expected fields are skipped rather than failing the sweep.
+/// outrig-unlabeled primary still shows up in the running set. A row missing its
+/// name or session label is skipped rather than failing the sweep; one with no
+/// readable `Created` is kept, with no creation time.
 async fn list_all_containers() -> Result<(Vec<LabeledContainer>, BTreeSet<String>)> {
     let listing =
         engine::capture("podman", &["ps", "-a", "--format", "json"], "outrig clean").await?;
@@ -926,7 +1143,9 @@ fn parse_all_containers(stdout: &[u8]) -> Result<(Vec<LabeledContainer>, BTreeSe
         let is_running = row
             .get("State")
             .and_then(|state| state.as_str())
-            .is_some_and(|state| state.eq_ignore_ascii_case("running"));
+            .is_some_and(|state| {
+                state.eq_ignore_ascii_case("running") || state.eq_ignore_ascii_case("paused")
+            });
         if is_running {
             running.insert(name.to_string());
         }
@@ -941,17 +1160,12 @@ fn parse_all_containers(stdout: &[u8]) -> Result<(Vec<LabeledContainer>, BTreeSe
             .and_then(|labels| labels.get(LABEL_SIDECAR))
             .and_then(|value| value.as_str())
             .map(str::to_string);
-        let created = row
-            .get("Created")
-            .and_then(|created| created.as_i64())
-            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64))
-            .unwrap_or(SystemTime::UNIX_EPOCH);
         labeled.push(LabeledContainer {
             name: name.to_string(),
             session_label: session_label.to_string(),
             sidecar_label,
             running: is_running,
-            created,
+            created: build_containers::created_time(&row),
         });
     }
     Ok((labeled, running))
@@ -960,6 +1174,57 @@ fn parse_all_containers(stdout: &[u8]) -> Result<(Vec<LabeledContainer>, BTreeSe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// A stopped, labeled row for `session`. `created` is the JSON text of its
+    /// `Created`, or `None` for a row that has no such field.
+    fn stopped_row(session: &str, created: Option<&str>) -> serde_json::Value {
+        let mut row = serde_json::json!({
+            "Names": [format!("outrig-{session}")],
+            "Labels": {"org.outrig.session": session},
+            "State": "exited",
+        });
+        if let Some(created) = created {
+            row["Created"] = serde_json::from_str(created).expect("created is JSON");
+        }
+        row
+    }
+
+    fn stray(name: &str, running: bool, created: Option<SystemTime>) -> LabeledContainer {
+        LabeledContainer {
+            name: name.to_string(),
+            session_label: name.to_string(),
+            sidecar_label: None,
+            running,
+            created,
+        }
+    }
+
+    fn names(containers: &[LabeledContainer]) -> Vec<&str> {
+        containers.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    /// A paused container is live: `podman rm` refuses it as it does a running
+    /// one, and `rm -f` would have deleted it. It counts as running everywhere.
+    #[test]
+    fn parse_all_containers_reads_a_paused_container_as_running() {
+        let stdout = br#"[
+          {
+            "Names": ["outrig-paused"],
+            "Labels": {"org.outrig.session": "paused"},
+            "State": "paused",
+            "Created": 1700000000
+          }
+        ]"#;
+
+        let (labeled, running) = parse_all_containers(stdout).expect("parse");
+
+        assert!(labeled[0].running, "paused is live");
+        assert!(running.contains("outrig-paused"));
+    }
 
     #[test]
     fn parse_all_containers_splits_labeled_rows_and_running_names() {
@@ -998,10 +1263,7 @@ mod tests {
         assert_eq!(labeled[0].session_label, "abc");
         assert_eq!(labeled[0].sidecar_label, None);
         assert!(labeled[0].running);
-        assert_eq!(
-            labeled[0].created,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
-        );
+        assert_eq!(labeled[0].created, Some(at(1_700_000_000)));
         assert_eq!(labeled[1].name, "outrig-abc-tools");
         assert_eq!(labeled[1].sidecar_label.as_deref(), Some("tools"));
         assert!(!labeled[1].running);
@@ -1018,5 +1280,66 @@ mod tests {
     #[test]
     fn parse_all_containers_rejects_bad_json() {
         assert!(parse_all_containers(b"not json").is_err());
+    }
+
+    /// podman writes an unset creation time as Go's zero `time.Time`. Read as
+    /// the epoch, that and every other `Created` that is not a time would clear
+    /// any cutoff, so each is read as no time at all.
+    #[test]
+    fn parse_all_containers_reads_a_created_that_is_no_time_as_unknown() {
+        for created in [
+            None,
+            Some("null"),
+            Some("-62135596800"),
+            Some("0"),
+            Some(r#""0001-01-01T00:00:00Z""#),
+            Some(r#""yesterday""#),
+            Some("1700000000.5"),
+        ] {
+            let stdout = serde_json::json!([stopped_row("gone", created)]).to_string();
+            let (labeled, _) = parse_all_containers(stdout.as_bytes()).expect("parse");
+            assert_eq!(labeled.len(), 1, "for {created:?}");
+            assert_eq!(labeled[0].created, None, "for {created:?}");
+        }
+    }
+
+    #[test]
+    fn parse_all_containers_reads_an_rfc3339_created() {
+        let row = stopped_row("gone", Some(r#""2023-11-14T22:13:20Z""#));
+        let stdout = serde_json::json!([row]).to_string();
+        let (labeled, _) = parse_all_containers(stdout.as_bytes()).expect("parse");
+        assert_eq!(labeled[0].created, Some(at(1_700_000_000)));
+    }
+
+    /// The cutoff is what keeps the sweep off a container made a moment ago, so
+    /// one whose age cannot be read is reported at every cutoff and removable at
+    /// none. #276: it was dated 1970 and removed under any cutoff below 56 years.
+    #[test]
+    fn classify_strays_reports_a_stray_with_no_creation_time_at_every_cutoff() {
+        let now = at(1_800_000_000);
+        let day = Duration::from_secs(24 * 60 * 60);
+        let labeled = vec![
+            stray("undated", false, None),
+            stray("undated-running", true, None),
+            stray("old", false, Some(now - 40 * day)),
+            stray("young", false, Some(now - Duration::from_secs(60))),
+        ];
+        let cutoffs = [
+            (Duration::from_secs(1), vec!["old", "young"]),
+            (30 * day, vec!["old"]),
+            (3650 * day, vec![]),
+            (36500 * day, vec![]),
+        ];
+        for (cutoff, expected) in cutoffs {
+            let (removable, running, undatable) =
+                classify_strays(&[], &BTreeSet::new(), &[], labeled.clone(), cutoff, now);
+            assert_eq!(names(&removable), expected, "removable at {cutoff:?}");
+            assert_eq!(
+                names(&running),
+                ["undated-running"],
+                "running at {cutoff:?}"
+            );
+            assert_eq!(names(&undatable), ["undated"], "undatable at {cutoff:?}");
+        }
     }
 }

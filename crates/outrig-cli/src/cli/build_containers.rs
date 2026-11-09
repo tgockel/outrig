@@ -159,9 +159,8 @@ pub fn join_build_containers(working: &[u8], external: &[u8]) -> Result<Vec<Buil
 
 /// Creation times out of `podman ps -a --external --format json`, keyed by id.
 ///
-/// `Created` is seconds since the epoch on some podman versions and an
-/// RFC 3339 string on others. Anything else yields no entry, which the
-/// classifier reads as "unknown age" rather than "old enough".
+/// A row whose time cannot be read (see [`created_time`]) yields no entry,
+/// which the classifier reads as "unknown age" rather than "old enough".
 fn external_creation_times(
     external: &[u8],
     wanted: &BTreeSet<&str>,
@@ -175,18 +174,27 @@ fn external_creation_times(
         else {
             continue;
         };
-        let Some(created) = row.get("Created") else {
-            continue;
-        };
-        let at = created
-            .as_i64()
-            .and_then(epoch_seconds)
-            .or_else(|| created.as_str().and_then(parse_rfc3339));
-        if let Some(at) = at {
+        if let Some(at) = created_time(&row) {
             times.insert(id.to_string(), at);
         }
     }
     Ok(times)
+}
+
+/// The creation time a `podman ps --format json` row reports, from its
+/// `Created`. Shared by the sweeps so that none of them has its own reading of
+/// what podman wrote.
+///
+/// `Created` is seconds since the epoch on some podman versions and an
+/// RFC 3339 string on others. Anything else -- absent, another JSON type, or a
+/// time at or before the epoch -- is `None`, which the sweeps read as "unknown
+/// age" rather than "old enough".
+pub fn created_time(row: &serde_json::Value) -> Option<SystemTime> {
+    let created = row.get("Created")?;
+    created
+        .as_i64()
+        .and_then(epoch_seconds)
+        .or_else(|| created.as_str().and_then(parse_rfc3339))
 }
 
 /// A creation time from epoch seconds, or `None` if it does not describe one.
@@ -194,7 +202,7 @@ fn external_creation_times(
 /// podman serializes an unset creation time as Go's zero `time.Time`, which
 /// is `-62135596800` seconds -- and clamping that to zero would turn "no idea
 /// when this was made" into "made in 1970", which clears every cutoff. That
-/// is precisely the container this sweep must not remove, so a value at or
+/// is precisely the container a sweep must not remove, so a value at or
 /// before the epoch is read as no value at all.
 fn epoch_seconds(secs: i64) -> Option<SystemTime> {
     let secs = u64::try_from(secs).ok().filter(|secs| *secs > 0)?;

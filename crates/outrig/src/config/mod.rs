@@ -22,16 +22,19 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 pub use api_key::{ApiKeyError, ApiKeyRef, EnvSecrets, Secrets};
 pub use binding::{Binding, FactoryValue};
+pub use env_ref::is_env_key;
 pub use env_value::{EnvValue, EnvValueError, ResolvedEnvValue};
 pub use lenient::{ConfigWarning, ConfigWarningKind};
 pub use merge::merge;
 pub use validate::{
-    BuildImageNameError, ConfigValidationError, MountRuleViolation, check_build_image_name,
+    BuildImageNameError, ConfigValidationError, MountRuleViolation, SecurityRuleViolation,
+    check_build_image_name,
 };
 pub(crate) use validate::{
-    check_binding_name, check_entrypoint_hosting, check_mcp_call_timeout_secs, check_sidecar_image,
-    check_sidecar_name, check_view_exclusions, is_valid_mcp_server_name,
-    mcp_call_timeout_secs_in_range, mcp_command_is_empty, validate_binding, validate_session_paths,
+    check_binding_name, check_entrypoint_hosting, check_env_keys, check_mcp_call_timeout_secs,
+    check_sidecar_image, check_sidecar_name, check_view_exclusions, fold_container_path,
+    is_valid_mcp_server_name, mcp_call_timeout_secs_in_range, mcp_command_is_empty,
+    validate_binding, validate_session_paths,
 };
 
 use crate::error::{IoPathExt, OutrigError, Result};
@@ -273,6 +276,24 @@ fn known_path(
         (None, None) => resolve_against(Path::new(""), path),
     };
     resolved.is_absolute().then(|| lexical(&resolved))
+}
+
+/// Name `path` on an error that config file raised, as
+/// [`OutrigError::ConfigFile`]. A load reads up to two files -- the global
+/// config, and the repo config or a `--config` file -- and reports their
+/// faults in the same words: a TOML excerpt with a line and a column, a rule
+/// that says "repo config". Without the file, the reader is left to work out
+/// which of the two is being quoted (#413).
+///
+/// Takes anything an [`OutrigError`] converts from, so the parse's own error
+/// and the repo-only rules' [`ConfigValidationError`] are named the same way.
+/// A failed *read* is not named here: [`OutrigError::Path`] carries its path
+/// already.
+fn in_file(path: &Path, source: impl Into<OutrigError>) -> OutrigError {
+    OutrigError::ConfigFile {
+        path: path.to_path_buf(),
+        source: Box::new(source.into()),
+    }
 }
 
 /// A config file named by path, made absolute, and the outcome of reading it.
@@ -572,20 +593,26 @@ impl Config {
     }
 
     /// Parse a repo-side file, hold it to the repo-only rules, and stamp it.
+    /// The repo-only rules speak of "the repo config", which is this file:
+    /// naming it is what tells a `--config` file from the repo's own.
     fn repo_side(text: &str, src: &ConfigSource) -> Result<Self> {
         let repo_cfg = Self::parse_stamped(text, src)?;
-        repo_cfg.validate_as_repo()?;
+        repo_cfg
+            .validate_as_repo()
+            .map_err(|e| in_file(&src.config_path(), e))?;
         Ok(repo_cfg)
     }
 
     /// Parse the file `src` names, setting aside what [`load_from_str`]
     /// does -- and, for the global config, a value that does not deserialize
-    /// -- with each warning naming the file, then stamp it.
+    /// -- with each warning naming the file, then stamp it. What is not set
+    /// aside fails the load naming the file too.
     ///
     /// [`load_from_str`]: Self::load_from_str
     fn parse_stamped(text: &str, src: &ConfigSource) -> Result<Self> {
         let global = matches!(src, ConfigSource::Global { .. });
-        let mut cfg = lenient::parse(text, Some(&src.config_path()), global)?;
+        let path = src.config_path();
+        let mut cfg = lenient::parse(text, Some(&path), global).map_err(|e| in_file(&path, e))?;
         cfg.stamp_source(src);
         Ok(cfg)
     }
@@ -618,6 +645,55 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).path_ctx("read", &path),
         }
+    }
+
+    /// The global config's `session-root`, read from a file that may not load
+    /// as a whole: the one key the session commands (`outrig ls`, `logs`,
+    /// `discard`, `clean`) need, and the only part of the file that answers
+    /// for them.
+    ///
+    /// Try [`load_global`](Self::load_global) first; this is the fallback for
+    /// the error it returns, so an unrelated fault in a shared file does not
+    /// stop a command that reads one key out of it (#384). `Ok(None)` means
+    /// the file cannot be declaring a session root at all, so the caller's
+    /// default stands; `Err` means the file cannot be asked, and the caller
+    /// should report it rather than guess.
+    ///
+    /// Only a root the damaged file states outright is read back: one plain,
+    /// non-empty string, no part of which the parser's recovery had to repair,
+    /// and the only mention of the key in the file. A parse error that reaches
+    /// the declaration, a value with a broken escape or an unterminated
+    /// string, and a second mention of the key are each an `Err` rather than
+    /// an answer -- what recovery makes of them is a reading of a damaged
+    /// file, not of what its writer meant.
+    ///
+    /// Uniqueness is judged from the file's text, not from the duplicate-key
+    /// error the parser would report in a file it read to the end: recovery
+    /// stops at some syntax errors, so a second declaration below one of them
+    /// is never visited and nothing points at it. The text test is coarse --
+    /// a mention of the key in a comment or inside another value costs the
+    /// salvage its answer -- which is the safe direction, the alternative
+    /// being a root the operator did not choose.
+    ///
+    /// The value resolves against the file's directory and a leading `~`
+    /// expands, exactly as `load_global` resolves it -- the promise that a
+    /// `session-root` handed out by this module is absolute holds here too, so
+    /// callers need not learn a second rule for the degraded read.
+    ///
+    /// A file that loads in full has no business here: `load_global` reads
+    /// every key, holds the strict tables to their rules, and reports what it
+    /// set aside. This answers one key and reports nothing else about the
+    /// file, which is right only once the whole-file read has already failed.
+    pub fn salvage_global_session_root(path: &Path) -> Result<Option<PathBuf>> {
+        let (path, text) = read_resolved(path)?;
+        let text = match text {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).path_ctx("read", &path),
+        };
+        let base = ConfigSource::Global { path }.base_dir().to_path_buf();
+        Ok(lenient::salvage_top_level_string(&text, "session-root")?
+            .map(|root| resolve_against(&base, Path::new(&root))))
     }
 
     /// [`load`](Self::load) up to the validation: both files read, each held
@@ -2618,6 +2694,40 @@ pub(crate) fn normalize_capability_name(name: &str) -> Option<String> {
         None
     }
 }
+
+/// The one name a `cap-add` or `cap-drop` entry stands for -- upper-cased, as
+/// podman reads it, with the `CAP_` prefix off -- or `None` if it is not a
+/// single name.
+///
+/// Flag lowering, `ContainerCapabilities::grants_net_admin` and the
+/// `view = "primary"` check on a `cap-drop` all go through this, so podman is
+/// handed the name the classifiers compare and none of them can read one entry
+/// differently. The upper-casing is for a hand-built spec, which skips the
+/// config path's own normalizer.
+pub(crate) fn canonical_capability_name(entry: &str) -> Option<String> {
+    normalize_capability_name(&entry.to_ascii_uppercase())
+}
+
+/// What `outrig-enter` needs of a `view = "primary"` sidecar's capability set,
+/// the part OutRig adds with `--cap-add`:
+///
+/// - `SYS_ADMIN`: `open_tree`, `setns`, `unshare`, `mount` and `move_mount`.
+/// - `SYS_PTRACE`: opening the primary's nsfs file.
+///
+/// Container lowering emits these flags and validation refuses a `cap-drop` of
+/// them, both from this list, so a capability the launcher comes to need is
+/// added in one place. `launcher.rs` carries the prose account, since it cannot
+/// import this.
+pub(crate) const PRIMARY_VIEW_ADDED_CAPS: [&str; 2] = ["SYS_ADMIN", "SYS_PTRACE"];
+
+/// The rest of what `outrig-enter` needs, which comes with podman's default
+/// set rather than a flag -- and so is what a `cap-drop` can take away:
+///
+/// - `SYS_CHROOT`: `setns(CLONE_NEWNS)`, which the kernel gates on it as well
+///   as on `SYS_ADMIN`.
+/// - `SETUID`, `SETGID`: the drop to the session's ids, which OutRig always asks
+///   the launcher for.
+pub(crate) const PRIMARY_VIEW_DEFAULT_CAPS: [&str; 3] = ["SYS_CHROOT", "SETUID", "SETGID"];
 
 /// One `[images.<name>]` entry: either a build source (`dockerfile` plus
 /// `context`) or a pull source (`image_name`), never both.

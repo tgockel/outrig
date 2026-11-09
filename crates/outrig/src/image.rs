@@ -7,7 +7,11 @@
 //! first; on miss it shells out to `buildah build`. Buildah's own layer cache
 //! still helps speed up the build itself when we miss; the project-level tag
 //! cache exists so a *hit* skips buildah entirely.
+//!
+//! A finished build is hashed again, and discarded rather than tagged if the
+//! key moved ([`OutrigError::BuildContextChanged`]).
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Write as _};
@@ -17,7 +21,6 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
-use tokio::io::AsyncReadExt;
 
 use crate::config::{
     ImageConfig, ImageSourceRef, McpServerSpec, ResolvedEnvValue, resolve_against,
@@ -34,7 +37,6 @@ use crate::supervise::{CLEANUP_RETRIES, CleanupGuard, RETRY_BACKOFF, Reissue};
 /// built image reads as `<image-config-name>:<hash>` in `podman images`.
 const TAG_PREFIX: &str = "outrig-cache";
 const KEY_HEX_LEN: usize = 16;
-const TAR_READ_CHUNK: usize = 64 * 1024;
 const UNNAMED_IMAGE: &str = "<image>";
 const DOCKER_TRANSPORT_PREFIX: &str = "docker://";
 const UNSUPPORTED_REMOTE_TRANSPORTS: &[&str] = &[
@@ -150,6 +152,56 @@ impl From<String> for ImageTag {
     }
 }
 
+/// The engine's own content id for one image, as podman reports it: the
+/// `sha256:` digest of its config, which names a fixed set of layers and
+/// labels for as long as that image exists on the machine.
+///
+/// A tag is a *pointer*: `registry/x:latest` means whatever the last pull put
+/// there, and a pull between a container starting and something asking about
+/// its image moves it. An id does not move, so a read addressed by one is a
+/// read of the image that is actually running. The field is private and there
+/// is no `From<String>`, so the only way to have one is [`image_id`] taking it
+/// out of what the engine printed -- without that, "the image" is a `String`
+/// like any other and every fallback that produces one, a tag included,
+/// type-checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImageId(String);
+
+impl ImageId {
+    /// The id as podman wants it where it takes an image.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ImageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Length of the hex digest in an image id, `sha256:` prefix excluded.
+const IMAGE_DIGEST_LEN: usize = 64;
+
+/// The image id in what `podman inspect --format {{.Image}}` printed, if what
+/// it printed is one.
+///
+/// Podman writes the bare 64-character digest; an engine that writes the
+/// `sha256:`-prefixed form is read too, since podman accepts either where it
+/// takes an image. Anything else -- a tag, a short id, an empty field, an
+/// error -- is `None` rather than something to address an image by: the
+/// caller's alternative is the tag it is trying not to use, so a lenient read
+/// here would put the moving pointer back on the path it was taken off.
+pub(crate) fn image_id(printed: &str) -> Option<ImageId> {
+    let trimmed = printed.trim();
+    let digest = trimmed.strip_prefix("sha256:").unwrap_or(trimmed);
+    (digest.len() == IMAGE_DIGEST_LEN
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+    .then(|| ImageId(trimmed.to_string()))
+}
+
 impl fmt::Display for ImageTag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -197,10 +249,7 @@ impl CacheKey {
     ) -> Result<String> {
         let mut hasher = blake3::Hasher::new();
 
-        let dockerfile_bytes = tokio::fs::read(dockerfile)
-            .await
-            .path_ctx("read", dockerfile)?;
-        hasher.update(&dockerfile_bytes);
+        hash_dockerfile(dockerfile, &mut hasher).await?;
 
         hash_pairs(build_args, &mut hasher);
 
@@ -225,10 +274,7 @@ impl CacheKey {
 
         let mut hasher = blake3::Hasher::new();
 
-        let dockerfile_bytes = tokio::fs::read(dockerfile)
-            .await
-            .path_ctx("read", dockerfile)?;
-        hasher.update(&dockerfile_bytes);
+        hash_dockerfile(dockerfile, &mut hasher).await?;
 
         hash_pairs(build_args, &mut hasher);
         hasher.update(b"\n[outrig-labels]\n");
@@ -265,6 +311,21 @@ fn pairs_block(pairs: &BTreeMap<String, String>) -> String {
 /// UTF-8 text here, which never holds `0xFF`, so the byte keeps an escaped block from matching
 /// anything it hashed. A backslash gets into the block only as an escape, so a block without one
 /// is hashed as it always was, and an image whose pairs hold neither character keeps its tag.
+/// Read `dockerfile` and hash its content's digest, not the bytes themselves, into `hasher`.
+///
+/// A 32-byte blake3 digest is fixed-width, so it frames the Dockerfile unambiguously from
+/// whatever `hasher` is fed next -- the resolved build-args block, in both callers. Hashing the
+/// raw bytes left no boundary between the two: a Dockerfile ending `# A=1\n`, built with no
+/// build args, fed the hasher the same bytes as one ending `# ` with no trailing newline, built
+/// with `A=1`, and the second build reused the first's image with `ARG A` unset. See #583.
+async fn hash_dockerfile(dockerfile: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
+    let dockerfile_bytes = tokio::fs::read(dockerfile)
+        .await
+        .path_ctx("read", dockerfile)?;
+    hasher.update(blake3::hash(&dockerfile_bytes).as_bytes());
+    Ok(())
+}
+
 fn hash_pairs(pairs: &BTreeMap<String, String>, hasher: &mut blake3::Hasher) {
     let block = pairs_block(pairs);
     if block.contains('\\') {
@@ -342,6 +403,32 @@ async fn compute_tag_with_build_args(
         .collect();
     let key = CacheKey::compute_with_labels(&dockerfile, &values, &context, &labels).await?;
     Ok(ImageTag::new(format!("{repo}:{key}")))
+}
+
+/// Refuse to name a finished build `tag` if its inputs no longer hash to it.
+///
+/// `tag` was computed before buildah started, and buildah reads the context as each `COPY` runs
+/// rather than when the build starts. A file saved while an earlier `RUN` was still going is
+/// one the image holds and the key does not hash, and under that key the image would be served
+/// the next time the old content came back. Called after `buildah build` and before anything
+/// is named `tag`, so the temporary image [`into_temp_tag`] removes on the error is all that
+/// exists. The same check also trips on an edit after the last `COPY`, which no key can tell
+/// from one before it.
+async fn ensure_key_still_holds(
+    image: &str,
+    cfg: &ImageConfig,
+    repo_root: &Path,
+    build_args: &BTreeMap<String, ResolvedEnvValue>,
+    tag: &ImageTag,
+) -> Result<()> {
+    let now = compute_tag_with_build_args(tag_repo(image), cfg, repo_root, build_args).await?;
+    if now == *tag {
+        return Ok(());
+    }
+    Err(OutrigError::BuildContextChanged {
+        image: image.to_string(),
+        tag: tag.to_string(),
+    })
 }
 
 /// Returns `true` iff `tag` already exists in buildah's local image store.
@@ -506,6 +593,11 @@ async fn run_shown_or_captured(
 
 /// Run `buildah build` for `cfg`, tagging the result `tag`, with build-arg
 /// resolution errors framed against the selected image-config.
+///
+/// `tag` is the one [`compute_tag_for`] gave for the same `image`, `cfg` and
+/// `repo_root`. A build whose Dockerfile or context no longer hashes to it when
+/// buildah finishes is discarded and nothing is tagged; see
+/// [`OutrigError::BuildContextChanged`].
 pub async fn build_image_for(
     image: &str,
     cfg: &ImageConfig,
@@ -570,7 +662,8 @@ async fn build_image_with_build_args(
             build_termination(),
         )
         .await?;
-        stamp_repo_image_labels(image, temp_tag, tag, cfg.mcp(), None, owed_first).await
+        ensure_key_still_holds(image, cfg, repo_root, build_args, tag).await?;
+        stamp_repo_image_labels(image, temp_tag, tag, cfg.mcp(), no_cache, None, owed_first).await
     })
     .await
 }
@@ -595,7 +688,17 @@ async fn build_image_logged_with_build_args(
             output,
         )
         .await?;
-        stamp_repo_image_labels(image, temp_tag, tag, cfg.mcp(), transcript, owed_first).await
+        ensure_key_still_holds(image, cfg, repo_root, build_args, tag).await?;
+        stamp_repo_image_labels(
+            image,
+            temp_tag,
+            tag,
+            cfg.mcp(),
+            no_cache,
+            transcript,
+            owed_first,
+        )
+        .await
     })
     .await
 }
@@ -613,6 +716,15 @@ pub async fn ensure_image(
 
 /// Implementation of [`ensure_image`] with build-arg resolution errors framed
 /// against the selected image-config.
+///
+/// A cache miss's pull or build is captured rather than streamed to this
+/// process's own stdout/stderr ([`BuildOutput::Captured`], no transcript):
+/// this is the one path [`crate::Outrig::launch`] reaches with
+/// [`crate::LaunchSource::Build`], and an embedder may be serving its own
+/// protocol over the inherited stdout -- `buildah`'s `STEP 1/3 ...` or an
+/// image id landing on it would corrupt that stream. `outrig build`, which
+/// owns the terminal, goes through [`pull_image`] / [`build_image_for`]
+/// instead and keeps the live stream.
 async fn ensure_image_for(
     image: &str,
     cfg: &ImageConfig,
@@ -629,7 +741,7 @@ async fn ensure_image_for(
                     cache_hit: true,
                 });
             }
-            pull_image(&tag).await?;
+            pull_image_logged(&tag, None, BuildOutput::Captured).await?;
             tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
             Ok(ImageBuildOutcome {
                 tag,
@@ -647,7 +759,17 @@ async fn ensure_image_for(
                     cache_hit: true,
                 });
             }
-            build_image_with_build_args(image, cfg, repo_root, &tag, no_cache, &build_args).await?;
+            build_image_logged_with_build_args(
+                image,
+                cfg,
+                repo_root,
+                &tag,
+                no_cache,
+                None,
+                &build_args,
+                BuildOutput::Captured,
+            )
+            .await?;
             tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
             Ok(ImageBuildOutcome {
                 tag,
@@ -661,6 +783,11 @@ async fn ensure_image_for(
 /// framed against the selected image-config. This lets session startup
 /// write a complete `session.json` and open `logs/container.log` before the
 /// buildah probe/build begins, without hashing the Dockerfile/context twice.
+///
+/// `tag` must be the one [`compute_tag_for`] gave for the same `image`, `cfg`
+/// and `repo_root`. A build whose Dockerfile or context changed while it ran
+/// is discarded rather than tagged, and fails with
+/// [`OutrigError::BuildContextChanged`].
 ///
 /// A cache miss's build or pull is captured; see
 /// [`ensure_tagged_image_for_with_output`] to show it as it runs.
@@ -812,10 +939,31 @@ pub async fn read_image_labels(
     tag: &ImageTag,
     transcript: Option<&Transcript>,
 ) -> Result<BTreeMap<String, String>> {
+    read_labels_of(tag.as_str(), transcript).await
+}
+
+/// [`read_image_labels`], addressed by the engine's image id instead of a tag.
+///
+/// A tag is a pointer and a pull moves it, so a label read that a running
+/// container's behavior depends on goes through the id of the image that
+/// container was started from -- see [`crate::container::Container::image_id`].
+pub(crate) async fn read_image_labels_by_id(
+    id: &ImageId,
+    transcript: Option<&Transcript>,
+) -> Result<BTreeMap<String, String>> {
+    read_labels_of(id.as_str(), transcript).await
+}
+
+/// `podman image inspect <image>` for its labels, where `image` is whatever
+/// the caller addresses the image by.
+async fn read_labels_of(
+    image: &str,
+    transcript: Option<&Transcript>,
+) -> Result<BTreeMap<String, String>> {
     let cmd = Cmd::new("podman")
         .arg("image")
         .arg("inspect")
-        .arg(tag.as_str())
+        .arg(image)
         .arg("--format")
         .arg("{{json .Config.Labels}}");
     let output = process::run_capture_logged(cmd, "podman", transcript).await?;
@@ -826,7 +974,7 @@ pub async fn read_image_labels(
     }
     serde_json::from_str(trimmed).map_err(|source| {
         OutrigError::Configuration(format!(
-            "podman image inspect {tag}: invalid labels JSON: {source}"
+            "podman image inspect {image}: invalid labels JSON: {source}"
         ))
     })
 }
@@ -1110,18 +1258,23 @@ async fn stamp_repo_image_labels(
     source_tag: &ImageTag,
     final_tag: &ImageTag,
     config_mcp: &BTreeMap<String, McpServerSpec>,
+    no_cache: bool,
     transcript: Option<&Transcript>,
     owed_first: &mut Vec<Owed>,
 ) -> Result<()> {
     let inherited = read_image_labels(source_tag, transcript).await?;
     let labels = merged_mcp_config_to_labels(image, &inherited, config_mcp)?;
-    commit_image_with_labels(source_tag, final_tag, &labels, transcript, owed_first).await
+    commit_image_with_labels(
+        source_tag, final_tag, &labels, no_cache, transcript, owed_first,
+    )
+    .await
 }
 
 async fn commit_image_with_labels(
     source_tag: &ImageTag,
     final_tag: &ImageTag,
     labels: &BTreeMap<String, String>,
+    no_cache: bool,
     transcript: Option<&Transcript>,
     owed_first: &mut Vec<Owed>,
 ) -> Result<()> {
@@ -1136,6 +1289,10 @@ async fn commit_image_with_labels(
             .absent_is_done("container not known"),
         Reissue::Safe,
     );
+    // Whether this call committed `final_tag` itself (`true`) or found another
+    // session had already won the race for it (`false`): the two leave the
+    // working container in different states, so `result` alone cannot steer
+    // the cleanup below.
     let result = async {
         run_buildah_capture(
             Cmd::new("buildah")
@@ -1155,6 +1312,30 @@ async fn commit_image_with_labels(
         config = config.arg(&builder);
         run_buildah_capture(config, transcript).await?;
 
+        // Issue #393: two sessions that miss the content-addressed cache for
+        // the same tag at once both reach this commit, and `buildah commit`
+        // over an existing tag re-points it rather than refusing -- so the
+        // loser would overwrite the winner's image with its own
+        // (same-content, later-metadata) copy, leaving the winner's former
+        // image dangling with nothing left pointing at it. Re-probing `final_tag`
+        // immediately before committing to it cannot close the race outright
+        // (the two commits can still interleave), but it does close the far
+        // more common case: one build finished first and is already sitting
+        // there to be seen. Losing this probe means skipping the commit, not
+        // failing the build -- the caller asked for an image at `final_tag`,
+        // and one is there.
+        //
+        // A forced rebuild (`no_cache`) skips the probe and always commits: the
+        // caller asked to replace whatever is at `final_tag`, stale copied
+        // gitignored files and all, and treating another session's unrelated
+        // win as this one's own would silently keep it stale. `no_cache`
+        // callers are rarer and already pay for a full rebuild, so losing the
+        // ordinary race's protection here costs them only the same
+        // re-point-over-an-existing-tag outcome `buildah commit` always had.
+        if !no_cache && probe_cached_logged(final_tag, transcript).await? {
+            return Ok(false);
+        }
+
         run_buildah_capture(
             Cmd::new("buildah")
                 .arg("commit")
@@ -1165,19 +1346,21 @@ async fn commit_image_with_labels(
             transcript,
         )
         .await?;
-        Ok(())
+        Ok(true)
     }
     .await;
 
-    // `commit --rm` takes the working container on the success path, and the
-    // awaited removal on the failure path. One buildah refuses is handed to
-    // the caller still armed rather than reissued here: the caller's `rmi` of
-    // the image this container was made from is refused as in use until the
-    // container is gone, so the two are detached as one chain, `rm` first,
-    // and the `rmi` gets its whole retry budget after the `rm` is done.
+    // `commit --rm` takes the working container on the success path. On
+    // every other path -- the race lost above, or a buildah failure -- it is
+    // still there, and the awaited removal reaches it. One buildah refuses is
+    // handed to the caller still armed rather than reissued here: the
+    // caller's `rmi` of the image this container was made from is refused as
+    // in use until the container is gone, so the two are detached as one
+    // chain, `rm` first, and the `rmi` gets its whole retry budget after the
+    // `rm` is done.
     match result {
-        Ok(()) => builder_owned.release(),
-        Err(_) => owed_first.extend(
+        Ok(true) => builder_owned.release(),
+        Ok(false) | Err(_) => owed_first.extend(
             try_remove(builder_owned, "container not known", transcript)
                 .await
                 .map(|(guard, _)| Owed {
@@ -1186,7 +1369,7 @@ async fn commit_image_with_labels(
                 }),
         ),
     }
-    result
+    result.map(|_| ())
 }
 
 async fn run_buildah_capture(cmd: Cmd, transcript: Option<&Transcript>) -> Result<()> {
@@ -1357,12 +1540,12 @@ fn buildah_build_cmd(
 }
 
 /// Key the build context `ctx`: by [`hash_git_context`] in a git worktree, or
-/// as a tarball of the whole directory outside one.
+/// by [`hash_non_git_context`], the same in-process walk, outside one.
 async fn hash_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
     if is_git_context(ctx).await? {
         hash_git_context(ctx, hasher).await
     } else {
-        hash_tar_context(ctx, hasher).await
+        hash_non_git_context(ctx, hasher).await
     }
 }
 
@@ -1611,12 +1794,20 @@ async fn ls_files(tree: &Path, flags: &[&str]) -> Result<Vec<Vec<u8>>> {
     Ok(paths)
 }
 
-/// `ctx/dir` whole, ignored files and all, by [`TreeHasher::dir`].
+/// `ctx/dir` whole, ignored files and all, by [`TreeHasher::dir`]. From the
+/// context's own root (an empty `dir`) the walk is [`TreeHasher::whole`].
 async fn hash_whole_tree(ctx: &Path, dir: &Path) -> Result<blake3::Hash> {
     let (root, dir) = (ctx.to_path_buf(), dir.to_path_buf());
-    tokio::task::spawn_blocking(move || TreeHasher::new(&root).dir(&dir))
-        .await
-        .expect("context hashing task panicked")
+    tokio::task::spawn_blocking(move || {
+        let mut tree = if dir.as_os_str().is_empty() {
+            TreeHasher::whole(&root)
+        } else {
+            TreeHasher::new(&root)
+        };
+        tree.dir(&dir)
+    })
+    .await
+    .expect("context hashing task panicked")
 }
 
 /// What one listed path contributes to [`hash_git_context`].
@@ -1635,6 +1826,10 @@ enum ContextEntry {
 /// or under `.git`) and which may hold more links, so every link is followed
 /// wherever it is met. A referent is hashed once; a link back into one still
 /// being hashed is a loop, and counts by its text alone.
+///
+/// A walk of the whole context, [`Self::whole`], follows no link: it meets the
+/// referent in its own place anyway, and following into it from every link
+/// that points at an ancestor would hash a subtree again for each.
 struct TreeHasher<'a> {
     ctx: &'a Path,
     /// Mode and digest of each referent hashed so far, by context-relative
@@ -1642,6 +1837,13 @@ struct TreeHasher<'a> {
     done: HashMap<PathBuf, (u32, blake3::Hash)>,
     /// Referents being hashed now.
     active: HashSet<PathBuf>,
+    /// Set for a walk of the whole context: the first path each file with more
+    /// than one link was met at, by device and inode. buildah keeps a `COPY
+    /// .`'s hard links, so a later link to a file is keyed as such, not by
+    /// bytes a pair of copies would share. Only the one walk, in name order,
+    /// makes "first" mean something; a referent hashed from the middle of
+    /// another walk would not.
+    whole: Option<HashMap<(u64, u64), PathBuf>>,
 }
 
 impl<'a> TreeHasher<'a> {
@@ -1650,6 +1852,16 @@ impl<'a> TreeHasher<'a> {
             ctx,
             done: HashMap::new(),
             active: HashSet::new(),
+            whole: None,
+        }
+    }
+
+    /// A hasher for [`Self::dir`] of the context's own root: every path in `ctx`
+    /// is met once, in name order.
+    fn whole(ctx: &'a Path) -> Self {
+        Self {
+            whole: Some(HashMap::new()),
+            ..Self::new(ctx)
         }
     }
 
@@ -1679,13 +1891,34 @@ impl<'a> TreeHasher<'a> {
     fn entry(&mut self, rel: &Path, meta: &std::fs::Metadata) -> Result<blake3::Hash> {
         let file_type = meta.file_type();
         if file_type.is_file() {
-            hash_file(&self.ctx.join(rel))
+            match self.earlier_link(rel, meta) {
+                Some(first) => Ok(hard_link_digest(&first)),
+                None => hash_file(&self.ctx.join(rel)),
+            }
         } else if file_type.is_symlink() {
             self.link(rel)
         } else if file_type.is_dir() {
             self.dir(rel)
         } else {
             Ok(NO_CONTENT)
+        }
+    }
+
+    /// Where a whole-context walk first met the regular file `meta` describes,
+    /// when `rel` is a later link to it. A file whose other links are outside
+    /// the context, or that has none, has no earlier one: nothing `COPY` sees
+    /// tells it from a plain file.
+    fn earlier_link(&mut self, rel: &Path, meta: &std::fs::Metadata) -> Option<PathBuf> {
+        let first_links = self.whole.as_mut()?;
+        if meta.nlink() < 2 {
+            return None;
+        }
+        match first_links.entry((meta.dev(), meta.ino())) {
+            Entry::Occupied(first) => Some(first.get().clone()),
+            Entry::Vacant(slot) => {
+                slot.insert(rel.to_path_buf());
+                None
+            }
         }
     }
 
@@ -1720,7 +1953,8 @@ impl<'a> TreeHasher<'a> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(target.as_os_str().as_bytes());
         hasher.update(b"\0");
-        if let Some(referent) = resolve_in_context(self.ctx, rel)
+        if self.whole.is_none()
+            && let Some(referent) = resolve_in_context(self.ctx, rel)
             && let Some((mode, digest)) = self.referent(referent)?
         {
             hasher.update(&mode.to_le_bytes());
@@ -1747,6 +1981,16 @@ impl<'a> TreeHasher<'a> {
         self.done.insert(rel, done);
         Ok(Some(done))
     }
+}
+
+/// What a later hard link to a file contributes in place of its bytes: the
+/// context-relative path of the first link, which the key already hashes the
+/// bytes of. The derive-key domain keeps it from ever matching a file's
+/// content hash, whatever the file holds.
+fn hard_link_digest(first: &Path) -> blake3::Hash {
+    blake3::Hasher::new_derive_key("outrig build context hard link")
+        .update(first.as_os_str().as_bytes())
+        .finalize()
 }
 
 fn hash_file(path: &Path) -> Result<blake3::Hash> {
@@ -1813,57 +2057,26 @@ fn clean_lexically(path: &Path) -> PathBuf {
     cleaned
 }
 
-async fn hash_tar_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
-    // Reproducibility flags: --sort=name fixes file order, --mtime pins
-    // archive mtimes to the epoch (otherwise filesystem mtimes leak in),
-    // --owner=0/--group=0/--numeric-owner strip uid/gid (otherwise the
-    // hash would differ across users / machines).
-    let cmd = Cmd::new("tar")
-        .args([
-            "--sort=name",
-            "--mtime=UTC 1970-01-01",
-            "--owner=0",
-            "--group=0",
-            "--numeric-owner",
-            "-cf",
-            "-",
-            "-C",
-        ])
-        .arg(ctx)
-        .arg(".");
-    let failed = cmd.clone();
-    let mut child = process::spawn_stdio(cmd).await?;
-
-    drop(child.stdin.take());
-
-    let stderr = child.stderr.take().expect("stderr was piped");
-    let stderr_task = tokio::spawn(async move {
-        let mut s = stderr;
-        let mut buf = Vec::new();
-        let _ = s.read_to_end(&mut buf).await;
-        if !buf.is_empty() {
-            let text = String::from_utf8_lossy(&buf);
-            for line in text.lines() {
-                tracing::warn!(target: "outrig::image", "[tar] {line}");
-            }
-        }
-    });
-
-    let mut stdout = child.stdout.take().expect("stdout was piped");
-    let mut chunk = vec![0u8; TAR_READ_CHUNK];
-    loop {
-        let n = stdout.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&chunk[..n]);
-    }
-
-    let status = child.wait().await?;
-    let _ = stderr_task.await;
-    if !status.success() {
-        return Err(failed.process_error(status.code(), String::new()));
-    }
+/// Key a context that is not in a git repository: every file and directory in
+/// it, by [`TreeHasher::whole`], since there is no ignore rule to narrow the
+/// set and no listing but the filesystem's own. A symlink counts by its text
+/// and a hard link by the first link to the same file, as the `tar` stream this
+/// replaced had them. Runs in process rather than shelling out to `tar`, so
+/// building from a non-git context no longer needs `tar` on the host at all,
+/// GNU or otherwise -- the prior `--sort=name` flag needed GNU tar 1.28+, which
+/// a minimal distro image's busybox `tar` does not implement -- and a read
+/// failure now comes back as the `OutrigError::Path` that named it, not a bare
+/// `tar` exit code with nothing in its stderr.
+async fn hash_non_git_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
+    let root = tokio::fs::symlink_metadata(ctx)
+        .await
+        .path_ctx("stat", ctx)?;
+    update_record(
+        hasher,
+        b"",
+        root.mode(),
+        &hash_whole_tree(ctx, Path::new("")).await?,
+    );
     Ok(())
 }
 
@@ -1874,6 +2087,49 @@ mod tests {
 
     use super::*;
     use crate::config::EnvValue;
+
+    /// An image id is taken only from output that is one. Anything else --
+    /// a tag, a short id, an error podman printed -- is `None`, because the
+    /// caller's only alternative is the tag whose moving is the whole reason
+    /// the id is being asked for. Accepting a token would put that pointer
+    /// back on the path, under a type that says it cannot be there. The same
+    /// argument the container's `engine_id` makes about a container selector.
+    #[test]
+    fn an_image_id_is_taken_only_from_output_that_is_one() {
+        let digest = "c1a1b4b8ff0d48b4e2ee1dd5c6cf5f0e0ac0bd0a7a8a4d1c5b7e8f90a1b2c3d4";
+        assert_eq!(digest.len(), IMAGE_DIGEST_LEN);
+        // What podman's `{{.Image}}` prints, and the prefixed spelling podman
+        // also accepts where it takes an image.
+        assert_eq!(image_id(digest).as_ref().map(ImageId::as_str), Some(digest));
+        let prefixed = format!("sha256:{digest}");
+        assert_eq!(
+            image_id(&format!("{prefixed}\n"))
+                .as_ref()
+                .map(ImageId::as_str),
+            Some(prefixed.as_str()),
+            "the prefix is kept: it is part of what podman is handed"
+        );
+
+        for not_an_id in [
+            // Nothing at all: a container that is gone inspects to this.
+            String::new(),
+            "   \n".to_string(),
+            // A tag. This is the one the fallback would have reached for.
+            "registry.example/x:latest".to_string(),
+            "<none>".to_string(),
+            // A short id, which podman would resolve -- and which is why it is
+            // not accepted as an identity here.
+            digest[..12].to_string(),
+            // Right length, wrong alphabet, and the uppercase spelling of a
+            // digest that is written lowercase everywhere podman prints one.
+            "z".repeat(IMAGE_DIGEST_LEN),
+            digest.to_uppercase(),
+            // Right shape, but two of them.
+            format!("{digest} {digest}"),
+        ] {
+            assert_eq!(image_id(&not_an_id), None, "not an id: {not_an_id:?}");
+        }
+    }
 
     /// The issue #355 shape: a sidecar's raw ref that is not local was blamed
     /// on `--image`, and the error never named the command that fixes it.

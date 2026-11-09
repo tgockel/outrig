@@ -21,8 +21,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use std::io::Write as _;
+
 use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -216,9 +217,10 @@ impl<K: Ord + Clone + Send + 'static> LineSink<K> {
         // combination this exists to prevent.
         if claims_exclusively(file.metadata().await).path_ctx("stat", path)? {
             // The typed `fcntl::Flock` that replaces this takes *ownership*
-            // of the file and unlocks on drop, and the writer owns a
-            // `tokio::fs::File` it goes on appending to -- so the lock has to
-            // outlive the call that takes it, which is what the raw form does.
+            // of the file and unlocks on drop, and the writer goes on
+            // appending through a `std::fs::File` converted from this one --
+            // so the lock has to outlive the call that takes it, which is
+            // what the raw form does.
             #[allow(deprecated)]
             nix::fcntl::flock(
                 std::os::fd::AsRawFd::as_raw_fd(&file),
@@ -242,6 +244,13 @@ impl<K: Ord + Clone + Send + 'static> LineSink<K> {
                     .path_ctx("set permissions on", path)?;
             }
         }
+
+        // Handed to the writer as a `std::fs::File`. The writer does each
+        // record's append, flush and rollback inside one `spawn_blocking`
+        // call, which needs to own the file outright to hand it back
+        // afterward; `into_std` waits out the work above rather than
+        // detaching it to a task this function does not control.
+        let file = file.into_std().await;
 
         let (records, queued) = mpsc::channel(queue);
         let mut sink = Self::over(records, None, labels);
@@ -371,13 +380,14 @@ impl<K: Ord + Clone + Send + 'static> LineSink<K> {
                 )
             }
         };
-        // Aborting ends the task, not the syscall. `tokio::fs` runs its writes
-        // on a blocking pool, and one already submitted completes whatever
-        // happens to the future awaiting it -- so bytes may still land, and the
-        // rollback that would have undone a partial write will not run because
-        // the task that does it is gone. The log is therefore of unknown
-        // integrity, and that is recorded where the sweep will find it rather
-        // than only described in the error returned here.
+        // Aborting ends the task, not the blocking call. A record's append,
+        // flush and rollback run together on the blocking pool, and one
+        // already submitted completes whatever happens to the future awaiting
+        // it -- so bytes may still land, and what that call found, a write that
+        // failed or a rollback that could not be proven, is never recorded,
+        // because the task that records it is gone. The log is therefore of
+        // unknown integrity, and that is recorded where the sweep will find it
+        // rather than only described in the error returned here.
         //
         // Per owner and by count, from what the writer was actually holding.
         self.convert_pending(&stopped);
@@ -601,7 +611,7 @@ pub(crate) fn claims_exclusively(opened: io::Result<std::fs::Metadata>) -> io::R
 /// losing power. Durability would cost a sync per record, and nothing here
 /// promises it.
 async fn write_lines<K: Ord + Clone + Send + 'static>(
-    mut file: tokio::fs::File,
+    file: std::fs::File,
     mut queue: mpsc::Receiver<Job<K>>,
     parts: Parts<K>,
 ) {
@@ -612,10 +622,28 @@ async fn write_lines<K: Ord + Clone + Send + 'static>(
         labels,
     } = parts;
     let what = labels.what;
+    // `tokio::fs::File` was tried here first and does not survive a runtime
+    // shutdown: `poll_write` takes its buffer out of `State::Idle` before
+    // calling `spawn_mandatory_blocking`, and once the blocking pool has shut
+    // down that call is refused, leaving the file as `Idle(None)` forever
+    // after -- so the rollback's `set_len` unwraps a buffer that is not there
+    // and panics (tokio-rs/tokio#8182). A plain `std::fs::File`, driven
+    // through `spawn_blocking` by hand, turns a refused spawn into a
+    // `JoinError` instead: a loss the writer can count rather than a panic on
+    // a worker thread. One blocking hop covers a record's append, flush and
+    // rollback together, down from the three (`metadata`, `write_all`,
+    // `flush`) `tokio::fs` took to get there, and keeps them atomic with
+    // respect to the runtime: no `await` separates a failed append from its
+    // rollback.
+    let mut file = Some(file);
     // Set when the file may hold a partial record: see the rollback below.
     // Everything after that point is refused rather than appended -- but still
     // received, answered and counted, because a caller waiting for its record
     // is owed an answer and a record refused is still a record lost.
+    //
+    // Also set, with `file` left `None`, when a record's blocking task could
+    // not be joined: that task owned the only handle to the file, so there is
+    // nothing left to write with, let alone roll back.
     let mut poisoned: Option<String> = None;
     while let Some(job) = queue.recv().await {
         let Job::Record { who, line, done } = job else {
@@ -636,22 +664,25 @@ async fn write_lines<K: Ord + Clone + Send + 'static>(
             continue;
         }
 
-        // Where the file ended before this record. `write_all` is a retry
-        // loop, not an atomic commit: a filesystem can take a prefix and then
-        // fail with `ENOSPC`, and the prefix would make every later record
-        // unparseable. Truncating back to here is what keeps the file a
-        // sequence of whole records even when a write fails partway.
-        let before = match file.metadata().await {
-            Ok(meta) => Some(meta.len()),
-            Err(_) => None,
-        };
-        let written = async {
-            file.write_all(&line).await?;
-            file.flush().await
-        }
-        .await;
-
-        if let Err(e) = written {
+        // Taken rather than borrowed: the blocking closure below needs to own
+        // the file to hand it back once the record is dealt with, and
+        // `poisoned` being unset here is what guarantees this is still
+        // `Some`.
+        let held = file
+            .take()
+            .expect("file present whenever the writer is not poisoned");
+        let outcome = tokio::task::spawn_blocking(move || {
+            let mut held = held;
+            // Where the file ended before this record. A single write is a
+            // retry loop, not an atomic commit: a filesystem can take a
+            // prefix and then fail with `ENOSPC`, and the prefix would make
+            // every later record unparseable. Truncating back to here is
+            // what keeps the file a sequence of whole records even when a
+            // write fails partway -- and running the whole thing in one
+            // blocking call is what keeps nothing else able to see the file
+            // in between.
+            let before = held.metadata().map(|meta| meta.len()).ok();
+            let written = held.write_all(&line).and_then(|()| held.flush());
             // Rolling back is what keeps the file a sequence of whole records.
             // When it cannot be done -- the length before the append was never
             // read, or the truncation itself failed -- a prefix may be sitting
@@ -663,34 +694,64 @@ async fn write_lines<K: Ord + Clone + Send + 'static>(
             // a boolean: if no further record ever arrives, this is the only
             // thing that will tell a reader the file may be corrupt and what
             // stopped it being repaired.
-            let recovery = match before {
-                None => Some("the file's length before the record was never read".to_string()),
-                Some(before) => match file.set_len(before).await {
-                    Err(e) => Some(format!("truncating back to {before} failed: {e}")),
-                    Ok(()) => match file.flush().await {
-                        Err(e) => Some(format!("flushing the truncation failed: {e}")),
-                        Ok(()) => None,
+            let recovery = if written.is_err() {
+                match before {
+                    None => Some("the file's length before the record was never read".to_string()),
+                    Some(before) => match held.set_len(before) {
+                        Err(e) => Some(format!("truncating back to {before} failed: {e}")),
+                        Ok(()) => match held.flush() {
+                            Err(e) => Some(format!("flushing the truncation failed: {e}")),
+                            Ok(()) => None,
+                        },
                     },
-                },
+                }
+            } else {
+                None
             };
-            (labels.warn)(format_args!("{what} write failed: {e}"));
-            LineSink::remember_unwritten(&unwritten, &who, 1, e);
-            if let Some(why) = recovery {
-                (labels.error)(format_args!(
-                    "the {what} log may hold a partial record and cannot be recovered ({why}); \
-                     no further records will be written to it"
-                ));
-                let integrity = format!(
-                    "the {what} log may hold a partial record that could not be rolled back \
-                     ({why}), so nothing further may be appended to it"
-                );
-                // Replaces the write error this record already recorded
-                // rather than counting a second loss: the same record, and
-                // this is the more useful thing to be told about it. Recorded
-                // now so a teardown that follows immediately still learns the
-                // file is suspect, even if nothing else is ever written.
-                LineSink::remember_integrity(&unwritten, &who, &integrity);
-                poisoned = Some(integrity);
+            (held, written, recovery)
+        })
+        .await;
+
+        match outcome {
+            Ok((held, written, recovery)) => {
+                file = Some(held);
+                if let Err(e) = written {
+                    (labels.warn)(format_args!("{what} write failed: {e}"));
+                    LineSink::remember_unwritten(&unwritten, &who, 1, e);
+                    if let Some(why) = recovery {
+                        (labels.error)(format_args!(
+                            "the {what} log may hold a partial record and cannot be recovered \
+                             ({why}); no further records will be written to it"
+                        ));
+                        let integrity = format!(
+                            "the {what} log may hold a partial record that could not be rolled \
+                             back ({why}), so nothing further may be appended to it"
+                        );
+                        // Replaces the write error this record already
+                        // recorded rather than counting a second loss: the
+                        // same record, and this is the more useful thing to
+                        // be told about it. Recorded now so a teardown that
+                        // follows immediately still learns the file is
+                        // suspect, even if nothing else is ever written.
+                        LineSink::remember_integrity(&unwritten, &who, &integrity);
+                        poisoned = Some(integrity);
+                    }
+                }
+            }
+            Err(joined) => {
+                // The blocking task never handed the file back: either it
+                // panicked partway through the append or the rollback, or the
+                // runtime refused to spawn it at all because it is shutting
+                // down -- tokio-rs/tokio#8182's trigger, one layer up, where
+                // it cannot panic because nothing here ever unwraps state
+                // `tokio::fs::File` keeps hidden. Either way there is no
+                // handle left to write with, so this is the one case where
+                // the file itself, not just this record, is the loss.
+                let why = format!("the {what} writer's blocking task did not finish: {joined}");
+                (labels.error)(format_args!("{why}"));
+                LineSink::remember_unwritten(&unwritten, &who, 1, io::Error::other(why.clone()));
+                LineSink::remember_integrity(&unwritten, &who, &why);
+                poisoned = Some(why);
             }
         }
         // Answered whatever the outcome: the producer is waiting to learn the

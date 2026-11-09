@@ -11,8 +11,9 @@ use outrig::config::{
     ApiKeyRef, BuildImageNameError, ChatCompletionsOptions, Config, ConfigSource,
     ConfigValidationError, DEFAULT_HOST_GRACE_SECS, EnvValue, EventsMode, HOST_GRACE_SECS_CEILING,
     ImageConfig, LlmProvider, McpServerSpec, MountAccess, MountConfig, MountRuleViolation,
-    NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy, SidecarOnFailure, SidecarStart,
-    SidecarView, SidecarWorkspaceAccess, Workspace, check_build_image_name, merge,
+    NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy, SecurityRuleViolation,
+    SidecarOnFailure, SidecarStart, SidecarView, SidecarWorkspaceAccess, Workspace,
+    check_build_image_name, merge,
 };
 use outrig::error::OutrigError;
 
@@ -45,19 +46,44 @@ fn expect_validation_err(cfg: &Config, repo_root: Option<&Path>) -> ConfigValida
     }
 }
 
-/// Unwrap the validation error out of a failed `Config::load`.
+/// Unwrap the validation error out of a failed `Config::load`. A repo-only
+/// rule is broken by one file and says so, so its error arrives wrapped in the
+/// file's name; a rule of the merged config belongs to no single file and
+/// arrives bare.
 fn expect_load_validation_err(err: OutrigError) -> ConfigValidationError {
-    match err {
+    match in_file_source(err) {
         OutrigError::ConfigValidation(e) => e,
         other => panic!("expected ConfigValidation, got: {other:?}"),
     }
 }
 
-/// Write `body` to `<root>/.agents/outrig/config.toml`, creating the tree.
-fn write_repo_cfg(root: &Path, body: &str) {
+/// The error an `OutrigError::ConfigFile` names a file on, or `err` as it is
+/// when no file was named.
+fn in_file_source(err: OutrigError) -> OutrigError {
+    match err {
+        OutrigError::ConfigFile { source, .. } => *source,
+        other => other,
+    }
+}
+
+/// The file an error names, which a test that cares which of the files in
+/// play failed asserts on. Panics when the error names none.
+fn named_file(err: &OutrigError) -> &Path {
+    match err {
+        OutrigError::ConfigFile { path, .. } => path,
+        other => panic!("expected the error to name its config file, got: {other:?}"),
+    }
+}
+
+/// Write `body` to `<root>/.agents/outrig/config.toml`, creating the tree,
+/// and return the path written, for a test that asserts on where an error
+/// came from.
+fn write_repo_cfg(root: &Path, body: &str) -> std::path::PathBuf {
     let agents = root.join(".agents/outrig");
     fs::create_dir_all(&agents).unwrap();
-    fs::write(agents.join("config.toml"), body).unwrap();
+    let path = agents.join("config.toml");
+    fs::write(&path, body).unwrap();
+    path
 }
 
 /// Write `body` to `<dir>/config.toml` and return the path, for use as a
@@ -369,6 +395,112 @@ context    = "ctx"
             err,
             ConfigValidationError::InvalidMcpServerName { .. }
         ));
+    }
+
+    /// The issue's case. podman and buildah split an entry at its first `=`,
+    /// so `"A=B" = "c"` sets `A` to `B=c`: a key nobody wrote, configured
+    /// with a value nobody wrote. It is refused when the config loads rather
+    /// than acted on at the first server connect.
+    #[test]
+    fn mcp_env_key_with_an_equals_errors() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+  [images.coding.mcp]
+  build = { command = ["cargo-mcp"], env = { "A=B" = "c" } }
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::McpEnvKeyInvalid {
+                ref image,
+                ref server,
+                ref key,
+                ..
+            } => {
+                assert_eq!(image, "coding");
+                assert_eq!(server, "build");
+                assert_eq!(key, "A=B");
+            }
+            other => panic!("expected McpEnvKeyInvalid, got: {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains(r#"env key "A=B" is not an environment variable name"#),
+            "{msg}"
+        );
+        assert!(msg.contains("^[A-Za-z_][A-Za-z0-9_]*$"), "{msg}");
+    }
+
+    /// Every shape podman misreads, and the empty key the engine refuses
+    /// outright -- the one that failed the session with podman's own message
+    /// rather than with the config's.
+    #[test]
+    fn mcp_env_key_that_is_not_a_variable_name_errors() {
+        for key in ["", "A=B", "my-key", "1AB", "K*", " K", "K ", "a.b"] {
+            let cfg = parse(&format!(
+                r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+  [images.coding.mcp]
+  build = {{ command = ["cargo-mcp"], env = {{ {key:?} = "v" }} }}
+"#
+            ));
+            let err = expect_validation_err(&cfg, None);
+            assert!(
+                matches!(&err, ConfigValidationError::McpEnvKeyInvalid { key: k, .. } if k == key),
+                "{key:?}: {err:?}"
+            );
+        }
+    }
+
+    /// A key sets a variable inside the container, where lower case is
+    /// ordinary -- the grammar is wider than a `${VAR}` reference's.
+    #[test]
+    fn mcp_env_key_may_be_lower_case() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+  [images.coding.mcp]
+  build = { command = ["cargo-mcp"], env = { http_proxy = "http://p:3128", _k1 = "v" } }
+"#,
+        );
+        cfg.validate(None).expect("a lower-case env key is a key");
+    }
+
+    #[test]
+    fn build_arg_key_that_is_not_a_variable_name_errors() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+build-args = { "A=B" = "c" }
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::BuildArgKeyInvalid {
+                ref image, ref key, ..
+            } => {
+                assert_eq!(image, "coding");
+                assert_eq!(key, "A=B");
+            }
+            other => panic!("expected BuildArgKeyInvalid, got: {other:?}"),
+        }
+        assert!(
+            err.to_string()
+                .contains("build-arg key \"A=B\" is not an environment variable name"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -890,6 +1022,159 @@ container-path = "/resources/../res"
         cfg.validate(None).expect("folds to /res");
     }
 
+    /// podman renders a bind mount as `<host>:<container>:<options>`, so a
+    /// `:` in either half makes a fourth field it refuses at launch, after the
+    /// image is acquired and naming neither the key nor the file (#365). Both
+    /// halves are structural rules: no repo root is needed to see the shape.
+    #[test]
+    fn workspace_mount_container_path_with_colon_errors() {
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/resources/a:b"
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::WorkspaceMountContainerFieldSeparator { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("/resources/a:b"));
+            }
+            other => panic!("expected WorkspaceMountContainerFieldSeparator, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_mount_host_path_with_colon_errors() {
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "/host/a:b"
+container-path = "/resources/docs"
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::WorkspaceMountHostFieldSeparator { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("/host/a:b"));
+            }
+            other => panic!("expected WorkspaceMountHostFieldSeparator, got: {other:?}"),
+        }
+    }
+
+    /// The mount is refused for its shape before the host half is looked for
+    /// on disk: `/host/a:b` does not exist either, and the missing-host error
+    /// would send the reader after the wrong thing.
+    #[test]
+    fn workspace_mount_colon_is_reported_before_host_existence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "/host/a:b"
+container-path = "/resources/docs"
+"#,
+        );
+        match expect_validation_err(&cfg, Some(tmp.path())) {
+            ConfigValidationError::WorkspaceMountHostFieldSeparator { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("/host/a:b"));
+            }
+            other => panic!("expected WorkspaceMountHostFieldSeparator, got: {other:?}"),
+        }
+    }
+
+    /// The rule is about what the config *spelled*. A clean relative
+    /// `host-path` that merely resolves through a directory with a `:` in its
+    /// name still validates: whether that matters depends on whether the
+    /// launch mounts anything, which the config layer cannot know, so the
+    /// CLI asks instead (`refuse_mount_field_separators`). Pinned here so the
+    /// check is not quietly moved back and `outrig mcp --attach` broken from
+    /// such a directory a second time (#365).
+    #[test]
+    fn workspace_mount_host_path_resolving_through_a_colon_validates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("a:b");
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        // The primary workspace is given a clean absolute path of its own, so
+        // this pins the mount's rule and not the workspace's.
+        let clean = tmp.path().join("clean");
+        std::fs::create_dir_all(&clean).unwrap();
+        let cfg = parse(&format!(
+            r#"
+[workspace]
+host-path = "{}"
+
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/resources/docs"
+"#,
+            clean.display()
+        ));
+        cfg.validate(Some(&root))
+            .expect("the entry spelled no colon; what it resolves through is the CLI's question");
+    }
+
+    /// The primary workspace is rendered by the same `-v` builder as the extra
+    /// mounts, so both of its paths are held to the same rule.
+    #[test]
+    fn workspace_container_path_with_colon_errors() {
+        let cfg = parse(
+            r#"
+[workspace]
+container-path = "/work:space"
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::WorkspaceContainerFieldSeparator { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("/work:space"));
+            }
+            other => panic!("expected WorkspaceContainerFieldSeparator, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_host_path_with_colon_errors() {
+        let cfg = parse(
+            r#"
+[workspace]
+host-path = "/host/a:b"
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::WorkspaceHostFieldSeparator { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("/host/a:b"));
+            }
+            other => panic!("expected WorkspaceHostFieldSeparator, got: {other:?}"),
+        }
+    }
+
+    /// An undeclared `host-path` is the repo root -- outrig's own pick, the
+    /// current directory when no config was found -- so a `:` in it is a fact
+    /// about where the user is standing and not about any config. It stays
+    /// valid here; the CLI refuses it for a launch that mounts, and lets
+    /// `outrig mcp --attach`, which serializes no `-v`, proceed (#365).
+    #[test]
+    fn workspace_host_path_resolving_through_a_colon_validates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("a:b");
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = parse("[workspace]\ncontainer-path = \"/workspace\"\n");
+        cfg.validate(Some(&root))
+            .expect("no config spelled a colon; the repo root's name is not a config error");
+    }
+
+    /// The rule is about `:` and nothing else: every other punctuation mark a
+    /// path may carry still validates.
+    #[test]
+    fn workspace_mount_without_a_colon_validates() {
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/resources/a-b.c_d"
+"#,
+        );
+        cfg.validate(None).expect("no colon, no rule broken");
+    }
+
     #[test]
     fn workspace_mount_duplicate_container_path_errors() {
         let cfg = parse(
@@ -1200,7 +1485,8 @@ devices = ["/dev/fuse", "/dev/kvm", "/dev/fuse"]
     }
 
     /// Sidecars reuse the whole `[security]` block, so the device rules reach
-    /// them too -- and the error names the sidecar's scope, not the bare image.
+    /// them too -- and the failure is a `SidecarSecurity`, which names the
+    /// sidecar, rather than one of the `image` variants wearing a scope string.
     #[test]
     fn sidecar_device_path_errors_name_the_sidecar_scope() {
         let cfg = parse(
@@ -1217,13 +1503,27 @@ devices = ["dev/fuse"]
 "#,
         );
         let err = expect_validation_err(&cfg, None);
+        let rendered = err.to_string();
         match err {
-            ConfigValidationError::DevicePathRelative { image, device } => {
-                assert_eq!(image, "sidecars.tools");
-                assert_eq!(device, "dev/fuse");
+            ConfigValidationError::SidecarSecurity {
+                sidecar, violation, ..
+            } => {
+                assert_eq!(sidecar, "tools");
+                match violation {
+                    SecurityRuleViolation::DevicePathRelative { device, .. } => {
+                        assert_eq!(device, "dev/fuse");
+                    }
+                    other => panic!("expected DevicePathRelative, got: {other:?}"),
+                }
             }
-            other => panic!("expected DevicePathRelative, got: {other:?}"),
+            other => panic!("expected SidecarSecurity, got: {other:?}"),
         }
+        // The point of the variant: it opens with the sidecar, where the image
+        // variants it used to borrow read `image "sidecars.tools"`.
+        assert_eq!(
+            rendered,
+            "sidecar \"tools\": `devices` entry \"dev/fuse\" must be an absolute path"
+        );
     }
 
     #[test]
@@ -1435,7 +1735,7 @@ unmask = ["{value}"]
     }
 
     /// Sidecars reuse the whole `[security]` block, so the unmask rules reach
-    /// them too -- and the error names the sidecar's scope.
+    /// them too -- and the failure names the sidecar, not an image.
     #[test]
     fn sidecar_unmask_path_errors_name_the_sidecar_scope() {
         let cfg = parse(
@@ -1452,13 +1752,25 @@ unmask = ["proc/acpi"]
 "#,
         );
         let err = expect_validation_err(&cfg, None);
+        let rendered = err.to_string();
         match err {
-            ConfigValidationError::UnmaskPathRelative { image, path } => {
-                assert_eq!(image, "sidecars.tools");
-                assert_eq!(path, "proc/acpi");
+            ConfigValidationError::SidecarSecurity {
+                sidecar, violation, ..
+            } => {
+                assert_eq!(sidecar, "tools");
+                match violation {
+                    SecurityRuleViolation::UnmaskPathRelative { path, .. } => {
+                        assert_eq!(path, "proc/acpi");
+                    }
+                    other => panic!("expected UnmaskPathRelative, got: {other:?}"),
+                }
             }
-            other => panic!("expected UnmaskPathRelative, got: {other:?}"),
+            other => panic!("expected SidecarSecurity, got: {other:?}"),
         }
+        assert_eq!(
+            rendered,
+            "sidecar \"tools\": `unmask` entry \"proc/acpi\" must be an absolute path or `ALL`"
+        );
     }
 
     #[test]
@@ -3773,6 +4085,198 @@ session-root  = "sessions"
         assert_eq!(cfg.session_root, Some(dir.path().join("sessions")));
     }
 
+    /// #384: the session commands need one key out of the global config, and a
+    /// file broken anywhere used to cost them all of it. The salvage reads
+    /// `session-root` out of a document that does not parse, resolved beside
+    /// the file exactly as `load_global` resolves it.
+    ///
+    /// Every break here is below the key, which is where a break can be: TOML
+    /// puts every top-level key above the first table header, so the half-
+    /// written `[models.<name>]` block or bad `[network]` value an operator is
+    /// in the middle of is always *after* the `session-root` line.
+    #[test]
+    fn a_session_root_is_salvaged_from_a_file_that_does_not_parse() {
+        let dir = tempdir().unwrap();
+        for body in [
+            // A table header that was never closed.
+            "session-root = \"sessions\"\n[models.half-written\n",
+            // A value left mid-edit.
+            "session-root = \"sessions\"\ndefault-model = [\n",
+            // Not a syntax error at all: a value `load_global` refuses rather
+            // than sets aside, because `[network]` is one of the strict tables
+            // where leaving a key out would loosen the sandbox.
+            "session-root = \"sessions\"\n[network]\nmode = \"nonsense\"\n",
+            // A key spelled with an escape is the same key, and this one is
+            // whole: the damage is a table below it.
+            "\"session-\\u0072oot\" = \"sessions\"\n[models.half-written\n",
+            // A duplicate that is not of this key decides nothing about it.
+            "session-root = \"sessions\"\n[a]\nx = 1\n[a]\ny = 2\n",
+        ] {
+            let path = write_global_cfg(dir.path(), body);
+            Config::load_global(&path).expect_err(body);
+            assert_eq!(
+                Config::salvage_global_session_root(&path).expect(body),
+                Some(dir.path().join("sessions")),
+                "{body}",
+            );
+        }
+    }
+
+    /// The refusal that keeps the salvage honest. A parse error can take the
+    /// declaration with it, and answering "no root" would send `clean` at the
+    /// default -- where it finds no records and reads every labeled container
+    /// as a stray. So a file that mentions the key without yielding a path is
+    /// an error, not a default.
+    #[test]
+    fn a_broken_file_that_might_declare_the_root_is_refused() {
+        let dir = tempdir().unwrap();
+        for body in [
+            // The value is itself where the parse failed.
+            "session-root = [\n",
+            // The same, under a key spelled with an escape: the recovered
+            // document holds the canonical key, which is what decides, not
+            // whether the raw bytes spell it out.
+            "\"session-\\u0072oot\" = [\n",
+            // Declared with nothing after the `=`.
+            "session-root =\n[broken\n",
+            // Under a table header that was never closed, so what recovery
+            // hands back under the key is a table rather than a path -- and a
+            // key under a header is not the top-level one in any case.
+            "[a.b\nsession-root = \"sessions\"\n",
+            // An unclosed array above the key swallows the declaration into
+            // itself, so the document has no top-level `session-root` at all
+            // -- but the text does, and it may be exactly what was lost.
+            "default-model = [\nsession-root = \"sessions\"\n",
+        ] {
+            let path = write_global_cfg(dir.path(), body);
+            Config::salvage_global_session_root(&path).expect_err(body);
+        }
+    }
+
+    /// A value recovery had to *repair* is not a declaration. The parser
+    /// resolves a damaged string as best it can -- an invalid escape becomes a
+    /// replacement character, an unterminated one swallows the lines below it
+    /// -- and the path that comes out is one the file does not name and nobody
+    /// has. Each is refused rather than used, and none of them silently
+    /// becomes the default.
+    #[test]
+    fn a_repaired_root_value_is_refused_rather_than_used() {
+        let dir = tempdir().unwrap();
+        for body in [
+            // `\uZZZZ` is not an escape; recovery keeps a replacement
+            // character where the escape was.
+            "session-root = \"/srv/\\uZZZZsessions\"\n[broken\n",
+            // Not an escape at all.
+            "session-root = \"/srv/\\q sessions\"\n[broken\n",
+            // An unterminated multi-line string takes the rest of the file
+            // into the value.
+            "session-root = \"\"\"/srv/sessions\ndefault-model = \"m\"\n",
+        ] {
+            let path = write_global_cfg(dir.path(), body);
+            let err = Config::salvage_global_session_root(&path)
+                .expect_err(body)
+                .to_string();
+            assert!(err.contains("TOML parse error"), "{body}: {err}");
+        }
+    }
+
+    /// Two declarations of the key in a file that does not parse are refused,
+    /// not silently read as the first. A file that *does* parse is refused for
+    /// a duplicate key outright, and a damaged one gives no better ground to
+    /// pick between them: recovery keeps whichever came first, which is a
+    /// property of the parser, not a statement about what the operator meant.
+    ///
+    /// The parser's own duplicate-key error cannot be what decides this. Its
+    /// recovery stops at some errors -- a bare key with no `=` ends it there
+    /// -- so a second declaration below one of those is never visited and no
+    /// error points at it. The last two bodies are that shape, and the text,
+    /// not the error list, is what refuses them.
+    #[test]
+    fn a_duplicated_root_declaration_is_refused() {
+        let dir = tempdir().unwrap();
+        for body in [
+            // Plainly twice -- and the second line is the only thing wrong
+            // with the file.
+            "session-root = \"/srv/one\"\nsession-root = \"/srv/two\"\n",
+            // The second spelled with an escape, so the raw bytes of the two
+            // declarations have nothing in common.
+            "session-root = \"/srv/one\"\n\"session-\\u0072oot\" = \"/srv/two\"\n",
+            // A dotted key cannot extend a string, and the file is again
+            // declaring the root twice over.
+            "session-root = \"/srv/one\"\nsession-root.sub = \"/srv/two\"\n",
+            // The second declaration sits past where recovery stopped: the
+            // bare `default-model` ends it at the missing `=`, and the only
+            // error the parser reports is that line, which is nowhere near
+            // either root.
+            "session-root = \"/srv/one\"\ndefault-model\nsession-root = \"/srv/two\"\n",
+            // The same, with the second declaration spelled through an escape
+            // the parser never resolved because it never got there.
+            "session-root = \"/srv/one\"\ndefault-model\n\"session-\\u0072oot\" = \"/srv/two\"\n",
+        ] {
+            let path = write_global_cfg(dir.path(), body);
+            Config::load_global(&path).expect_err(body);
+            Config::salvage_global_session_root(&path).expect_err(body);
+        }
+    }
+
+    /// The text search that catches an unvisited duplicate is coarse -- a
+    /// mention is the key's bytes or a backslash anywhere outside the
+    /// declaration -- so a damaged file that names the key in a comment, or
+    /// in some other value, loses its salvage. That is the safe direction:
+    /// the alternative to refusing is a root the operator did not choose.
+    ///
+    /// The declaration's own text is excluded from the search, so a root whose
+    /// *value* contains the key's name or an escape is still salvaged. Without
+    /// that, a legitimate `/srv/session-root` would refuse itself.
+    #[test]
+    fn the_declarations_own_text_is_not_a_second_mention() {
+        let dir = tempdir().unwrap();
+        for (body, salvaged) in [
+            ("session-root = \"/srv/session-root\"\n[broken\n", true),
+            ("session-root = \"/srv/a\\tb\"\n[broken\n", true),
+            (
+                "session-root = \"/srv/one\"\n[broken\n# session-root moved\n",
+                false,
+            ),
+            (
+                "default-model = \"session-root\"\nsession-root = \"/srv/one\"\n[broken\n",
+                false,
+            ),
+        ] {
+            let path = write_global_cfg(dir.path(), body);
+            Config::load_global(&path).expect_err(body);
+            let got = Config::salvage_global_session_root(&path);
+            assert_eq!(got.is_ok(), salvaged, "{body}: {got:?}");
+        }
+    }
+
+    /// A file that cannot be declaring the key -- its bytes do not contain it
+    /// -- is `None`, which is the default. This is the common broken file: the
+    /// operator was editing a provider or a model, and where sessions live was
+    /// never in question.
+    #[test]
+    fn a_broken_file_that_cannot_declare_the_root_falls_back() {
+        let dir = tempdir().unwrap();
+        let path = write_global_cfg(dir.path(), "default-model = [\n");
+        Config::load_global(&path).expect_err("the file does not parse");
+        assert_eq!(
+            Config::salvage_global_session_root(&path).expect("no root to find"),
+            None,
+        );
+    }
+
+    /// A missing file is `None` rather than an error, as it is for
+    /// `load_global`: there is nothing to salvage and nothing wrong.
+    #[test]
+    fn salvaging_from_a_missing_file_is_the_default() {
+        let dir = tempdir().unwrap();
+        assert_eq!(
+            Config::salvage_global_session_root(&dir.path().join("absent.toml"))
+                .expect("a missing file has no root"),
+            None,
+        );
+    }
+
     /// Missing is empty, as it is for `load`; anything else unreadable is an
     /// error naming the path.
     #[test]
@@ -3894,6 +4398,60 @@ image-name = ""
         assert!(
             matches!(err, ConfigValidationError::ImageNameEmpty { .. }),
             "expected ImageNameEmpty, got: {err:?}"
+        );
+    }
+
+    /// Whitespace-only is empty: a ref of nothing but blanks names no image,
+    /// and `check_sidecar_image` has always held a sidecar's `image` to the
+    /// trimmed test. Left to podman it surfaced at launch as `image not
+    /// known`, naming neither the key nor the file.
+    #[test]
+    fn whitespace_only_image_name_errors() {
+        for value in ["  ", "\t", " \t "] {
+            let cfg = parse(&format!(
+                r#"
+[images.bad]
+image-name = "{}"
+"#,
+                value.escape_default(),
+            ));
+            let err = expect_validation_err(&cfg, None);
+            assert!(
+                matches!(err, ConfigValidationError::ImageNameEmpty { .. }),
+                "expected ImageNameEmpty for {value:?}, got: {err:?}"
+            );
+        }
+    }
+
+    /// The companion to the sidecar scope tests: an image-config's `[security]`
+    /// failure is still the same variant carrying the same `image` field it
+    /// carried before `SecurityRuleViolation` existed. This is a patch release,
+    /// so a consumer's `DevicePathRelative { image, device }` match has to go
+    /// on compiling and go on seeing the image-config name.
+    #[test]
+    fn image_security_errors_keep_their_image_field() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+devices = ["dev/fuse"]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        let rendered = err.to_string();
+        match err {
+            ConfigValidationError::DevicePathRelative { image, device } => {
+                assert_eq!(image, "coding");
+                assert_eq!(device, "dev/fuse");
+            }
+            other => panic!("expected DevicePathRelative, got: {other:?}"),
+        }
+        assert_eq!(
+            rendered,
+            "image \"coding\": `devices` entry \"dev/fuse\" must be an absolute path"
         );
     }
 
@@ -4202,6 +4760,122 @@ context    = "ctx"
         }
     }
 
+    /// A `cap-drop` of anything the launcher needs fails the sidecar late, at
+    /// whichever syscall wanted it first -- `SYS_CHROOT` at `setns`, with a hint
+    /// that used to blame another capability (#398). `ALL` is `drop-all` spelled
+    /// in the list, and a `CAP_` prefix is the same name.
+    #[test]
+    fn view_primary_with_cap_drop_of_a_launcher_capability_rejected() {
+        for dropped in [
+            "SYS_ADMIN",
+            "SYS_PTRACE",
+            "SYS_CHROOT",
+            "SETUID",
+            "SETGID",
+            "ALL",
+            "CAP_SYS_CHROOT",
+        ] {
+            let named = dropped.strip_prefix("CAP_").unwrap_or(dropped);
+            let cfg = image_block(&format!(
+                r#"
+  [sidecars.tools]
+  image = "docker.io/mcp/filesystem:latest"
+  view  = "primary"
+
+  [sidecars.tools.security]
+  cap-drop = ["MKNOD", "{dropped}"]
+
+  [images.coding.mcp]
+  fs = {{ sidecar = "tools" }}
+"#
+            ));
+            match expect_validation_err(&cfg, None) {
+                ConfigValidationError::SidecarViewCapDrop {
+                    sidecar,
+                    capability,
+                    ..
+                } => {
+                    assert_eq!(sidecar, "tools", "cap-drop = [{dropped:?}]");
+                    assert_eq!(capability, named, "cap-drop = [{dropped:?}]");
+                }
+                other => {
+                    panic!("cap-drop = [{dropped:?}]: expected SidecarViewCapDrop, got: {other:?}")
+                }
+            }
+        }
+    }
+
+    /// The refusal is for what the launcher needs, not for any `cap-drop`: a
+    /// primary-view sidecar can still shed the rest.
+    #[test]
+    fn view_primary_with_an_unrelated_cap_drop_validates_clean() {
+        let cfg = image_block(
+            r#"
+  [sidecars.tools]
+  image = "docker.io/mcp/filesystem:latest"
+  view  = "primary"
+
+  [sidecars.tools.security]
+  capability-profile = "no-net-raw"
+  cap-drop           = ["MKNOD", "CAP_AUDIT_WRITE"]
+
+  [images.coding.mcp]
+  fs = { sidecar = "tools" }
+"#,
+        );
+        cfg.validate(None)
+            .expect("dropping what the launcher does not need validates clean");
+    }
+
+    /// The launcher puts the payload under `no_new_privs` whatever the
+    /// container carries, so the opt-out on a view sidecar would do nothing --
+    /// refused rather than silently ignored, as `drop-all` is (#398).
+    #[test]
+    fn view_primary_without_no_new_privileges_rejected() {
+        let cfg = image_block(
+            r#"
+  [sidecars.tools]
+  image = "docker.io/mcp/filesystem:latest"
+  view  = "primary"
+
+  [sidecars.tools.security]
+  no-new-privileges = false
+
+  [images.coding.mcp]
+  fs = { sidecar = "tools" }
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::SidecarViewNoNewPrivsOff { sidecar, .. } => {
+                assert_eq!(sidecar, "tools");
+            }
+            other => panic!("expected SidecarViewNoNewPrivsOff, got: {other:?}"),
+        }
+    }
+
+    /// The same key stays what it was everywhere the view is not in play: on a
+    /// sidecar that does not join the primary, and on an image-config.
+    #[test]
+    fn no_new_privileges_opt_out_is_untouched_without_a_view() {
+        let cfg = image_block(
+            r#"
+  [images.coding.security]
+  no-new-privileges = false
+
+  [sidecars.tools]
+  image = "mcp-tools"
+
+  [sidecars.tools.security]
+  no-new-privileges = false
+
+  [images.coding.mcp]
+  lint = { command = ["lint"], sidecar = "tools" }
+"#,
+        );
+        cfg.validate(None)
+            .expect("no-new-privileges = false validates without a view");
+    }
+
     #[test]
     fn view_primary_hosting_exec_stdio_rejected() {
         let cfg = image_block(
@@ -4346,6 +5020,58 @@ context    = "ctx"
         );
     }
 
+    /// A sidecar mount goes through the same `-v` builder, so a `:` in either
+    /// half is the same malformed value (#365).
+    #[test]
+    fn sidecar_mount_container_path_with_colon_errors() {
+        let cfg = image_block(
+            r#"
+  [sidecars.tools]
+  image = "mcp-tools"
+
+  [[sidecars.tools.mounts]]
+  host-path      = "a"
+  container-path = "/data:extra"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::SidecarMount {
+                    violation: MountRuleViolation::ContainerFieldSeparator { .. },
+                    ..
+                }
+            ),
+            "expected a container-field-separator SidecarMount, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_mount_host_path_with_colon_errors() {
+        let cfg = image_block(
+            r#"
+  [sidecars.tools]
+  image = "mcp-tools"
+
+  [[sidecars.tools.mounts]]
+  host-path      = "/host/a:b"
+  container-path = "/data"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::SidecarMount {
+                    violation: MountRuleViolation::HostFieldSeparator { .. },
+                    ..
+                }
+            ),
+            "expected a host-field-separator SidecarMount, got: {err:?}"
+        );
+    }
+
     #[test]
     fn sidecar_mount_collides_with_enabled_workspace() {
         let cfg = image_block(
@@ -4401,13 +5127,25 @@ context    = "ctx"
 "#,
         );
         let err = expect_validation_err(&cfg, None);
+        let rendered = err.to_string();
         match err {
-            ConfigValidationError::CapabilityDropAddConflict { image, capability } => {
-                assert_eq!(image, "sidecars.tools");
-                assert_eq!(capability, "NET_RAW");
+            ConfigValidationError::SidecarSecurity {
+                sidecar, violation, ..
+            } => {
+                assert_eq!(sidecar, "tools");
+                match violation {
+                    SecurityRuleViolation::CapabilityDropAddConflict { capability, .. } => {
+                        assert_eq!(capability, "NET_RAW");
+                    }
+                    other => panic!("expected CapabilityDropAddConflict, got: {other:?}"),
+                }
             }
-            other => panic!("expected CapabilityDropAddConflict, got: {other:?}"),
+            other => panic!("expected SidecarSecurity, got: {other:?}"),
         }
+        assert_eq!(
+            rendered,
+            "sidecar \"tools\": capability \"NET_RAW\" is listed in both `cap-drop` and `cap-add`"
+        );
     }
 
     #[test]
@@ -5276,6 +6014,22 @@ image = "docker.io/library/alpine:3"
             for cfg in [&loaded, &global] {
                 assert_eq!(cfg.session_root, Some(home.join("outrig-sessions")));
             }
+        });
+    }
+
+    /// The salvage expands `~` as `load_global` expands it, so the degraded
+    /// read of a damaged file keeps the promise that the root it hands back is
+    /// absolute, rather than leaving its callers a second rule to learn.
+    #[test]
+    fn a_salvaged_tilde_root_resolves_under_the_home_directory() {
+        with_temp_home(|home| {
+            let (_repo, _global, global_cfg) =
+                repo_and_global("session-root = \"~/outrig-sessions\"\n[models.broken\n");
+            Config::load_global(&global_cfg).expect_err("the file does not parse");
+            assert_eq!(
+                Config::salvage_global_session_root(&global_cfg).expect("the root is salvaged"),
+                Some(home.join("outrig-sessions")),
+            );
         });
     }
 
@@ -6553,14 +7307,22 @@ provider   = "openai"
 identifier = "gpt-4o-mini"
 max-tokens = "plenty"
 "#;
-        write_repo_cfg(tmp.path(), bad);
+        let repo = write_repo_cfg(tmp.path(), bad);
         let err = Config::load_for_build(tmp.path(), Some(&global)).unwrap_err();
-        assert!(matches!(err, OutrigError::Config(_)), "got: {err:?}");
+        assert_eq!(named_file(&err), repo);
+        assert!(
+            matches!(in_file_source(err), OutrigError::Config(_)),
+            "the repo file's bad value fails its load",
+        );
 
         let file = tmp.path().join("ci.toml");
         fs::write(&file, bad).unwrap();
         let err = Config::load_file_for_build(&file, tmp.path(), Some(&global)).unwrap_err();
-        assert!(matches!(err, OutrigError::Config(_)), "got: {err:?}");
+        assert_eq!(named_file(&err), file);
+        assert!(
+            matches!(in_file_source(err), OutrigError::Config(_)),
+            "a --config file's bad value fails its load",
+        );
     }
 
     /// `[network]` and the `security` tables set nothing aside, even from the
@@ -6577,7 +7339,11 @@ max-tokens = "plenty"
         ] {
             let global = write_global_cfg(tmp.path(), body);
             let err = Config::load_global(&global).expect_err(body);
-            assert!(matches!(err, OutrigError::Config(_)), "{body}: {err:?}");
+            assert_eq!(named_file(&err), global, "{body}");
+            assert!(
+                matches!(in_file_source(err), OutrigError::Config(_)),
+                "{body}: a strict table sets nothing aside",
+            );
         }
     }
 
@@ -6592,7 +7358,11 @@ max-tokens = "plenty"
             "[providers.openai\nstyle = \"chat-completions\"\n",
         );
         let err = Config::load_global(&global).unwrap_err();
-        assert!(matches!(err, OutrigError::Config(_)), "got: {err:?}");
+        assert_eq!(named_file(&err), global);
+        assert!(
+            matches!(in_file_source(err), OutrigError::Config(_)),
+            "a syntax error leaves nothing to read",
+        );
     }
 
     /// A misquoted name is still the error it was, hint and all, from either
@@ -6605,9 +7375,137 @@ max-tokens = "plenty"
             "[models.opus-4.7]\nprovider = \"openai\"\nidentifier = \"x\"\n",
         );
         let err = Config::load_global(&global).unwrap_err();
+        assert_eq!(named_file(&err), global);
         assert!(
-            matches!(err, OutrigError::ConfigDottedKey { .. }),
-            "got: {err:?}"
+            matches!(in_file_source(err), OutrigError::ConfigDottedKey { .. }),
+            "the hint survives the file's name",
+        );
+    }
+}
+
+/// #413: a load reads up to two files -- the global config, and the repo
+/// config or a `--config` file -- and the faults they are refused for are
+/// described in words that say nothing about which file was read: a TOML
+/// excerpt quotes a line and a column, and the repo-only rules say "repo
+/// config". Every such error names the file it is about.
+mod errors_name_their_file {
+    use super::*;
+
+    /// A table header that never closes: a syntax error wherever the text came
+    /// from, and the one the reader cannot place without the file name.
+    const UNCLOSED_TABLE: &str = "[images.named\nimage-name = \"debian\"\n";
+
+    /// A key only the operator's file may set, which fails the repo-only rules
+    /// rather than the parse.
+    const REPO_FORBIDDEN: &str = "[network]\ndefault = \"deny\"\n";
+
+    #[test]
+    fn a_syntax_error_names_the_global_file() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), UNCLOSED_TABLE);
+
+        let err = Config::load(tmp.path(), Some(&global)).unwrap_err();
+        assert_eq!(named_file(&err), global);
+        let message = err.to_string();
+        assert!(
+            message.starts_with(&format!("{}: TOML parse error", global.display())),
+            "the excerpt follows the file it was read from, got: {message}",
+        );
+    }
+
+    #[test]
+    fn a_syntax_error_names_the_repo_file() {
+        let tmp = tempdir().unwrap();
+        let repo = write_repo_cfg(tmp.path(), UNCLOSED_TABLE);
+
+        let err = Config::load(tmp.path(), None).unwrap_err();
+        assert_eq!(named_file(&err), repo);
+        assert!(err.to_string().contains("TOML parse error"), "got: {err}");
+    }
+
+    #[test]
+    fn a_syntax_error_names_the_config_file() {
+        let tmp = tempdir().unwrap();
+        let named = tmp.path().join("ci/outrig.toml");
+        fs::create_dir_all(named.parent().unwrap()).unwrap();
+        fs::write(&named, UNCLOSED_TABLE).unwrap();
+
+        let err = Config::load_file(&named, tmp.path(), None).unwrap_err();
+        assert_eq!(named_file(&err), named);
+        assert!(err.to_string().contains("TOML parse error"), "got: {err}");
+    }
+
+    /// The point of naming the file: with a broken file on each side in turn,
+    /// the name moves with the fault instead of the reader guessing.
+    #[test]
+    fn the_file_named_is_the_one_at_fault() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), UNCLOSED_TABLE);
+        let repo = write_repo_cfg(tmp.path(), "[images.named]\nimage-name = \"debian\"\n");
+
+        let err = Config::load(tmp.path(), Some(&global)).unwrap_err();
+        assert_eq!(named_file(&err), global);
+
+        let global = write_global_cfg(tmp.path(), PROVIDER_AND_FAST_MODEL);
+        write_repo_cfg(tmp.path(), UNCLOSED_TABLE);
+
+        let err = Config::load(tmp.path(), Some(&global)).unwrap_err();
+        assert_eq!(named_file(&err), repo);
+    }
+
+    /// The repo-only rules speak of "the repo config", which is the repo's own
+    /// file or the one `--config` named; the error says which.
+    #[test]
+    fn a_repo_only_rule_names_the_file_that_broke_it() {
+        let tmp = tempdir().unwrap();
+        let repo = write_repo_cfg(tmp.path(), REPO_FORBIDDEN);
+
+        let err = Config::load(tmp.path(), None).unwrap_err();
+        assert_eq!(named_file(&err), repo);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{}: repo config may set [network].mode only; [network].default belongs in \
+                 global config",
+                repo.display()
+            ),
+        );
+
+        let tmp = tempdir().unwrap();
+        let named = tmp.path().join("ci.toml");
+        fs::write(&named, REPO_FORBIDDEN).unwrap();
+
+        let err = Config::load_file(&named, tmp.path(), None).unwrap_err();
+        assert_eq!(named_file(&err), named);
+        assert!(
+            matches!(
+                in_file_source(err),
+                OutrigError::ConfigValidation(ConfigValidationError::RepoNetworkPolicy {
+                    key: "default"
+                })
+            ),
+            "the rule is the one the repo file broke",
+        );
+    }
+
+    /// A rule of the *merged* config is nobody's file: the two halves are
+    /// equally answerable for a model whose provider the other was to declare,
+    /// so no file is named rather than one being blamed.
+    #[test]
+    fn a_merged_rule_names_no_file() {
+        let tmp = tempdir().unwrap();
+        write_repo_cfg(
+            tmp.path(),
+            "[models.fast]\nprovider = \"absent\"\nidentifier = \"gpt-4o-mini\"\n",
+        );
+
+        let err = Config::load(tmp.path(), None).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OutrigError::ConfigValidation(ConfigValidationError::UnknownModelProvider { .. })
+            ),
+            "got: {err:?}",
         );
     }
 }

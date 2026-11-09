@@ -40,10 +40,11 @@ use crate::cli::watcher::{LABEL_INSTANCE, SessionWatcher, SidecarRef};
 use crate::error::{CliError, OutrigError, Result};
 use crate::llm;
 use crate::paths::{
-    RepoConfig, default_session_root, refuse_home_workspace, refuse_repo_declared_mounts,
-    refuse_workspace_covering_global_config, repo_config_path,
+    RepoConfig, default_session_root, refuse_home_workspace, refuse_mount_field_separators,
+    pin_repo_declared_mounts, recheck_pinned_mounts, refuse_workspace_covering_global_config,
+    refuse_workspace_field_separator, repo_config_path,
 };
-use crate::session::{self, Session, SessionId, SessionStore};
+use crate::session::{self, Session, SessionId, SessionLock, SessionStore};
 use outrig::config::{
     Config, ImageConfig, McpServerSpec, MountConfig, NetworkMode, SidecarOnFailure, SidecarStart,
     SidecarView,
@@ -276,6 +277,13 @@ pub struct SessionRuntime {
     pub mcp_arcs: Vec<Arc<McpClient>>,
     pub network: Option<NetworkInterceptor>,
     pub containers: SessionContainers,
+    /// This launch's claim on the record as a live session, from
+    /// [`SessionStore::create`]. Out of teardown order deliberately:
+    /// [`teardown`] takes it out before the stops and drops it only after the
+    /// record is finalized, so nothing can remove the record while the
+    /// session is being torn down (#366). `None` when the claim could not be
+    /// taken -- see [`session::claim_owner`].
+    pub session_lock: Option<SessionLock>,
 }
 
 impl SessionRuntime {
@@ -285,12 +293,14 @@ impl SessionRuntime {
         watcher: Option<SessionWatcher>,
         network: Option<NetworkInterceptor>,
         containers: SessionContainers,
+        session_lock: Option<SessionLock>,
     ) -> Self {
         Self {
             watcher,
             mcp_arcs: Vec::new(),
             network,
             containers,
+            session_lock,
         }
     }
 }
@@ -327,6 +337,11 @@ pub struct SessionSetup {
     /// at its default disposition. The command races its own slow steps
     /// against these, as setup did.
     pub signals: Signals,
+    /// The claim that says this session is live, taken as the record was
+    /// written. The command hands it to [`SessionRuntime::new`], which hands
+    /// it to [`teardown`]; dropping it early would expose the record to
+    /// `clean` and `discard` while the session still runs (#366).
+    pub session_lock: Option<SessionLock>,
 }
 
 #[derive(Debug)]
@@ -372,6 +387,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     // A workspace no config declared is outrig's pick, and outrig never picks
     // the home directory or one above it, nor one that contains the global
     // config. An attached session mounts nothing.
+    let mut pinned_mounts = Vec::new();
     if attach.is_none() {
         // Spelled without the default `.` it joins to the root.
         let workspace: PathBuf = cfg
@@ -384,7 +400,17 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             refuse_home_workspace(&workspace, &repo_root)?;
             refuse_workspace_covering_global_config(&workspace, &repo_root, args.global_cfg_path)?;
         }
-        refuse_repo_declared_mounts(&cfg, &repo_root, args.global_cfg_path)?;
+        // A `:` in a path *as written* is a config error, refused when the
+        // config was read. These two ask the other question, which only a
+        // launch that mounts can answer: whether what a clean path resolves
+        // through carries one. Attaching is excluded above -- it borrows a
+        // container and serializes no `-v` -- so a session started from a
+        // directory with a `:` in its name can still be attached to (#365).
+        refuse_workspace_field_separator(&workspace, &cfg.workspace, &repo_root)?;
+        refuse_mount_field_separators(&cfg, &repo_root)?;
+        // `run` and `mcp` start no bindings.
+        pinned_mounts =
+            pin_repo_declared_mounts(&mut cfg, &repo_root, args.global_cfg_path, false)?;
         // No config of its own at the root, and no declared host path, means
         // the working directory by default, whether or not `--config`
         // supplied the settings.
@@ -426,12 +452,14 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             )
             .into());
         }
+        // Against the working directory, not `repo_root`: the flag was typed
+        // at a shell, which reads a relative path from where it was typed,
+        // and a `--volume` is declared in no config file (#367). Resolved
+        // before validation so the existence check and any diagnostic speak
+        // of the directory the user meant.
+        let cwd = crate::paths::current_dir()?;
         for vol in args.volumes {
-            cfg.workspace.mounts.push(MountConfig::new(
-                vol.host.clone(),
-                vol.container.clone(),
-                vol.access,
-            ));
+            cfg.workspace.mounts.push(vol.to_mount(&cwd));
         }
         cfg.validate_workspace_mounts(Some(&repo_root))?;
     }
@@ -575,7 +603,6 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         image_tag
     };
 
-    let sid = SessionId::new();
     let host_workspace = cfg.workspace.resolved_host_path(&repo_root);
     let container_workspace = cfg.workspace.container_path().to_path_buf();
     let mut launch =
@@ -586,33 +613,43 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     launch.devices = security.devices.clone();
     launch.no_new_privileges = security.no_new_privileges;
     launch.unmask = security.unmask.clone();
-    launch.labels = BTreeMap::from([(LABEL_SESSION.to_string(), sid.0.clone())]);
 
-    let container_name = attach
-        .as_ref()
-        .map(|attach| attach.container_name.clone())
-        .unwrap_or_else(|| format!("outrig-{sid}"));
-    let mut session = Session {
-        id: sid.clone(),
-        started_at: SystemTime::now(),
-        ended_at: None,
-        container_name: container_name.clone(),
-        sidecar_container_names: Vec::new(),
-        image_tag: image_tag.to_string(),
-        image_config_name: Some(image_cfg_name.clone()),
-        agent_name: session_agent_name,
-        working_dir: repo_root.clone(),
-        session_dir: PathBuf::new(), // set by `create` below
-        exit_code: None,
-        link_target: None,
-    };
     // The record is the first thing a signal could orphan. From here on, none
     // ends the process without the session torn down: each slow step below
     // is raced against these, and a signal takes that step's bail-out.
     let mut signals = Signals::install()?;
-    let session_dir = store.create(&sid, args.explicit_session_dir, &mut session)?;
+    // `session_lock` is this launch's claim on the record as a live one, held
+    // from here to `teardown`'s finalize. Without it `clean` and `discard`
+    // decide liveness by the recorded container, which does not exist until
+    // the image is built and started below -- minutes, for a cold build
+    // (#366). An id already taken under the root is drawn again, and the
+    // record rebuilt for the new one (#382).
+    let (mut session, session_dir, session_lock) =
+        store.create_fresh(SessionId::new, args.explicit_session_dir, |sid| Session {
+            id: sid.clone(),
+            started_at: SystemTime::now(),
+            ended_at: None,
+            container_name: attach
+                .as_ref()
+                .map(|attach| attach.container_name.clone())
+                .unwrap_or_else(|| format!("outrig-{sid}")),
+            sidecar_container_names: Vec::new(),
+            image_tag: image_tag.to_string(),
+            image_config_name: Some(image_cfg_name.clone()),
+            agent_name: session_agent_name.clone(),
+            working_dir: repo_root.clone(),
+            session_dir: PathBuf::new(), // set by `create`
+            exit_code: None,
+            link_target: None,
+        })?;
+    // Set after the claim, so the label carries the id the record has.
+    let sid = session.id.clone();
+    let container_name = session.container_name.clone();
+    launch.labels = BTreeMap::from([(LABEL_SESSION.to_string(), sid.0.clone())]);
     // Every bail-out before there are containers to stop: end the record with
-    // the exit code `e` carries, and pass `e` on.
+    // the exit code `e` carries, and pass `e` on. `session_lock` is still a
+    // local here, so it outlives the finalize and is dropped as the `?`
+    // returns -- the order `teardown` spells out.
     let fail = |e: CliError| {
         let _ = store.finalize(&sid, SystemTime::now(), e.exit_code());
         e
@@ -630,7 +667,19 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         None
     };
 
-    let container = if let Some(attach) = &attach {
+    // With an interceptor to attach, the primary's process is held until it is
+    // (see `Container::start_named_held`). `None` for the default mode, and
+    // for `--attach`, which refuses the others.
+    let interception = match network_mode {
+        NetworkMode::Default => None,
+        mode => Some(Interception {
+            mode,
+            cfg: &cfg,
+            log_dir: &log_dir,
+            sid: &sid,
+        }),
+    };
+    let (container, primary_span) = if let Some(attach) = &attach {
         let span = ProgressSpan::start(format!("attaching to container {}", attach.container_name));
         // Raced like every step after the record: a stalled podman must not
         // leave a signal with nothing to answer it.
@@ -640,12 +689,13 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         {
             Ok(true) => {
                 span.done(format!("attached to container: {}", attach.container_name));
-                Container::attach(
+                let container = Container::attach(
                     attach.container_name.clone(),
                     image_tag.clone(),
                     Some((&host_workspace, &container_workspace)),
                     transcript.clone(),
-                )
+                );
+                (container, None)
             }
             Ok(false) => {
                 return Err(fail(
@@ -692,11 +742,22 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             cache_status(raw_local_image, &image_outcome)
         ));
 
+        // The image work above can take minutes, and the repo is writable by
+        // a concurrent session: look again at what the guard validated (#604).
+        recheck_pinned_mounts(&pinned_mounts).map_err(|e| fail(e.into()))?;
         let span = ProgressSpan::start(format!("starting container {container_name}"));
-        let start = Container::start_named(&image_tag, launch, container_name, transcript.clone());
+        let start = async {
+            if interception.is_some() {
+                Container::start_named_held(&image_tag, launch, container_name, transcript.clone())
+                    .await
+            } else {
+                Container::start_named(&image_tag, launch, container_name, transcript.clone())
+                    .await
+            }
+        };
         let container = signals.race(start).await.map_err(fail)?;
-        span.done(format!("container ready: {}", container.name()));
-        container
+        // Done once it is running, which for a held one is after the release.
+        (container, Some(span))
     };
 
     // In a local as well as in `containers`, because the sidecar phase takes
@@ -709,9 +770,31 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         primary: container,
     };
 
+    // Owned here rather than by the sidecar phase, so a bail-out from any later
+    // step drops it on the way out.
+    let mut network = None;
+    if let Some(interception) = &interception {
+        // The attach is what the primary was held for. Failing it aborts the
+        // container set like any step after the primary exists.
+        let attach_and_release = async {
+            let interceptor = interception.start(&containers.primary).await?;
+            containers.primary.release().await?;
+            Ok::<_, CliError>(interceptor)
+        };
+        match signals.race(attach_and_release).await {
+            Ok(interceptor) => network = Some(interceptor),
+            Err(e) => {
+                return Err(abort_containers(containers, &store, &sid, session_lock, e).await);
+            }
+        }
+    }
+    if let Some(span) = primary_span {
+        span.done(format!("container ready: {}", containers.primary.name()));
+    }
+
     let span = ProgressSpan::start("bootstrapping container user");
     if let Err(e) = signals.race(containers.primary.bootstrap_user()).await {
-        return Err(abort_containers(containers, &store, &sid, e).await);
+        return Err(abort_containers(containers, &store, &sid, session_lock, e).await);
     }
     span.done("container user ready");
 
@@ -723,27 +806,25 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         repo_root: &repo_root,
         image_cfg_name: &image_cfg_name,
         image_cfg: &image_cfg,
-        image_tag: &image_tag,
         sid: &sid,
         host_workspace: &host_workspace,
         container_workspace: &container_workspace,
-        log_dir: &log_dir,
         session_dir: &session_dir,
-        network_mode,
+        intercept_dns: network.is_some(),
         start_sidecars: args.start_sidecars,
         cli_env: args.cli_env,
         transcript: transcript.as_ref(),
     };
-    let sidecars_and_network = setup_sidecars_and_network(phase, &mut containers);
-    let (mcp_plan, network) = match signals.race_settled(sidecars_and_network).await {
-        Ok(outcome) => outcome,
-        Err(e) => return Err(abort_containers(containers, &store, &sid, e).await),
+    let sidecars = setup_sidecars(phase, &mut containers, &mut network);
+    let mcp_plan = match signals.race_settled(sidecars).await {
+        Ok(plan) => plan,
+        Err(e) => return Err(abort_containers(containers, &store, &sid, session_lock, e).await),
     };
 
     if !containers.sidecars.is_empty() {
         let names = containers.sidecar_names();
         if let Err(e) = store.set_sidecar_containers(&sid, &names) {
-            return Err(abort_containers(containers, &store, &sid, e).await);
+            return Err(abort_containers(containers, &store, &sid, session_lock, e).await);
         }
         session.sidecar_container_names = names;
     }
@@ -780,11 +861,12 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         mcp_plan,
         watcher,
         signals,
+        session_lock,
     })
 }
 
 /// Borrowed inputs threaded from [`setup`] into
-/// [`setup_sidecars_and_network`]; grouped so the phase reads as one call.
+/// [`setup_sidecars`]; grouped so the phase reads as one call.
 struct SidecarPhaseArgs<'a> {
     cfg: &'a Config,
     repo_root: &'a Path,
@@ -792,15 +874,15 @@ struct SidecarPhaseArgs<'a> {
     instance_salt: &'a str,
     image_cfg_name: &'a str,
     image_cfg: &'a ImageConfig,
-    image_tag: &'a ImageTag,
     sid: &'a SessionId,
     host_workspace: &'a Path,
     container_workspace: &'a Path,
-    log_dir: &'a Path,
     /// Session directory; a `view = "primary"` sidecar materializes the
     /// `outrig-enter` launcher here for its read-only bind.
     session_dir: &'a Path,
-    network_mode: NetworkMode,
+    /// Whether the session has an interceptor, whose resolver an
+    /// entrypoint-stdio sidecar has to have baked in at create.
+    intercept_dns: bool,
     start_sidecars: bool,
     cli_env: &'a CliEnvEntries,
     transcript: Option<&'a Transcript>,
@@ -874,7 +956,9 @@ pub(crate) async fn launch_declared_sidecar(
 
 /// Build the placement plan (config + primary and sidecar label merges),
 /// check `--env SERVER:` names against it, start `start = "auto"` sidecars,
-/// and attach the network interceptor to every running container.
+/// and attach the session's network interceptor, if it has one, to each of
+/// them. The primary is already attached: `setup` does that before its process
+/// runs.
 ///
 /// Building the plan is a step of its own on stderr, so a failure in it prints
 /// under that step's line rather than under `container user ready`.
@@ -885,13 +969,21 @@ pub(crate) async fn launch_declared_sidecar(
 /// malformed labels, and a label entry whose `env` references a host variable
 /// `[repo] env-allow` does not list are startup errors regardless of
 /// `on-failure`, as are all primary-container failures.
-async fn setup_sidecars_and_network(
+async fn setup_sidecars(
     args: SidecarPhaseArgs<'_>,
     containers: &mut SessionContainers,
-) -> Result<(SessionMcpPlan, Option<NetworkInterceptor>)> {
+    network: &mut Option<NetworkInterceptor>,
+) -> Result<SessionMcpPlan> {
     let span = ProgressSpan::start("reading and merging MCP configuration");
     let mut plan = sidecar::plan_from_config(args.cfg, args.image_cfg);
-    let image_mcp = embedded::read_embedded_mcp(args.image_tag, args.transcript).await?;
+    // Off the image the primary is *running*, by the engine's id for it,
+    // rather than off whatever its tag names now. The two differ when a pull
+    // moved the tag between the container starting and this read -- a wide
+    // window with `--attach`, which borrows a container someone else started
+    // from an `image-name` ref, and a narrow one for a fresh session, whose
+    // image was ensured a moment ago. Either way the servers merged here are
+    // the ones this container can actually run.
+    let image_mcp = embedded::read_embedded_mcp_of(&containers.primary).await?;
     sidecar::merge_primary_labels(&mut plan, image_mcp);
 
     // Phase A -- ensure each distinct sidecar image (and read its labels when a
@@ -958,26 +1050,15 @@ async fn setup_sidecars_and_network(
     // Phase C -- start the auto sidecars concurrently, inserting in name order.
     start_auto_sidecars(&plan, &args, to_start, containers).await?;
 
-    let network = match args.network_mode {
-        NetworkMode::Default => None,
-        NetworkMode::Audit => Some(attach_interceptor("audit", &plan, containers, &args).await?),
-        NetworkMode::Filter => Some(attach_interceptor("filter", &plan, containers, &args).await?),
-        // `NetworkMode` is `#[non_exhaustive]`. Refusing beats falling back to
-        // no interception, which would silently drop the monitoring the mode
-        // was asking for.
-        mode => {
-            return Err(OutrigError::Configuration(format!(
-                "network mode {mode} is not supported by this build"
-            ))
-            .into());
-        }
-    };
+    if let Some(interceptor) = network {
+        attach_sidecars(interceptor, &plan, containers).await?;
+    }
 
-    Ok((plan, network))
+    Ok(plan)
 }
 
 /// One distinct sidecar image resolved once and shared by every sidecar that
-/// references it (Phase A of [`setup_sidecars_and_network`]). `tag` is the
+/// references it (Phase A of [`setup_sidecars`]). `tag` is the
 /// image-ensure result; `labels` is the `org.outrig.mcp` read, present only
 /// when some sidecar using the image honors labels (see
 /// [`SessionMcpPlan::sidecar_honors_labels`]) -- otherwise it is never
@@ -1204,27 +1285,55 @@ fn shared_image_error(message: &str) -> CliError {
     CliError::from(std::io::Error::other(message.to_string()))
 }
 
-/// Start the network interceptor on the primary and attach every running
-/// sidecar. A sidecar attach failure follows its `on-failure`; `warn` stops
-/// and drops that sidecar.
-async fn attach_interceptor(
-    mode_word: &str,
+/// What it takes to start the session's network interceptor, for a session
+/// whose mode is not the default.
+struct Interception<'a> {
+    mode: NetworkMode,
+    cfg: &'a Config,
+    log_dir: &'a Path,
+    sid: &'a SessionId,
+}
+
+impl Interception<'_> {
+    /// Start the interceptor and attach it to `primary`, which is held: the
+    /// image's process has not run.
+    async fn start(&self, primary: &Container) -> Result<NetworkInterceptor> {
+        let policy = match self.mode {
+            NetworkMode::Audit => None,
+            NetworkMode::Filter => Some(self.cfg.network.policy()),
+            // `NetworkMode` is `#[non_exhaustive]`. Refusing beats falling back to
+            // no interception, which would silently drop the monitoring the mode
+            // was asking for.
+            mode => {
+                return Err(OutrigError::Configuration(format!(
+                    "network mode {mode} is not supported by this build"
+                ))
+                .into());
+            }
+        };
+        let mode = self.mode;
+        let span = ProgressSpan::start(format!("starting network {mode} interceptor"));
+        let session_id = self.sid.as_str();
+        let interceptor = match policy {
+            None => NetworkInterceptor::start(primary, self.log_dir, session_id).await?,
+            Some(policy) => {
+                NetworkInterceptor::start_with_policy(primary, self.log_dir, session_id, policy)
+                    .await?
+            }
+        };
+        span.done(format!("network {mode} interceptor ready"));
+        Ok(interceptor)
+    }
+}
+
+/// Attach every running sidecar to the session's interceptor, which already
+/// covers the primary. A sidecar attach failure follows its `on-failure`;
+/// `warn` stops and drops that sidecar.
+async fn attach_sidecars(
+    interceptor: &mut NetworkInterceptor,
     plan: &SessionMcpPlan,
     containers: &mut SessionContainers,
-    args: &SidecarPhaseArgs<'_>,
-) -> Result<NetworkInterceptor> {
-    let span = ProgressSpan::start(format!("starting network {mode_word} interceptor"));
-    let mut interceptor = if mode_word == "audit" {
-        NetworkInterceptor::start(&containers.primary, args.log_dir, args.sid.as_str()).await?
-    } else {
-        NetworkInterceptor::start_with_policy(
-            &containers.primary,
-            args.log_dir,
-            args.sid.as_str(),
-            args.cfg.network.policy(),
-        )
-        .await?
-    };
+) -> Result<()> {
     for name in containers.sidecars.keys().cloned().collect::<Vec<_>>() {
         // Entrypoint-stdio sidecars are created+initialized but not yet
         // started here; attaching now -- before `podman start` in
@@ -1259,8 +1368,7 @@ async fn attach_interceptor(
             }
         }
     }
-    span.done(format!("network {mode_word} interceptor ready"));
-    Ok(interceptor)
+    Ok(())
 }
 
 /// `warn` on-failure: log the failure and let the caller drop the sidecar.
@@ -1480,7 +1588,7 @@ async fn create_one_entrypoint_sidecar(
         env_spec,
         &args.cli_env.for_server(server_name),
     )?;
-    let intercept_dns = args.network_mode != NetworkMode::Default;
+    let intercept_dns = args.intercept_dns;
 
     // A `view = "primary"` sidecar runs `outrig-enter` as its ENTRYPOINT (set in
     // the launch flags) and hands it the payload command, which has to be
@@ -1521,10 +1629,15 @@ async fn create_one_entrypoint_sidecar(
 ///
 /// A signal during the stops ends the wait, not the cleanup -- see
 /// [`signals::unless_signaled`] -- and the record is finalized either way.
+///
+/// `lock` is the session's liveness claim, taken by value and dropped on
+/// return: a bail-out is still a live session until its record says it
+/// ended, exactly as in [`teardown`].
 async fn abort_containers(
     containers: SessionContainers,
     store: &SessionStore,
     sid: &SessionId,
+    lock: Option<SessionLock>,
     cause: CliError,
 ) -> CliError {
     signals::unless_signaled(async move {
@@ -1544,6 +1657,7 @@ async fn abort_containers(
     })
     .await;
     let _ = store.finalize(sid, SystemTime::now(), cause.exit_code());
+    drop(lock);
     cause
 }
 
@@ -1726,16 +1840,23 @@ pub async fn connect_mcp_clients(
 /// A SIGINT or SIGTERM during the stops ends the wait, not the cleanup --
 /// see [`signals::unless_signaled`]. The record is finalized either way,
 /// which is why it is not part of the sequence that signal can cut short.
+/// The session's liveness claim outlasts all of it and is released last, so
+/// the record cannot be removed between the last stop and the finalize.
 ///
 /// Callers must drop any `Arc<McpClient>` clones (e.g. tool adapters) and
 /// the agent before invoking this -- otherwise [`Arc::try_unwrap`] returns
 /// `Err` and the explicit `shutdown` is skipped in favor of `Drop`.
 pub async fn teardown(
-    runtime: SessionRuntime,
+    mut runtime: SessionRuntime,
     store: &SessionStore,
     sid: &SessionId,
     outcome: &Result<i32>,
 ) {
+    // Out of `runtime` before the stops, so it is not dropped with the rest
+    // of it: the session is live until the record says it ended, and a
+    // `clean` or `discard` landing between the last stop and the finalize
+    // would remove the record this is about to write (#366).
+    let session_lock = runtime.session_lock.take();
     signals::unless_signaled(stop_session(runtime)).await;
     let exit_code = outcome
         .as_ref()
@@ -1746,6 +1867,9 @@ pub async fn teardown(
             "session finalize failed: {e}"
         );
     }
+    // The record is finalized: the session is no longer live, and this is
+    // what says so to anything probing the directory.
+    drop(session_lock);
 }
 
 /// Everything [`teardown`] does before it finalizes the record.
@@ -1755,6 +1879,11 @@ async fn stop_session(runtime: SessionRuntime) {
         mcp_arcs,
         network,
         containers,
+        // `teardown` took it out before calling this, so the stops cannot
+        // drop the session's liveness claim ahead of the finalize. Anything
+        // else dropping a `SessionRuntime` wholesale releases it here, which
+        // is right: there is no finalize coming.
+        session_lock: _,
     } = runtime;
     if let Some(watcher) = watcher {
         watcher.shutdown();
@@ -1956,7 +2085,7 @@ lint = { command = ["mcp-lint"], sidecar = "lint" }
         check_env(&[]).expect("an empty overlay names no server");
     }
 
-    /// A plan of `[images.x]` over `config`, as `setup_sidecars_and_network`
+    /// A plan of `[images.x]` over `config`, as `setup_sidecars`
     /// starts one before the labels merge in.
     fn label_plan(config: &str) -> SessionMcpPlan {
         let cfg: Config = toml::from_str(&format!(

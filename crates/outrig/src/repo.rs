@@ -1,5 +1,7 @@
 //! Repo discovery needed by `load_project` and `Config::load`.
 
+use std::fs;
+use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
@@ -15,9 +17,22 @@ pub(crate) fn find_repo_root_from(cwd: &Path) -> Result<PathBuf> {
 fn find_repo_root_with(cwd: &Path, uid: u32) -> Result<PathBuf> {
     let mut cur = cwd;
     loop {
-        if cur.join(REPO_CONFIG_REL).is_file() {
-            refuse_foreign_repo_config(cur, uid)?;
-            return Ok(cur.to_path_buf());
+        let config = cur.join(REPO_CONFIG_REL);
+        match fs::metadata(&config) {
+            Ok(meta) if meta.is_file() => {
+                refuse_foreign_repo_config(cur, uid)?;
+                return Ok(cur.to_path_buf());
+            }
+            // A `.agents/` or `.agents/outrig/` that is a file rather than a
+            // directory, or a `config.toml` that is a directory: not the
+            // config this is looking for, so the walk goes on, same as a
+            // missing entry.
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {}
+            // Anything else says nothing about whether the config is there,
+            // so it is not treated as absent (#829; see outrig-cli's
+            // `paths::find_repo_root_with`, which has the same split).
+            Err(e) => return Err(e).path_ctx("stat", config),
         }
         match cur.parent() {
             Some(parent) => cur = parent,
@@ -67,8 +82,40 @@ pub(crate) fn repo_config_path(root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
+
+    /// #829: `.agents/outrig/` the caller cannot search must stop the walk
+    /// rather than be read as absent -- a config further up, or none, picked
+    /// silently in place of one never examined.
+    #[test]
+    fn a_config_that_cannot_be_examined_is_reported_not_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let agents = proj.join(".agents").join("outrig");
+        fs::create_dir_all(&agents).unwrap();
+        let config = agents.join("config.toml");
+        fs::write(&config, "").unwrap();
+        let nested = proj.join("sub");
+        fs::create_dir_all(&nested).unwrap();
+        let uid = fs::metadata(&config).unwrap().uid();
+        fs::set_permissions(&agents, fs::Permissions::from_mode(0o000)).unwrap();
+        // A superuser searches any directory, so there is nothing to see.
+        let searchable = fs::metadata(&config).is_ok();
+
+        let result = find_repo_root_with(&nested, uid);
+
+        fs::set_permissions(&agents, fs::Permissions::from_mode(0o755)).unwrap();
+        if searchable {
+            return;
+        }
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, OutrigError::Path { op: "stat", path, .. } if *path == config),
+            "{err:?}"
+        );
+    }
 
     /// A config another user owns is refused by name, not taken and not
     /// walked past.

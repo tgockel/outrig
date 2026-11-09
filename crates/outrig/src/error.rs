@@ -10,9 +10,10 @@ use crate::config::{ApiKeyError, ConfigValidationError, EnvValueError};
 use crate::container::embedded::EmbeddedImageConfigError;
 
 /// Why `build.rs` could not embed the `outrig-enter` helper. It sets
-/// `OUTRIG_ENTER_UNAVAILABLE_REASON` only when it degrades, so `None` is the
-/// build that succeeded -- in which case this error is unreachable and the
-/// fallback is what a mismatched build would be told.
+/// `OUTRIG_ENTER_UNAVAILABLE_REASON` only when it degrades, so `None` is a
+/// build that embedded one -- the musl build or its static fallback -- in
+/// which case this error is unreachable and the default text is what a
+/// mismatched build would be told.
 fn filesystem_helper_unavailable_reason() -> &'static str {
     option_env!("OUTRIG_ENTER_UNAVAILABLE_REASON").unwrap_or(
         "install the matching `x86_64-unknown-linux-musl` or \
@@ -28,8 +29,10 @@ pub enum OutrigError {
 
     #[error(
         "this outrig was built without the filesystem-view helper\n\
-         build detail: {}",
-        filesystem_helper_unavailable_reason()
+         build detail: {}\n\
+         help: see {}usage/no-musl.html",
+        filesystem_helper_unavailable_reason(),
+        crate::PUBLIC_DOC_BASE_URL
     )]
     FilesystemHelperUnavailable,
 
@@ -53,6 +56,27 @@ pub enum OutrigError {
     ConfigDottedKey {
         #[source]
         source: toml::de::Error,
+    },
+
+    /// A config file's own content is what an error is about, named by the
+    /// file it came from. A load reads up to two of them -- the global
+    /// config, and the repo config or a `--config` file -- and a diagnostic
+    /// that quotes a line and a column says nothing about which one it read
+    /// (#413).
+    ///
+    /// Only what the file *says* is wrapped: a TOML syntax error, a value the
+    /// types refuse, and the repo-only rules
+    /// ([`Config::validate_as_repo`](crate::config::Config::validate_as_repo)),
+    /// whose wording says "repo config" without saying which file that is.
+    /// A failed read is an [`OutrigError::Path`], which names the path
+    /// already, and a rule of the *merged* config belongs to no one file.
+    #[error("{}: {source}", path.display())]
+    #[non_exhaustive]
+    ConfigFile {
+        /// The file the error is about, as the load resolved it.
+        path: PathBuf,
+        #[source]
+        source: Box<OutrigError>,
     },
 
     #[error("{0}")]
@@ -162,6 +186,17 @@ pub enum OutrigError {
         #[source]
         source: EnvValueError,
     },
+
+    // The image was built, and discarded: buildah reads the context as each
+    // `COPY` runs, so a build that read an edit holds content its key does not
+    // hash, and naming it `tag` would serve it for the content the key does.
+    #[error(
+        "image {image:?}: its Dockerfile or build context changed while it was building, so \
+         the build was discarded rather than saved as {tag}\n\
+         help: run the build again"
+    )]
+    #[non_exhaustive]
+    BuildContextChanged { image: String, tag: String },
 
     // Raised by the build merge, a runtime read of a raw or sidecar image, and
     // `image inspect`, so the `help:` cannot assume the reader owns the
@@ -808,8 +843,14 @@ mod tests {
     fn missing_filesystem_helper_error_carries_the_build_reason() {
         let rendered = OutrigError::FilesystemHelperUnavailable.to_string();
         assert!(rendered.contains("filesystem-view helper"), "{rendered}");
+        // An installed binary has no `doc/` tree, so the page is linked by URL.
+        assert!(
+            rendered.contains("https://tgockel.github.io/outrig/usage/no-musl.html"),
+            "{rendered}"
+        );
         if crate::container::enter::is_available() {
-            // Nothing degraded, so there is no build-time reason to report and
+            // Nothing degraded -- a fallback build that worked is not a
+            // degradation -- so there is no build-time reason to report and
             // the message falls back to naming both musl targets.
             assert!(rendered.contains("x86_64-unknown-linux-musl"), "{rendered}");
             assert!(

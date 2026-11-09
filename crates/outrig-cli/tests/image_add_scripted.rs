@@ -18,8 +18,9 @@ use tokio::time::timeout;
 
 use outrig::config::Config;
 use outrig::error::OutrigError;
-use outrig_cli::error::CliError;
-use outrig_cli::image_setup::add::run_with;
+use outrig_cli::error::{CliError, Result};
+use outrig_cli::image_setup::add::{run_bootstrapped, run_with};
+use outrig_cli::init::prompt::{Field, PromptSource};
 use outrig_cli::init::repo::resolve_or_bootstrap;
 
 use common::scripted_prompt;
@@ -237,8 +238,13 @@ async fn add_from(
     let (mut prompt, _stderr) = scripted_prompt(script).await;
     let name = name.map(str::to_string);
     timeout(TEST_TIMEOUT, async {
-        let (repo_root, name) = resolve_or_bootstrap(cwd, Some(global), name, &mut prompt).await?;
-        run_with(&repo_root, name, false, &mut prompt).await
+        let (repo_root, name, bootstraps) =
+            resolve_or_bootstrap(cwd, Some(global), name, &mut prompt).await?;
+        if bootstraps {
+            run_bootstrapped(&repo_root, name, false, &mut prompt).await
+        } else {
+            run_with(&repo_root, name, false, &mut prompt).await
+        }
     })
     .await
     .expect("image add must not hang")
@@ -252,7 +258,7 @@ async fn fallback_yes_bootstraps_repo_config() {
     // deterministic (`myproj-standard`).
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("myproj");
-    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
     let global = Path::new("/dev/null");
 
     // Script: configure-now (Y) + 5 repo-config defaults (container name,
@@ -282,6 +288,46 @@ async fn fallback_yes_bootstraps_repo_config() {
     assert!(cfg.agents.contains_key("coder"));
 }
 
+/// The caller's signal for whether to set `default-image` comes from
+/// `resolve_or_bootstrap`'s own return, not a second walk of `cwd` run
+/// separately: an existing repo answers `false` and a bootstrapped one
+/// answers `true`, from the same call that resolved the root.
+#[tokio::test]
+async fn resolve_or_bootstrap_reports_whether_it_bootstrapped() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_repo(tmp.path(), STANDARD_SEED);
+    let cwd = tmp.path().join("src");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("global.toml");
+
+    let (mut prompt, _stderr) = scripted_prompt(b"").await;
+    let (root, name, bootstraps) = timeout(
+        TEST_TIMEOUT,
+        resolve_or_bootstrap(&cwd, Some(&global), None, &mut prompt),
+    )
+    .await
+    .expect("must not hang")
+    .expect("an existing repo config must resolve without prompting");
+    assert_eq!(root, tmp.path());
+    assert_eq!(name, None);
+    assert!(!bootstraps, "an existing repo config was not just written");
+
+    let tmp2 = tempfile::tempdir().unwrap();
+    let cwd2 = tmp2.path().join("myproj");
+    std::fs::create_dir_all(cwd2.join(".git")).unwrap();
+    let (mut prompt2, _stderr2) = scripted_prompt(b"\n\n\n\n\n\n").await;
+    let (root2, name2, bootstraps2) = timeout(
+        TEST_TIMEOUT,
+        resolve_or_bootstrap(&cwd2, Some(Path::new("/dev/null")), None, &mut prompt2),
+    )
+    .await
+    .expect("must not hang")
+    .expect("a declined-then-accepted bootstrap must still succeed");
+    assert_eq!(root2, cwd2);
+    assert!(name2.is_some());
+    assert!(bootstraps2, "a config just written by this call");
+}
+
 /// #195: given a name, the bootstrap writes it as `default-image` instead of
 /// asking for one, so its config defaults to the image `image add` goes on to
 /// scaffold, and loads beside a global config.
@@ -289,7 +335,7 @@ async fn fallback_yes_bootstraps_repo_config() {
 async fn fallback_yes_with_a_name_writes_it_as_default_image() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("myproj");
-    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
     let global = tmp.path().join("global.toml");
     std::fs::write(&global, GLOBAL).unwrap();
 
@@ -333,6 +379,67 @@ async fn a_configured_repo_keeps_its_default_image() {
     assert!(cfg.images.contains_key("coding"), "{text}");
 }
 
+/// #408: outside a git repository Enter declines the bootstrap, so a bare
+/// Enter in `$HOME` does not make the home directory a read-write workspace.
+#[tokio::test]
+async fn fallback_default_outside_git_declines() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A TMPDIR beneath a git repository would make the default yes.
+    if tmp.path().ancestors().any(|d| d.join(".git").exists()) {
+        eprintln!(
+            "skipping: {} is inside a git repository",
+            tmp.path().display()
+        );
+        return;
+    }
+    let global = Path::new("/dev/null");
+
+    let (mut prompt, _stderr) = scripted_prompt(b"\n").await;
+    let err = timeout(
+        TEST_TIMEOUT,
+        resolve_or_bootstrap(tmp.path(), Some(global), None, &mut prompt),
+    )
+    .await
+    .expect("fallback must not hang")
+    .expect_err("the default outside git must decline");
+
+    assert!(
+        matches!(err, CliError::Outrig(OutrigError::NoRepoConfig)),
+        "expected NoRepoConfig, got: {err:?}"
+    );
+    assert!(!tmp.path().join(".agents").exists());
+}
+
+/// #408: a `.git` above the directory counts, and an explicit `y` bootstraps
+/// even where the default is no.
+#[tokio::test]
+async fn fallback_explicit_yes_outside_git_bootstraps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("myproj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let global = Path::new("/dev/null");
+
+    // `y`, then the same eight defaults as `fallback_yes_bootstraps_repo_config`.
+    add_from(&cwd, global, None, b"y\n\n\n\n\n\n\n\n\n\n")
+        .await
+        .expect("an explicit yes must bootstrap");
+    assert!(cwd.join(".agents/outrig/config.toml").is_file());
+}
+
+#[tokio::test]
+async fn fallback_default_below_a_git_root_bootstraps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("repo/sub");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(tmp.path().join("repo/.git")).unwrap();
+    let global = Path::new("/dev/null");
+
+    add_from(&cwd, global, None, b"\n\n\n\n\n\n\n\n\n")
+        .await
+        .expect("the default inside a git repo must bootstrap");
+    assert!(cwd.join(".agents/outrig/config.toml").is_file());
+}
+
 #[tokio::test]
 async fn fallback_no_returns_no_repo_config() {
     let tmp = tempfile::tempdir().unwrap();
@@ -357,6 +464,74 @@ async fn fallback_no_returns_no_repo_config() {
 
     // Nothing was written.
     assert!(!tmp.path().join(".agents").exists());
+}
+
+/// Delegates every `PromptSource` call to `inner`, except that `ask_bool`
+/// removes `path` first -- standing in for #505's user, who deletes an
+/// explicit `--global-config` in the span between the bootstrap's "configure
+/// now?" prompt appearing and their answer landing.
+struct DeleteOnAskBool<'a, P> {
+    inner: P,
+    path: &'a Path,
+}
+
+impl<P: PromptSource> PromptSource for DeleteOnAskBool<'_, P> {
+    async fn ask_string(&mut self, field: &Field, default: &str) -> Result<String> {
+        self.inner.ask_string(field, default).await
+    }
+
+    async fn ask_bool(&mut self, field: &Field, default: bool) -> Result<bool> {
+        std::fs::remove_file(self.path).expect("the global config must exist to remove");
+        self.inner.ask_bool(field, default).await
+    }
+
+    async fn ask_select(&mut self, field: &Field, default_idx: usize) -> Result<usize> {
+        self.inner.ask_select(field, default_idx).await
+    }
+
+    async fn ask_multiselect(
+        &mut self,
+        field: &Field,
+        default_indices: &[usize],
+    ) -> Result<Vec<usize>> {
+        self.inner.ask_multiselect(field, default_indices).await
+    }
+}
+
+/// #505: an explicit `--global-config` that exists when the bootstrap's
+/// "configure now?" prompt fires, but is gone by the time the user answers
+/// it, must be refused the same way a `--global-config` missing from the
+/// start is -- not read as an empty config, which would let the wizard write
+/// a repo config whose agent has no model without ever saying why.
+#[tokio::test]
+async fn the_bootstrap_refuses_a_global_config_removed_while_the_prompt_is_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path().join("config.toml");
+    std::fs::write(&global, GLOBAL).unwrap();
+
+    // `y` to the only prompt this path reaches before the removed file
+    // would otherwise be read.
+    let (inner, _stderr) = scripted_prompt(b"y\n").await;
+    let mut prompt = DeleteOnAskBool {
+        inner,
+        path: &global,
+    };
+    let err = timeout(
+        TEST_TIMEOUT,
+        resolve_or_bootstrap(tmp.path(), Some(&global), None, &mut prompt),
+    )
+    .await
+    .expect("the bootstrap must not hang")
+    .expect_err("a --global-config removed during the prompt must be refused");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "configuration: --global-config {} does not exist",
+            global.display()
+        ),
+    );
+    assert!(entries(tmp.path()).is_empty(), "{:?}", entries(tmp.path()));
 }
 
 /// #342: the bootstrap is where `image add` reads the global config, so a
@@ -703,7 +878,7 @@ async fn a_dotted_name_is_written_quoted_and_loads() {
 async fn the_bootstraps_name_prompt_asks_again() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("myproj");
-    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
     let global = Path::new("/dev/null");
 
     // Configure-now, agent name, preamble, image name (refused), image

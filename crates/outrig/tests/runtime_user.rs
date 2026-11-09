@@ -21,14 +21,17 @@ mod common;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
-use outrig::container::Container;
+use outrig::config::MountAccess;
+use outrig::container::{Container, ContainerLaunchSpec, ContainerMount};
+use outrig::image::ImageTag;
 use outrig::{ExecOptions, Transcript};
 
 use common::{
-    entry_for_id, field_for_id, init_tracing, install_shadow, pull_alpine, read_stdout, root_cmd,
-    root_stdout, run_capture, start_alpine,
+    ALPINE, entry_for_id, field_for_id, init_tracing, install_shadow, pull_alpine, read_stdout,
+    root_cmd, root_stdout, run_capture, start_alpine,
 };
 
 #[tokio::test]
@@ -496,6 +499,68 @@ async fn bootstrap_refuses_a_home_that_is_not_a_directory() {
         let owner = root_stdout(&name, &["stat", "-c", "%u %g", victim]);
         assert_eq!(owner.trim(), "0 0", "`{plant}`: {victim} was chowned");
     }
+
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
+/// A home the user already owns is used as it is, not `chown`ed: a tools
+/// directory mounted read-only over `/home/<user>` is the user's own to start
+/// with -- keep-id maps the host user to the container's -- and a `chown` of
+/// it would change nothing and fail with `EROFS`, which used to abort the
+/// bootstrap.
+#[tokio::test]
+async fn bootstrap_accepts_a_read_only_mount_over_a_home_the_user_owns() {
+    init_tracing();
+    pull_alpine();
+
+    // The name keep-id gives the host user is the one the home is named after.
+    let named = run_capture(Command::new("podman").args([
+        "run",
+        "--rm",
+        "--userns=keep-id",
+        ALPINE,
+        "id",
+        "-un",
+    ]));
+    let user = String::from_utf8_lossy(&named.stdout).trim().to_string();
+    let home = format!("/home/{user}");
+
+    let host_ws = tempfile::tempdir().expect("tempdir");
+    let tools = tempfile::tempdir().expect("tempdir");
+    fs::write(tools.path().join("tool"), "#!/bin/sh\n").expect("write");
+    let mut launch = ContainerLaunchSpec::workspace(host_ws.path(), "/workspace");
+    launch.mounts.push(ContainerMount::new(
+        tools.path(),
+        &home,
+        MountAccess::ReadOnly,
+    ));
+    let mut container = Container::start(&ImageTag::new(ALPINE), launch)
+        .await
+        .expect("start");
+
+    container
+        .bootstrap_user()
+        .await
+        .expect("bootstrap over a read-only home the user owns");
+    assert_eq!(container.home_dir().as_deref(), Some(home.as_str()));
+
+    let mut child = container
+        .exec_stdio(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo $HOME; ls $HOME".to_string(),
+            ],
+            &ExecOptions::new(),
+        )
+        .await
+        .expect("exec_stdio");
+    let out = read_stdout(&mut child).await;
+    assert_eq!(
+        out,
+        format!("{home}\ntool\n"),
+        "HOME is the mounted directory"
+    );
 
     container.stop(Duration::from_secs(2)).await.expect("stop");
 }

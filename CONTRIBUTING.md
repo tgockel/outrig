@@ -8,11 +8,14 @@ Install the musl target matching your architecture once before building:
 rustup target add x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
 ```
 
-`crates/outrig/build.rs` compiles the `outrig-enter` launcher for it. Without the target the
-build still succeeds -- it emits a warning and embeds an empty artifact -- but every
-`view = "primary"` sidecar fails at session start, including the three this repo's own
-`.agents/outrig/config.toml` declares. Development happens on Linux: macOS and native Windows
-are not supported, and WSL2 is an ordinary Linux build.
+`crates/outrig/build.rs` compiles the `outrig-enter` launcher for it, which is the build CI tests
+and the release checklist requires. Without the target it warns and builds the launcher
+statically for your machine's own target instead, which works the same but needs your static C
+library (`libc6-dev` on Debian and Ubuntu, `glibc-static` on Fedora). Only when both fail does it
+embed an empty artifact, and then every `view = "primary"` sidecar fails at session start,
+including the three this repo's own `.agents/outrig/config.toml` declares. See
+[Building without the musl target](doc/usage/no-musl.md). Development happens on Linux: macOS
+and native Windows are not supported, and WSL2 is an ordinary Linux build.
 
 The same build script downloads the static CPython every session mounts -- about 36 MB, once per
 machine, into `~/.cache/outrig/downloads` -- verifies it against a pinned SHA-256, and embeds it.
@@ -85,18 +88,21 @@ instead of writing it, bind loopback ports and fetch over HTTP; they stop what t
 
 What gets published is not what `cargo test` builds. `crates/outrig/build.rs` compiles the
 `outrig-enter` launcher out of the crate's own sources at build time and degrades any failure --
-including sources that are not in the archive -- to a cargo warning and an empty artifact. A
-published crate missing `src/container/enter/launcher.rs` would therefore build green and then
-fail every `view = "primary"` sidecar at session start.
+including sources that are not in the archive, which its static fallback build cannot compile
+either -- to a cargo warning and an empty artifact. A published crate missing
+`src/container/enter/launcher.rs` would therefore build green and then fail every
+`view = "primary"` sidecar at session start.
 
 CI's `package` job closes that by packaging both crates with `OUTRIG_REQUIRE_ENTER=1`, which
-makes the degradation a build error, against the packaged archive rather than the working tree:
+makes a missing musl build a build error, against the packaged archive rather than the working
+tree:
 
 ```sh
 OUTRIG_REQUIRE_ENTER=1 cargo package --locked -p outrig -p outrig-cli
 ```
 
-Like an ordinary build it needs the `<arch>-unknown-linux-musl` target installed.
+Unlike an ordinary build it needs the `<arch>-unknown-linux-musl` target installed: the variable
+rules out the fallback.
 
 ## End-to-end tests
 
@@ -110,8 +116,9 @@ cargo test --workspace --locked --features outrig/e2e,outrig-cli/e2e
 
 Run the same command yourself. Both crates declare `e2e`, so the feature has to be named per
 package or one crate's suite silently stays out. Prefix it with `OUTRIG_REQUIRE_ENTER=1` to
-match CI: without it `build.rs` degrades a launcher it cannot compile to a warning, and the
-`view = "primary"` tests then fail as a missing helper rather than as a missing musl target.
+match CI: without it a build with no musl target tests the static fallback launcher instead,
+and one where that fails too runs the `view = "primary"` tests against no launcher, so they
+fail as a missing helper rather than as a missing musl target.
 
 Prerequisites: rootless `podman` + `buildah` on `PATH`, plus `nft` and `nsenter` for the
 network-interceptor tests. The two run-time tests have different requirements:

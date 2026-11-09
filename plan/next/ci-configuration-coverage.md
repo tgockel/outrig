@@ -5,7 +5,7 @@
 > compile-only `e2e` matrix row this entry's efficiency items were written about; see the two
 > notes below. The `cargo publish --dry-run` item has **landed** too -- 0002-52 added a
 > `package` job; see the entry for it. What stays here: the generalizing `cargo hack
-> --each-feature` job, the MSRV check, and the sccache cleanup. The `macos-latest` x
+> --each-feature` job and the sccache cleanup. The `macos-latest` x
 > `local-llm,metal` item, the `cuda`/`metal` note, and the `local-llm` + `e2e` gap all
 > **evaporated** when the 0.3 line removed the in-process backend: the three features, the macOS
 > dependency block, and the ML dependency pins are gone.
@@ -25,8 +25,9 @@ the `cuda` feature that needed `nvcc` went with the in-process backend.
 
 ## Remaining uncovered configurations
 
-**`rust-version = "1.87"` is never verified.** All jobs use `dtolnay/rust-toolchain@stable`, so a
-dependency bump or newly stabilized API can silently raise the true MSRV above the declared one.
+**~~`rust-version` is never verified.~~ Landed with #838** as an `msrv` job running `cargo check
+--locked --workspace --all-targets` on the toolchain `Cargo.toml` declares. It found that the
+`rustyline` git pin needed Rust 1.95 while the manifest promised 1.88.
 
 **~~No `cargo publish --dry-run` / `cargo package` job.~~ Landed in 0002-52** as a `package`
 job running `cargo package --locked -p outrig -p outrig-cli` with `OUTRIG_REQUIRE_ENTER=1`.

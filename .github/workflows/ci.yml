@@ -20,12 +20,14 @@ jobs:
     name: cargo (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     env:
-      # `crates/outrig/build.rs` degrades *every* launcher failure -- a missing
-      # target, a launcher that stopped compiling, an unrunnable rustc -- to a
-      # cargo warning plus an empty artifact, and `tests/enter_embedded.rs` has
-      # a matching early-return, so none of it turns CI red on its own. This
-      # makes the degradation a hard build error. Both musl targets are
-      # installed below, so every row can satisfy it.
+      # `crates/outrig/build.rs` answers *every* musl launcher failure -- a
+      # missing target, a launcher that stopped compiling, an unrunnable rustc
+      # -- with a static build for the runner's own target, and when that fails
+      # too, with a cargo warning plus an empty artifact. `tests/enter_embedded.rs`
+      # has a matching early-return, so none of it turns CI red on its own. This
+      # makes a missing musl build a hard build error, with no fallback tried.
+      # Both musl targets are installed below, so every row can satisfy it. The
+      # fallback is `fallback-e2e`'s to test.
       OUTRIG_REQUIRE_ENTER: "1"
       # The same for the static CPython `build.rs` downloads and embeds: a
       # fetch that failed would otherwise be a warning, and every session in
@@ -179,10 +181,11 @@ jobs:
     # hold it all afternoon.
     timeout-minutes: 75
     env:
-      # `view = "primary"` sidecars need the embedded musl launcher, and
-      # `build.rs` degrades a launcher it cannot compile to a warning plus an
-      # empty artifact. Without this the primary-view tests would fail as a
-      # missing helper rather than the row failing as a missing target.
+      # `view = "primary"` sidecars need the embedded launcher, and without a
+      # musl build `build.rs` falls back to a static build for the runner's own
+      # target, or failing that to an empty artifact. This row is evidence
+      # about the musl launcher, so a missing musl build fails the row here
+      # instead; `fallback-e2e` runs the primary-view tests on the fallback.
       OUTRIG_REQUIRE_ENTER: "1"
       # Every `Outrig::launch` mounts the embedded CPython; without this a
       # failed fetch would surface as every library test failing to start.
@@ -229,6 +232,41 @@ jobs:
       # running at all from `1dad8af` on (#637), and a run that is red for one
       # reason cannot say whether it is red for another.
       - run: cargo test --workspace --locked --features outrig/e2e,outrig-cli/e2e --no-fail-fast
+
+  # `crates/outrig/build.rs` without a musl target: it compiles the `outrig-enter` launcher
+  # statically for the runner's own target instead (`+crt-static`, so glibc linked in), and no
+  # other job takes that path -- each of them installs a musl target. So this one runs the
+  # tests that exec the launcher against that build. Their Alpine sidecars are the point: a
+  # dynamically linked launcher could not start in them, and this one has to.
+  #
+  # One row. The fallback is the same source against a different libc; what is
+  # architecture-specific in it, the syscall numbers, the aarch64 `live-e2e` row decides.
+  fallback-e2e:
+    name: fallback-e2e (x86-64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # No `targets` and no `OUTRIG_REQUIRE_ENTER`: either one keeps the fallback from running.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fallback-e2e
+          cache-on-failure: true
+      # The job's premise, checked. With a musl target installed every step below would test
+      # the musl launcher and pass for the wrong reason. The glibc is what the fallback links in.
+      - name: Record the engine and the libc
+        run: |
+          if rustup target list --installed | grep -- -musl; then
+            echo "a musl target is installed, so this job would not test the fallback" >&2
+            exit 1
+          fi
+          uname -srm
+          podman --version
+          ldd --version | head -n 1
+      - run: cargo test --locked -p outrig --test enter_embedded
+      - run: cargo test --locked -p outrig --features e2e --test library_surface primary_view
+      - run: cargo test --locked -p outrig-cli --features e2e --test primary_view_e2e
 
   public-api:
     name: public-api
@@ -310,6 +348,27 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
       - run: cargo package --locked -p outrig -p outrig-cli
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain is read from the manifest, so the declared `rust-version` is the single
+      # source of truth and cannot drift from what this job builds. Every other job runs on
+      # `stable`, which cannot notice a dependency (or a git pin in `Cargo.lock`) that quietly
+      # raised the real minimum above the promised one (#838). The musl target is there so
+      # `crates/outrig/build.rs` compiles the `outrig-enter` launcher the way releases do,
+      # rather than through its fallback for the runner's own target.
+      - id: msrv
+        run: echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - run: |
+          test -n "${{ steps.msrv.outputs.version }}"
+          rustup toolchain install "${{ steps.msrv.outputs.version }}" --profile minimal \
+            --target x86_64-unknown-linux-musl
+          rustup default "${{ steps.msrv.outputs.version }}"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --workspace --all-targets
 
   doc-style:
     name: doc-style

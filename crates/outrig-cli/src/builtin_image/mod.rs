@@ -18,6 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
+use outrig::PUBLIC_DOC_BASE_URL;
 use outrig::config::{Config, ImageConfig, SidecarView, SidecarWorkspaceAccess};
 use outrig::container::enter;
 use outrig::error::Result;
@@ -92,13 +93,13 @@ pub(crate) fn inject(cfg: &mut Config) -> Injection {
     let mut notes = Vec::new();
     let launcher = enter::is_available();
     if !launcher {
-        notes.push(
+        notes.push(format!(
             "warning: this build has no `outrig-enter` launcher, so the built-in default's \
              `fs` server falls back to a read-write bind mount of the workspace and its \
-             `shell` server is unavailable. Install the <arch>-unknown-linux-musl target and \
-             rebuild outrig -- see doc/usage/run.md#the-built-in-default-image."
-                .to_string(),
-        );
+             `shell` server is unavailable. Rebuild outrig with the <arch>-unknown-linux-musl \
+             target installed, or with the host's static C library -- see \
+             {PUBLIC_DOC_BASE_URL}usage/no-musl.html"
+        ));
     }
 
     // Only materialize when the launcher can actually run it; without one the
@@ -200,8 +201,8 @@ fn shell_dir_or_note(notes: &mut Vec<String>) -> Option<PathBuf> {
 
 /// Write the embedded Dockerfile into `dir`, skipping the write when the
 /// bytes already match. Rewriting every session would be harmless for the
-/// content hash -- `hash_tar_context` pins mtime and ownership -- but it is
-/// pointless I/O on a path every run takes.
+/// content hash -- the non-git context walk hashes content and mode, not
+/// mtime or ownership -- but it is pointless I/O on a path every run takes.
 fn materialize(dir: &Path) -> Result<()> {
     let path = dir.join("Dockerfile");
     if std::fs::read_to_string(&path).is_ok_and(|current| current == SHELL_DOCKERFILE) {

@@ -43,10 +43,13 @@ use nix::unistd::{Gid, Group, Uid, User};
 use serde_json::Value;
 use tokio::process::Child;
 
-use crate::config::{CapabilityProfile, MountAccess, ResolvedEnvValue, normalize_capability_name};
+use crate::config::{
+    CapabilityProfile, MountAccess, PRIMARY_VIEW_ADDED_CAPS, ResolvedEnvValue,
+    canonical_capability_name,
+};
 use crate::engine_env;
 use crate::error::{OutrigError, Result};
-use crate::image::ImageTag;
+use crate::image::{ImageId, ImageTag, image_id};
 use crate::process::{self, Cmd, Transcript};
 use crate::supervise::Reissue;
 
@@ -106,6 +109,10 @@ pub struct Container {
     /// In-container user name resolved by [`Container::bootstrap_user`].
     /// `None` until bootstrap has run.
     user_name: Option<String>,
+    /// In-container home directory of that user, resolved by
+    /// [`Container::bootstrap_user`]: the `HOME` of every exec. `None` until
+    /// bootstrap has run.
+    home: Option<String>,
     /// In-container group name resolved by [`Container::bootstrap_user`].
     /// `None` until bootstrap has run.
     group_name: Option<String>,
@@ -127,6 +134,16 @@ pub struct Container {
     /// Init PID, cached by [`Container::pid`] after the first `podman
     /// inspect`.
     pid: OnceCell<u32>,
+    /// The engine's id for the image this container is running, cached by
+    /// [`Container::image_id`] after the first `podman inspect`.
+    ///
+    /// `image_tag` is what the container was *asked* for, and a tag is a
+    /// pointer: a pull can move `registry/x:latest` while this container goes
+    /// on running the image it started from. The id names that image for as
+    /// long as it exists, so every read of what the running image declares
+    /// goes through this. Like the PID it cannot go stale -- a container's
+    /// image is fixed at creation.
+    image_id: OnceCell<ImageId>,
     /// The engine's own id for this container, from the `create`/`run` that
     /// made it. `None` for a container outrig only borrowed, which it never
     /// stops.
@@ -144,7 +161,8 @@ pub struct Container {
     ctr_log: Option<CtrLog>,
     /// Stands in for the engine call whose rendering contains the fragment,
     /// first match winning, so a test can wedge the stop or the removal in
-    /// particular and hold the other one still. Every bounded-call path here
+    /// particular and hold the other one still, or answer an inspect as a
+    /// podman that is not installed here would. Every call path this covers
     /// ends at a `podman` a test cannot install.
     #[cfg(test)]
     engine_override: Vec<(&'static str, Cmd)>,
@@ -615,6 +633,67 @@ impl Container {
         name: String,
         transcript: Option<Transcript>,
     ) -> Result<Self> {
+        Self::launch_named(image, launch, name, transcript, false).await
+    }
+
+    /// [`Container::start_named`] with the container's process held back: the
+    /// container is created and initialized, so its PID and namespaces exist,
+    /// but nothing in it runs until [`Container::release`]. For a caller that
+    /// has to act on the container first -- the network interceptor, which
+    /// must be in its network namespace before an image's `ENTRYPOINT` can
+    /// send a packet.
+    ///
+    /// The interceptor's resolver is baked in through `--dns`, as
+    /// [`ContainerCreateOptions::with_intercept_dns`] does: nothing can be
+    /// exec'd into a container that has not started, so the install
+    /// [`NetworkInterceptor::attach`](crate::network::NetworkInterceptor::attach)
+    /// makes in a running one is not possible here. A caller that does not
+    /// attach the interceptor would leave the container resolving through a
+    /// listener that is not there, and wants [`Container::start_named`].
+    ///
+    /// Everything else is what `start_named` runs: the same flags, and the
+    /// same `sleep infinity` as the container's command. The returned
+    /// container is not running, so [`Container::bootstrap_user`] and every
+    /// exec have to come after [`Container::release`].
+    pub async fn start_named_held(
+        image: &ImageTag,
+        launch: ContainerLaunchSpec,
+        name: String,
+        transcript: Option<Transcript>,
+    ) -> Result<Self> {
+        Self::launch_named(image, launch, name, transcript, true).await
+    }
+
+    /// Run the process a container from [`Container::start_named_held`] has
+    /// been holding back: `podman start`, detached. A container that is
+    /// already running answers it as podman does, with success.
+    pub async fn release(&self) -> Result<()> {
+        process::run_capture_logged(
+            self.engine_call(self.release_cmd()),
+            "podman",
+            self.transcript.as_ref(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The start [`release`](Self::release) runs. By id where there is one,
+    /// for the reason [`stop_cmd`](Self::stop_cmd) is.
+    fn release_cmd(&self) -> Cmd {
+        Cmd::new("podman").arg("start").arg(self.selector())
+    }
+
+    /// The one body of [`Container::start_named`] and
+    /// [`Container::start_named_held`]. `held` swaps the `podman run -d` for a
+    /// `podman create` and a `podman init`, and records that the resolver was
+    /// baked in.
+    async fn launch_named(
+        image: &ImageTag,
+        launch: ContainerLaunchSpec,
+        name: String,
+        transcript: Option<Transcript>,
+        held: bool,
+    ) -> Result<Self> {
         // Armed before anything is spawned, and the only owner of what podman
         // creates until the `Container` below exists. A `?` or a dropped
         // future in between drops the guard, which removes the container this
@@ -622,9 +701,15 @@ impl Container {
         // for Container` can do, because no `Container` exists yet.
         reject_reserved_labels(&launch.labels)?;
         reject_malformed_capabilities(&launch.capabilities)?;
+        reject_bind_mount_separators(&launch)?;
         let reserved = NameGuard::reserve(&name);
 
-        let cmd = build_podman_run_cmd(
+        let build = if held {
+            build_podman_held_cmd
+        } else {
+            build_podman_run_cmd
+        };
+        let cmd = build(
             image,
             &name,
             &launch,
@@ -637,6 +722,12 @@ impl Container {
         // than left behind under a handle that cannot name it.
         let id = engine_id(&created.stdout)
             .ok_or_else(|| unidentified_container(&name, &created.stdout))?;
+        if held {
+            // As in `create_initialized`: the guard is still armed, so an
+            // `init` that fails or is cancelled leaves nothing behind.
+            let init = Cmd::new("podman").arg("init").arg(id.as_str());
+            process::run_capture_logged(init, "podman", transcript.as_ref()).await?;
+        }
 
         let workspace = match &launch.workspace {
             Some(workspace) => (workspace.host.clone(), workspace.container.clone()),
@@ -649,8 +740,8 @@ impl Container {
             workspace,
             transcript,
             LaunchFacts {
+                dns_preconfigured: held,
                 net_admin: launch.capabilities.grants_net_admin(),
-                ..LaunchFacts::default()
             },
         ))
     }
@@ -681,6 +772,7 @@ impl Container {
         // guard removes nothing.
         reject_reserved_labels(&options.launch.labels)?;
         reject_malformed_capabilities(&options.launch.capabilities)?;
+        reject_bind_mount_separators(&options.launch)?;
         let reserved = NameGuard::reserve(&options.name);
 
         let selinux = selinux_enforcing().await;
@@ -784,12 +876,14 @@ impl Container {
             uid: nix::unistd::getuid().as_raw(),
             gid: nix::unistd::getgid().as_raw(),
             user_name: None,
+            home: None,
             group_name: None,
             transcript,
             ownership,
             dns_preconfigured,
             net_admin,
             pid: OnceCell::new(),
+            image_id: OnceCell::new(),
             id,
             ctr_log: None,
             #[cfg(test)]
@@ -857,6 +951,21 @@ impl Container {
     pub(crate) fn holding_net_admin() -> Self {
         let mut container = Self::stops_cleanly();
         container.net_admin = true;
+        container
+    }
+
+    /// A *borrowed* handle wired to answer `podman inspect --format
+    /// {{.EffectiveCaps}}` with `caps` -- e.g. `"[CAP_CHOWN CAP_NET_ADMIN]"`
+    /// -- for tests of [`NetworkInterceptor::attach`](crate::network::NetworkInterceptor::attach)'s
+    /// #549 refusal, which a borrowed handle's `net_admin` field cannot carry
+    /// (there is no launch to have set it from).
+    #[cfg(test)]
+    pub(crate) fn attached_reporting_effective_caps(caps: &str) -> Self {
+        let mut container = Self::stops_cleanly();
+        container.engine_override = vec![(
+            "inspect",
+            Cmd::new("/bin/echo").arg(format!("the-container {caps}")),
+        )];
         container
     }
 
@@ -989,7 +1098,7 @@ impl Container {
     /// one: a container named with this one's full id is not this container.
     async fn inspect_format(&self, format: &str) -> Result<String> {
         let output = process::run_capture_logged(
-            self.inspect_cmd(&format!("{{{{.Id}}}} {format}")),
+            self.engine_call(self.inspect_cmd(&format!("{{{{.Id}}}} {format}"))),
             "podman",
             self.transcript.as_ref(),
         )
@@ -1021,8 +1130,80 @@ impl Container {
         self.net_admin
     }
 
+    /// Whether a *borrowed* container (`Container::attach`) currently holds
+    /// `CAP_NET_ADMIN`, read from the engine rather than a launch outrig had
+    /// no part in. Always `Ok(false)` for an owned container: its launch is
+    /// known exactly through [`holds_net_admin`](Self::holds_net_admin), so
+    /// nothing here is worth an extra round trip.
+    ///
+    /// `podman inspect --format {{.EffectiveCaps}}` is what it asks: unlike
+    /// the launch-derived flag, it is exact for a borrowed container
+    /// whichever way its capabilities arrived -- an explicit `--cap-add`,
+    /// `--privileged`, or a `containers.conf` `default_capabilities` entry
+    /// outrig never saw. See
+    /// [`NetworkInterceptor::attach`](crate::network::NetworkInterceptor::attach),
+    /// the only caller: a borrowed container used to bypass the #363 refusal
+    /// entirely, because `Container::attach` records no launch and so no
+    /// `LaunchFacts` to read it from (#549).
+    pub(crate) async fn attached_holds_net_admin(&self) -> Result<bool> {
+        if self.ownership != ContainerOwnership::Attached {
+            return Ok(false);
+        }
+        let caps = self.inspect_format("{{.EffectiveCaps}}").await?;
+        Ok(effective_caps_grant_net_admin(&caps))
+    }
+
+    /// The image this container was asked for.
+    ///
+    /// Not necessarily the one it is *running*: a tag is a pointer, and a pull
+    /// can move it to another image while this container goes on running the
+    /// one it started from. So this is the tag for reporting -- a banner, a
+    /// session record, an error naming what the caller asked for -- while a
+    /// read of what the running image declares goes through the engine's id
+    /// for it, as
+    /// [`embedded::read_embedded_mcp_of`] does.
     pub fn image_tag(&self) -> &ImageTag {
         &self.image_tag
+    }
+
+    /// The engine's id for the image this container is actually running, from
+    /// `podman inspect --format {{.Image}}`.
+    ///
+    /// The answer is cached after the first success, and cannot go stale: a
+    /// container's image is fixed when it is created, whatever happens to the
+    /// tag afterwards.
+    ///
+    /// An inspect that does not report an id -- the container is gone, or the
+    /// engine printed something that is not one -- is an error rather than a
+    /// fallback to [`image_tag`](Self::image_tag). The tag is the thing being
+    /// avoided here, so falling back to it would quietly answer about a
+    /// different image than the one that was asked about.
+    pub(crate) async fn image_id(&self) -> Result<ImageId> {
+        if let Some(known) = self.image_id.get() {
+            return Ok(known.clone());
+        }
+        let id = self.inspect_image_id().await?;
+        Ok(self.image_id.get_or_init(|| async { id }).await.clone())
+    }
+
+    async fn inspect_image_id(&self) -> Result<ImageId> {
+        let printed = self.inspect_format("{{.Image}}").await?;
+        image_id(&printed).ok_or_else(|| {
+            OutrigError::Configuration(format!(
+                "podman inspect {} did not report an image id for the running container; it \
+                 printed {printed:?}, and the tag {} it was started from may since have been \
+                 moved to another image",
+                self.name, self.image_tag,
+            ))
+        })
+    }
+
+    /// The OCI labels of the image this container is running, read by
+    /// [`image_id`](Self::image_id) so a pull that moved the tag cannot change
+    /// the answer.
+    pub(crate) async fn image_labels(&self) -> Result<BTreeMap<String, String>> {
+        let id = self.image_id().await?;
+        crate::image::read_image_labels_by_id(&id, self.transcript.as_ref()).await
     }
 
     pub fn host_workspace(&self) -> &Path {
@@ -1048,9 +1229,12 @@ impl Container {
     /// The in-container home directory of the bootstrapped user, or `None`
     /// before [`Container::bootstrap_user`] has run. The same path
     /// `Container::build_exec_argv` gives every exec-stdio server as `HOME`,
-    /// so a sidecar that takes it from here cannot disagree with them.
+    /// so a sidecar that takes it from here cannot disagree with them. It is
+    /// `/home/<user>`, except for uid 0, whose home is the one the image's
+    /// own `root` entry names -- `/root` in nearly every image -- when that
+    /// will do; see [`Container::bootstrap_user`].
     pub fn home_dir(&self) -> Option<String> {
-        self.user_name.as_deref().map(userdb::home_dir)
+        self.home.clone()
     }
 
     pub fn group_name(&self) -> Option<&str> {
@@ -1070,6 +1254,31 @@ impl Container {
     /// [`Container::home_dir`], though -- podman's names the container's
     /// working directory, which for a primary is the user's checkout -- except
     /// in a container from [`Container::attach`], whose file is left alone.
+    ///
+    /// That home is `/home/<user>`, except at uid 0, where it is the one the
+    /// image's `root` entry names -- `/root` in nearly every image, and where
+    /// the image put what root uses -- and the entry is left as it is. Root's
+    /// home is `/root` instead when the image has no entry for root, when the
+    /// entry's is not a plain absolute path below `/` (empty, relative, `/`
+    /// itself, a `.`, `..` or empty part, not UTF-8), or when it is the
+    /// workspace or inside it, however the workspace's path is spelled; the
+    /// entry is then written or pointed at `/root`. A workspace at `/root`
+    /// leaves `/home/<user>`.
+    ///
+    /// The entry has to be the image's, though. `--userns=keep-id` plants none
+    /// for a root caller, but for an image with no account at uid 0 the
+    /// `--user` it implies does, naming the container's working directory (the
+    /// checkout for a primary, the image's `WORKDIR` otherwise), which is no
+    /// home to make and `chown`. Podman appends it to the container's own file,
+    /// so `podman diff` lists `/etc/passwd` as changed, and an entry in a file
+    /// that changed is taken for podman's: root's home is `/root`, as when the
+    /// image has no entry. That is asked before this opens the file, which
+    /// copies it into the layer whether or not anything is written, and a diff
+    /// that cannot be had counts as a change. So a container this crate
+    /// bootstrapped before -- one borrowed with `outrig mcp --attach` --
+    /// already reads as changed, and gets `/root` even when the image's own
+    /// root home is elsewhere. A home that already belongs to the user is not
+    /// `chown`ed, so one that is a read-only mount does not fail the bootstrap.
     ///
     /// Records the resolved names on the struct for
     /// [`Container::exec_stdio`] to reference. Must be called once, after
@@ -1093,15 +1302,18 @@ impl Container {
         );
 
         let pid = self.pid().await?;
+        // Asked before the databases are opened: `passwd_changed` says why. Only
+        // root's home comes from the entry, so only there can it be podman's.
+        let planted = self.uid == 0 && self.passwd_changed().await;
         let db = namespace::open_user_db(pid)
             .map_err(|e| self.bootstrap_failed(e.step.label_for(pid), e.source))?;
 
         let group_name = self.resolve_or_append(&db, namespace::Db::Group, &host_group)?;
         let user_name = self.resolve_or_append(&db, namespace::Db::Passwd, &host_user)?;
 
-        // On the reuse path the name, and so the home directory, is whatever
-        // the image put at the host uid -- so it has to be checked before it
-        // becomes a path, and the path goes in the error after that.
+        // On the reuse path the name, and so (root aside) the home directory,
+        // is whatever the image put at the host uid -- so it has to be checked
+        // before it becomes a path, and the path goes in the error after that.
         if !userdb::is_path_component(&user_name) {
             return Err(self.bootstrap_failed(
                 format!(
@@ -1114,11 +1326,23 @@ impl Container {
                 ),
             ));
         }
-        let home = userdb::home_dir(&user_name);
+        let passwd = namespace::Db::Passwd;
+        let raw = db
+            .read_raw(passwd)
+            .map_err(|e| self.bootstrap_failed(format!("read {}", passwd.path()), e))?;
+        // An entry podman planted is no home of the image's: read the file as if
+        // the image had none for root.
+        let image_passwd: &[u8] = if planted { &[] } else { &raw };
+        let home = userdb::home_dir(
+            image_passwd,
+            self.uid,
+            &user_name,
+            &self.container_workspace,
+        );
         namespace::create_home(pid, Path::new(&home), self.uid, self.gid).map_err(|e| {
             self.bootstrap_failed(format!("{} ({home})", e.step.label_for(pid)), e.source)
         })?;
-        self.reconcile_home(&db, &home).await?;
+        self.reconcile_home(&db, &raw, &home).await?;
 
         self.log_bootstrap(&format!(
             "user {user_name} and group {group_name} ready in {}, written from the host",
@@ -1127,8 +1351,24 @@ impl Container {
         .await;
 
         self.user_name = Some(user_name);
+        self.home = Some(home);
         self.group_name = Some(group_name);
         Ok(())
+    }
+
+    /// Whether `podman diff` lists `/etc/passwd` among the container's changes, or
+    /// cannot say. Podman appends the entry it plants to the container's own copy
+    /// of the file, so a file it does not list holds the image's entries alone.
+    /// Ask before anything has opened the file read-write: that copies it up into
+    /// the container's layer, and the diff lists the copy as changed.
+    async fn passwd_changed(&self) -> bool {
+        let diff = Cmd::new("podman")
+            .args(["diff", "--format", "json"])
+            .arg(self.selector());
+        let output =
+            process::run_capture_logged(self.engine_call(diff), "podman", self.transcript.as_ref())
+                .await;
+        output.map_or(true, |output| diff_lists_passwd(&output.stdout))
     }
 
     /// The name at the host's uid (or gid) in one of the container's
@@ -1160,7 +1400,7 @@ impl Container {
         let line = match which {
             namespace::Db::Group => userdb::group_line(&name, id),
             namespace::Db::Passwd => {
-                userdb::passwd_line(&name, id, self.gid, &userdb::home_dir(&name))
+                userdb::passwd_line(&name, id, self.gid, &self.container_workspace)
             }
         };
         db.append(which, &userdb::append_blob(&text, &line))
@@ -1170,9 +1410,10 @@ impl Container {
 
     /// Point the passwd entry at the host uid to `home` if it names another,
     /// so `getpwuid` agrees with the `HOME` every exec gets. Only a reused
-    /// entry can disagree; one this bootstrap appended already names `home`.
-    /// Runs after [`namespace::create_home`], so a home that step refuses
-    /// leaves the file as it was.
+    /// entry can disagree, and root's only when its own home was not kept; one
+    /// this bootstrap appended already names `home`. `raw` is the file `home`
+    /// was settled from. Runs after [`namespace::create_home`], so a home that
+    /// step refuses leaves the file as it was.
     ///
     /// Only in a container this handle started. The rewrite is safe only while
     /// nothing else can be using the file, and a failed one is cleaned up only
@@ -1180,12 +1421,9 @@ impl Container {
     /// --attach`) is already running someone else's processes, and outlives
     /// this handle, so its entry is left as it is. One outrig started was
     /// reconciled by its own bootstrap anyway.
-    async fn reconcile_home(&self, db: &namespace::UserDb, home: &str) -> Result<()> {
+    async fn reconcile_home(&self, db: &namespace::UserDb, raw: &[u8], home: &str) -> Result<()> {
         let passwd = namespace::Db::Passwd;
-        let raw = db
-            .read_raw(passwd)
-            .map_err(|e| self.bootstrap_failed(format!("read {}", passwd.path()), e))?;
-        let Some(rehome) = userdb::rehome(&raw, self.uid, home) else {
+        let Some(rehome) = userdb::rehome(raw, self.uid, home) else {
             return Ok(());
         };
         if self.ownership == ContainerOwnership::Attached {
@@ -1241,8 +1479,8 @@ impl Container {
     /// the user/group don't exist inside the container, so a `--user`-scoped
     /// exec would fail at the podman layer with a less useful message.
     pub(crate) fn build_exec_argv(&self, cmd: &[String], options: &ExecOptions) -> Cmd {
-        let user_name = self
-            .user_name
+        let home = self
+            .home
             .as_deref()
             .expect("bootstrap_user must be called before build_exec_argv");
 
@@ -1250,7 +1488,7 @@ impl Container {
             .args(["exec", "-i"])
             .arg(format!("--user={}:{}", self.uid, self.gid))
             .arg("--env")
-            .arg(format!("HOME={}", userdb::home_dir(user_name)));
+            .arg(format!("HOME={home}"));
         c = engine_env::push_resolved(c, "--env", &options.env);
         if let Some(workdir) = &options.workdir {
             c = c.arg("--workdir").arg(workdir);
@@ -1821,15 +2059,58 @@ fn reject_reserved_labels(labels: &BTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-/// The one name a `cap-add` or `cap-drop` entry stands for -- upper-cased, as
-/// podman reads it, with the `CAP_` prefix off -- or `None` if it is not a
-/// single name.
+/// Reject a bind-mount path carrying podman's `-v` field separator.
 ///
-/// Flag lowering and [`ContainerCapabilities::grants_net_admin`] both go
-/// through this, so podman is handed the name the classifier compares and the
-/// two cannot read one entry differently.
-fn canonical_capability_name(entry: &str) -> Option<String> {
-    normalize_capability_name(&entry.to_ascii_uppercase())
+/// [`append_bind_mount`] renders each mount as one colon-joined
+/// `<host>:<container>:<options>` value, so a `:` in either path makes a
+/// fourth field that podman refuses -- at `podman run`, after the image is
+/// acquired, naming neither the mount nor where it came from. Config
+/// validation already refuses one (`MountRuleViolation::HostFieldSeparator` /
+/// `ContainerFieldSeparator`); this holds a hand-built [`ContainerLaunchSpec`]
+/// to the same rule, as [`reject_malformed_capabilities`] does for a
+/// capability entry, so that the rendering below can stay a `format!`.
+///
+/// Not an injection: podman reads options only from the third field, which a
+/// path cannot reach without pushing the real options past where podman stops
+/// reading. This is about naming the malformed mount before podman sees it.
+///
+/// A `view = "primary"` sidecar's helper bind is checked too. Its container
+/// side is outrig's own [`PRIMARY_VIEW_HELPER_MOUNT`] and its nsfs bind is
+/// `/proc/<pid>/ns`, but the helper's *host* side is materialized into the
+/// session directory, which `--session-dir` or a configured `session-root`
+/// can put anywhere -- including under a name with a `:` in it. Left
+/// unchecked, that bind reached podman with four fields and failed the
+/// sidecar after the primary was up and bootstrapped.
+fn reject_bind_mount_separators(launch: &ContainerLaunchSpec) -> Result<()> {
+    let workspace = launch
+        .workspace
+        .as_ref()
+        .map(|ws| ("workspace", ws.host.as_path(), ws.container.as_path()));
+    let mounts = launch
+        .mounts
+        .iter()
+        .map(|mount| ("mount", mount.host.as_path(), mount.container.as_path()));
+    let helper = launch.primary_view.as_ref().map(|pv| {
+        (
+            "primary-view helper",
+            pv.helper_host.as_path(),
+            // The container side is a constant; paired here so the one loop
+            // below reads both halves of every bind this spec renders.
+            Path::new(PRIMARY_VIEW_HELPER_MOUNT),
+        )
+    });
+    for (what, host, container) in workspace.into_iter().chain(mounts).chain(helper) {
+        for (field, path) in [("host", host), ("container", container)] {
+            if path.as_os_str().as_encoded_bytes().contains(&b':') {
+                return Err(OutrigError::Configuration(format!(
+                    "{what} {field} path {path:?} must not contain `:`: podman reads a `-v` \
+                     value as `<host>:<container>[:<options>]`, so a path carrying one \
+                     becomes a fourth field the engine refuses at launch"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reject a `cap-add` or `cap-drop` entry that is not one capability name.
@@ -1905,8 +2186,40 @@ fn build_podman_run_cmd(
     selinux: bool,
     attempt_label: &str,
 ) -> Cmd {
+    build_idle_cmd(false, image, name, launch, selinux, attempt_label)
+}
+
+/// The argv of [`build_podman_run_cmd`] as a `podman create`, for
+/// [`Container::start_named_held`], with the interceptor's resolver baked in.
+fn build_podman_held_cmd(
+    image: &ImageTag,
+    name: &str,
+    launch: &ContainerLaunchSpec,
+    selinux: bool,
+    attempt_label: &str,
+) -> Cmd {
+    build_idle_cmd(true, image, name, launch, selinux, attempt_label)
+}
+
+/// What the two builders above share: a container whose command is `sleep
+/// infinity`. `held` makes it a `podman create` that [`Container::release`]
+/// starts later, and with that the resolver is baked in: nothing can install
+/// it in a container that has not started.
+fn build_idle_cmd(
+    held: bool,
+    image: &ImageTag,
+    name: &str,
+    launch: &ContainerLaunchSpec,
+    selinux: bool,
+    attempt_label: &str,
+) -> Cmd {
+    let verb: &[&str] = if held {
+        &["create", "--rm"]
+    } else {
+        &["run", "-d", "--rm"]
+    };
     let cmd = Cmd::new("podman")
-        .args(["run", "-d", "--rm"])
+        .args(verb)
         // PID 1 is `sleep infinity`, which installs no SIGTERM handler, so the
         // kernel discards the default stop signal and every stop would wait
         // out its whole grace (and `rm -f` podman's 10 s) before the SIGKILL
@@ -1914,13 +2227,22 @@ fn build_podman_run_cmd(
         .arg("--stop-signal=SIGKILL")
         .args(["--name"])
         .arg(name);
+    let mut cmd = append_launch_flags(cmd, launch, selinux);
+    if held {
+        cmd = append_intercept_dns(cmd);
+    }
     // After the caller's labels, so podman's last-wins parsing cannot let one
     // of theirs displace the value cleanup removes by.
-    append_launch_flags(cmd, launch, selinux)
-        .arg("--label")
+    cmd.arg("--label")
         .arg(attempt_label)
         .arg(image.as_str())
         .args(["sleep", "infinity"])
+}
+
+/// Point the container's resolver at the interceptor, at create time.
+fn append_intercept_dns(cmd: Cmd) -> Cmd {
+    cmd.args(["--dns", crate::network::INTERCEPT_DNS_NAMESERVER])
+        .args(["--dns-option", crate::network::INTERCEPT_DNS_OPTION])
 }
 
 /// `podman create` argv for an entrypoint-stdio container: the image's
@@ -1952,9 +2274,7 @@ fn build_podman_create_cmd(
     cmd = append_launch_flags(cmd, &options.launch, selinux);
 
     if options.intercept_dns {
-        cmd = cmd
-            .args(["--dns", crate::network::INTERCEPT_DNS_NAMESERVER])
-            .args(["--dns-option", crate::network::INTERCEPT_DNS_OPTION]);
+        cmd = append_intercept_dns(cmd);
     }
     // `HOME` first, so a configured `env` entry of the same name wins: podman
     // takes the last `--env` for a key. A `view = "primary"` payload is the
@@ -2046,10 +2366,12 @@ fn append_launch_flags(mut cmd: Cmd, launch: &ContainerLaunchSpec, selinux: bool
     }
 
     cmd = append_capability_flags(cmd, &launch.capabilities);
-    // `open_tree`/`setns(CLONE_NEWNS)` need CAP_SYS_ADMIN; opening the target's
-    // nsfs file needs CAP_SYS_PTRACE. Scoped to the rootless user namespace.
+    // The launcher's join needs `PRIMARY_VIEW_ADDED_CAPS`, scoped to the
+    // rootless user namespace.
     if launch.primary_view.is_some() {
-        cmd = cmd.arg("--cap-add=SYS_ADMIN").arg("--cap-add=SYS_PTRACE");
+        for capability in PRIMARY_VIEW_ADDED_CAPS {
+            cmd = cmd.arg(format!("--cap-add={capability}"));
+        }
     }
     for device in &launch.devices {
         cmd = cmd.arg(format!("--device={device}"));
@@ -2108,6 +2430,11 @@ fn append_capability_flags(mut cmd: Cmd, capabilities: &ContainerCapabilities) -
     cmd
 }
 
+/// One `-v <host>:<container>:<options>`. Neither path may contain a `:` --
+/// [`reject_bind_mount_separators`] refuses a spec whose does, before anything
+/// is started -- so the colons here are the engine's field separators and
+/// nothing else.
+///
 /// `relabel` is podman's SELinux option, `Z` or `z`, or `None` off SELinux.
 fn append_bind_mount(
     cmd: Cmd,
@@ -2334,9 +2661,11 @@ fn discharge(attempt: &str) {
 }
 
 /// A session id in the shape `outrig run` mints: a UTC timestamp,
-/// `yyyymmddTHHMMSS`, then four hex digits of randomness. [`Container::start`]
+/// `yyyymmddTHHMMSS`, then eight hex digits of randomness. [`Container::start`]
 /// names its container by one, and `Outrig::launch` mints one when its
-/// `LaunchSpec` names no session.
+/// `LaunchSpec` names no session. Eight, as `outrig run`'s are since #382:
+/// sessions under different roots share podman's container names, so the
+/// width is what keeps two launches in the same second from colliding.
 pub(crate) fn mint_session_id() -> String {
     use jiff::Zoned;
     use rand::Rng;
@@ -2344,9 +2673,21 @@ pub(crate) fn mint_session_id() -> String {
     let ts = Zoned::now()
         .with_time_zone(jiff::tz::TimeZone::UTC)
         .strftime("%Y%m%dT%H%M%S");
-    let mut buf = [0_u8; 2];
-    rand::rng().fill_bytes(&mut buf);
-    format!("{ts}-{:02x}{:02x}", buf[0], buf[1])
+    format!("{ts}-{:08x}", rand::rng().next_u32())
+}
+
+/// Whether `caps`, the trimmed output of `podman inspect --format
+/// {{.EffectiveCaps}}`, lists `CAP_NET_ADMIN`.
+///
+/// Podman prints a `[]string` as a Go template renders one: bracketed and
+/// space-separated, e.g. `[CAP_CHOWN CAP_NET_ADMIN CAP_SYS_CHROOT]`. Tokenized
+/// on anything that is not part of a capability name rather than matched as a
+/// substring, so a name this never sees cannot coincide with one that
+/// contains `NET_ADMIN` as a piece of something longer -- there is none today,
+/// but the parse does not depend on that staying true.
+fn effective_caps_grant_net_admin(caps: &str) -> bool {
+    caps.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|token| token == "CAP_NET_ADMIN")
 }
 
 fn parse_container_inspect(name: &str, stdout: &[u8]) -> Result<ContainerInspect> {
@@ -2411,6 +2752,17 @@ async fn selinux_enforcing() -> bool {
     }
 }
 
+/// Whether `diff`, the output of `podman diff --format json`, lists
+/// `/etc/passwd` as added or changed. That is an object -- `{}` when nothing
+/// changed, else a list of paths under each kind that has any -- so anything
+/// that is not one is no answer, and counts as listing it: nothing then shows
+/// the file unchanged. The path is looked for as a quoted string, which is how it
+/// appears whatever the kinds are called.
+fn diff_lists_passwd(diff: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(diff);
+    !text.trim_start().starts_with('{') || text.contains("\"/etc/passwd\"")
+}
+
 /// The parent PID in the bytes of a `/proc/<pid>/stat`. `comm`, the second
 /// field, is the kernel's raw task name -- free bytes that may hold spaces,
 /// `)`, or a multibyte character cut mid-sequence by the 15-byte limit -- so
@@ -2450,6 +2802,21 @@ mod tests {
         stat.extend_from_slice(b") S 7 1 1 0");
         assert!(std::str::from_utf8(&stat).is_err());
         assert_eq!(parent_pid_from_stat(&stat), Some(7));
+    }
+
+    /// The release, like the stop, names the container the engine made: a
+    /// `podman start <name>` could start whatever has taken the name since.
+    #[test]
+    fn a_release_names_the_container_and_not_a_name_something_else_can_have() {
+        let id = "2f8b1c0d".repeat(8);
+        let mut container = Container::unstoppable();
+        container.name = "outrig-a-name-that-can-come-round-again".to_string();
+        container.id = engine_id(id.as_bytes());
+
+        assert_eq!(
+            container.release_cmd().render(),
+            format!("podman start {id}")
+        );
     }
 
     /// The stop names the container the engine made, not the name it was
@@ -2492,6 +2859,7 @@ mod tests {
         owned.name = "outrig-a-name-that-can-come-round-again".to_string();
         owned.id = engine_id(id.as_bytes());
         owned.user_name = Some("tester".to_string());
+        owned.home = Some("/home/tester".to_string());
 
         assert_eq!(owned.selector(), id);
         for argv in [
@@ -2508,6 +2876,7 @@ mod tests {
 
         let mut borrowed = Container::stops_cleanly();
         borrowed.user_name = Some("tester".to_string());
+        borrowed.home = Some("/home/tester".to_string());
         assert_eq!(borrowed.selector(), "outrig-test-borrowed");
         for argv in [
             borrowed.build_exec_argv(&["true".to_string()], &ExecOptions::default()),
@@ -2561,6 +2930,90 @@ mod tests {
         }
         // Not text at all.
         assert_eq!(engine_id(&[0xff, 0xfe]), None);
+    }
+
+    /// The issue #370 shape, at the read that answers it: what a container is
+    /// running is asked of the engine, not taken from the tag the handle
+    /// carries. A borrowed container's tag was read out of an inspect at
+    /// attach time and names whatever the last pull put there, so merging the
+    /// servers *it* declares merges another image's.
+    #[tokio::test]
+    async fn the_running_image_is_asked_of_the_engine_not_taken_from_the_tag() {
+        let _emitting = crate::process::process_tests::emitting().await;
+        let digest = "7f1e9b2d5c4a3e8f0d1c2b3a49586770819243a5b6c7d8e9f0a1b2c3d4e5f607";
+        let mut container = Container::stops_cleanly();
+        container.image_tag = ImageTag::new("registry.example/x:latest");
+        // `inspect_format` asks for the container's own id first and splits
+        // it off, so the stand-in answers in that shape.
+        container.engine_override = vec![(
+            "inspect",
+            Cmd::new("/bin/echo").arg(format!("the-container {digest}")),
+        )];
+
+        let id = container.image_id().await.expect("the engine answered");
+
+        assert_eq!(id.as_str(), digest);
+        assert_ne!(
+            id.as_str(),
+            container.image_tag().as_str(),
+            "the tag is what a pull moves; the id is what the container runs"
+        );
+    }
+
+    /// The answer is cached, like the PID and for the same reason: a
+    /// container's image is fixed when it is created, so a second read cannot
+    /// disagree with the first -- and startup takes several.
+    #[tokio::test]
+    async fn the_running_image_is_asked_for_once() {
+        let _emitting = crate::process::process_tests::emitting().await;
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let counter = tempfile::NamedTempFile::new().expect("counter file");
+        let path = counter.path().to_string_lossy().into_owned();
+        let mut container = Container::stops_cleanly();
+        // Appends a line per run and prints the id, so the file length counts
+        // the inspects this handle actually issued.
+        container.engine_override = vec![(
+            "inspect",
+            Cmd::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("echo ran >> {path}; echo the-container {digest}")),
+        )];
+
+        let first = container.image_id().await.expect("first read");
+        let second = container.image_id().await.expect("second read");
+
+        assert_eq!(first, second);
+        let runs = std::fs::read_to_string(counter.path()).expect("read counter");
+        assert_eq!(runs.lines().count(), 1, "the engine was asked twice");
+    }
+
+    /// An inspect that answers with something that is not an id fails the
+    /// read. The tempting fallback -- "use the tag, it is right nearly
+    /// always" -- would silently answer about whatever the tag names now,
+    /// which is exactly the case this read exists to tell apart.
+    #[tokio::test]
+    async fn an_inspect_that_names_no_image_does_not_fall_back_to_the_tag() {
+        let _emitting = crate::process::process_tests::emitting().await;
+        let mut container = Container::stops_cleanly();
+        container.image_tag = ImageTag::new("registry.example/x:latest");
+        // A container that is gone: podman prints nothing for it, so the
+        // field where the image id belongs is empty.
+        container.engine_override = vec![("inspect", Cmd::new("/bin/echo").arg("the-container "))];
+
+        let err = container
+            .image_id()
+            .await
+            .expect_err("no id means no answer");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("registry.example/x:latest"),
+            "the message should name the tag the caller knows: {message}"
+        );
+        assert!(
+            message.contains("did not report an image id"),
+            "and say what was missing: {message}"
+        );
     }
 
     /// A stop whose client never returns is given up on, and the container
@@ -3144,6 +3597,62 @@ mod tests {
                 "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
+                "--label",
+                "org.outrig.attempt=testtoken",
+                "local:test",
+                "sleep",
+                "infinity",
+            ]
+        );
+    }
+
+    /// A held primary is the run argv as a `podman create`, and nothing else
+    /// but the resolver: the same stop signal (so a stop is not spent waiting
+    /// out `sleep`'s ignored SIGTERM), the same flags in the same order, the
+    /// same command, and no `--interactive` or log driver, which would change
+    /// what the image's process is handed. The resolver sits before the
+    /// attempt label, where `build_podman_create_cmd` puts it.
+    #[test]
+    fn podman_held_args_are_the_run_args_as_a_create_with_the_resolver() {
+        let launch = ContainerLaunchSpec {
+            workspace: Some(ContainerWorkspace {
+                host: "/host/repo".into(),
+                container: "/workspace".into(),
+                access: MountAccess::ReadWrite,
+            }),
+            ..Default::default()
+        };
+
+        let args = argv(build_podman_held_cmd(
+            &ImageTag::new("local:test"),
+            "outrig-test",
+            &launch,
+            false,
+            "org.outrig.attempt=testtoken",
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "create",
+                "--rm",
+                "--stop-signal=SIGKILL",
+                "--name",
+                "outrig-test",
+                "-v",
+                "/host/repo:/workspace:rw",
+                "--userns=keep-id",
+                "-w",
+                "/workspace",
+                "--security-opt=no-new-privileges",
+                "--http-proxy=false",
+                "--image-volume=ignore",
+                "--pull=never",
+                "--dns",
+                "127.0.0.1",
+                "--dns-option",
+                "ndots:0",
                 "--label",
                 "org.outrig.attempt=testtoken",
                 "local:test",
@@ -3750,6 +4259,89 @@ mod tests {
         assert!(!caps(default, &["NET_ADMIN"], &[]).grants_net_admin());
     }
 
+    /// What podman's Go template prints for a `[]string`, bracketed and
+    /// space-separated, is what `effective_caps_grant_net_admin` tokenizes --
+    /// not a substring search, so a name it has never seen cannot false-match
+    /// by containing `NET_ADMIN` as a piece of something longer (#549).
+    #[test]
+    fn effective_caps_grant_net_admin_reads_podmans_bracketed_list() {
+        assert!(effective_caps_grant_net_admin(
+            "[CAP_CHOWN CAP_NET_ADMIN CAP_SYS_CHROOT]"
+        ));
+        assert!(effective_caps_grant_net_admin("[CAP_NET_ADMIN]"));
+        assert!(!effective_caps_grant_net_admin(
+            "[CAP_CHOWN CAP_SYS_CHROOT]"
+        ));
+        assert!(!effective_caps_grant_net_admin("[]"));
+        assert!(!effective_caps_grant_net_admin(""));
+        // Not a substring match: a name that merely contains the text is not
+        // the capability itself.
+        assert!(!effective_caps_grant_net_admin(
+            "[CAP_NET_ADMIN_SOMETHING_ELSE]"
+        ));
+    }
+
+    /// An owned container answers from the launch-derived flag alone: no
+    /// engine call, which this proves by giving the container no
+    /// `engine_override` and a `podman` that does not exist on this host's
+    /// `PATH` in CI -- a stray inspect would fail the test rather than
+    /// silently pass.
+    #[tokio::test]
+    async fn an_owned_container_reads_net_admin_from_its_launch_with_no_engine_call() {
+        let container = Container::unstoppable();
+        assert!(!container.holds_net_admin());
+
+        let holds = container
+            .attached_holds_net_admin()
+            .await
+            .expect("no engine call means nothing to fail");
+
+        assert!(!holds, "an owned container's launch said no NET_ADMIN");
+    }
+
+    /// A borrowed container with no launch of its own is asked directly:
+    /// `podman inspect --format {{.EffectiveCaps}}`, and a `CAP_NET_ADMIN` in
+    /// the answer is what `NetworkInterceptor::attach` refuses on (#549).
+    #[tokio::test]
+    async fn a_borrowed_container_asks_the_engine_for_its_effective_capabilities() {
+        let _emitting = crate::process::process_tests::emitting().await;
+        let mut container = Container::stops_cleanly();
+        // `inspect_format` prefixes the id podman would answer with; a
+        // borrowed handle has none of its own to check it against, so
+        // whatever comes first is discarded and the rest is read.
+        container.engine_override = vec![(
+            "inspect",
+            Cmd::new("/bin/echo").arg("the-container [CAP_CHOWN CAP_NET_ADMIN]"),
+        )];
+
+        let holds = container
+            .attached_holds_net_admin()
+            .await
+            .expect("the stand-in engine answered");
+
+        assert!(holds, "CAP_NET_ADMIN was in the engine's answer");
+    }
+
+    /// The same borrowed container, asked when the engine reports no
+    /// `CAP_NET_ADMIN`: attaches, as a borrowed container with nothing
+    /// outrig need refuse always could before #549.
+    #[tokio::test]
+    async fn a_borrowed_container_without_net_admin_is_not_flagged() {
+        let _emitting = crate::process::process_tests::emitting().await;
+        let mut container = Container::stops_cleanly();
+        container.engine_override = vec![(
+            "inspect",
+            Cmd::new("/bin/echo").arg("the-container [CAP_CHOWN CAP_SYS_CHROOT]"),
+        )];
+
+        let holds = container
+            .attached_holds_net_admin()
+            .await
+            .expect("the stand-in engine answered");
+
+        assert!(!holds);
+    }
+
     /// Podman reads a capability flag value as CSV -- measured against 5.7,
     /// `--cap-add=SYS_ADMIN,NET_ADMIN` grants `NET_ADMIN`, as does a quoted
     /// `--cap-add='"NET_ADMIN"'`, and a quoted drop takes it off `ALL` -- so
@@ -3809,6 +4401,78 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{entry:?} is one name: {e}"));
         }
         reject_malformed_capabilities(&ContainerCapabilities::default()).unwrap();
+    }
+
+    /// A `:` in either half of a bind mount renders as a four-field `-v`
+    /// value, which podman refuses at launch, after the image is acquired and
+    /// naming neither the mount nor where it came from (#365). Config
+    /// validation refuses one; a hand-built spec is held to the same rule, so
+    /// `append_bind_mount` can keep rendering with `format!`.
+    #[test]
+    fn a_bind_mount_path_with_a_colon_is_refused() {
+        let workspace = |host: &str, container: &str| ContainerLaunchSpec {
+            workspace: Some(ContainerWorkspace::new(
+                host,
+                container,
+                MountAccess::ReadWrite,
+            )),
+            ..Default::default()
+        };
+        let extra = |host: &str, container: &str| ContainerLaunchSpec {
+            mounts: vec![ContainerMount::new(host, container, MountAccess::ReadOnly)],
+            ..Default::default()
+        };
+
+        for (what, field, launch) in [
+            ("workspace", "host", workspace("/host/a:b", "/workspace")),
+            ("workspace", "container", workspace("/host", "/work:space")),
+            ("mount", "host", extra("/host/a:b", "/data")),
+            ("mount", "container", extra("/host", "/data:extra")),
+            // The options podman acts on live in the third field only, so
+            // this cannot smuggle one in -- it is still a malformed value,
+            // and still refused.
+            ("mount", "container", extra("/host", "/data:rw,Z")),
+        ] {
+            let error = reject_bind_mount_separators(&launch)
+                .expect_err(&format!("{what} {field} path with a colon is refused"));
+            let OutrigError::Configuration(message) = error else {
+                panic!("{what} {field}: expected Configuration, got {error:?}");
+            };
+            assert!(
+                message.contains(what) && message.contains(field),
+                "names what and which half: {message}"
+            );
+        }
+
+        // The helper's host side is materialized into the session directory,
+        // which `--session-dir` can put under a name with a `:` in it. Left
+        // unchecked, this bind failed the sidecar after the primary was up.
+        let primary_view = |helper_host: &str| ContainerLaunchSpec {
+            primary_view: Some(PrimaryView::new(
+                "outrig-primary",
+                42,
+                helper_host,
+                "/home/agent",
+            )),
+            ..Default::default()
+        };
+        let error = reject_bind_mount_separators(&primary_view("/sessions/a:b/outrig-enter"))
+            .expect_err("the helper bind carries the colon");
+        let OutrigError::Configuration(message) = error else {
+            panic!("expected Configuration, got {error:?}");
+        };
+        assert!(
+            message.contains("primary-view helper") && message.contains("host"),
+            "names the bind: {message}"
+        );
+        reject_bind_mount_separators(&primary_view("/sessions/clean/outrig-enter"))
+            .expect("a clean session directory is fine");
+
+        reject_bind_mount_separators(&ContainerLaunchSpec::workspace("/host", "/workspace"))
+            .expect("no colon, nothing to refuse");
+        reject_bind_mount_separators(&extra("/host/a-b.c_d", "/data"))
+            .expect("other punctuation is not the separator");
+        reject_bind_mount_separators(&ContainerLaunchSpec::default()).unwrap();
     }
 
     /// The classifier and the flags are two readings of the same entry, so
@@ -4262,10 +4926,116 @@ mod tests {
         let mut container =
             Container::attach("outrig-test-exec", ImageTag::new("local:test"), None, None);
         container.user_name = Some("dev".to_string());
+        container.home = Some("/home/dev".to_string());
         container.group_name = Some("dev".to_string());
         container.uid = 1000;
         container.gid = 1000;
         container
+    }
+
+    /// The home is the one bootstrap resolved, so a root caller's exec gets
+    /// the image's own `/root` -- or whatever its entry names -- and not a
+    /// `/home/root` rebuilt from the name (#399).
+    #[test]
+    fn a_root_handle_execs_with_the_home_bootstrap_resolved() {
+        // The common case, which has not moved.
+        assert_eq!(
+            bootstrapped_container().home_dir().as_deref(),
+            Some("/home/dev")
+        );
+
+        for home in ["/root", "/var/lib/root"] {
+            let mut container = bootstrapped_container();
+            container.user_name = Some("root".to_string());
+            container.home = Some(home.to_string());
+            container.uid = 0;
+            container.gid = 0;
+
+            assert_eq!(container.home_dir().as_deref(), Some(home));
+            let args = argv(container.build_exec_argv(&["id".to_string()], &ExecOptions::new()));
+            let home_env = format!("HOME={home}");
+            assert_eq!(
+                args,
+                vec![
+                    "podman",
+                    "exec",
+                    "-i",
+                    "--user=0:0",
+                    "--env",
+                    home_env.as_str(),
+                    "outrig-test-exec",
+                    "id",
+                ]
+            );
+        }
+    }
+
+    /// Before bootstrap there is no home to hand a sidecar, and an exec has no
+    /// user to run as.
+    #[test]
+    #[should_panic(expected = "bootstrap_user must be called before build_exec_argv")]
+    fn an_exec_before_bootstrap_panics() {
+        let container =
+            Container::attach("outrig-test-exec", ImageTag::new("local:test"), None, None);
+        assert_eq!(container.home_dir(), None);
+        container.build_exec_argv(&["true".to_string()], &ExecOptions::new());
+    }
+
+    /// `podman diff --format json` prints an object with the paths under each
+    /// kind that has any, and `{}` for no change at all: `/etc/passwd` counts when
+    /// it is listed, and only that exact path. Anything that is not such an object
+    /// is not an answer, and shows nothing unchanged.
+    #[test]
+    fn the_diff_lists_passwd_when_it_is_added_or_changed() {
+        for (diff, listed) in [
+            ("{}", false),
+            ("\n {}\n", false),
+            (r#"{"changed":["/etc/group"],"added":["/data"]}"#, false),
+            (r#"{"changed":["/etc","/etc/group","/etc/passwd"]}"#, true),
+            (r#"{"added":["/etc/passwd"]}"#, true),
+            (r#"{"changed":null,"added":[]}"#, false),
+            (
+                r#"{"changed":["/etc/passwd-","/usr/etc/passwd","/etc/passwd/x"]}"#,
+                false,
+            ),
+            // Whatever the kinds are called.
+            (r#"{"modified":["/etc/passwd"]}"#, true),
+            // As podman 4.9.3 prints it, for an image with no account at uid 0.
+            (
+                "{\n     \"changed\": [\n          \"/etc/passwd\"\n     ],\n     \"added\": [\n          \"/data\"\n     ]\n}\n",
+                true,
+            ),
+            ("", true),
+            ("not json", true),
+            ("[]", true),
+            ("null", true),
+            (r#""/etc/passwd""#, true),
+        ] {
+            assert_eq!(diff_lists_passwd(diff.as_bytes()), listed, "{diff:?}");
+        }
+    }
+
+    /// The file counts as changed unless the diff says it did not: an engine that
+    /// fails, or prints something else, cannot vouch for its entries.
+    #[tokio::test]
+    async fn passwd_is_changed_unless_the_diff_says_it_is_not() {
+        let _emitting = crate::process::process_tests::emitting().await;
+        for (diff, changed) in [
+            (Some("{}"), false),
+            (Some(r#"{"changed":["/etc/passwd"]}"#), true),
+            (Some("not json"), true),
+            (None, true),
+        ] {
+            let mut container = Container::stops_cleanly();
+            container.engine_override = vec![(
+                "diff",
+                match diff {
+                    Some(printed) => Cmd::new("/bin/echo").arg(printed),
+                    None => Cmd::new("/bin/false"),
+                },
+            )];
+            assert_eq!(container.passwd_changed().await, changed, "{diff:?}");
+        }
     }
 
     #[test]

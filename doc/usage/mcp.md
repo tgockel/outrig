@@ -53,7 +53,8 @@ outrig mcp self
   sessions.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
   container, on top of the default workspace mount. Read-only unless `:rw` is given; the host
-  directory must exist. Rejected with `--attach`.
+  directory must exist. A relative host path resolves against the directory you ran outrig
+  from, not against the repo root. Rejected with `--attach`.
 - `--verbose` (default: off): adds buildah/podman command transcripts to stderr and
   `container.log`.
 
@@ -115,6 +116,14 @@ With `--attach`, image-config selection is different:
 
 `--network audit` and `--network filter` are rejected with `--attach`; borrowed containers are
 not retrofitted with a new interceptor.
+
+The primary's label is read off the image its container is *running*, by the
+engine's id for that image, not off whatever its tag names at the time of the read. The two
+differ once a tag moves: a pull of a re-pushed `registry/x:latest` re-points the ref while
+every container started from the old one keeps running it. This matters most with `--attach`,
+which borrows a container someone else may have started long ago -- the servers merged are the
+ones that container can actually run. A repo-local build's tag is content-addressed and cannot
+move, so nothing changes there.
 
 The selected image must expose at least one backing MCP server after image
 `org.outrig.mcp` label entries and `[images.<name>.mcp]` overrides are merged. Repo-local
@@ -179,8 +188,8 @@ Use attach mode when a container is already running and you want an external MCP
 to share its workspace, installed tools, and environment:
 
 ```sh
-outrig mcp --attach 20260504T141907-a83f
-outrig mcp --attach outrig-20260504T141907-a83f --image coding
+outrig mcp --attach 20260504T141907-a83f6eda
+outrig mcp --attach outrig-20260504T141907-a83f6eda --image coding
 ```
 
 The first form resolves an existing outrig session id. The second form borrows a
@@ -287,8 +296,49 @@ For local multi-process access without a TCP port, use a Unix socket:
 outrig mcp --listen unix:/tmp/outrig.sock --image coding
 ```
 
-Socket filesystem permissions are the access boundary. HTTP clients still use the
-Streamable HTTP protocol and the `/mcp` path over that socket.
+Socket filesystem permissions are the access boundary, so the socket is created
+`0600` -- only the user running `outrig mcp` can connect, whatever the process
+umask is. HTTP clients still use the Streamable HTTP protocol and the `/mcp` path
+over that socket.
+
+A socket file left behind by a process that is gone is removed and the path
+reused. A path another `outrig mcp` is still serving is refused instead, naming
+it: taking it over would leave that instance running and holding its container
+with nothing able to reach it. Stop it, or pick another path. A socket that
+answers neither way -- one whose server has stopped accepting, or that this user
+cannot connect to -- is also refused, since the risk of cutting off a running
+instance outweighs an error message.
+
+Point `--listen` at a directory only you can write. In a shared one without the
+sticky bit, another user can replace the socket's directory entry; outrig refuses
+the path instead of following the replacement, but it cannot stop the entry from
+being taken.
+
+#### Browser defenses
+
+Two request headers are checked before anything is dispatched, and both are about pages in
+a browser rather than about MCP clients:
+
+- `Host` guards against DNS rebinding. A loopback TCP listener accepts only `localhost`,
+  `127.0.0.1`, and `::1`, so a name that resolves to the loopback address does not reach the
+  tools under a hostname outrig does not serve. A non-loopback bind and a Unix socket are
+  reached under names outrig cannot enumerate -- whatever a reverse proxy publishes -- so
+  the check is off for them.
+- `Origin` guards against a web page driving the listener, which the MCP transport spec
+  requires a local server to do. A loopback listener accepts the origins that name itself,
+  port included (`http://localhost:7331`, `http://127.0.0.1:7331`, `http://[::1]:7331`);
+  every other origin is refused with `403`, including another local port, because a page on
+  `http://localhost:3000` is as cross-origin as one on the internet. A non-loopback bind and
+  a Unix socket recognize no origin as their own and refuse every one.
+
+A request that carries no `Origin` header is served in all cases. That is what every
+non-browser client sends -- an editor, a CLI, a script, rmcp's own HTTP transport -- so these
+rules cost an ordinary client nothing. A browser is what attaches the header, and a browser is
+what the rules are for.
+
+Neither check is authentication. They keep a page a user did not open from reaching tools that
+the user's own machine can; anything that can send a request without a browser attaching
+headers to it is still limited only by what can reach the port or the socket.
 
 ## What Happens, in Order
 
@@ -303,7 +353,10 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
    explicit `--image`, top-level `default-image` still names a config block.
 3. **Prepare the container.** Fresh mode builds, cache-hits, pulls configured
    `image-name` refs, or probes raw local refs, then starts
-   `podman run -d --rm --name outrig-<sid> ...`. Attach mode probes the existing
+   `podman run -d --rm --name outrig-<sid> ...`. With network interception on (step 5) the
+   primary is instead created and initialized with its process held, the interceptor attaches
+   to it, and only then does `podman start` run it, so an image `ENTRYPOINT` cannot reach the
+   network before policy is in place. Attach mode probes the existing
    container with `podman inspect`, verifies that it is running, and does not build,
    start, stop, or remove it.
 4. **Merge MCP config and start sidecars.** Read the primary image's `org.outrig.mcp`
@@ -319,8 +372,9 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
    with a notice. `outrig mcp` has no mid-session start surface; manual sidecars are started
    from the `outrig run` REPL (`/sidecar add <name>`) or the library API.
 5. **Start network interception, if enabled.** The interceptor attaches to the primary
-   and every sidecar -- including created-but-not-started entrypoint sidecars, whose
-   first packet is therefore already subject to policy. Fresh sessions can write
+   -- before its process runs, as step 3 describes -- and to every sidecar, including
+   created-but-not-started entrypoint sidecars, whose first packet is therefore already
+   subject to policy. Fresh sessions can write
    `<session_dir>/logs/network.jsonl` and filter mode can enforce global policy; attach mode
    cannot install a new interceptor.
 6. **Connect MCP servers.** For each merged entry, `podman exec -i` the configured
@@ -354,7 +408,7 @@ answered `tools/list`, `outrig mcp` prints one banner to stderr:
 [outrig] mcp fs:    initialized (3 tools)
 [outrig] mcp shell: initialized (1 tool)
 [outrig] tools available: fs__list_directory, fs__read_file, fs__write_file, shell__exec
-[outrig] session id: 20260504T141907-a83f
+[outrig] session id: 20260504T141907-a83f6eda
 [outrig] transport: stdio
 [outrig] mcp server ready
 ```
@@ -419,7 +473,9 @@ Sixty-four characters cannot encode every possible pair, so two tools can still 
 name. outrig widens one side's suffix rather than dropping either, and picks which side
 moves from the two tools' identities rather than from listing order. A widened name does
 depend on the rest of the session's tool set, so it is the one kind of name worth re-reading
-instead of caching when the servers in play change.
+instead of caching when the servers in play change. `outrig run` applies the same rule, so a
+tool set gets the same names on either surface. The one difference is `/sidecar add`: names the
+model has already seen cannot move, so a tool added mid-session is the one widened.
 
 See [Concepts -> MCP Servers](../concepts/mcp-servers.md#tool-name-prefixing) for the
 collision and sanitization rules.
@@ -517,10 +573,10 @@ On disk, new `outrig mcp` session JSON omits `agent_name`; older JSON with
 
 ```sh
 $ outrig ls
-ID                     STARTED              DURATION  IMAGE      EXIT
-20260504T141907-a83f   2026-05-04 14:19:07  0m44s     coding     0
+ID                         STARTED              DURATION  IMAGE      EXIT
+20260504T141907-a83f6eda   2026-05-04 14:19:07  0m44s     coding     0
 
-$ outrig logs 20260504T141907-a83f fs
+$ outrig logs 20260504T141907-a83f6eda fs
 [mcp-server-filesystem] starting; root=/workspace
 [mcp-server-filesystem] tools/list: 3 tools advertised
 ```

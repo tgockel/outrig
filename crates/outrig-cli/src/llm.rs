@@ -26,6 +26,7 @@ use rig::providers::openai::OpenAIConfig;
 use rig::tool::ToolContext;
 use thiserror::Error;
 
+use crate::notice::notice;
 use crate::error::{CliError, Result};
 use crate::session_tool::{self, SessionTool, SharedTools};
 use outrig::config::{ApiStyle, Config, DEFAULT_TOOL_CALL_MAX, LlmProvider};
@@ -941,6 +942,7 @@ fn build_candidate(
             ..
         } => {
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
+            let answered = http.answered();
             // Chat Completions, never Responses: an OpenAI-compatible proxy
             // serves `/chat/completions`, and the configured `base-url` is
             // sent as written.
@@ -949,7 +951,7 @@ fn build_candidate(
                 .connect(DynHttpClient::new(http))
                 .chat(&candidate.model_identifier);
             Ok((
-                link(candidate, policy, model, candidate.max_tokens, None),
+                link(candidate, policy, model, candidate.max_tokens, None, answered),
                 EffectiveCeiling::new(candidate, candidate.max_tokens),
             ))
         }
@@ -960,6 +962,7 @@ fn build_candidate(
             ..
         } => {
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
+            let answered = http.answered();
             // `{base-url}/responses`, the whole conversation on every call.
             let model = OpenAIConfig::new(api_key.as_str())
                 .with_base_url(base_url)
@@ -968,7 +971,7 @@ fn build_candidate(
             Ok((
                 Box::new(
                     failover::ModelCandidate::new(
-                        retry::RetryingModel::new(model, policy.clone()),
+                        retry::RetryingModel::new(model, policy.clone()).with_answered(answered),
                         &candidate.model_name,
                         &candidate.model_identifier,
                         candidate.max_tokens,
@@ -985,10 +988,9 @@ fn build_candidate(
             request_timeout_secs,
             ..
         } => {
-            let http = DynHttpClient::new(remote_http_client(
-                *request_timeout_secs,
-                policy.clone(),
-            )?);
+            let http = remote_http_client(*request_timeout_secs, policy.clone())?;
+            let answered = http.answered();
+            let http = DynHttpClient::new(http);
             // Rig's client owns the protocol: `x-api-key`, the
             // `anthropic-version` header, `POST {base-url}/v1/messages`, and the
             // native content blocks. It also normalizes a trailing `/v1` or
@@ -1009,7 +1011,7 @@ fn build_candidate(
                 candidate,
             );
             Ok((
-                link(candidate, policy, bound, Some(max_tokens), Some(unbound)),
+                link(candidate, policy, bound, Some(max_tokens), Some(unbound), answered),
                 EffectiveCeiling::new(candidate, Some(max_tokens)),
             ))
         }
@@ -1017,24 +1019,27 @@ fn build_candidate(
 }
 
 /// `model`, retried under `policy`, as `candidate`'s link of the chain: its
-/// calls carry `max_tokens`. With `unbound`, they go through it instead once
-/// the endpoint has refused a request that asked for `drop_block`. What every
-/// provider's link shares.
+/// calls carry `max_tokens`, and a body rig rejects is read from `answered`,
+/// its client's, for the finish reason (#742). With `unbound`, they go through
+/// it instead once the endpoint has refused a request that asked for
+/// `drop_block`. What every provider's link shares.
 fn link<M>(
     candidate: &ResolvedCandidate,
     policy: &retry::RetryPolicy,
     model: M,
     max_tokens: Option<u32>,
     unbound: Option<M>,
+    answered: retry::AnsweredBody,
 ) -> Box<dyn failover::Candidate>
 where
     M: Into<DynModel<Completion>>,
 {
-    let binding = unbound.map(|model| {
-        failover::Binding::new(retry::RetryingModel::new(model, policy.clone()))
-    });
+    let retried = |model: M| {
+        retry::RetryingModel::new(model, policy.clone()).with_answered(answered.clone())
+    };
+    let binding = unbound.map(|model| failover::Binding::new(retried(model)));
     Box::new(failover::ModelCandidate::new(
-        retry::RetryingModel::new(model, policy.clone()),
+        retried(model),
         &candidate.model_name,
         &candidate.model_identifier,
         max_tokens,
@@ -1127,7 +1132,7 @@ fn warn_fallback_ceiling(candidate: &ResolvedCandidate) {
     {
         return;
     }
-    eprintln!(
+    notice!(
         "[outrig] {} has no published output-token ceiling in this build, so turns \
          are capped at {ANTHROPIC_FALLBACK_MAX_TOKENS}. Set [models.{}].max-tokens \
          (or the agent's) to choose your own.",
@@ -1168,8 +1173,15 @@ impl RigAgent {
         label: &str,
         injections: InjectionSource,
     ) -> Result<TurnEnd> {
-        let hook = OutrigPromptHook::for_subagent(self.tool_call_max(), label, injections);
-        self.run_turn_with(prompt, history, hook).await
+        // Scoped around the whole round, not only the hook: the lines rig's
+        // own layers print -- a retry, a failover move, a textless turn --
+        // come from below the hook, where there is nothing to ask for a label.
+        // See `TURN_LABEL`.
+        with_turn_label(label, async move {
+            let hook = OutrigPromptHook::for_subagent(self.tool_call_max(), label, injections);
+            self.run_turn_with(prompt, history, hook).await
+        })
+        .await
     }
 
     /// What was built, whichever variant it is.
@@ -1682,7 +1694,7 @@ fn endpoint_failed(
     } else {
         HISTORY_UNCHANGED
     };
-    eprintln!("{}", hook.turn_end_notice(&reason, tried, advice));
+    notice!("{}", hook.turn_end_notice(&reason, tried, advice));
     Ok(TurnEnd {
         // Nothing belongs on stdout: the model never spoke, or spoke only in
         // tool calls, which the history now holds. `repl.rs`'s
@@ -1800,7 +1812,7 @@ fn handle_prompt_error(
         ),
         other => return Err(other.into()),
     };
-    eprintln!(
+    notice!(
         "{}",
         hook.turn_end_notice(&reason, None, PARTIAL_HISTORY_RETAINED)
     );
@@ -1907,6 +1919,62 @@ impl RepeatTracker {
             _ => RepeatVerdict::Allow,
         }
     }
+}
+
+tokio::task_local! {
+    /// The subagent whose turn the current task is running, as the path
+    /// [`SubagentRegistry::path_of`] spells it.
+    ///
+    /// Everything a turn prints *above* the model carries its label already:
+    /// the hook holds one and prefixes its own traces with it. Below the hook
+    /// there is no hook to ask. `RetryingModel`, the retrying HTTP client, and
+    /// a failover chain each print lines of their own, and each is reached
+    /// through rig, which carries nothing of outrig's. With two subagents in
+    /// flight those lines landed among the parent's traces naming no one
+    /// (#381).
+    ///
+    /// Task-local rather than a field on the model, because a model is not the
+    /// agent that is using it: a rebuilt agent, a relaunched subagent, and the
+    /// parent can all reach the same row, so a label stamped at build time
+    /// would say whose agent built it rather than whose turn is running. A
+    /// turn, by contrast, belongs to exactly one agent for its whole length,
+    /// and a subagent's round is already a task of its own ([`run_rounds`]), so
+    /// scoping the turn labels every line it reaches no matter how deep.
+    /// Nothing between here and the model spawns: rig drives a completion
+    /// inline in the awaiting task, so the scope is still in force when the
+    /// model prints.
+    ///
+    /// Unset for the primary agent, whose lines keep the shape they have
+    /// always had.
+    ///
+    /// [`SubagentRegistry::path_of`]: crate::subagent::SubagentRegistry::path_of
+    /// [`run_rounds`]: crate::subagent::run_rounds
+    static TURN_LABEL: Arc<str>;
+}
+
+/// `  [audit] ` while a subagent's turn is running, and `""` otherwise.
+///
+/// The same shape [`OutrigPromptHook::trace_prefix`] produces, so a model-layer
+/// line lands in the same column as the tool-call traces around it.
+fn turn_label_prefix() -> String {
+    TURN_LABEL
+        .try_with(|label| format!("  [{label}] "))
+        .unwrap_or_default()
+}
+
+/// One `[outrig]` line from below the hook, labeled for whichever agent's turn
+/// is running.
+///
+/// The one place that knows how such a line is assembled: every caller passes
+/// only what it has to say, so no site can print the prefix in the wrong place
+/// or forget it.
+pub(crate) fn labeled_line(body: impl std::fmt::Display) -> String {
+    format!("[outrig] {}{body}", turn_label_prefix())
+}
+
+/// Run `turn` with everything it prints attributed to `label`.
+async fn with_turn_label<F: std::future::Future>(label: &str, turn: F) -> F::Output {
+    TURN_LABEL.scope(Arc::from(label), turn).await
 }
 
 /// Per-request hook that traces every tool call to stderr and stops the agent
@@ -2220,7 +2288,7 @@ impl AgentHook for OutrigPromptHook {
                 self.max
             ));
         }
-        eprintln!(
+        notice!(
             "[outrig] {}tool call: {tool_name}({})",
             self.trace_prefix(),
             event.tool_args().unwrap_or_default()
@@ -2260,7 +2328,7 @@ impl AgentHook for OutrigPromptHook {
             _ => return None,
         };
         let args = event.args.as_deref().unwrap_or_default();
-        eprintln!(
+        notice!(
             "[outrig] {}tool call: {}({args}) -- not run",
             self.trace_prefix(),
             event.tool_name
@@ -2685,6 +2753,208 @@ mod tests {
         );
     }
 
+    /// A chain candidate that records the label in force at the moment the
+    /// chain called it.
+    ///
+    /// The whole question these label tests ask: everything below the hook --
+    /// the retry loops, a failover move -- prints from inside the model call,
+    /// and the label has to still be there when it does.
+    struct PrefixObserving(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl failover::Candidate for PrefixObserving {
+        fn model_name(&self) -> &str {
+            "observer"
+        }
+
+        fn model_identifier(&self) -> &str {
+            "observer"
+        }
+
+        fn max_tokens(&self) -> Option<u64> {
+            None
+        }
+
+        fn capabilities(&self) -> rig::completion::ProviderCapabilities {
+            rig::completion::ProviderCapabilities::new()
+        }
+
+        fn completion(
+            &self,
+            _request: rig::completion::CompletionRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<
+                            rig::completion::CompletionResponse,
+                            rig::error::ProviderError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                // Yield first: a label that survived only because nothing
+                // awaited in between would not survive a real provider call.
+                tokio::task::yield_now().await;
+                self.0
+                    .lock()
+                    .expect("observed prefixes")
+                    .push(turn_label_prefix());
+                Ok(rig::completion::CompletionResponse::new(
+                    vec![rig::completion::AssistantContent::text("ok")],
+                    rig::completion::Usage::new(),
+                    rig::completion::message::Origin::new("mock.script", "mock", "observer"),
+                    serde_json::Value::Null,
+                ))
+            })
+        }
+    }
+
+    /// Run one turn -- a subagent's under `label`, the primary's without one
+    /// -- through rig's whole drive, and report the prefix the model saw.
+    async fn prefix_seen_by_the_model(label: Option<&str>) -> String {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let chain = failover::FailoverModel::new(
+            vec![Box::new(PrefixObserving(Arc::clone(&seen)))],
+            retry::RetryPolicy::default(),
+        );
+        let resolved = crate::subagent::fixtures::test_resolved(1);
+        let agent = RigAgent::Failover(BuiltAgent {
+            agent: finish_agent(chain.clone(), &resolved, Vec::new()).expect("the agent builds"),
+            chain,
+            tool_call_max: 10,
+        });
+        let mut history = Vec::new();
+        match label {
+            Some(label) => {
+                let injections: InjectionSource = Arc::new(|_: &TurnUndo| Vec::new());
+                agent
+                    .run_turn_captured("hi", &mut history, label, injections)
+                    .await
+                    .expect("the scripted turn succeeds");
+            }
+            None => {
+                agent
+                    .run_turn_with("hi", &mut history, OutrigPromptHook::new(10))
+                    .await
+                    .expect("the scripted turn succeeds");
+            }
+        }
+        let seen = seen.lock().expect("observed prefixes");
+        assert_eq!(seen.len(), 1, "one model call per turn: {seen:?}");
+        seen[0].clone()
+    }
+
+    /// The bug (#381): a line printed from under the hook -- by `RetryingModel`,
+    /// the HTTP retry loop, or a chain -- reached stderr naming no one, because
+    /// rig carries nothing of outrig's down to the model. The label has to
+    /// cross the whole of rig's drive, awaits and all.
+    #[tokio::test]
+    async fn a_subagents_label_reaches_the_model_layer() {
+        assert_eq!(prefix_seen_by_the_model(Some("audit")).await, "  [audit] ");
+    }
+
+    /// The primary agent has no label, and its lines keep the shape they have
+    /// always had -- which is what lets every existing wording test go on
+    /// asserting the unprefixed string.
+    #[tokio::test]
+    async fn the_primary_agents_turn_labels_nothing() {
+        assert_eq!(prefix_seen_by_the_model(None).await, "");
+    }
+
+    /// The case the report is written against: two subagents in flight at
+    /// once. Each model call must see its *own* turn's label, which is the
+    /// whole reason this is scoped per turn rather than stored in a global
+    /// that the last launch would win.
+    #[tokio::test]
+    async fn concurrent_turns_each_keep_their_own_label() {
+        let (a, b) = tokio::join!(
+            prefix_seen_by_the_model(Some("parent-a/audit")),
+            prefix_seen_by_the_model(Some("parent-b/audit")),
+        );
+        assert_eq!(a, "  [parent-a/audit] ");
+        assert_eq!(b, "  [parent-b/audit] ");
+    }
+
+    /// The label has to survive the retry loop as well as rig's drive: a
+    /// retried call sleeps in between, and the second attempt's report is
+    /// exactly the one a reader needs attributed. Wrapped in the real
+    /// `RetryingModel` rather than a stand-in, so the production stack is what
+    /// is being measured.
+    #[tokio::test(start_paused = true)]
+    async fn the_label_survives_a_retry_inside_one_model_call() {
+        use rig::driver::{Exchange, Model, Opened, Opening, Transport};
+        use rig::test_utils::{MOCK_API, MOCK_PROVIDER, MockFrame, MockScript};
+
+        /// Fails once with the class `RetryingModel` retries, then answers.
+        #[derive(Clone)]
+        struct Flaky(Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl Transport<MockScript> for Flaky {
+            fn send(
+                &self,
+                _request: rig::completion::CompletionRequest,
+                _exchange: Exchange,
+            ) -> Opening<MockFrame> {
+                let mut seen = self.0.lock().expect("observed prefixes");
+                seen.push(turn_label_prefix());
+                let first = seen.len() == 1;
+                drop(seen);
+                let frame = if first {
+                    Err(rig::error::ProviderError::Response("empty".into()))
+                } else {
+                    Ok(MockFrame::Response(Box::new(
+                        rig::completion::CompletionResponse::new(
+                            vec![rig::completion::AssistantContent::text("ok")],
+                            rig::completion::Usage::new(),
+                            rig::completion::message::Origin::new(MOCK_API, MOCK_PROVIDER, ""),
+                            serde_json::Value::Null,
+                        ),
+                    )))
+                };
+                Opening::ready(Opened::new(futures_util::stream::iter([frame])))
+            }
+        }
+
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let model = retry::RetryingModel::new(
+            Model::new(MockScript::default(), Flaky(Arc::clone(&seen))).erase(),
+            retry::RetryPolicy::default(),
+        );
+
+        with_turn_label("audit", async {
+            model
+                .completion(rig::completion::CompletionRequest::new("hi"))
+                .await
+                .expect("the retry carries the call through the unusable response");
+        })
+        .await;
+
+        let seen = seen.lock().expect("observed prefixes");
+        assert_eq!(
+            *seen,
+            vec!["  [audit] ".to_string(), "  [audit] ".to_string()],
+            "both the failing attempt and the retry after the wait are the \
+             subagent's, and both print from here",
+        );
+    }
+
+    /// A model-layer line has to land in the same column as the hook's
+    /// tool-call traces around it, or the log reads as two unrelated streams.
+    /// Pinned against the hook rather than against a literal, so the two
+    /// cannot drift apart.
+    #[test]
+    fn a_model_layer_line_is_prefixed_exactly_as_the_hooks_traces_are() {
+        let injections: InjectionSource = Arc::new(|_: &TurnUndo| Vec::new());
+        let hook = OutrigPromptHook::for_subagent(10, "audit", injections);
+        let prefix = hook.trace_prefix();
+
+        assert_eq!(
+            TURN_LABEL
+                .sync_scope(Arc::from("audit"), || labeled_line("something happened")),
+            format!("[outrig] {prefix}something happened"),
+        );
+    }
     /// A model name resolved through an alias shows the hop it took. Static
     /// selection is otherwise invisible: picking a candidate because of an
     /// environment variable is exactly the kind of decision that stays hidden

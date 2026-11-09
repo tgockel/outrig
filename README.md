@@ -35,14 +35,17 @@ For library use, depend on the `outrig` crate from your Rust package.
 
 OutRig runs on Linux, x86-64 or AArch64. Both architectures are held to the same evidence:
 the end-to-end suite runs against a live podman on each of them on every pull request, so
-neither is a claim resting on a build that compiled. Install the matching musl target
-(`x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`) to enable `view = "primary"`
-sidecars: those need the `outrig-enter` helper, which is always a Linux binary because it runs
-inside the container rather than in the host process. A build without that target still works
--- the sidecar mode reports why the helper is unavailable, before creating a container, and
-the [built-in default image-config](doc/reference/config.md#the-built-in-default-image-config)
-degrades rather than failing: its `fs` server switches to a read-write bind mount of the
-workspace, and its `shell` server is dropped.
+neither is a claim resting on a build that compiled. `view = "primary"` sidecars need the
+`outrig-enter` helper, which runs inside the container rather than in the host process, so it is
+always a statically linked Linux binary. The build compiles it for the matching musl target
+(`x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`) when that is installed, and
+otherwise statically for the build machine's own target, which needs the host's static C
+library. Only when neither works is the helper missing: the sidecar mode then reports why,
+before creating a container, and the
+[built-in default image-config](doc/reference/config.md#the-built-in-default-image-config)
+degrades rather than failing -- its `fs` server switches to a read-write bind mount of the
+workspace, and its `shell` server is dropped. See
+[Building without the musl target](doc/usage/no-musl.md).
 
 macOS and native Windows are not supported. WSL2 works: it is an ordinary Linux build.
 
@@ -51,13 +54,13 @@ macOS and native Windows are not supported. WSL2 works: it is an ordinary Linux 
 ```sh
 $ outrig run
 [outrig] agent: coding (model: fast / provider: openai / gpt-4o-mini)
-[outrig] container outrig-20260502T103412-3f2a started
+[outrig] container outrig-20260502T103412-3f2a98ac started
 [outrig] mcp servers: fs, shell
 > what's in this repo?
 This repo is a Rust project named "outrig". The top level contains Cargo.toml,
 src/, and doc/. src/ has lib.rs and main.rs...
 > ^D
-[outrig] session 20260502T103412-3f2a ended
+[outrig] session 20260502T103412-3f2a98ac ended
 ```
 
 ## Documentation

@@ -114,7 +114,15 @@ where
     F: FnOnce(RawFd),
 {
     let mut sv = [0 as RawFd; 2];
-    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, sv.as_mut_ptr()) } == -1 {
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    } == -1
+    {
         return Err(CollectError::Spawn(io::Error::last_os_error()));
     }
 
@@ -140,9 +148,16 @@ where
 
     // Reaping our own child doesn't race tokio's process driver: it only
     // waits on pids it spawned itself.
-    // A failed wait leaves the status at 0, which reads as a plain exit.
+    // `EINTR` here just means a signal landed before the child changed state;
+    // retry rather than leave a zombie behind. Any other failure leaves the
+    // status at 0, which reads as a plain exit.
     let mut wait_status = 0;
-    let _ = unsafe { libc::waitpid(pid, &mut wait_status, 0) };
+    loop {
+        let rc = unsafe { libc::waitpid(pid, &mut wait_status, 0) };
+        if rc != -1 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break;
+        }
+    }
 
     received
         .and_then(|reply| reply.ok_or_else(|| silent_child(wait_status)))
@@ -236,10 +251,17 @@ fn recv_status(sock: RawFd) -> io::Result<Option<(Status, Vec<OwnedFd>)>> {
     msg.msg_control = control.0.as_mut_ptr().cast();
     msg.msg_controllen = CTRL_LEN as _;
 
-    let n = unsafe { libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC) };
-    if n == -1 {
-        return Err(io::Error::last_os_error());
-    }
+    let n = loop {
+        let n = unsafe { libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if n == -1 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        break n;
+    };
     if n == 0 {
         return Ok(None);
     }
@@ -386,6 +408,22 @@ mod tests {
 
         assert_eq!(reply, Status::OK);
         assert_eq!(fds.len(), 1, "the pipe read end should arrive owned");
+    }
+
+    #[test]
+    fn fork_collect_opens_the_socketpair_cloexec() {
+        // #396: a non-CLOEXEC fd here is inherited by any child the helper's
+        // own process forks or execs before its end is closed -- a podman
+        // client another task spawns in the fork/close window -- which can
+        // then hold the parent's read end open past the helper's own exit.
+        let (reply, _fds) = fork_collect(|sock| {
+            let flags = unsafe { libc::fcntl(sock, libc::F_GETFD) };
+            let cloexec = flags != -1 && flags & libc::FD_CLOEXEC != 0;
+            let _ = send_status(sock, Status::failed(0, i32::from(!cloexec)), &[]);
+        })
+        .expect("fork_collect");
+
+        assert_eq!(reply.errno, 0, "the child's end of the pair is not CLOEXEC");
     }
 
     #[test]

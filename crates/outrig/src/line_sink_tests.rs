@@ -150,6 +150,80 @@ async fn a_loss_is_its_owners_with_its_cause_and_its_integrity() {
     assert_eq!(rest, [("b", 1)]);
 }
 
+/// A write the runtime's blocking pool refuses because it is shutting down is
+/// a write failure like any other -- not a panic on a worker thread. This is
+/// tokio-rs/tokio#8182's trigger reproduced directly: `shutdown_background`
+/// tears the pool down without waiting, and `handle.enter()` lets a future
+/// still be polled by hand afterward, the only way to observe what
+/// `spawn_blocking` does once nothing is left to run it. A `#[tokio::test]`
+/// runtime cannot reach this shape -- it cannot be shut down out from under
+/// the test that is still running on it -- so this drives `write_lines` with
+/// a borrowed `Waker` instead of a second runtime driving it as a task.
+#[test]
+fn a_write_refused_by_a_shutting_down_runtime_is_reported_not_panicked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("log.jsonl");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("create the log");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let handle = rt.handle().clone();
+    rt.shutdown_background();
+    let _guard = handle.enter();
+
+    // The sink only lends its accounting: the writer reads its own queue.
+    let (unused, _) = mpsc::channel(1);
+    let sink = LineSink::queuing_to(unused, None, &LABELS);
+    let (records, queue) = mpsc::channel(1);
+    let (done, mut answered) = oneshot::channel();
+    records
+        .try_send(Job::Record {
+            who: "a",
+            line: b"{}\n".to_vec(),
+            done,
+        })
+        .expect("the channel has room for one, synchronously");
+    // Nothing else is ever queued, so the writer's next `recv` sees the
+    // channel closed once this record is dealt with and the loop ends.
+    drop(records);
+
+    let mut writer = std::pin::pin!(write_lines(file, queue, sink.clone_parts()));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    // Driven by hand rather than awaited: there is no executor left to hand
+    // this to, and that absence is the point. A bound here is a failing test,
+    // not impatience -- a writer that is actually stuck leaves
+    // `Poll::Pending` forever, and spinning on that silently would only hide
+    // it.
+    let mut polls = 0;
+    while std::future::Future::poll(writer.as_mut(), &mut cx).is_pending() {
+        polls += 1;
+        assert!(
+            polls < 10_000,
+            "the writer never finished with its one record"
+        );
+    }
+
+    let lost = sink
+        .take_loss(&"a")
+        .map(|loss| (loss.records, loss.integrity.is_some()));
+    assert_eq!(
+        lost,
+        Some((1, true)),
+        "a refused spawn is a write failure, reported like any other, and the file is lost with it"
+    );
+    assert!(
+        answered.try_recv().is_ok(),
+        "the producer waiting on `done` is still answered, not left hanging"
+    );
+}
+
 /// A writer that will not stop is stopped at the deadline, and what it had
 /// taken and not answered for is counted, by owner, with the file's integrity
 /// in doubt.

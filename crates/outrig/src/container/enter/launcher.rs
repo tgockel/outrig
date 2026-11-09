@@ -7,15 +7,20 @@
 //! A Rust port of the prototype's `sidecar-enter.c`
 //! (<https://github.com/tgockel/prototype-podman-shared-fs>). It is the sidecar
 //! image's ENTRYPOINT, so it runs before any graft exists, against an image
-//! OutRig does not control -- hence it is compiled statically for
-//! `*-unknown-linux-musl` and depends on nothing but the kernel: it declares
-//! the handful of libc symbols and syscall numbers it needs itself, so the
-//! embedding `build.rs` can compile it with a single `rustc` invocation.
+//! OutRig does not control -- hence it is compiled statically, for
+//! `*-unknown-linux-musl` or, without that target, for the build machine's own
+//! target with `+crt-static`, and depends on nothing but the kernel: it
+//! declares the handful of libc symbols and syscall numbers it needs itself, so
+//! the embedding `build.rs` can compile it with a single `rustc` invocation.
 //!
 //! Expected launch (0002-13 arranges it): `--userns=container:<target>` (so we are
 //! already in the user namespace that owns the target's mount namespace),
 //! `--cap-add=SYS_ADMIN` (setns is gated on it) and `--cap-add=SYS_PTRACE`
-//! (to open the target's nsfs file).
+//! (to open the target's nsfs file). Two more are needed and come with podman's
+//! default set rather than a flag: `CAP_SYS_CHROOT`, which `setns(CLONE_NEWNS)`
+//! demands beside `CAP_SYS_ADMIN`, and `CAP_SETUID`/`CAP_SETGID` for the drop
+//! to `--uid`/`--gid`. A `cap-drop` of any of the five fails the launch, which
+//! is why config validation refuses one on a `view = "primary"` sidecar.
 //!
 //! **The argv contract, which the caller depends on:** `PROGRAM` is in *this*
 //! container's coordinates, ungrafted -- it is opened *and resolved to a
@@ -45,7 +50,9 @@
 //! `open_tree`, `open(ns)`, `setns`, `unshare`, `mount`, `move_mount`, and a
 //! `--cwd` that may name a directory only root can enter. Nothing after it
 //! does, so `--uid`/`--gid` drop to the session's ids there, immediately
-//! before the exec. `PROGRAM` is opened at the very top, while this image's
+//! before the exec, and the drop also sets `no_new_privs`, so that nothing the
+//! payload starts can get the capabilities back (see `drop_privileges`).
+//! `PROGRAM` is opened at the very top, while this image's
 //! rootfs is still at `/` and while still privileged, so the `ElfKind::Static`
 //! `execveat` from that descriptor still works afterwards -- the kernel checks
 //! exec permission against the file's own mode, which for an image binary is
@@ -59,13 +66,19 @@
 //! same pre-setns phase, and for the same reason rather than as a tidiness
 //! pass: after the setns an absolute symlink resolves in the primary's rootfs
 //! instead of the graft, which `canon.rs` explains in full. That closes the
-//! paths this file names. It does not close the ones the loader goes on to find
-//! for itself, which also mean the primary's files after the setns: a
-//! `DT_NEEDED` library that is an absolute symlink, the loader's built-in
-//! search directories (a library missing from `--library-path` falls through
-//! to them), and the entries of musl's `/etc/ld-musl-<arch>.path`. The path
-//! file itself is the sidecar's, since musl finds it relative to its own
-//! pathname, which is under the graft; see #595.
+//! paths this file names. The ones the loader goes on to find for itself also
+//! mean the primary's files after the setns: a `DT_NEEDED` library that is an
+//! absolute symlink, the loader's built-in search directories (a library
+//! missing from `--library-path` falls through to them), and the entries of
+//! musl's `/etc/ld-musl-<arch>.path` (the file is the sidecar's, since musl
+//! finds it relative to its own pathname, but its entries are absolute).
+//! `libs.rs` closes them (task 0003-01): before the setns it resolves the
+//! payload's whole `DT_NEEDED` closure under this image's rootfs, failing the
+//! launch on a name it cannot find, and after the graft `main` stages one
+//! graft-prefixed link per library in a tmpfs mounted at `<graft>/proc`, which
+//! leads `--library-path`. What stays open is listed in `libs.rs`: a library
+//! the payload `dlopen`s, a slash-bearing `DT_NEEDED` name, and an absolute
+//! `DT_RPATH` entry.
 //!
 //! One file the loader reads for itself is handled here (#268), because a mount
 //! can cover it: glibc's loader opens `/etc/ld.so.preload` on every start, and
@@ -99,15 +112,16 @@
 //! that paragraph with it.
 //!
 //! This file is compiled only by the `outrig` crate's `build.rs`, always for a
-//! Linux musl target; it is not part of the normal `cargo build`. The logic it
-//! relies on lives in `elf.rs`, `path_search.rs` and `canon.rs`, pulled in
-//! below and unit-tested on the host.
+//! Linux target and always statically linked; it is not part of the normal
+//! `cargo build`. The logic it relies on lives in `elf.rs`, `path_search.rs`
+//! and `canon.rs`, pulled in below and unit-tested on the host.
 
 use std::ffi::{CString, OsString, c_char, c_int, c_long, c_ulong, c_void};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 include!("canon.rs");
 include!("elf.rs");
+include!("libs.rs");
 include!("path_search.rs");
 
 unsafe extern "C" {
@@ -131,8 +145,11 @@ unsafe extern "C" {
     ) -> c_int;
     fn execv(path: *const c_char, argv: *const *const c_char) -> c_int;
     fn setgroups(size: usize, list: *const u32) -> c_int;
+    fn setfsuid(uid: u32) -> c_int;
+    fn setfsgid(gid: u32) -> c_int;
     fn setresgid(rgid: u32, egid: u32, sgid: u32) -> c_int;
     fn setresuid(ruid: u32, euid: u32, suid: u32) -> c_int;
+    fn prctl(option: c_int, ...) -> c_int;
     fn syscall(num: c_long, ...) -> c_long;
 }
 
@@ -145,6 +162,7 @@ const AT_RECURSIVE: c_long = 0x8000;
 const OPEN_TREE_CLONE: c_long = 1;
 const MOVE_MOUNT_F_EMPTY_PATH: c_long = 0x04;
 const CLONE_NEWNS: c_int = 0x0002_0000;
+const PR_SET_NO_NEW_PRIVS: c_int = 38;
 const MS_NOSUID: c_ulong = 2;
 const MS_NODEV: c_ulong = 4;
 const MS_NOEXEC: c_ulong = 8;
@@ -337,8 +355,18 @@ fn num_arg<T: std::str::FromStr>(flag: &str, value: &OsString) -> T {
 /// There is deliberately no `capset` here. The kernel clears the permitted,
 /// effective and ambient capability sets on a transition away from uid 0, so
 /// `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` are gone with the `setresuid` -- for this
-/// process and for everything it spawns. Spelling that out because the absence
-/// of a capability call is otherwise the first thing a reader will flag.
+/// process. Spelling that out because the absence of a capability call is
+/// otherwise the first thing a reader will flag.
+///
+/// What the transition leaves is the *bounding* set, which still holds those
+/// two (`--cap-add` put them there), and that is what a later `exec` draws on:
+/// a setuid-root binary or one with file capabilities is handed it back.
+/// `no_new_privs` closes that for the whole subtree and for good -- an `exec`
+/// then gains neither the setuid bit's uid nor any capability. The container's
+/// `--security-opt=no-new-privileges` does the same, but a sidecar may opt out
+/// of it, and this guarantee is the launcher's own. Dropping the bounding set
+/// instead would not do: it needs `CAP_SETPCAP`, and leaves the uid change of a
+/// setuid binary alone.
 fn drop_privileges(uid: u32, gid: u32) {
     if unsafe { setgroups(0, std::ptr::null()) } < 0 {
         die("setgroups(0)", "");
@@ -348,6 +376,14 @@ fn drop_privileges(uid: u32, gid: u32) {
     }
     if unsafe { setresuid(uid, uid, uid) } < 0 {
         die(&format!("setresuid({uid})"), "");
+    }
+    // The arguments are `unsigned long` to the variadic `prctl`, so they are
+    // typed as such rather than left as the `i32` a bare literal would be.
+    if unsafe {
+        prctl(PR_SET_NO_NEW_PRIVS, 1 as c_ulong, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong)
+    } < 0
+    {
+        die("prctl(PR_SET_NO_NEW_PRIVS)", "");
     }
 }
 
@@ -363,6 +399,9 @@ struct DynamicLaunch {
     loader: String,
     /// [`present_lib_dirs`], for the loader's `--library-path`.
     lib_dirs: Vec<String>,
+    /// [`resolve_closure`]'s `(name, canonical path)` per library, staged as
+    /// links after the graft so the loader finds each one by name first.
+    needed: Vec<(Vec<u8>, Vec<u8>)>,
     /// Whether that loader is musl's, which takes no `--inhibit-cache` and reads
     /// no `/etc/ld.so.preload`, so `main` masks that file for every other one.
     musl: bool,
@@ -488,15 +527,38 @@ fn main() {
                     " (the payload's PT_INTERP; not in the sidecar image)",
                 );
             }
+            // Read from the interpreter as the image wrote it, not as it
+            // resolves: an image is free to route `ld-musl-*.so.1` through
+            // a differently named real file, and which loader this is does
+            // not change when its path does.
+            let musl = interp.contains("ld-musl");
+            let lib_dirs = present_lib_dirs();
+            let musl_dirs = musl_path_dirs(b"", &loader);
+            // Read as the payload will: a library only its user can read is the
+            // payload's to load, and this process may have dropped the
+            // capabilities that would let root read it (#600). Only the
+            // filesystem identity changes, so the namespace work below keeps
+            // its privileges; the old ids come back before it.
+            let fs_ids = drop_to.map(|(uid, gid)| unsafe {
+                (setfsgid(gid) as u32, setfsuid(uid) as u32)
+            });
+            let closure = resolve_closure(b"", &program, &loader, musl, &lib_dirs, &musl_dirs);
+            if let Some((old_gid, old_uid)) = fs_ids {
+                unsafe {
+                    setfsuid(old_uid);
+                    setfsgid(old_gid);
+                }
+            }
+            let needed = closure.unwrap_or_else(|e| {
+                eprintln!("outrig-enter: DT_NEEDED {e}");
+                std::process::exit(1);
+            });
             Some(DynamicLaunch {
                 program,
                 loader,
-                lib_dirs: present_lib_dirs(),
-                // Read from the interpreter as the image wrote it, not as it
-                // resolves: an image is free to route `ld-musl-*.so.1` through
-                // a differently named real file, and which loader this is does
-                // not change when its path does.
-                musl: interp.contains("ld-musl"),
+                lib_dirs,
+                needed,
+                musl,
             })
         }
     };
@@ -529,7 +591,7 @@ fn main() {
     }
     if unsafe { setns(ns_fd, CLONE_NEWNS) } < 0 {
         let hint = if std::io::Error::last_os_error().raw_os_error() == Some(EPERM) {
-            " (need --cap-add=SYS_ADMIN and --userns=container:<target>)"
+            " (need CAP_SYS_ADMIN and CAP_SYS_CHROOT, and --userns=container:<target>)"
         } else {
             ""
         };
@@ -571,6 +633,40 @@ fn main() {
             die(&format!("move_mount -> {g}"), &format!(" (does {g} exist in the target image?)"));
         }
         unsafe { close(tree_fd) };
+    }
+
+    // Stage the closure `resolve_closure` settled: a link per library, each to
+    // its graft-prefixed real path, in a tmpfs of our own. The loader finds the
+    // name there first, so no absolute symlink, built-in directory or musl path
+    // entry gets to answer for it. `<graft>/proc` is a directory every image
+    // has and no payload reads, and the tmpfs is in the private namespace only.
+    let stage = format!("{}/proc", graft.to_string_lossy());
+    if let Some(d) = dynamic.as_ref().filter(|d| !d.needed.is_empty()) {
+        let tmpfs = cstr(b"tmpfs");
+        let stage_c = cstr(stage.as_bytes());
+        if unsafe {
+            mount(
+                tmpfs.as_ptr(),
+                stage_c.as_ptr(),
+                tmpfs.as_ptr(),
+                MS_NOSUID | MS_NODEV,
+                std::ptr::null(),
+            )
+        } < 0
+        {
+            die(&format!("mount(tmpfs -> {stage})"), " (staging the payload's libraries)");
+        }
+        let g = graft.to_string_lossy();
+        for (name, target) in &d.needed {
+            let mut link = format!("{stage}/").into_bytes();
+            link.extend_from_slice(name);
+            let mut dest = g.as_bytes().to_vec();
+            dest.extend_from_slice(target);
+            if let Err(e) = std::os::unix::fs::symlink(as_path(&dest), as_path(&link)) {
+                eprintln!("outrig-enter: link {}: {e}", String::from_utf8_lossy(&link));
+                std::process::exit(1);
+            }
+        }
     }
 
     // The `/proc` we inherited is the target's: an instance of *its* PID
@@ -674,10 +770,11 @@ fn main() {
             let g = graft.to_string_lossy();
             let loader = format!("{g}{}", dynamic.loader);
             let progpath = format!("{g}{}", dynamic.program);
-            let libpath = dynamic
-                .lib_dirs
-                .iter()
-                .map(|d| format!("{g}{d}"))
+            // The staged links lead, so they answer before any directory does.
+            let libpath = (!dynamic.needed.is_empty())
+                .then(|| stage.clone())
+                .into_iter()
+                .chain(dynamic.lib_dirs.iter().map(|d| format!("{g}{d}")))
                 .collect::<Vec<_>>()
                 .join(":");
 

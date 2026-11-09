@@ -54,6 +54,11 @@ outrig build [--image <name>]
      `${VAR}` build-arg may name only a variable the global config lists in
      [`[repo]` `env-allow`](../reference/config.md#repo); any other is refused when the config
      loads, before buildah runs.
+     buildah reads the context as each `COPY` runs, not when the build starts, so once it ends the
+     key is hashed again. If it moved -- a file was saved while an earlier `RUN` was still going --
+     the image holds content its key does not, and saving it would serve that image for the old
+     content later. The build is discarded, nothing is tagged, and the command fails naming the
+     image-config; run it again to build the edited content under its own key.
      Then it reads any inherited/Dockerfile `org.outrig.mcp` label, overlays
      `[images.<name>.mcp]`, and commits the final `<image-config-name>:<hash>` image with the
      merged `org.outrig.mcp` label.

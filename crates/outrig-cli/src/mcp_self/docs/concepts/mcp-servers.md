@@ -260,6 +260,16 @@ One that starts copies of itself cannot take `view = "primary"` unless it is a s
 executes the literal path `/proc/self/exe`; run it as an entrypoint sidecar in its own image,
 with the project mounted through `workspace` instead.
 
+**A dynamic payload's libraries come from the sidecar, and only the ones it declares.** Before
+joining the primary, the launcher walks the payload's `DT_NEEDED` libraries, and theirs in turn,
+in the sidecar's own rootfs -- through its absolute symlinks, and the directories its own musl
+`/etc/ld-musl-<arch>.path` names -- and has the loader find each one there first. A library the
+sidecar does not ship fails startup, naming it and the directories searched, rather than running
+on the primary's copy. The walk follows `DT_NEEDED` only, so three things can still reach the
+primary's files: a library the payload loads at run time with `dlopen`, a `DT_NEEDED` name that
+contains a `/`, and an absolute `DT_RPATH` entry, which the loader searches before anything the
+launcher passes.
+
 A program named without a `/` -- `ENTRYPOINT ["node", "/app/dist/index.js"]`, which is what
 the quickstart image above declares -- is searched along the **sidecar image's** `PATH`, in
 that same pre-join instant and for the same reason: the program is one of the sidecar's own
@@ -270,20 +280,29 @@ matches, startup fails with a message naming the program and the `PATH` that was
 `view = "primary"` is a real posture change: the container starts with `CAP_SYS_ADMIN` and
 `CAP_SYS_PTRACE` in the primary's user namespace, and the server can read the primary's whole
 filesystem. See [Trust Model](mcp-trust-model.md) and `SECURITY.md`. It needs the
-`outrig-enter` helper. The helper is supported on Linux x86-64 and AArch64 and is compiled
-when the matching `<arch>-unknown-linux-musl` Rust target is installed; without it a
-`view = "primary"` session fails at start with a message naming the missing artifact and the
-specific build-time reason. The helper is always a Linux binary because it runs inside the
-container, not in the host process. macOS and native Windows are unsupported; WSL2 is Linux and
-uses the normal path.
+`outrig-enter` helper. The helper is supported on Linux x86-64 and AArch64. It is compiled for
+the matching `<arch>-unknown-linux-musl` Rust target when that is installed, and otherwise
+statically for the build machine's own target, which needs the host's static C library; either
+build runs in any sidecar image. When neither works, a `view = "primary"` session fails at
+start with a message naming the missing artifact and the specific build-time reason, and a link
+to the page on building without the musl target. The helper is always a Linux binary because
+it runs inside the container, not in the host process. macOS and native Windows are
+unsupported; WSL2 is Linux and uses the normal path.
 
 **The capabilities belong to the launcher, not to the server.** `outrig-enter` needs them for
 the namespace join and the graft, and gives them up the moment that work is done: it becomes the
 session's uid/gid immediately before exec'ing the payload, which clears its capability sets with
-the uid transition. The server -- and anything it shells out to -- therefore runs as the same
-user every other OutRig-launched server runs as, so what it writes into the workspace is yours
-rather than a subuid you cannot chown back, and a root-owned path in the primary is out of
-reach. The image's `USER` does not enter into it.
+the uid transition, and it sets `no_new_privs` there too, so a setuid-root binary or a file with
+capabilities that the server runs cannot hand them back. The server -- and anything it shells
+out to -- therefore runs as the same user every other OutRig-launched server runs as, so what it
+writes into the workspace is yours rather than a subuid you cannot chown back, and a root-owned
+path in the primary is out of reach. The image's `USER` does not enter into it.
+
+The launcher needs five capabilities to get that far: `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE`, which
+OutRig adds, and `CAP_SYS_CHROOT`, `CAP_SETUID` and `CAP_SETGID`, which podman's default set
+carries. A sidecar block that takes one away -- `cap-drop` naming it or `ALL`, or
+`capability-profile = "drop-all"` -- is refused when the config is read, as is
+`no-new-privileges = false`, which the launcher's own `no_new_privs` would make a no-op.
 
 That posture is identical from the library. `SidecarSpec::with_view(SidecarView::Primary)`
 takes the same capabilities in the same namespace, drops to the same ids, and a build without
@@ -328,6 +347,13 @@ label off the image, then overlays entries from `config.toml`. If both sources
 define the same server name, the `config.toml` entry replaces the image entry in
 full; fields are not deep-merged. Servers that appear in only one source remain
 in the merged set.
+
+"The image" there is the one the primary container is *running*, addressed by the engine's id
+for it, not whatever the tag it was started from names at the moment of the read. A tag is a
+pointer and a pull of a re-pushed ref moves it, while every container already started from the
+old image goes on running that one. So the merged servers are always ones the container can
+serve, even when `outrig mcp --attach` borrows a container started before the last pull. A
+repo-local build image is named by a content hash, which no pull can re-point.
 
 A label entry may carry `call-timeout-secs`, since the image's author knows how long its tools
 run (see [What if a server hangs?](#what-if-a-server-hangs)). The placement keys and `args` are
@@ -391,10 +417,11 @@ search = { command = ["mcp-search"], sidecar = "tools" }
 
 ## Lifecycle
 
-When `outrig run` starts, the primary container comes up first, then every `start = "auto"`
-sidecar, then network interception attaches to each container, and only then do MCP servers
-connect -- primary-hosted and sidecar-hosted alike, in name order. The sequence per MCP server
-is:
+When `outrig run` starts, the primary container comes up first -- with network interception on,
+it is created and initialized, the interceptor attaches, and only then does its process start --
+then every `start = "auto"` sidecar, then interception attaches to each of those, and only then
+do MCP servers connect -- primary-hosted and sidecar-hosted alike, in name order. The sequence
+per MCP server is:
 
 1. `podman exec -i <container> <command>` -- outrig spawns the server as a child process inside
    its placement's running container, with stdin/stdout piped back to outrig.

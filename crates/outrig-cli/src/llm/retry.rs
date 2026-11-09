@@ -14,7 +14,9 @@
 //!
 //! [`RetryingHttpClient`] is a [`rig::http_client::HttpClientExt`] backed by a
 //! `reqwest::Client`. Every request it sends retries transient failures --
-//! request timeouts, connection errors, and the retry-friendly HTTP statuses
+//! request timeouts, connection errors, a `200` whose body fails partway
+//! through (a reset or a timeout mid-read, same as if it had hit the
+//! connection instead of the body), and the retry-friendly HTTP statuses
 //! (408/425/429/5xx) -- honoring a `Retry-After` header when the server sends
 //! one and falling back to jittered exponential backoff when it does not. The
 //! whole loop is bounded by a wall-clock budget rather than an attempt count,
@@ -83,6 +85,7 @@ use rig::http_client::{
 use rig::operation::Completion;
 use rig::wasm_compat::WasmCompatSend;
 
+use crate::notice::notice;
 use super::is_blank;
 
 /// First backoff delay; doubles each attempt, capped at [`RetryPolicy::max_delay`].
@@ -319,6 +322,7 @@ pub struct RetryingHttpClient {
     /// not retry.
     transport: ReqwestClient,
     policy: RetryPolicy,
+    answered: AnsweredBody,
 }
 
 impl RetryingHttpClient {
@@ -327,7 +331,35 @@ impl RetryingHttpClient {
             transport: ReqwestClient::from(inner.clone()),
             inner,
             policy,
+            answered: AnsweredBody::default(),
         }
+    }
+
+    /// The handle on the latest `2xx` body this client has returned, for the
+    /// [`RetryingModel`] built over it ([`RetryingModel::with_answered`]).
+    pub fn answered(&self) -> AnsweredBody {
+        self.answered.clone()
+    }
+}
+
+/// The body of the latest `2xx` response a [`RetryingHttpClient`] returned.
+///
+/// Rig parses a completion out of the body and, when it rejects one, keeps
+/// only its own complaint -- "Response contained no choices", "Response did
+/// not contain a valid message or tool call" -- so the provider's account of
+/// *why* the reply was empty (`content_filter`, `length`) is gone by the time
+/// [`RetryingModel`] sees the error. This is the
+/// way back to it: one slot per client, overwritten by each answered request.
+#[derive(Clone, Debug, Default)]
+pub struct AnsweredBody(Arc<Mutex<Option<Bytes>>>);
+
+impl AnsweredBody {
+    fn set(&self, body: Bytes) {
+        *self.0.lock().expect("answered body") = Some(body);
+    }
+
+    fn latest(&self) -> Option<Bytes> {
+        self.0.lock().expect("answered body").clone()
     }
 }
 
@@ -350,7 +382,16 @@ impl HttpClientExt for RetryingHttpClient {
         // Converted once: `Bytes::clone` is a refcount bump, so replaying the
         // body on each attempt costs nothing.
         let body: Bytes = body.into();
-        send_with_retry(client, policy, parts.method, parts.uri, parts.headers, body)
+        let answered = self.answered.clone();
+        send_with_retry(
+            client,
+            policy,
+            answered,
+            parts.method,
+            parts.uri,
+            parts.headers,
+            body,
+        )
     }
 
     fn send_multipart<U>(
@@ -410,6 +451,7 @@ impl HttpClientExt for RetryingHttpClient {
 pub struct RetryingModel {
     inner: DynModel<Completion>,
     policy: RetryPolicy,
+    answered: AnsweredBody,
 }
 
 impl RetryingModel {
@@ -417,7 +459,16 @@ impl RetryingModel {
         Self {
             inner: inner.into(),
             policy,
+            answered: AnsweredBody::default(),
         }
+    }
+
+    /// Name the provider's finish reason in an unusable-response error, read
+    /// from the body `answered` holds -- the one the [`RetryingHttpClient`]
+    /// under this model's provider client returned last.
+    pub fn with_answered(mut self, answered: AnsweredBody) -> Self {
+        self.answered = answered;
+        self
     }
 
     /// What the provider composes, as rig's wire for it reports.
@@ -456,9 +507,27 @@ impl RetryingModel {
                 None => Ok(response),
             },
             Err(error) => Err(match undecodable(error) {
-                Ok(message) => ProviderError::Response(message),
+                Ok(message) => ProviderError::Response(self.name_finish_reason(message)),
                 Err(error) => error,
             }),
+        }
+    }
+
+    /// Lead an unusable-response message with the finish reason the provider
+    /// gave for it, so the retry line and the final error both say whether
+    /// the reply was filtered or cut off rather than only that it was empty.
+    /// For a body rig rejected outright: one it decoded already names its
+    /// reason through [`unusable_reply`]. A body that is not JSON, or names no
+    /// reason, leaves the message as is.
+    fn name_finish_reason(&self, message: String) -> String {
+        let reason = self
+            .answered
+            .latest()
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+            .and_then(|value| provider_finish_reason(&value));
+        match reason {
+            Some(reason) => format!("finish reason {reason}: {message}"),
+            None => message,
         }
     }
 
@@ -507,12 +576,15 @@ impl RetryingModel {
                 return Err(ProviderError::Response(message));
             };
 
-            eprintln!(
-                "[outrig] model returned an unusable response ({message}); retry in {:.1}s \
-                 (attempt {}/{})",
-                delay.as_secs_f64(),
-                attempt + 2,
-                RESPONSE_RETRY_ATTEMPTS + 1,
+            notice!(
+                "{}",
+                super::labeled_line(format!(
+                    "model returned an unusable response ({message}); retry in {:.1}s \
+                     (attempt {}/{})",
+                    delay.as_secs_f64(),
+                    attempt + 2,
+                    RESPONSE_RETRY_ATTEMPTS + 1,
+                ))
             );
             tokio::time::sleep(delay).await;
             attempt += 1;
@@ -634,7 +706,7 @@ fn report_textless_completion(response: &CompletionResponse, max_tokens: Option<
     }
 
     let finish_reason = provider_finish_reason(&response.raw);
-    eprintln!("{}", textless_line(finish_reason.as_deref(), max_tokens));
+    notice!("{}", textless_line(finish_reason.as_deref(), max_tokens));
 }
 
 /// Whether a completion showed the user anything: non-blank text, or a tool
@@ -661,7 +733,9 @@ fn textless_line(finish_reason: Option<&str>, max_tokens: Option<u64>) -> String
         Some(limit) => format!("the request carried max-tokens = {limit}"),
         None => "the request carried no max-tokens, so the provider's own default applied".into(),
     };
-    format!("[outrig] the model produced no text and no tool call this turn{reason}; {ceiling}.")
+    super::labeled_line(format!(
+        "the model produced no text and no tool call this turn{reason}; {ceiling}."
+    ))
 }
 
 /// The provider's own word for why generation stopped, from the completion's
@@ -685,6 +759,7 @@ fn provider_finish_reason(raw: &serde_json::Value) -> Option<String> {
 async fn send_with_retry<U>(
     client: reqwest::Client,
     policy: RetryPolicy,
+    answered_body: AnsweredBody,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -712,7 +787,30 @@ where
             .await;
 
         let (err, retry_after) = match sent {
-            Ok(response) if response.status().is_success() => return into_lazy_response(response),
+            Ok(response) if response.status().is_success() => {
+                // The status line is back, so the endpoint has answered even
+                // if the body that follows never finishes (#379): a reset or a
+                // request timeout mid-read is exactly as transient as the same
+                // failure hitting `send()` instead, and the full budget is
+                // already the one in force once a response exists.
+                answered = true;
+                let status = response.status();
+                let headers = response.headers().clone();
+                // Read here, inside the loop, rather than handed back lazy:
+                // rig has not been given anything from this response yet, so a
+                // failure reading the body is still a failure this attempt can
+                // retry in full, not a one-shot a lazy future would only be
+                // able to report once, outside this loop's budget and
+                // backoff. The eventual `LazyBody` below is immediately ready
+                // -- these bytes are already in hand.
+                match response.bytes().await {
+                    Ok(bytes) => {
+                        answered_body.set(bytes.clone());
+                        return ready_lazy_response(status, headers, bytes);
+                    }
+                    Err(error) => (HttpError::Instance(Box::new(error)), None),
+                }
+            }
             Ok(response) => {
                 answered = true;
                 let status = response.status();
@@ -769,42 +867,49 @@ where
         // wait does not wrap in a terminal the user is watching. The budget
         // shown is the one actually being spent against, so a connect failure
         // does not count down against a ten-minute bound it will never reach.
-        eprintln!(
-            "[outrig] LLM call failed ({}); retry in {:.1}s ({}; {}s/{}s spent)",
-            failure_label(&err),
-            delay.as_secs_f64(),
-            if retry_after.is_some() {
-                "Retry-After"
-            } else {
-                "backoff"
-            },
-            elapsed.as_secs(),
-            policy.bound(answered).as_secs(),
+        notice!(
+            "{}",
+            super::labeled_line(format!(
+                "LLM call failed ({}); retry in {:.1}s ({}; {}s/{}s spent)",
+                failure_label(&err),
+                delay.as_secs_f64(),
+                if retry_after.is_some() {
+                    "Retry-After"
+                } else {
+                    "backoff"
+                },
+                elapsed.as_secs(),
+                policy.bound(answered).as_secs(),
+            ))
         );
         tokio::time::sleep(delay).await;
         attempt += 1;
     }
 }
 
-/// Repackage a successful `reqwest::Response` as the `http::Response` rig
-/// expects, with the body left lazy. Mirrors rig-reqwest's `into_response`,
-/// less the binding of the body to rig's own runtime, which a process on
-/// tokio does not need. rig exposes no public converter for this, so it is a
-/// copy by necessity rather than by choice.
-fn into_lazy_response<U>(
-    response: reqwest::Response,
+/// Repackage an already-read success body as the `http::Response` rig
+/// expects. The shape -- status, headers, a boxed future for the body --
+/// mirrors rig-reqwest's `into_response`, less the binding of the body to
+/// rig's own runtime, which a process on tokio does not need; rig exposes no
+/// public converter for this, so it is a copy by necessity rather than by
+/// choice. What differs is that there is nothing left to await. The body was
+/// read inside the retry loop so a failure partway through it could still be
+/// retried there (#379), so by the time this runs it is already bytes in hand
+/// -- the `LazyBody` future the trait signature still requires is `async` only
+/// in name, and resolves on its first poll.
+fn ready_lazy_response<U>(
+    status: StatusCode,
+    headers: HeaderMap,
+    bytes: Bytes,
 ) -> rig::http_client::Result<Response<LazyBody<U>>>
 where
     U: From<Bytes> + WasmCompatSend + 'static,
 {
-    let mut res = Response::builder().status(response.status());
+    let mut res = Response::builder().status(status);
     if let Some(hs) = res.headers_mut() {
-        *hs = response.headers().clone();
+        *hs = headers;
     }
-    let body: LazyBody<U> = Box::pin(async move {
-        let bytes = response.bytes().await.map_err(HttpError::instance)?;
-        Ok(U::from(bytes))
-    });
+    let body: LazyBody<U> = Box::pin(async move { Ok(U::from(bytes)) });
     res.body(body).map_err(HttpError::Protocol)
 }
 
@@ -947,10 +1052,36 @@ fn transport_label(err: &ProviderError) -> Option<String> {
 }
 
 /// The label for a failed candidate in a failover chain's move line and
-/// `tried` rows: a transport failure reads as it does on a retry line, and
-/// anything else keeps rig's own text.
+/// `tried` rows, held to one line so the report stays one row per candidate.
+///
+/// A transient failure reads as it does outside a chain, via
+/// [`transient_label`]: the status or the transport cause, never the body
+/// (#298). A terminal status keeps its body after the status, collapsed onto
+/// one line, because a `400` or `401` body says what to fix. Anything else
+/// keeps rig's own text.
 pub(crate) fn candidate_failure_label(err: &ProviderError) -> String {
-    transport_label(err).unwrap_or_else(|| err.to_string())
+    // Every transport failure, permanent ones too: the cause is the whole message.
+    if let Some(label) = transport_label(err) {
+        return one_line(&label);
+    }
+    if let Some(label) = transient_label(err) {
+        return label;
+    }
+    match (
+        err.provider_response_status(),
+        err.provider_response_body().map(one_line),
+    ) {
+        (Some(status), Some(body)) if !body.is_empty() => {
+            format!("{}: {body}", status_label(status))
+        }
+        (Some(status), _) => status_label(status),
+        _ => one_line(&err.to_string()),
+    }
+}
+
+/// `text` with every run of whitespace, newlines included, as one space.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Classify an HTTP failure as transient -- the same predicate the retry loop
@@ -975,6 +1106,14 @@ fn is_transient(err: &HttpError) -> bool {
 /// [`send_with_retry`], or a second layer that retried this class, would make
 /// this claim more than it knows. Note it stays true when the budget is `0`:
 /// nothing was retried, and there was nothing to retry with.
+///
+/// This used to be false for one case (#379): a `200` whose body failed
+/// partway through surfaced from the lazy body rig polls, outside
+/// [`send_with_retry`]'s loop entirely, as a transport failure that
+/// `is_transient` accepted on the strength of a single, unretried attempt.
+/// [`send_with_retry`] now reads that body itself and retries a failure in it
+/// the same as any other transient one, so every failure this predicate
+/// sees, body-read failures included, really did exhaust the budget.
 ///
 /// Note the deliberate reach: a `base-url` naming the wrong host fails with a
 /// connection error, which is transient by this predicate, so an unreachable
@@ -1316,6 +1455,65 @@ mod tests {
             1 + RESPONSE_RETRY_ATTEMPTS as usize,
             "the first try plus the bounded re-rolls, and not one more",
         );
+    }
+
+    /// The finish reason lives only in the body rig rejected, so it has to come
+    /// from the slot the HTTP layer fills -- and reach both the final error and
+    /// the retry line, which share the one message (#742).
+    #[tokio::test(start_paused = true)]
+    async fn an_unusable_response_names_the_finish_reason_in_the_body() {
+        /// A `200` whose body rig rejected, as its OpenAI wire rejects one
+        /// with no choices in it.
+        #[derive(Clone)]
+        struct Rejected;
+
+        impl Transport<MockScript> for Rejected {
+            fn send(&self, _request: CompletionRequest, _exchange: Exchange) -> Opening<MockFrame> {
+                Opening::ready(Opened::new(futures_util::stream::iter([Err(
+                    ProviderError::Response("Response contained no choices".into()),
+                )])))
+            }
+        }
+
+        let answered = AnsweredBody::default();
+        answered.set(Bytes::from_static(
+            br#"{"choices":[{"finish_reason":"content_filter","message":{"content":null}}]}"#,
+        ));
+        let model = RetryingModel::new(
+            Model::new(MockScript::default(), Rejected).erase(),
+            RetryPolicy::default(),
+        )
+        .with_answered(answered);
+
+        let err = model
+            .completion(CompletionRequest::new("hi"))
+            .await
+            .expect_err("a model that only ever answers empty never recovers");
+
+        assert!(
+            matches!(
+                &err,
+                ProviderError::Response(message)
+                    if message == "finish reason content_filter: Response contained no choices"
+            ),
+            "{err}",
+        );
+    }
+
+    #[test]
+    fn the_finish_reason_is_read_from_either_dialect_and_only_when_present() {
+        let model = RetryingModel::new(always_unusable(&Arc::default()), RetryPolicy::default());
+        let named = |body: &'static str| {
+            let answered = AnsweredBody::default();
+            answered.set(Bytes::from_static(body.as_bytes()));
+            RetryingModel::new(always_unusable(&Arc::default()), RetryPolicy::default())
+                .with_answered(answered)
+                .name_finish_reason("empty".into())
+        };
+        assert_eq!(named(r#"{"stop_reason":"refusal"}"#), "finish reason refusal: empty");
+        assert_eq!(named(r#"{"choices":[{}]}"#), "empty");
+        assert_eq!(named("not json"), "empty");
+        assert_eq!(model.name_finish_reason("empty".into()), "empty");
     }
 
     /// With retries off the wrapper is a pass-through: one call, no clone of
@@ -1788,6 +1986,7 @@ mod tests {
         let result = send_with_retry::<Bytes>(
             test_client(),
             loop_policy(),
+            AnsweredBody::default(),
             Method::POST,
             format!("http://127.0.0.1:{port}/v1/chat/completions")
                 .parse()
@@ -1913,6 +2112,61 @@ mod tests {
         );
     }
 
+    /// The bug this task fixes (#379): a `200` whose body never finishes
+    /// retries from inside the loop rather than surfacing to the REPL as an
+    /// unretried failure. The first connection answers success and then dies
+    /// mid-body; the second serves the whole thing.
+    #[tokio::test(start_paused = true)]
+    async fn a_200_whose_body_fails_partway_is_retried_from_inside_the_loop() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a two-shot server");
+        let port = listener.local_addr().expect("loopback address").port();
+        tokio::spawn(async move {
+            // First connection: a `200` that promises ten bytes and delivers
+            // three before the socket closes -- a reset or a timeout mid-read
+            // looks the same to the client as this.
+            let (mut socket, _) = listener.accept().await.expect("first connection arrives");
+            let mut buffer = [0u8; 1024];
+            let _ = socket.read(&mut buffer).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabc")
+                .await
+                .expect("the truncated body is written");
+            socket.shutdown().await.expect("close before the body completes");
+            drop(socket);
+
+            // Second connection: the retry, served in full.
+            let (mut socket, _) = listener.accept().await.expect("second connection arrives");
+            let _ = socket.read(&mut buffer).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello")
+                .await
+                .expect("the whole body is written");
+            let _ = socket.shutdown().await;
+            drop(listener);
+        });
+
+        let result = send_with_retry::<Bytes>(
+            test_client(),
+            loop_policy(),
+            AnsweredBody::default(),
+            Method::POST,
+            format!("http://127.0.0.1:{port}/v1/chat/completions")
+                .parse()
+                .expect("a loopback URI parses"),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await
+        .expect("the retried attempt serves a whole body");
+
+        let bytes = result.into_body().await.expect("the body is already in hand");
+        assert_eq!(&bytes[..], b"hello", "the retried attempt's body, not the truncated one");
+    }
+
     /// A URL reqwest refuses to send fails the same way on every replay, so the
     /// loop returns it at once, with its budget unspent, and calls it what it
     /// is: not something a wait or a resend could clear. The URL has a typo'd
@@ -1924,6 +2178,7 @@ mod tests {
         let err = send_with_retry::<Bytes>(
             test_client(),
             loop_policy(),
+            AnsweredBody::default(),
             Method::POST,
             format!("htps://127.0.0.1:{REFUSED_PORT}/v1/chat/completions")
                 .parse()
@@ -1999,8 +2254,40 @@ mod tests {
             candidate_failure_label(&err),
             "connection error: error sending request: Connection refused"
         );
-        let status = http_status(503);
-        assert_eq!(candidate_failure_label(&status), status.to_string());
+    }
+
+    fn http_status_with(code: u16, body: &str) -> ProviderError {
+        ProviderError::from_http_response(
+            StatusCode::from_u16(code).expect("status"),
+            body.to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_permanent_transport_failure_keeps_its_cause() {
+        let sent = reqwest::Client::new().get("ftp://example.invalid/").send().await;
+        let source = sent.expect_err("reqwest refuses a scheme other than http(s)");
+        assert!(is_permanent(&source), "premise: this failure is permanent");
+        let err = transport(source);
+        let label = candidate_failure_label(&err);
+        assert!(label.starts_with("connection error: "), "{label}");
+        assert!(label.contains("scheme"), "{label}");
+        assert!(!label.contains('\n'), "{label}");
+    }
+
+    #[test]
+    fn a_transient_candidate_failure_is_the_status_alone() {
+        let err = http_status_with(503, "<html>\n<body>\nnginx\n</body>\n</html>\n");
+        assert_eq!(candidate_failure_label(&err), "HTTP 503 Service Unavailable");
+    }
+
+    #[test]
+    fn a_terminal_candidate_failure_keeps_its_body_on_one_line() {
+        let err = http_status_with(401, "{\n  \"error\": \"bad key\"\n}\n");
+        assert_eq!(
+            candidate_failure_label(&err),
+            "HTTP 401 Unauthorized: { \"error\": \"bad key\" }"
+        );
     }
 
     #[test]

@@ -1036,6 +1036,11 @@ impl Outrig {
     /// name a container, if an MCP `tools/call` deadline is out of range, or if
     /// the build could not embed the payload.
     ///
+    /// Under [`NetworkMode::Audit`] or [`NetworkMode::Filter`] the interceptor
+    /// attaches to the primary before its process runs, so the traffic of an
+    /// image's `ENTRYPOINT` is recorded and filtered like any other's. See
+    /// [`Container::start_named_held`].
+    ///
     /// Under [`EmbeddedMcpPolicy::Merge`], a server the image's
     /// `org.outrig.mcp` label declares is held to
     /// [`spec.embedded_mcp_env_allow`](LaunchSpec::embedded_mcp_env_allow)
@@ -1085,8 +1090,14 @@ impl Outrig {
         };
 
         let (name, launch) = primary_launch(spec, &session_id, python);
-        let mut container = Container::start_named(&image_tag, launch, name, None).await?;
-        container.bootstrap_user().await?;
+        // Under interception the primary's process is held until the
+        // interceptor is in its network namespace; see `start_named_held`.
+        let intercepting = spec.network.mode != NetworkMode::Default;
+        let mut container = if intercepting {
+            Container::start_named_held(&image_tag, launch, name, None).await?
+        } else {
+            Container::start_named(&image_tag, launch, name, None).await?
+        };
 
         let network = match spec.network.mode {
             NetworkMode::Default => None,
@@ -1116,6 +1127,10 @@ impl Outrig {
                 )
             }
         };
+        if intercepting {
+            container.release().await?;
+        }
+        container.bootstrap_user().await?;
 
         let mcp = match spec.embedded_mcp_policy {
             EmbeddedMcpPolicy::Merge => {
@@ -1230,10 +1245,15 @@ impl Outrig {
     /// With [`SidecarView::Primary`] the sidecar additionally joins the
     /// primary's mount namespace through the `outrig-enter` helper, which is
     /// materialized into the session's log directory. That is a real posture
-    /// change -- the sidecar runs with `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` in
-    /// the primary's user namespace and can read the primary's whole
-    /// filesystem. A build without the helper fails here rather than emitting
-    /// a broken container.
+    /// change -- the sidecar's launcher holds `CAP_SYS_ADMIN` and
+    /// `CAP_SYS_PTRACE` in the primary's user namespace, and its server can
+    /// read the primary's whole filesystem. The server itself runs as the
+    /// session's uid/gid under `no_new_privs`, which the launcher sets, so what
+    /// the launcher holds is not passed on. A build without the helper fails
+    /// here rather than emitting a broken container, and so does a spec the
+    /// launcher cannot run under or that asks of it what it will not do --
+    /// `ConfigValidationError::SidecarViewDropsCaps`, `SidecarViewCapDrop` and
+    /// `SidecarViewNoNewPrivsOff` say which.
     pub async fn add_sidecar(&mut self, spec: SidecarSpec) -> Result<Vec<ToolHandle>> {
         validate_sidecar_spec(&spec, &self.clients, &self.sidecars, enter::is_available())?;
 
@@ -1330,9 +1350,17 @@ impl Outrig {
             .await);
         }
 
-        match connect_sidecar_servers(&container, &spec, &self.log_dir, self.mcp_call_timeout_secs)
-            .await
-        {
+        // A no-op when the session has no interceptor. Armed across the connect
+        // because that is where a caller's timeout or `select!` drops this
+        // future, and the container's own `Drop` removes only the container.
+        let attachment = UncommittedAttachment::arm(self.network.as_mut(), container.name());
+        let connected =
+            connect_sidecar_servers(&container, &spec, &self.log_dir, self.mcp_call_timeout_secs)
+                .await;
+        // Both arms below see to the attachment themselves: the failure detaches
+        // it in order, and the commit keeps it for the session.
+        attachment.disarm();
+        match connected {
             Ok((clients, tools)) => {
                 self.sidecars.insert(spec.name.clone(), container);
                 self.clients
@@ -1646,6 +1674,8 @@ fn validate_sidecar_spec<C, S>(
         spec.view,
         spec.workspace,
         spec.security.capabilities.profile,
+        &spec.security.capabilities.cap_drop,
+        spec.security.no_new_privileges,
     )?;
     let hosted: Vec<(&str, bool)> = spec
         .servers
@@ -1661,6 +1691,46 @@ fn validate_sidecar_spec<C, S>(
         return Err(OutrigError::FilesystemHelperUnavailable);
     }
     Ok(())
+}
+
+/// A sidecar's interceptor attachment between a successful `attach` and the
+/// point where [`Outrig::add_sidecar`] either commits it or detaches it in
+/// order.
+///
+/// Dropped while still armed -- the add's future dropped mid-connect, by a
+/// timeout or a `select!` -- it retires the attachment. That frees the name,
+/// which a retried add of the same sidecar needs: it gets the same container
+/// name, and would be refused as already attached until `shutdown`. It does
+/// not end the interception, because the sidecar's own `Drop` only *requests*
+/// the container's removal in the background and nothing here can tell when it
+/// lands. A server that withheld `initialize` stays filtered, and its audit
+/// records are still written, until `shutdown` tears the attachment down in
+/// order.
+struct UncommittedAttachment<'a> {
+    network: Option<&'a mut NetworkInterceptor>,
+    container: String,
+}
+
+impl<'a> UncommittedAttachment<'a> {
+    fn arm(network: Option<&'a mut NetworkInterceptor>, container: &str) -> Self {
+        Self {
+            network,
+            container: container.to_string(),
+        }
+    }
+
+    /// The add reached a path that sees to the attachment itself.
+    fn disarm(mut self) {
+        self.network = None;
+    }
+}
+
+impl Drop for UncommittedAttachment<'_> {
+    fn drop(&mut self) {
+        if let Some(network) = self.network.take() {
+            network.retire_attachment(&self.container);
+        }
+    }
 }
 
 /// Stop `container` and report `source` with whatever stopping it could not
@@ -2018,7 +2088,7 @@ mod tests {
         assert_eq!(spec.session_id, None, "the constructors choose no id");
 
         let id = resolve_session_id(&spec).expect("minted");
-        let shape = regex::Regex::new(r"^\d{8}T\d{6}-[0-9a-f]{4}$").expect("a regex");
+        let shape = regex::Regex::new(r"^\d{8}T\d{6}-[0-9a-f]{8}$").expect("a regex");
         assert!(shape.is_match(&id), "{id}");
 
         let (name, launch) = primary_launch(&spec, &id, python_stand_in());
@@ -2223,6 +2293,17 @@ mod tests {
             .with_entrypoint_server("fs", ["/"])
     }
 
+    /// [`view_sidecar`] with `cap_drop` entries, spelled as given.
+    fn view_sidecar_dropping(entries: &[&str]) -> SidecarSpec {
+        view_sidecar().with_security(SecuritySpec {
+            capabilities: CapabilitySpec {
+                cap_drop: entries.iter().map(|entry| entry.to_string()).collect(),
+                ..CapabilitySpec::default()
+            },
+            ..SecuritySpec::default()
+        })
+    }
+
     #[test]
     fn validate_accepts_a_primary_view_entrypoint_spec() {
         validate_alone(&view_sidecar()).expect("spec is valid");
@@ -2269,6 +2350,56 @@ view = "primary"
             view_config_error("[sidecars.fs.security]\ncapability-profile = \"drop-all\""),
             "the two paths must produce the same text from the same code"
         );
+    }
+
+    /// A hand-built spec skips the config path's normalizer, and podman reads
+    /// `cap_sys_chroot` and `CAP_SYS_CHROOT` as the one capability -- so the
+    /// check has to, or the spelling decides whether the refusal happens.
+    #[test]
+    fn validate_rejects_primary_view_dropping_a_launcher_capability() {
+        for entry in [
+            "SYS_CHROOT",
+            "sys_chroot",
+            "CAP_SYS_CHROOT",
+            "cap_sys_chroot",
+        ] {
+            let err = validate_alone(&view_sidecar_dropping(&[entry]))
+                .expect_err("setns(CLONE_NEWNS) needs SYS_CHROOT");
+            assert!(
+                matches!(
+                    err,
+                    OutrigError::ConfigValidation(
+                        crate::config::ConfigValidationError::SidecarViewCapDrop { .. }
+                    )
+                ),
+                "cap_drop = [{entry:?}]: got {err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                view_config_error("[sidecars.fs.security]\ncap-drop = [\"SYS_CHROOT\"]"),
+                "cap_drop = [{entry:?}]: the two paths must produce the same text from the same code"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_primary_view_without_no_new_privileges() {
+        let spec = view_sidecar().with_security(SecuritySpec {
+            no_new_privileges: false,
+            ..SecuritySpec::default()
+        });
+        let err = validate_alone(&spec).expect_err("the launcher sets no_new_privs regardless");
+        assert_eq!(
+            err.to_string(),
+            view_config_error("[sidecars.fs.security]\nno-new-privileges = false"),
+            "the two paths must produce the same text from the same code"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_primary_view_dropping_what_the_launcher_does_not_need() {
+        validate_alone(&view_sidecar_dropping(&["MKNOD"]))
+            .expect("an unrelated drop is the sidecar's to make");
     }
 
     #[test]
@@ -2320,9 +2451,10 @@ view = "primary"
         validate_alone(&spec).expect("the ceiling itself is in range");
     }
 
-    /// A build without the musl target embeds no launcher, so a
-    /// `view = "primary"` spec has to fail before any container exists --
-    /// naming the artifact rather than surfacing an opaque podman error.
+    /// A build that embeds no launcher -- no musl build, and no static
+    /// fallback either -- has to fail a `view = "primary"` spec before any
+    /// container exists, naming the artifact rather than surfacing an opaque
+    /// podman error.
     #[test]
     fn validate_rejects_primary_view_without_the_helper() {
         let (clients, sidecars) = no_existing();

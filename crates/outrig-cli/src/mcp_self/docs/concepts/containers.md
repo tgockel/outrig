@@ -47,11 +47,17 @@ exec-form `ENTRYPOINT` rather than replacing it. An image that sets one therefor
 `<entrypoint> sleep infinity`, which is rarely what either side intended. Leave `ENTRYPOINT`
 unset on an image you mean to use as a primary.
 
+Under `--network audit` or `--network filter`, outrig holds the primary's process back until the
+network interceptor is attached to it, so an `ENTRYPOINT` that does reach the network is audited
+and filtered like everything else in the session. That is a safety net for an image you cannot
+change, not a reason to set one.
+
 The same goes for a sidecar image whose servers are `podman exec`'d into it -- those containers
-start exactly the way the primary does. An *entrypoint-stdio* sidecar is the opposite case:
-there the image's `ENTRYPOINT` is the server, outrig appends no command of its own, and `args`
-supply its arguments. See [MCP Servers](mcp-servers.md#sidecar-placement) for which entries are
-which.
+start exactly the way the primary does, except that nothing holds them for the interceptor, so an
+`ENTRYPOINT` on one runs before the interceptor attaches to that sidecar. An *entrypoint-stdio*
+sidecar is the opposite case: there the image's `ENTRYPOINT` is the server, outrig appends no
+command of its own, and `args` supply its arguments. See
+[MCP Servers](mcp-servers.md#sidecar-placement) for which entries are which.
 
 The one thing the image has to supply is a `sleep` that accepts `infinity`. GNU coreutils has
 always understood it, and busybox has since 1.30 -- Alpine 3.10, June 2019 -- so any current
@@ -76,14 +82,19 @@ works unchanged. What it does need is the two files to already exist and a writa
 base so minimal that it ships neither cannot be bootstrapped, and neither can one without the
 `sleep` the section above describes.
 
-What the image installs has to work for that user. The build runs as root, but outrig execs
-nothing as root: every exec gets your UID and `HOME=/home/<user>` (see
+What the image installs has to work for that user. The build runs as root, but outrig execs as
+you: every exec gets your UID and `HOME=/home/<user>` (see
 [What outrig sets in an exec](#what-outrig-sets-in-an-exec)). Install tools under a shared prefix
 such as `/usr/local`, not into root's home, which is `0700`. A tool that keeps its state under
 `$HOME` by default -- rustup, nvm, pyenv, `pip install --user` -- needs that state pointed at the
 prefix as well, or at run time it looks under your home and finds nothing there; and whatever it
 writes as it works, as cargo does its registry cache, has to be writable by you. The `rust`
 toolchain [`outrig image add`](../usage/image.md#what-gets-written) generates does all of this.
+
+If you run outrig as root, "you" is root: every exec is uid 0, and `HOME` is the home the image's
+`root` entry names -- `/root` in nearly every base image -- not `/home/root`, so what the
+Dockerfile left in root's home is found there. See
+[Workspace](workspace.md#uidgid-runtime-user-mapping).
 
 ### Download for the image's architecture
 
@@ -391,9 +402,10 @@ build context. When the context is in a git repo, that means every file in it th
 does not exclude, committed or not, by path, permission bits, and content, and every directory it
 does not exclude, empty ones included, by path and permission bits. If `.gitignore` matches the
 context directory, or every file in it, committed or not, then every file counts: the rules say
-nothing about which of them the build uses. Outside a git repo, it is a tarball hash of the whole
-directory. So `[images.outrig-standard]` builds to `outrig-standard:<hash>`, which
-podman shows as `localhost/outrig-standard`.
+nothing about which of them the build uses. Outside a git repo, every file and directory in it
+counts the same way, and so does which of its files are hard links to one another; it is walked in
+process rather than listed by git. So `[images.outrig-standard]` builds to
+`outrig-standard:<hash>`, which podman shows as `localhost/outrig-standard`.
 
 Repo-local build images carry an `org.outrig.mcp` label too. On a cache miss, outrig builds a
 temporary image, reads any inherited/Dockerfile MCP label, overlays `[images.<name>.mcp]`, and
@@ -450,9 +462,12 @@ to run first; an inline `image` on an MCP entry reads `(from the inline image of
 "<name>")`. An optional `[sidecars.<sc>.security]` block reuses the
 whole security surface of the primary -- capability keys, `no-new-privileges`, `devices`, and
 `unmask` alike -- and each sidecar's block stands on its own, so opting one out of
-`no-new-privileges` leaves the others hardened. `start = "manual"` declares a sidecar that does
-not start with the session (a later release adds the surfaces that start one mid-session; until
-then its servers are skipped with a notice).
+`no-new-privileges` leaves the others hardened. The exception is a `view = "primary"` sidecar,
+whose launcher needs five capabilities and sets `no_new_privs` itself: a `cap-drop` of one of
+them (or `ALL`) and `no-new-privileges = false` are refused, as `capability-profile = "drop-all"`
+is; see [MCP Servers](mcp-servers.md#primary-filesystem-view). `start = "manual"` declares a
+sidecar that does not start with the session (a later release adds the surfaces that start one
+mid-session; until then its servers are skipped with a notice).
 
 **Naming and labels.** Sidecar containers are named `outrig-<sid>-<sc>`; an anonymous sidecar
 uses its server's name as `<sc>`. Every session container -- primary included -- carries the
@@ -540,7 +555,17 @@ own namespaces. Removing the container is what stops that, which is why the guar
 than just a kill.
 
 Session `[network]` policy applies to every container: the network interceptor attaches to each
-sidecar the same way it attaches to the primary, before any MCP server connects.
+one before any MCP server connects. It attaches to the primary and to an entrypoint-stdio
+sidecar before their processes run; an exec-stdio sidecar is already running when it attaches.
+
+Attaching runs nothing from the image. The only program it enters into a container is the host's
+`nft`, in that container's network namespace; the primary and entrypoint-stdio sidecars are
+created with `--dns` naming the interceptor's listener, and an exec-stdio sidecar's
+`/etc/resolv.conf` is rewritten from the host the way the bootstrap writes `/etc/passwd` -- a
+forked child opens the file inside the container's namespaces, and outrig writes through the
+descriptor. So the writable `/etc` above is the whole of what interception asks of an image, and a
+base with no shell is as attachable as any other. See
+[`[network]`](../reference/config.md#network).
 
 ## What outrig sets in the run
 
@@ -550,11 +575,17 @@ workspace mounts, for an `outrig run-new` primary its own read-only mounts under
 and the runtime user-mapping bootstrap (see [Workspace](workspace.md)). It
 also supplies the container's command: `sleep infinity`, appended after the image reference,
 which overrides the image's `CMD` (see [Don't set an `ENTRYPOINT`](#dont-set-an-entrypoint)).
-The bootstrap runs from the host: a forked child joins the container's user namespace, becomes
+With network interception on, it is `podman create` and `podman init` rather than `podman run -d`:
+the interceptor attaches to the initialized container's network namespace, its resolver given to
+the create as `--dns`, and only then does `podman start` run the container's process. Without
+interception it is the one `podman run -d`. The bootstrap runs from the host, once the container
+is running: a forked child joins the container's user namespace, becomes
 its root, joins its mount namespace, and appends the missing `/etc/passwd` and `/etc/group`
 entries before creating `/home/<user>`. No `podman exec` is involved. When podman's `keep-id`
 mapping already planted the entries, nothing is appended, but the planted user entry's home --
-the container's working directory -- is rewritten to `/home/<user>`. A
+the container's working directory -- is rewritten to `/home/<user>`. For uid 0 the image's own
+`root` entry keeps its home; podman plants one only for an image with no root account, naming
+the working directory, and that one is pointed at `/root`. A
 `view = "primary"` sidecar is the one exception to `keep-id`: it runs `--userns=container:<primary>`
 to join the primary's user namespace, plus `--cap-add=SYS_ADMIN`/`SYS_PTRACE`, the primary's
 `/proc/<pid>/ns` directory, and the `outrig-enter` launcher as its `--entrypoint` (see
@@ -562,8 +593,9 @@ to join the primary's user namespace, plus `--cap-add=SYS_ADMIN`/`SYS_PTRACE`, t
 launcher mounts a fresh `proc` over the primary's before the exec -- `/proc/self` in the
 primary's procfs would name nothing. The launcher's argv carries
 `--uid`/`--gid` with the session user's ids: it holds those capabilities only until the graft is
-in place, then becomes that user for the exec, so the *server* runs unprivileged even though the
-container was created privileged.
+in place, then becomes that user for the exec and sets `no_new_privs`, so the *server* runs
+unprivileged, and a setuid binary it starts cannot change that, even though the container was
+created privileged.
 `--security-opt=no-new-privileges` goes on too unless the selected image-config sets
 `no-new-privileges = false`. Capability flags are emitted only when that image-config opts
 into a capability profile or explicit `cap-drop` / `cap-add` entries, `--device=<entry>` flags
@@ -586,7 +618,8 @@ Most real processes -- an exec-hosted MCP server, a command a library caller run
 container through `podman exec`, and that invocation is assembled separately from the run. For
 those, outrig always passes `-i` so stdin stays open for a stdio-speaking server,
 `--user=<uid>:<gid>` with the session's ids, and `--env HOME=/home/<user>` naming the home
-directory the runtime user bootstrap created. Each entry a caller supplies becomes one further
+directory the runtime user bootstrap created -- for uid 0, the home the image's `root` entry
+names, normally `/root`. Each entry a caller supplies becomes one further
 `--env K=V`, emitted in sorted key order so the same inputs always produce the same command line.
 
 **An entrypoint-stdio server is the exception, and gets none of that.** It is the image's own

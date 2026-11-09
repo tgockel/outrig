@@ -7,6 +7,9 @@
 //! [`Container::bootstrap_user`]: super::Container::bootstrap_user
 
 use std::borrow::Cow;
+use std::path::Path;
+
+use crate::config::fold_container_path;
 
 /// Login shell written into new `/etc/passwd` entries.
 ///
@@ -79,13 +82,72 @@ pub(super) fn is_path_component(name: &str) -> bool {
     !matches!(name, "" | "." | "..") && !name.contains(['/', '\0'])
 }
 
-/// The in-container home directory for `name`. The one definition: it is
-/// written into `/etc/passwd` -- or, for an entry reused from the image or
+/// The in-container home directory for the user at `uid`, named `name`, given
+/// `passwd` -- that file as it is, or as the user is about to be appended to
+/// it -- and `workspace`, where the checkout is bind-mounted in the container
+/// (empty when there is none). The one definition: it is written into
+/// `/etc/passwd` -- by [`passwd_line`] or, for an entry reused from the image or
 /// planted by podman, rewritten there by [`rehome`] -- created and `chown`ed
 /// after that, and passed as `HOME` to every `podman exec`. All three have to
 /// agree.
-pub(super) fn home_dir(name: &str) -> String {
-    format!("/home/{name}")
+///
+/// `/home/<name>`, except at uid 0, where the image's home for root is kept:
+/// it is where the image's build left root's dotfiles and toolchains, and
+/// [`rehome`] then has nothing to do. That is the home the entry names, when it
+/// [is usable](is_usable_home) and is not the `workspace` or inside it -- a home
+/// in the checkout would put root's caches in the user's repository, and
+/// `create_home` would `chown` the user's own directory. Otherwise root's home
+/// is `/root`, which is what an image with no entry at uid 0 gets, or
+/// `/home/<name>` when `/root` is in the `workspace` too. The `workspace` is
+/// compared [folded](fold_container_path), as podman folds a destination before
+/// it mounts there: `/var/../root` is `/root`. A home that is not UTF-8 is not
+/// usable either: decoded lossily it would be made and exported as a directory
+/// the entry does not name.
+///
+/// The entry has to be the image's, and the bytes cannot say whether it is. For
+/// an image with no account at the uid its `--user` names -- which
+/// `--userns=keep-id` implies -- podman plants one whose home is the
+/// container's working directory: the checkout for a primary, the image's
+/// `WORKDIR` for a container with no workspace, which an extra mount can cover.
+/// That is no home for root, so a caller that takes the entry for podman's
+/// passes an empty `passwd`, as for an image with none.
+pub(super) fn home_dir(passwd: &[u8], uid: u32, name: &str, workspace: &Path) -> String {
+    let named = format!("/home/{name}");
+    if uid != 0 {
+        return named;
+    }
+    let home = entry_at(passwd, uid)
+        .and_then(|entry| entry.line.split(|&b| b == b':').nth(5))
+        .and_then(|home| std::str::from_utf8(home).ok())
+        .filter(|home| is_usable_home(home) && !in_workspace(home, workspace))
+        .unwrap_or("/root");
+    // The entry's home was kept out of the workspace above; only `/root` can be in it.
+    if in_workspace(home, workspace) {
+        named
+    } else {
+        home.to_string()
+    }
+}
+
+/// Whether `home` is `workspace` or inside it, by path component: `/workspace2`
+/// is not inside `/workspace`, and a `workspace` of `/var/../root` is `/root`.
+/// An empty `workspace` -- the container has none -- holds nothing, though
+/// [`Path::starts_with`] takes it for the parent of every path and
+/// [`fold_container_path`] for `/`.
+fn in_workspace(home: &str, workspace: &Path) -> bool {
+    !workspace.as_os_str().is_empty() && Path::new(home).starts_with(fold_container_path(workspace))
+}
+
+/// Whether a home that an image's `/etc/passwd` names can go to `mkdir -p` and
+/// `fchown` in the container as root just as it is written: a `/` and then
+/// [plain names](is_path_component) separated by single `/`s. So not `/`
+/// itself, which `create_home` has no directory to make for; not a `..`, which
+/// would walk the `chown` out of the home (`/root/..` is the container's `/`);
+/// and not a trailing `/`, which makes `O_NOFOLLOW` follow a symlink at the end
+/// of the path.
+fn is_usable_home(home: &str) -> bool {
+    home.strip_prefix('/')
+        .is_some_and(|below| below.split('/').all(is_path_component))
 }
 
 /// How to make the entry at a uid name a given home: truncate the file at
@@ -109,8 +171,7 @@ pub(super) struct Rehome {
 /// because [`UserDb::read`](super::namespace::UserDb::read) decodes lossily: a
 /// non-UTF-8 GECOS written back from that would come back as `U+FFFD`.
 pub(super) fn rehome(raw: &[u8], uid: u32, home: &str) -> Option<Rehome> {
-    let entry =
-        entries(raw).find(|entry| entry_id(&entry.text).is_some_and(|(_, id)| id == uid))?;
+    let entry = entry_at(raw, uid)?;
     let mut fields: Vec<&[u8]> = entry.line.splitn(7, |&b| b == b':').collect();
     let was = *fields.get(5)?;
     if was == home.as_bytes() {
@@ -136,10 +197,12 @@ pub(super) fn group_line(name: &str, gid: u32) -> String {
 /// `x` password, empty GECOS, and a home directory that is named but not
 /// created (that is a separate step, exactly as `useradd` without `-m`).
 ///
-/// `home` must agree with the `HOME` that
-/// [`Container::build_exec_argv`](super::Container::build_exec_argv) passes to
-/// every `podman exec`.
-pub(super) fn passwd_line(name: &str, uid: u32, gid: u32, home: &str) -> String {
+/// The home is [`home_dir`] of a file with no entry for this user yet, in a
+/// container whose checkout is at `workspace`, so it agrees with the `HOME`
+/// that [`Container::build_exec_argv`](super::Container::build_exec_argv)
+/// passes to every `podman exec` without the caller having to say so.
+pub(super) fn passwd_line(name: &str, uid: u32, gid: u32, workspace: &Path) -> String {
+    let home = home_dir(&[], uid, name, workspace);
     format!("{name}:x:{uid}:{gid}::{home}:{DEFAULT_SHELL}\n")
 }
 
@@ -185,6 +248,12 @@ fn entries(raw: &[u8]) -> impl Iterator<Item = Entry<'_>> {
             let skipped = text.trim().is_empty() || text.trim_start().starts_with('#');
             (!skipped).then_some(Entry { at, line, text })
         })
+}
+
+/// The first entry whose numeric id is `uid`: the line [`lookup_id`] resolves
+/// a name from, found over the same iterator.
+fn entry_at(raw: &[u8], uid: u32) -> Option<Entry<'_>> {
+    entries(raw).find(|entry| entry_id(&entry.text).is_some_and(|(_, id)| id == uid))
 }
 
 /// An entry's name and numeric id: its first and third fields.
@@ -254,7 +323,7 @@ mod tests {
         let mut text = String::new();
         let mut name = "tgockel".to_string();
         for i in 0..10 {
-            text.push_str(&passwd_line(&name, 100 + i, 100 + i, "/home/x"));
+            text.push_str(&passwd_line(&name, 100 + i, 100 + i, Path::new("")));
             name.push('_');
         }
         assert_eq!(free_name(&text, "tgockel", 10), None);
@@ -305,8 +374,18 @@ mod tests {
     #[test]
     fn passwd_line_matches_useradd_output() {
         assert_eq!(
-            passwd_line("tgockel", 1000, 1000, "/home/tgockel"),
+            passwd_line("tgockel", 1000, 1000, Path::new("")),
             "tgockel:x:1000:1000::/home/tgockel:/bin/sh\n"
+        );
+    }
+
+    /// An entry bootstrap writes for uid 0 -- an image with no root line --
+    /// names `/root`, the home `home_dir` settles on for it afterwards.
+    #[test]
+    fn passwd_line_puts_root_at_slash_root() {
+        assert_eq!(
+            passwd_line("root", 0, 0, Path::new("")),
+            "root:x:0:0::/root:/bin/sh\n"
         );
     }
 
@@ -323,13 +402,315 @@ mod tests {
 
     #[test]
     fn an_appended_entry_is_found_by_a_later_lookup() {
-        let line = passwd_line("tgockel", 1000, 1000, "/home/tgockel");
+        let line = passwd_line("tgockel", 1000, 1000, Path::new(""));
         let mut text = ALPINE_PASSWD.to_string();
         text.push_str(&String::from_utf8(append_blob(&text, &line)).unwrap());
 
         assert_eq!(lookup_id(&text, 1000).as_deref(), Some("tgockel"));
         assert_eq!(lookup_id(&text, 0).as_deref(), Some("root"));
         assert!(name_taken(&text, "tgockel"));
+    }
+
+    /// An image's root entry naming `home`.
+    fn root_entry(home: &str) -> String {
+        format!("root:x:0:0:root:{home}:/bin/sh\n")
+    }
+
+    /// What bootstrap makes of the entry at uid 0 in `raw`: the home it settles
+    /// on, and the file once the entry has been pointed at that home.
+    fn settled_root(raw: &[u8]) -> (String, Vec<u8>) {
+        settled_root_in(raw, Path::new(""))
+    }
+
+    /// [`settled_root`] in a container whose checkout is mounted at `workspace`.
+    fn settled_root_in(raw: &[u8], workspace: &Path) -> (String, Vec<u8>) {
+        let home = home_dir(raw, 0, "root", workspace);
+        let after = rehome(raw, 0, &home).map_or(raw.to_vec(), |rehome| applied(raw, &rehome));
+        (home, after)
+    }
+
+    /// [`home_dir`] with no workspace to keep out of.
+    fn home(passwd: &[u8], uid: u32, name: &str) -> String {
+        home_dir(passwd, uid, name, Path::new(""))
+    }
+
+    #[test]
+    fn home_dir_is_under_home_for_every_uid_but_zero() {
+        // podman's entry names the working directory: for `rehome` to move, not
+        // to follow.
+        let raw = format!("{ALPINE_PASSWD}{}", podman_keep_id_entry("/workspace"));
+        assert_eq!(home(raw.as_bytes(), 1000, "tgockel"), "/home/tgockel");
+        assert_eq!(home(&[], 1000, "tgockel"), "/home/tgockel");
+        // An image's own entry at some other uid is no different.
+        assert_eq!(home(ALPINE_PASSWD.as_bytes(), 1, "bin"), "/home/bin");
+        // Only uid 0 is special: the name `root` at another uid is not.
+        assert_eq!(home(&[], 1000, "root"), "/home/root");
+    }
+
+    #[test]
+    fn is_usable_home_accepts_only_a_plain_absolute_path_below_the_root() {
+        for ok in [
+            "/root",
+            "/home/root",
+            "/var/lib/root",
+            "/home/a b",
+            "/.hidden",
+            "/...",
+            "/..x",
+        ] {
+            assert!(is_usable_home(ok), "{ok:?}");
+        }
+        for bad in [
+            "", "root", "./root", "/", "//", "/.", "/..", "/root/", "/root/.", "/root/..",
+            "/a/../b", "/a//b", "/ro\0ot",
+        ] {
+            assert!(!is_usable_home(bad), "{bad:?}");
+        }
+    }
+
+    /// The entry at uid 0 is the image's own, so the home it names is where the
+    /// image put what root uses -- and the file is left as it is (#399).
+    #[test]
+    fn root_keeps_a_usable_home_and_its_entry_is_not_rewritten() {
+        let debian = "root:x:0:0:root:/root:/bin/bash\n\
+                      daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n";
+        for (raw, home) in [
+            (ALPINE_PASSWD.to_string(), "/root"),
+            (debian.to_string(), "/root"),
+            (root_entry("/var/lib/root"), "/var/lib/root"),
+            // No shell field, with and without a line ending: still the sixth field.
+            ("root:x:0:0:root:/var/root\r\n".to_string(), "/var/root"),
+            ("root:x:0:0:root:/var/root".to_string(), "/var/root"),
+        ] {
+            let settled = settled_root(raw.as_bytes());
+            assert_eq!(settled, (home.to_string(), raw.into_bytes()));
+        }
+
+        // The first entry at the uid counts, as it does for `lookup_id`.
+        let raw = "# root:x:0:0::/commented:/bin/sh\n\
+                   first:x:0:0::/one:/bin/sh\n\
+                   second:x:0:0::/two:/bin/sh\n";
+        assert_eq!(lookup_id(raw, 0).as_deref(), Some("first"));
+        assert_eq!(
+            settled_root(raw.as_bytes()),
+            ("/one".to_string(), raw.as_bytes().to_vec())
+        );
+    }
+
+    /// A root entry with no home that can be used is pointed at `/root`, the way
+    /// a reused entry's home is pointed at the one bootstrap exports.
+    #[test]
+    fn root_without_a_usable_home_is_pointed_at_slash_root() {
+        // Empty, relative, `/`, a `.`, `..` or empty part, or a trailing `/`.
+        for home in [
+            "", "root", "/", "//", "/root/", "/root/.", "/..", "/a/../b", "/ro\0ot",
+        ] {
+            assert_eq!(
+                settled_root(root_entry(home).as_bytes()),
+                ("/root".to_string(), root_entry("/root").into_bytes()),
+                "{home:?}"
+            );
+        }
+
+        // Not UTF-8, so not a home to make or export; the bytes around it stay.
+        assert_eq!(
+            settled_root(b"root:x:0:0:Jos\xe9:/r\xf6\xf6t:/bin/sh\n"),
+            (
+                "/root".to_string(),
+                b"root:x:0:0:Jos\xe9:/root:/bin/sh\n".to_vec()
+            )
+        );
+
+        // Too short to name a home at all: `/root`, though there is no field to
+        // rewrite.
+        assert_eq!(home(b"root:x:0:0:root\n", 0, "root"), "/root");
+        assert_eq!(rehome(b"root:x:0:0:root\n", 0, "/root"), None);
+    }
+
+    /// With no account at uid 0 in the image, podman's `--user` handling plants
+    /// one naming the working directory, which is the workspace -- under the
+    /// host user's name or, failing that lookup, the uid. Neither is the image's
+    /// home for root: it would put root's caches in the checkout, and
+    /// `create_home` would `chown` the user's directory (#399).
+    #[test]
+    fn root_is_not_homed_in_the_workspace_podman_names_for_its_entry() {
+        let before = format!(
+            "bin:x:1:1:bin:/bin:/sbin/nologin\n{}",
+            podman_keep_id_entry("/workspace")
+        );
+        for (planted, pointed) in [
+            (
+                "root:*:0:0:root:/workspace:/bin/sh\n",
+                "root:*:0:0:root:/root:/bin/sh\n",
+            ),
+            (
+                "0:*:0:0:container user:/workspace:/bin/sh\n",
+                "0:*:0:0:container user:/root:/bin/sh\n",
+            ),
+        ] {
+            let raw = format!("{before}{planted}");
+            let want = format!("{before}{pointed}");
+            assert_eq!(
+                settled_root_in(raw.as_bytes(), Path::new("/workspace")),
+                ("/root".to_string(), want.into_bytes()),
+                "{planted:?}"
+            );
+        }
+    }
+
+    /// The workspace mounted at `/root` -- where a stock image's root entry
+    /// points -- makes `/root` no better a home than the checkout is, whatever
+    /// the entry names or lacks, so root is homed as any other user is (#399).
+    #[test]
+    fn root_is_homed_under_home_when_slash_root_is_the_workspace() {
+        let workspace = Path::new("/root");
+        assert_eq!(
+            settled_root_in(root_entry("/root").as_bytes(), workspace),
+            (
+                "/home/root".to_string(),
+                root_entry("/home/root").into_bytes()
+            )
+        );
+
+        // No entry: the line bootstrap appends is for the same workspace, so it
+        // already names `/home/root` and the file needs no rewriting.
+        let raw = "bin:x:1:1:bin:/bin:/sbin/nologin\n";
+        assert_eq!(home_dir(raw.as_bytes(), 0, "root", workspace), "/home/root");
+        let after = format!("{raw}{}", passwd_line("root", 0, 0, workspace));
+        assert_eq!(after, format!("{raw}root:x:0:0::/home/root:/bin/sh\n"));
+        assert_eq!(
+            settled_root_in(after.as_bytes(), workspace),
+            ("/home/root".to_string(), after.into_bytes())
+        );
+
+        // The home is named for whoever is at uid 0.
+        let raw = "0:*:0:0:container user:/root:/bin/sh\n";
+        assert_eq!(home_dir(raw.as_bytes(), 0, "0", workspace), "/home/0");
+
+        // An entry whose home is the image's own, and not the checkout, stands.
+        let raw = root_entry("/home/dev");
+        assert_eq!(home_dir(raw.as_bytes(), 0, "root", workspace), "/home/dev");
+    }
+
+    /// The path a workspace is spelled with is not the path it is mounted at:
+    /// podman folds `.` and `..` out of a destination, so `/var/../root` is
+    /// `/root`, and comparing the spelling would take the checkout for root's
+    /// home -- `chown`ed to the container's root, or failing on a read-only
+    /// mount (#399). With or without an entry, root is then homed under
+    /// `/home`, as for the plain spelling.
+    #[test]
+    fn a_workspace_is_compared_as_podman_folds_it() {
+        for spelling in [
+            "/var/../root",
+            "/./root",
+            "//root",
+            "/root/",
+            "/a/b/../../root",
+            "/root/x/..",
+        ] {
+            let workspace = Path::new(spelling);
+            for raw in [root_entry("/root"), String::new()] {
+                assert_eq!(
+                    home_dir(raw.as_bytes(), 0, "root", workspace),
+                    "/home/root",
+                    "{spelling} with {raw:?}"
+                );
+            }
+            // The line bootstrap appends for an image with no entry agrees.
+            assert_eq!(
+                passwd_line("root", 0, 0, workspace),
+                "root:x:0:0::/home/root:/bin/sh\n",
+                "{spelling}"
+            );
+        }
+
+        // The entry's own home is held to the folded workspace too, at any depth.
+        let raw = root_entry("/workspace/home");
+        for spelling in ["/data/../workspace", "/workspace/.", "/workspace/a/.."] {
+            assert_eq!(
+                home_dir(raw.as_bytes(), 0, "root", Path::new(spelling)),
+                "/root",
+                "{spelling}"
+            );
+        }
+
+        // A spelling that folds to somewhere else leaves `/root` alone.
+        for spelling in ["/var/../root2", "/root/../workspace", "/root/a/../b"] {
+            assert_eq!(
+                home_dir(ALPINE_PASSWD.as_bytes(), 0, "root", Path::new(spelling)),
+                "/root",
+                "{spelling}"
+            );
+        }
+    }
+
+    /// A workspace below or beside `/root` is not `/root`, so it stays out of
+    /// its way: with or without an entry, root is at `/root`, file as it was.
+    #[test]
+    fn a_workspace_below_or_beside_slash_root_leaves_it_alone() {
+        for workspace in ["/root/project", "/root2", "/rooted", "/workspace"] {
+            for raw in [root_entry("/root"), String::new()] {
+                let settled = settled_root_in(raw.as_bytes(), Path::new(workspace));
+                assert_eq!(
+                    settled,
+                    ("/root".to_string(), raw.into_bytes()),
+                    "{workspace}"
+                );
+            }
+        }
+    }
+
+    /// A home is out when it is the workspace or inside it at any depth, not
+    /// when it merely shares a prefix with it or sits above it. The spelling of
+    /// the workspace's path does not matter. With no workspace there is nothing
+    /// to keep out of, so the entry's home stands.
+    #[test]
+    fn a_root_home_is_out_only_when_it_is_the_workspace_or_inside_it() {
+        for (home, kept) in [
+            ("/workspace", false),
+            ("/workspace/home", false),
+            ("/workspace/a/b", false),
+            ("/workspace/.cache", false),
+            ("/workspace2", true),
+            ("/workspace-old", true),
+            ("/work", true),
+            ("/var/workspace", true),
+            ("/root", true),
+        ] {
+            let (settled, _) =
+                settled_root_in(root_entry(home).as_bytes(), Path::new("/workspace"));
+            assert_eq!(settled, if kept { home } else { "/root" }, "{home}");
+        }
+
+        let raw = root_entry("/workspace");
+        assert_eq!(
+            home_dir(raw.as_bytes(), 0, "root", Path::new("/workspace/")),
+            "/root"
+        );
+        // A home the workspace is below is the image's own.
+        let raw = root_entry("/home/dev");
+        let workspace = Path::new("/home/dev/project");
+        assert_eq!(home_dir(raw.as_bytes(), 0, "root", workspace), "/home/dev");
+
+        let raw = root_entry("/workspace");
+        assert_eq!(
+            settled_root(raw.as_bytes()),
+            ("/workspace".to_string(), raw.into_bytes())
+        );
+    }
+
+    /// With no entry at uid 0 the line bootstrap appends names `/root`, and the
+    /// file then agrees with the home `home_dir` settles on.
+    #[test]
+    fn root_with_no_entry_is_appended_naming_slash_root() {
+        let raw = "bin:x:1:1:bin:/bin:/sbin/nologin\n";
+        assert_eq!(home(raw.as_bytes(), 0, "root"), "/root");
+
+        let after = format!("{raw}{}", passwd_line("root", 0, 0, Path::new("")));
+        assert_eq!(
+            settled_root(after.as_bytes()),
+            ("/root".to_string(), after.into_bytes())
+        );
     }
 
     /// `raw` with `rehome`'s rewrite applied, as the truncate-and-append

@@ -55,41 +55,78 @@ pub async fn ensure(
 /// unconfigured case.
 /// `name` is the image `image add` was given, if any. One it can't build
 /// is refused before anything is asked or written; otherwise the
-/// bootstrap writes it as `default-image` rather than asking for one.
-/// Returns the resolved repo root paired with `name`, or, when that is
-/// `None` and the bootstrap ran, the name it asked for.
-/// `global_override` is `--global-config`, which only the bootstrap reads: one
-/// that names nothing is refused before the bootstrap asks anything. With no
-/// flag and no default location, the bootstrap reads no global config, as it
-/// does when the default file is missing.
+/// bootstrap hands it to `image add` as `default-image` rather than asking for one.
+/// Returns the resolved repo root paired with `name` (or, when that is
+/// `None` and the bootstrap ran, the name it asked for), and whether this
+/// call is the one that wrote the config: the caller's own signal for
+/// whether to set `default-image`, rather than a separate walk of its own
+/// that a `stat` between the two could answer differently from this one.
+///
+/// [`resolve_global_config`] is called twice around the "configure now?"
+/// prompt, not once before it: an explicit `--global-config` that is
+/// already gone is refused before the prompt fires, so a script with
+/// nothing scripted for it fails on the missing file rather than hanging
+/// on the question; the second call, right before the bootstrap reads the
+/// file, catches one removed during the wait a user paces rather than
+/// handing the bootstrap a path that read empty (#505).
 pub async fn resolve_or_bootstrap(
     cwd: &Path,
     global_override: Option<&Path>,
     name: Option<String>,
     prompt: &mut impl PromptSource,
-) -> Result<(PathBuf, Option<String>)> {
+) -> Result<(PathBuf, Option<String>, bool)> {
     // Ahead of the bootstrap, which would walk a fresh repo through its
     // prompts and write the name as its `default-image`.
     if let Some(name) = &name {
         image_add::check_name(name).map_err(OutrigError::from)?;
     }
     match find_repo_root_from(cwd) {
-        Ok(root) => Ok((root, name)),
+        Ok(root) => Ok((root, name, false)),
         Err(OutrigError::NoRepoConfig) => {
-            let global_path = resolve_global_config(global_override)?;
+            // Fails fast, ahead of the prompt below, when an explicit
+            // `--global-config` is already missing.
+            resolve_global_config(global_override)?;
             eprintln!(
                 "[outrig] no .agents/outrig/config.toml found in {} or any parent.",
                 cwd.display()
             );
-            if !prompt.ask_bool(&CONFIGURE_NOW_FIELD, true).await? {
+            // The directory becomes the read-write workspace (`host-path = "."`),
+            // so say so, and decline by default where nothing marks it a project:
+            // Enter in `$HOME` must not hand the whole home directory to every
+            // later `outrig run` that walks up to this config.
+            let in_git = in_git_repo(cwd);
+            eprintln!(
+                "[outrig] the config would go in {}, which is then mounted read-write \
+                 as the workspace.",
+                cwd.display()
+            );
+            if !in_git {
+                eprintln!(
+                    "[outrig] {} is not inside a git repository, so this defaults to no.",
+                    cwd.display()
+                );
+            }
+            if !prompt.ask_bool(&CONFIGURE_NOW_FIELD, in_git).await? {
                 eprintln!("[outrig] skipping; run `outrig init` later to set up.");
                 return Err(OutrigError::NoRepoConfig.into());
             }
+            // Re-resolved here, at the read itself: the prompt above waits on
+            // the user's own pace, so an explicit `--global-config` checked
+            // only before it could vanish in the meantime and be read as an
+            // empty config instead of refused (#505).
+            let global_path = resolve_global_config(global_override)?;
             let name = write_repo_config(cwd, global_path.as_deref(), name, prompt).await?;
-            Ok((cwd.to_path_buf(), Some(name)))
+            Ok((cwd.to_path_buf(), Some(name), true))
         }
         Err(other) => Err(other.into()),
     }
+}
+
+/// Whether `dir`, or a directory above it, holds a `.git` (a directory, or
+/// the file a worktree or submodule has). Only a hint that `dir` is a project
+/// rather than, say, a home directory.
+fn in_git_repo(dir: &Path) -> bool {
+    dir.ancestors().any(|d| d.join(".git").exists())
 }
 
 /// Walks the three repo-config sections (image / model / agent),
@@ -97,8 +134,10 @@ pub async fn resolve_or_bootstrap(
 /// [`write_atomic`] once [`check_loads`] finds the next load would take
 /// it; when that finds otherwise, nothing is written. Section headers
 /// signal each transition so the prompts don't bleed together. A given
-/// `image_name` is written as `default-image` without asking for one.
-/// Returns the name written.
+/// `image_name` is not asked for. Neither is written here: the `image add`
+/// that follows writes the name as `default-image`, with the image's block,
+/// so an interrupt before it leaves no config naming a missing image.
+/// Returns the name for it.
 async fn write_repo_config(
     repo_root: &Path,
     global_path: Option<&Path>,
@@ -141,7 +180,6 @@ async fn write_repo_config(
     let toml_text = render(
         agent_name,
         agent_model,
-        image_name.clone(),
         workspace,
         model_choices,
         preamble,
@@ -406,7 +444,6 @@ pub(crate) const DEFAULT_AGENT_NAME: &str = "coder";
 fn render(
     agent_name: String,
     agent_model: Option<String>,
-    image_name: String,
     workspace: Workspace,
     model_choices: RepoModelChoices,
     preamble: String,
@@ -418,7 +455,6 @@ fn render(
     agents.insert(agent_name.clone(), agent);
 
     let mut cfg = Config::default();
-    cfg.default_image = Some(image_name);
     cfg.default_agent = Some(agent_name);
     cfg.default_model = model_choices.default_model;
     cfg.workspace = workspace;
@@ -459,6 +495,8 @@ fn check_loads(
         pending_image.to_string(),
         ImageConfig::from_image_name(pending_image),
     );
+    // Written by the `image add` after this, beside the image's block.
+    merged.default_image = Some(pending_image.to_string());
     if let Some(agent) = modelless_agent {
         merged.agents.remove(agent);
         merged.default_agent = None;
@@ -472,7 +510,9 @@ const CONFIGURE_NOW_FIELD: Field = Field {
     name: "Configure outrig in this directory now?",
     description: "Yes walks the same prompts as `outrig init` (workspace, model, \
                   agent) and writes .agents/outrig/config.toml here, then \
-                  continues with `image add`. No exits without changes.",
+                  continues with `image add`. This directory becomes the \
+                  read-write workspace, so the default is no outside a git \
+                  repository. No exits without changes.",
     options: &[],
     doc_link: "doc/usage/init.md",
 };

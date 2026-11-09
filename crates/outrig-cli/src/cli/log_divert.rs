@@ -4,8 +4,9 @@
 //! `run-new`'s screen draws on the terminal for as long as it is up, and a
 //! record written to stderr meanwhile -- a retry the library warns of, say --
 //! would land on top of what it drew. So the screen diverts records to itself
-//! while it is up. With nothing diverted, a record goes to stderr exactly as it
-//! always has, for every command.
+//! while it is up. With nothing diverted, a record goes to stderr through
+//! [`crate::notice`], which holds it while `outrig run`'s line editor is
+//! reading, for every command.
 
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -45,7 +46,7 @@ impl LogWriter {
         Diverted(self.clone(), before)
     }
 
-    fn writer(&self, level: Level) -> EitherWriter<io::Stderr, Collector> {
+    fn writer(&self, level: Level) -> EitherWriter<crate::notice::Record, Collector> {
         // Cloned under the lock and called after it is released, so a sink
         // that logs does not take it again.
         let sink = self
@@ -59,13 +60,13 @@ impl LogWriter {
                 level,
                 text: Vec::new(),
             }),
-            None => EitherWriter::A(io::stderr()),
+            None => EitherWriter::A(crate::notice::TracingWriter.make_writer()),
         }
     }
 }
 
 impl<'a> MakeWriter<'a> for LogWriter {
-    type Writer = EitherWriter<io::Stderr, Collector>;
+    type Writer = EitherWriter<crate::notice::Record, Collector>;
 
     fn make_writer(&'a self) -> Self::Writer {
         self.writer(Level::INFO)

@@ -842,7 +842,8 @@ without touching each other, from one ensured image. [The container facade besid
   is `None` when the config left it unset, and `resolved_container_path(repo_root)`. A session
   with a binding requires every mount at its host path; a declared one that differs, and a
   `workspace.container-path` that differs, is a `ConfigValidationError::BindingContainerPath`
-  naming the key.
+  naming the key. At the start, a container path that resolves on the host to the directory
+  mounted there counts as its host path.
 
 - **`Outrig::launch` labels its primary `org.outrig.session=<id>`**, with the id its name carries.
   The sidecars it starts already carried it; the primary did not, so `outrig clean` could not
@@ -987,6 +988,499 @@ without touching each other, from one ensured image. [The container facade besid
   the round as before. The resend is recorded as a `model.call` whose `budget.window_source` is
   the new `rejected`. (#833)
 
+- **A child whose rounds keep failing before its code runs stops after five, and fails what it
+  holds.** Such a round was opened again with what it opened with, for as long as the session
+  lived: the wait between rounds was capped at 60 s, the count of rounds never was, and the
+  conversation keeps nothing of a round that failed, so each one sent the provider the same
+  request. One a provider refuses on every attempt -- an empty reply with finish reason
+  `content_filter` -- cost a round a minute, and the parent heard nothing. In one session a
+  single child ran 603 rounds over 5.8 hours on a view that never changed, about 82M input
+  tokens, and four others did the same. Now the fifth round in a row to fail ends the child's
+  model as one that can answer nothing, as a key its provider refuses does: what the child holds
+  open, and anything sent to it after, ends `failed` with the error named, finish reason
+  included, and no call is made again. A round that runs ends the count. A request the host
+  ends before its child has read it -- for this, a key the provider refuses, or a spent budget --
+  is also taken out of the child's queue, where its copy had stayed for a child that would never
+  read it, so a parent that goes on sending leaves nothing behind. A provider outage that
+  outlasts the five rounds, about 30 s of waiting plus each call's own retries, ends the child
+  the same way, where it used to wait the outage out. (#757)
+
+- **`help(runtime)` in a child names only what that child has.** A work child's runtime carried a
+  two-line docstring deferring to `help(Runtime)`, and `Runtime` is bound in no kernel, so
+  following it raised `NameError`; the text deferred to described `runtime.channels["user"]`,
+  which no child has. Each kind of agent now has a runtime class with a docstring of its own, the
+  shared text around one paragraph that names that agent's channels: the primary's user channel,
+  a work child's `complete` and `progress`, and a request child's own channels, which says it has
+  no `complete`. Request children get `RequestRuntime`, where they used to share the primary's
+  `Runtime`. A runtime also takes `__slots__`, which keeps `__dict__` and `__weakref__` -- a
+  tenth of the 8 KiB `help` bound, and of no use to the agent -- off the page, so all three fit
+  whole as `0003-10` decided `help(runtime)` should. (#686)
+
+## [0.2.3](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.3) - 2026-11-09
+
+The third patch release since 0.2.0. Every change to the public surface is additive, and no
+requirement moves. Several fixes change what a consumer sees without asking. A config file's error
+is now an `OutrigError::ConfigFile` that wraps the `Config`, `ConfigDottedKey` or
+`ConfigValidation` error a caller used to match on, so match on its `source`. These configs are
+refused now: a `view = "primary"` sidecar that sets `no-new-privileges = false` or drops a
+capability the `outrig-enter` launcher needs, an `env` or `build-args` key podman would misread,
+and a mount path containing `:`. `Outrig::launch` keeps a cache miss's build output off the
+embedder's stdout and, in `audit` and `filter` mode, attaches the network interceptor before the
+primary's process runs. `NetworkInterceptor::attach` refuses a borrowed container that holds
+`CAP_NET_ADMIN`. A build whose context changed while it ran is discarded, as
+`OutrigError::BuildContextChanged`, rather than saved under the old key. A build without the musl
+target now tries to compile the launcher statically for its own target, which needs the host's
+static C library; when that fails too, the launcher is missing as before. The rest are fixes, each
+described below.
+
+### Added
+
+- **A build without the musl target still embeds the `outrig-enter` launcher.** `build.rs` used
+  to embed an empty one when `<arch>-unknown-linux-musl` was not installed or its build failed,
+  and every `view = "primary"` sidecar was then refused with
+  `OutrigError::FilesystemHelperUnavailable`. It now compiles the same launcher statically for
+  the build machine's own target instead (`-C target-feature=+crt-static`, which links glibc in
+  on a gnu host), so like the musl build it needs nothing from the sidecar image. That build
+  needs the host's static C library -- `libc6-dev` on Debian and Ubuntu, `glibc-static` on
+  Fedora -- and is only tried for a native build. When it fails too the launcher is missing as
+  before, and `FilesystemHelperUnavailable` names both failures and links
+  https://tgockel.github.io/outrig/usage/no-musl.html. `OUTRIG_REQUIRE_ENTER` still requires the
+  musl build and never tries the fallback. (#868)
+
+- **`NetworkInterceptor::retire_attachment` frees one container's name without ending its
+  interception.** Where `drop_attachment` aborts the loops and hands the undo to a background
+  reaper, this keeps the loops, the nft table and the resolver redirect in place, and tears the
+  attachment down in order at `shutdown`. It is for code that
+  cannot await and cannot say the container is gone, such as a destructor unwinding an attach
+  that was never committed. (#501)
+
+- **`OutrigError::ConfigFile`**: a fault a config file is refused for, wrapped in the path of the
+  file it was read from. It carries the error it names the file on -- the parse's
+  `OutrigError::Config` or `ConfigDottedKey`, or an `OutrigError::ConfigValidation` from the
+  repo-only rules -- so a caller that matched on those matches `source` now. A failed read is
+  still `OutrigError::Path`, and a rule of the merged config is still a bare
+  `OutrigError::ConfigValidation`: neither belongs to one file. See the fix below. (#413)
+
+- **`ConfigValidationError::SidecarViewCapDrop` / `SidecarViewNoNewPrivsOff`**: a `view = "primary"`
+  sidecar whose `cap-drop` names a capability the `outrig-enter` launcher needs (`SYS_ADMIN`,
+  `SYS_PTRACE`, `SYS_CHROOT`, `SETUID`, `SETGID`, or `ALL`), and one that sets
+  `no-new-privileges = false`. The first carries the capability as podman reads it: upper case,
+  no `CAP_`. `Outrig::add_sidecar` refuses the same specs, with the same text, as
+  `OutrigError::ConfigValidation`. See the fix below. (#398)
+- **`OutrigError::BuildContextChanged`**: a build whose Dockerfile or context changed while buildah
+  ran, discarded rather than saved. It names the image-config and the tag the build would have been
+  saved as. For a caller that computes a tag, builds into it, and has to tell this refusal from a
+  build that failed. See the fix below. (#392)
+- **`Container::start_named_held` and `Container::release`**: `start_named` with the container's
+  process held back, and the `podman start` that runs it. The container is created and
+  initialized, so its PID and network namespace exist and `NetworkInterceptor::attach` can work
+  on it, but nothing in it runs until it is released. The interceptor's resolver is baked in at
+  create (`--dns`), as it is for an entrypoint-stdio sidecar, because nothing can be exec'd into
+  a container that has not started. For a caller that has to act on a container before the
+  image's process does. See the fix below. (#395)
+- **`Config::salvage_global_session_root`**: the global config's `session-root` read out of a
+  file that does not load as a whole, resolved beside the file and `~`-expanded exactly as
+  `load_global` resolves it. Only a declaration the damaged file states outright is read: one
+  plain, non-empty string, declared once, no part of which the parser's recovery had to repair.
+  `Ok(None)` is "this file cannot be declaring the key", so the caller's default stands; `Err` is
+  the file refusing to be asked, which is what a parse error reaching the declaration, a repaired
+  value, or a second mention of the key anywhere in the file produces -- the file's text answers
+  for uniqueness, because a syntax error can stop the parser's recovery before a second
+  declaration below it. For a caller that needs this one
+  machine-level key and can go on without the rest of the file -- `outrig ls` and its three
+  siblings. See the fix below. (#384)
+- **`config::is_env_key`**: whether a string can name a variable an `env` or `build-args` table
+  sets (`^[A-Za-z_][A-Za-z0-9_]*$`). It is the grammar validation now holds those keys to, and
+  the one that already decided whether a resolved `${VAR}` could be passed to podman by name;
+  public so a caller building an `McpServerSpec` or an `--env` overlay can refuse the same keys
+  with the same answer. (#369)
+- **`ConfigValidationError::BuildArgKeyInvalid` / `McpEnvKeyInvalid`**, and
+  **`EmbeddedImageConfigError::EnvKeyInvalid` / `StandaloneImageTomlError::EnvKeyInvalid`**: an
+  `env` or `build-args` key that is not a variable name, in a config file and in an image's
+  label or `image.toml` respectively. See the fix below. (#369)
+- **`container::embedded::read_embedded_mcp_of`**: the `org.outrig.mcp` of the image a running
+  `Container` was started from, by the engine's id for it. The by-tag
+  `read_embedded_mcp` remains, and remains right for the caller deciding what to *start*, since
+  the launch that follows resolves the same tag; this is the read for a container that is
+  already running. See the fix below. (#370)
+- **`config::SecurityRuleViolation`, and `ConfigValidationError::SidecarSecurity` which carries
+  it**: a `[security]` rule failure with no owning block baked into it, and the variant that
+  frames one for a sidecar. `Display` on the violation is the rule alone -- ``` `devices` entry
+  "dev/fuse" must be an absolute path` ``` -- so the caller supplies the owner. The fifteen
+  per-image variants (`DevicePathEmpty`, `CapabilityNameInvalid`, `UnmaskAllNotAlone`, and the
+  rest) keep their `image: String` field and their messages exactly as they were: an
+  `[images.<name>]` failure is unchanged, and a `match` written against 0.2.2 goes on compiling.
+  See the fix below. (#378)
+- **`MountRuleViolation::HostFieldSeparator` / `ContainerFieldSeparator`, and the four
+  `ConfigValidationError` variants that restate them**
+  (`WorkspaceHostFieldSeparator`, `WorkspaceContainerFieldSeparator`,
+  `WorkspaceMountHostFieldSeparator`, `WorkspaceMountContainerFieldSeparator`): a bind-mount path
+  that contains `:`. See the fix below for why it is now refused. (#365)
+
+### Fixed
+
+- **A build without the musl target no longer recompiles `outrig` on every `cargo` invocation.**
+  `build.rs` watched the musl target's library directory, so that installing the target would
+  rebuild the crate. Cargo counts a watched path that does not exist as changed on every build,
+  and a rerun build script makes everything built on the crate stale, so `outrig` and all of its
+  dependents were recompiled each time. It now watches the toolchain's `lib/rustlib` directory
+  until the target's own directory exists, and `rustup target add` still triggers the rebuild.
+  (#868)
+
+- **A `view = "primary"` payload's own libraries now come from the sidecar, not the primary.**
+  After `outrig-enter` joins the primary's namespace the loader resolves every absolute name it
+  builds for itself in the primary's rootfs, which let three things escape: a `DT_NEEDED` library
+  that is an absolute symlink in the sidecar failed to start, a library the sidecar lacked was
+  silently supplied by the primary's copy, and the entries of the sidecar's own musl
+  `/etc/ld-musl-<arch>.path` meant the primary's directories. The launcher now resolves the
+  payload's `DT_NEEDED` closure in the sidecar before the join and stages a link per library at
+  the head of the loader's `--library-path`. **Behavior change:** a dependency the sidecar does
+  not ship now fails the launch naming the library, where it used to start on the primary's copy.
+  Libraries loaded with `dlopen`, slash-bearing `DT_NEEDED` names and absolute `DT_RPATH` entries
+  still reach the primary; see "Primary filesystem view" in the MCP servers concept doc. (#595)
+
+- **The Dockerfile a cache key hashes is now framed, so one cannot share a key with another whose
+  tail spells the first's build-arg lines.** `CacheKey::compute` and `compute_with_labels` hashed
+  the Dockerfile's raw bytes straight into the resolved build-arg block that follows, with nothing
+  between them to say where the Dockerfile ended. A Dockerfile ending `# A=1` and a newline, built
+  with no build args, and a Dockerfile ending `# ` with no trailing newline, built with `A=1`, fed
+  the hasher the same bytes; the second build reported a cache hit on the first's image, with
+  `ARG A` empty inside it. Both callers now hash the Dockerfile to a blake3 digest first --
+  fixed-width, so no split of its bytes and the block's can agree -- through the new
+  `hash_dockerfile`. Every cache key changes, so every image rebuilds once. (#583)
+
+- **`NetworkInterceptor::attach` now refuses a *borrowed* container (`Container::attach`) that
+  currently holds `CAP_NET_ADMIN`, not only one outrig launched.** The #363 refusal read
+  `Container::holds_net_admin`, which comes from outrig's own `--cap-add`/`--cap-drop` lowering --
+  the one thing a borrowed container does not have, since outrig did not launch it. `attach`
+  recorded `LaunchFacts::default()` for it, `net_admin` was always `false`, and the redirect table
+  installed in its netns could be deleted by its own root with nothing recorded: the #363 fix
+  working as documented, and the one case where it said "refused" and meant it only for a
+  container outrig started. `NetworkInterceptor::attach` now also asks a borrowed container's
+  engine state directly, through the new `Container::attached_holds_net_admin`
+  (`podman inspect --format {{.EffectiveCaps}}`), and refuses on what that reports -- exact for
+  `--privileged` and for anything a host's `containers.conf` grants on its own, neither of which
+  the launch-derived check could ever see. An owned container still answers from the launch alone;
+  the extra engine round trip is only for one outrig did not launch. The CLI is unaffected: `outrig
+  mcp --attach` already refuses `--network audit`/`filter` outright. (#549)
+
+- **The DNS forward no longer clips a resolver's answer at 4096 bytes.** Under `audit` or
+  `filter` mode, `recv_dns_answer` read a UDP answer into a fixed 4096-byte buffer; a response
+  larger than that -- reachable once a stub advertises an EDNS payload above it, which common
+  libraries do -- arrived at the container truncated mid-record, with `TC` still clear and the
+  header's record count unchanged, rather than with `TC` set so the stub retries over TCP.
+  `record_dns_bindings` then bound only the addresses that happened to parse before the cut, so a
+  hostname `allow` could silently miss one the resolver did send. The buffer is now
+  `DNS_UDP_MAX_DATAGRAM` (65535), past what a UDP/IPv4 or UDP/IPv6 datagram can actually carry, so
+  nothing forwarded is clipped. (#543)
+
+- **A header opening an unknown table nested under a fixed one is set aside with a warning, not
+  refused.** `[workspace.new-thing]` failed the load and told the reader to quote a dotted name
+  that was not one -- the inline form of the same key, `new-thing = { ... }` under `[workspace]`,
+  already loaded with a warning. The quoting hint is for a chosen name split by a stray `.` --
+  `[models.opus-4.7]`, `[images.my.thing]` -- so it now fires only where the table an unknown key
+  landed in is itself a `providers`, `models`, `agents`, `images`, or `sidecars` entry (including
+  an `images.<n>.mcp.<s>`); elsewhere, as under `[workspace]`, the key is an ordinary unknown one,
+  warned about and ignored like its inline form. `[network.new-thing]` is still refused, as any
+  unknown key under `[network]` is, but no longer with the wrong hint. (#536)
+
+- **A dropped `Outrig::add_sidecar` no longer leaves its network-interceptor attachment holding
+  the sidecar's name.** Under `audit` or `filter` mode, a future dropped while connecting the
+  sidecar's servers -- by a `tokio::time::timeout` or a `select!` -- removed the container but
+  kept the interceptor's entry for it. A retried add of the same sidecar, which gets the same
+  container name, was refused as "already attached" until `shutdown`. The attachment is now
+  retired with the future: the name is free, but the interception keeps running, because the
+  container's removal is only requested in the background. It is torn down in order -- loops
+  stopped, audit records drained, rules and resolver undone -- at `shutdown`, so a cancelled
+  teardown can never discard an audit record. (#501)
+
+- **`find_repo_root_with`/`load_project` no longer treat a config they cannot `stat` as
+  absent.** A `.agents/outrig/config.toml` under a directory without search permission for the
+  invoking user made `is_file()` false, the same as a missing file, so the walk went on past it
+  and found a config further up, or none. It now stops and returns `OutrigError::Path` naming the
+  config and the cause; a directory or other non-file entry at that path still does not end the
+  walk. outrig-cli's own copy of the walk has the same fix. (#829)
+
+- **The network audit writer no longer panics when the runtime is shutting down mid-append.**
+  A failed append is rolled back by truncating the file to where the record began; `tokio::fs::File`
+  cannot be trusted to do that once a blocking spawn it attempted has been refused, which happens
+  while the runtime is shutting down with a record in flight -- its internal state is left with no
+  buffer to resume from, and the rollback's `set_len` panicked unwrapping it (tokio-rs/tokio#8182).
+  The writer now owns a `std::fs::File` and runs a record's append, flush, and rollback inside a
+  single `spawn_blocking` call instead: a spawn the runtime refuses surfaces as a `JoinError` the
+  writer counts as a loss, like any other failed write, rather than as `tokio::fs::File` state that
+  panics on next use. (#453)
+
+- **A config file that does not load names itself.** A TOML parse error was reported with a line,
+  a column, and an excerpt but no file, so with the global config and a repo (or `--config`) file
+  both in play the reader had to work out which one was being quoted; the repo-only rules were
+  worse, saying "repo config" of a file that may be the repo's own or one `--config` named. Every
+  error a file's own content raises is now prefixed with that file's path, as each warning from a
+  load already was. What a load sets aside, and what it refuses, are unchanged. (#413)
+
+- **A container interception cannot put a resolver in is refused by what it owes, not by an
+  errno.** Attach creates `/etc/resolv.conf` for a container that has none, and a create that
+  failed surfaced as a bare "failed to create" path error whose cause repeated it, naming neither
+  the container nor the one thing the image had to supply. It now refuses the way every other
+  unusable resolver shape does, as `container "x" cannot be network-intercepted: ...`, and says
+  that interception creates the resolver a container does not have, so the image needs an `/etc`
+  outrig can write `/etc/resolv.conf` into. A file that appeared since the probe found none is
+  still a race, and says so. The reference and Containers now state what either mode asks of an
+  image, since nothing in it is run: that `/etc`, for the exec-stdio sidecars whose resolver is
+  not baked in with `--dns`, and nothing else -- a shell-less base intercepts like any other.
+  (#410)
+- **A bracketed IPv6 `Host:` header with a port is read as its address.** The cleartext sniffer
+  trimmed `[` and `]` from the ends of the value, so `Host: [2001:db8::1]:443` became
+  `2001:db8::1]:443` -- neither an IP nor a name -- and an address deny naming that host could not
+  match the claim, which also showed as a wrong `outrig.host`. The address is now what sits inside
+  the brackets and the `:port` after them is dropped. (#409)
+- **Running outrig as uid 0 no longer rehomes the container's `root` entry to `/home/root`.**
+  `Container::bootstrap_user` gave the user at the host uid the home `/home/<name>` and rewrote a
+  reused `/etc/passwd` entry to name it -- a rule made for the entry podman's `--userns=keep-id`
+  plants, whose home is the container's working directory. keep-id plants none for a root caller,
+  so at uid 0 (`sudo outrig run`, a root CI runner) the entry it reused was the image's own
+  `root:x:0:0:root:/root:...`: bootstrap created `/home/root`, rewrote root's home to it, and gave
+  every exec -- and a `view = "primary"` sidecar's payload, through `Container::home_dir` --
+  `HOME=/home/root`, where nothing the Dockerfile had left under `/root` (`~/.cargo`, dotfiles)
+  was found. At uid 0 the home is now the one the image's entry names, `/root` in nearly every
+  base image, and the entry is left as it is. An image with no uid-0 entry gets one naming
+  `/root`, and an entry whose home is not a plain absolute path below `/` -- empty, relative,
+  `/` itself, a `.`, `..` or empty part such as a trailing `/`, or not UTF-8 -- is pointed at
+  `/root`. So is an entry podman planted rather than the image: an image with no root account
+  does get one from podman's `--user` handling, appended to the container's own file and naming
+  the container's working directory (the checkout for a primary, the image's `WORKDIR` for a
+  sidecar with no workspace), and keeping it would put root's caches in the checkout, or have the
+  bootstrap `chown` the developer's directory, or whatever is mounted over `WORKDIR`, to root.
+  An entry in a file `podman diff` lists as changed is taken for podman's, asked before the
+  bootstrap opens the file read-write, which copies it into the container's layer; a diff that
+  cannot be had counts as a change. So an image's own root home is kept in a container just
+  started, even when it is the image's `WORKDIR`, but a container bootstrapped before, such as
+  one borrowed with `outrig mcp --attach`, reads as changed and gets `/root`. So is a home inside
+  the workspace, however the workspace's path is spelled: a `container-path` of `/var/../root` is
+  `/root`, where podman mounts it. With the workspace at `/root` itself, root's home is
+  `/home/<name>`, as it was. The home is made like any other, so a `/root` that is a symlink (an
+  ostree-based image) or a file fails the bootstrap naming the path, where it used to be passed over
+  for `/home/root`. Every other uid is unchanged: `/home/<name>`. (#399)
+- **A home that already belongs to the user is no longer `chown`ed.** `Container::bootstrap_user`
+  handed the home directory to the session user with an `fchown` whether or not it was theirs
+  already. On a home that is a read-only mount -- a tools directory mounted over `/root`, or over
+  `/home/<user>` -- that no-op failed with `EROFS`, and the bootstrap with it: "bootstrapping the
+  runtime user failed at chown the home directory". It now compares the owner of the directory it
+  opened with the uid and gid it wants, and skips the `chown` when they match; a home owned by
+  anyone else is handed over as before. A uid or gid that is the kernel's overflow id (65534 unless
+  the host changed it) is never matched: an owner the container's user namespace has no mapping for
+  reads as that id too, so the `chown` is tried and reports it. (#399)
+- **A `-v` transcript that cannot be written no longer fails the command it records.** A full disk
+  or a closed stderr made the transcript's write fail, and `capture_stream` -- having drained the
+  stream -- returned that error in place of the captured output, as did the `$ <command>` echo
+  before the command was even spawned. So a `podman stop` that succeeded classified as `Failed`
+  and kept its handle, and a successful `podman run -d` in `start_named` was torn down by the name
+  guard, the session failing with a message about `container.log`. The command's own result --
+  exit status, output, stderr tail -- is now returned as it is, and the incomplete transcript is
+  reported separately as a `tracing` warning, once per stream. The MCP transport's `$` echo
+  follows the same rule. (#401)
+- **`Outrig::launch` with `LaunchSource::Build` no longer streams `buildah`/`podman pull` onto the
+  embedder's own stdout.** `ensure_image`, the one path `launch` reaches for a build-type source,
+  called `pull_image` / `run_streamed_checked`, which inherits this process's stdout -- fine for the
+  CLI, which owns the terminal, but not for a library caller serving a protocol over its own stdout:
+  a cache miss's `STEP 1/3 ...` or an image id landed on it, interleaved with whatever the embedder
+  was writing. `ensure_image` now captures a cache miss's build or pull (`BuildOutput::Captured`, no
+  transcript) instead of streaming it; `outrig build`, which calls `pull_image` / `build_image_for`
+  directly, is unaffected and still shows the live stream. (#400)
+- **A cache miss's captured build or pull no longer buffers a newline-free run of output whole.**
+  `ensure_image`'s capture (above) drains the child's stdout through `capture_stream`, which
+  split on `\n` even with nothing asking to keep a line -- `keep_stdout = false`, no transcript --
+  so a `RUN` step writing gigabytes with no newline at all (`head -c 1GiB /dev/zero`, a `\r`-driven
+  progress bar) grew the embedding process by the length of that run before the retention limit
+  ever got a completed line to trim. `capture_stream` now checks whether anything is listening
+  (`Tee::is_idle`) and, when nothing is, drains in fixed `STREAM_READ_CHUNK` reads instead of
+  hunting for `\n`; a tee or a kept stdout still goes through the line-oriented path
+  unchanged. (#400)
+- **A `view = "primary"` payload can no longer regain the launcher's capabilities, and a `cap-drop`
+  the launcher needs is refused up front.** `outrig-enter` dropped to the session's uid/gid, which
+  clears the payload's own capability sets, and left the rest to the container's
+  `--security-opt=no-new-privileges`. The bounding set still held the `CAP_SYS_ADMIN` and
+  `CAP_SYS_PTRACE` the sidecar was given, and a sidecar that set `no-new-privileges = false` had
+  no `no_new_privs` at all: the kernel hands a setuid-root binary (`su`, `mount`) the bounding set,
+  so one run by the payload or anything it spawned came back as the container's root with both,
+  contrary to the trust model's "can pass no privilege to anything it spawns". The launcher now
+  sets `no_new_privs` itself when it drops, so an `exec` gains neither the uid nor a capability
+  whatever the container carries; with the container's flag off, the payload read `NoNewPrivs: 0`
+  before and `1` after, against podman 5.7. `no-new-privileges = false` on a `view = "primary"`
+  sidecar is therefore refused, as `capability-profile = "drop-all"` already was. Separately, a
+  `cap-drop` of a capability the launcher needs passed validation and failed in the launcher --
+  `SYS_CHROOT`, which `setns(CLONE_NEWNS)` needs, at the `setns` with a hint that named only
+  `SYS_ADMIN` and `--userns` -- and is now refused when the config is read or the spec is added,
+  as the `Added` entry above says. The `setns` hint names `CAP_SYS_CHROOT`. (#398)
+- **The home directory's `mkdir`s no longer honor the host process's `umask`.** A forked helper
+  creating `/home` and `/home/<user>` inside the container called `mkdir(dir, 0o755)` with
+  whatever `umask` it inherited still in force, so an image without `/home` (a `scratch` or
+  Nix-style base) picked up `/home` as `0750 root:root` under a hardened `umask 027`: every exec
+  then got `HOME=/home/<user>` it could not even enter, and tools failed with `EACCES` on
+  `$HOME`. The helper now clears its `umask` before creating either directory and restores it
+  right after, so the mode asked for is the mode it gets. (#397)
+- **The nsfork helper's socketpair is `SOCK_CLOEXEC`, and its `recvmsg`/`waitpid` retry on
+  `EINTR`.** The pair `fork_collect` opens to talk to its child was plain `SOCK_SEQPACKET`: a
+  `podman` client another task spawned in the window before the parent closed its end inherited
+  both descriptors, since neither `std` nor tokio's `Command::spawn` closes an inherited fd that
+  is not `CLOEXEC`. A helper that then died without replying left its end held open by that
+  unrelated process, so the parent's `recvmsg` saw no EOF and the bootstrap hung on a tokio
+  worker until the client exited. `socketpair` now passes `SOCK_CLOEXEC` alongside
+  `SOCK_SEQPACKET`, closing both ends across any `exec` in between. Separately, an embedder
+  without `SA_RESTART` on its signal handlers (the CLI's tokio and `signal-hook` set it, so this
+  never reached it) saw a spurious bootstrap failure from an `EINTR`-interrupted `recvmsg`, or a
+  zombie left behind by one from `waitpid`; both now loop past `EINTR` instead of surfacing or
+  skipping it. (#396)
+- **A context outside a git repository is hashed in process, not by shelling out to `tar`.**
+  `tar`'s stderr went to a `tracing::warn!` line and never into the error, so a failure --
+  a context directory that does not exist, a file in it the process cannot read -- surfaced as
+  `process `tar` exited with code 2` with an empty stderr tail and nothing to act on. It also
+  meant building from a non-git context needed `tar --sort=name`, a GNU extension a minimal
+  image's busybox `tar` does not implement, undocumented either way. The walk
+  `hash_git_context` already uses per path for an untracked file now runs over the whole
+  directory, so a read failure comes back as the `OutrigError::Path` that names the path and the
+  underlying error, and the host needs neither `tar` nor (for a context that is not itself a
+  git repository) GNU tar to build at all. As the `tar` stream did, the key counts a symlink by
+  its text and a hard link by the first link to the same file: replacing two identical files
+  with a linked pair rebuilds, and a symlink to an ancestor does not send the walk back through
+  that subtree. `doc/quickstart.md` now lists `git` as a prerequisite:
+  every build still probes the context with `git -C <context> rev-parse --git-dir` to decide
+  which of the two paths to take, whether or not the context is git-hosted. (#394)
+- **Two sessions that miss the cache for the same tag at once no longer leave a dangling image.**
+  `build_image_with_build_args` commits the labeled image to `<repo>:<key>` once its build
+  finishes, and buildah's `commit` re-points an existing tag rather than refusing it, so the
+  second session to finish overwrote the first session's image with its own -- same content,
+  later metadata -- and left the first session's former image dangling with nothing pointing at
+  it anymore. The commit now re-probes `<repo>:<key>` immediately before committing to it, and a
+  hit skips the commit and discards its own working container instead: the caller still gets the
+  image it asked for, the one the race's winner left there, and nothing it built is left behind
+  unreferenced. The probe does not close the race outright -- the two commits can still interleave
+  -- but it closes the far more common shape, one build finishing before the other starts its own
+  commit. A forced rebuild (`--no-cache`, or a library caller's `no_cache = true`) skips this
+  probe and always commits: it is not a race loser, and treating a stale tag the probe happens to
+  find as though it were a concurrent winner's would have left `--no-cache` unable to refresh an
+  image whose content hash the stale copy shares. (#393)
+- **An image built while its context changed is no longer saved under the old key.** The cache key
+  is hashed before `buildah build` starts, and buildah reads the context as each `COPY` runs, so a
+  file saved during an earlier `RUN` landed in an image tagged with the key of the content before
+  the edit. Restoring that content later probed the key, hit, and served the edited image. The key
+  is now hashed again once buildah finishes and before anything is named, and if it moved the build
+  is discarded, nothing is tagged, and the call fails with the new
+  `OutrigError::BuildContextChanged`. Running it again keys the edited content, and buildah's layer
+  cache keeps that short. `build_image_for` and `ensure_tagged_image_for[_with_output]` take the
+  `tag` that `compute_tag_for` gave for the same inputs, and now refuse any other the same way once
+  their build has run. `ensure_image` computes its own. (#392)
+- **`Outrig::launch` attaches the network interceptor before the primary's process runs.** An
+  image that sets an `ENTRYPOINT` -- which `containers.md` asks nobody to do, and which podman
+  gives `sleep infinity` as its arguments -- ran it the moment `podman run -d` returned, and
+  `launch` attached the interceptor only after the user bootstrap. Whatever that entrypoint sent
+  was outside audit mode's record of every connection and filter mode's policy. Under audit or
+  filter mode the primary is now created and initialized, the interceptor attached to its
+  network namespace, and only then is it started, the way an entrypoint-stdio sidecar already
+  was; the user bootstrap follows. The default mode still starts it with `podman run -d`. A
+  sidecar whose servers are `podman exec`'d is not held, and still starts before it is attached.
+  (#395)
+- **The 750 ms network sniff window is documented for server-first protocols.** In audit and
+  filter modes a connection waits up to 750 ms for the client's first bytes, so SMTP, IMAP, FTP,
+  MySQL, and an SSH client that waits for the server's banner off port 22 -- where the server
+  speaks first -- paid it on every connection with no mention in the docs. `outrig run`'s `--network` entry now says so; the behavior is
+  unchanged, because exempting a port also skips the host-claim sniff. (#391)
+- **A network audit record names the resolved names that granted an `allow`, not only the
+  client's claim.** `outrig.host` holds the name a client claimed (`Host:` or SNI) when it made
+  one, and the first resolved name when it did not, with `outrig.host_source` saying which. Only a
+  resolved name can satisfy a hostname `allow` entry, so a connection granted by `allow[n]` whose
+  client claimed another name was recorded under a name that granted nothing, and the one that did
+  was written nowhere: the grant could not be read back from `network.jsonl`. The same held with no
+  claim and several resolved names, where `outrig.host` shows one of them. A record now also
+  carries `outrig.resolved`: the names this attachment's DNS listener had validated for the
+  destination address when the connection was decided, left out when there were none. Purely
+  additive: a new key, with `outrig.host` and `outrig.host_source` meaning what they did, so this
+  ships in a patch release. (#390)
+- **An allowed connection whose upstream connect fails now says why in its record.** The
+  interceptor returned from a refused connect, one still unanswered after 20 seconds, or one with
+  no route, and left the record as it stood: `outrig.action` `allow`, zero byte counts,
+  `conn_state` `S0`, and the cause only in a `warn` log line. That is the record of a connection
+  that opened and moved nothing, so a reader of `network.jsonl` working out why an agent could not
+  reach a host could not tell a destination that refused it from a connection that was never
+  used. The record now carries `outrig.error`, the reason in words, and omits it for a connection
+  whose upstream opened or was never dialed:
+  `upstream connect failed: Connection refused (os error 111)`, or
+  `upstream connect failed: timed out after 20s`. Where the dial went to another address than the
+  destination -- the host under pasta -- the message names it after `via`. `outrig.action` is still
+  the policy's decision, and `conn_state` is unchanged. (#389)
+- **A global config that does not load no longer stops the commands that need one key out of
+  it.** `session-root` is global-only, so `outrig ls`, `logs`, `discard`, and `clean` read the
+  global config and nothing else -- but they read all of it, through `Config::load_global`, so a
+  TOML syntax error anywhere in that one machine-wide file, or a value it refuses rather than
+  sets aside (a bad `[network].mode`), failed a listing over something that had nothing to do
+  with sessions. A file mid-edit cost the user every session command until they finished
+  editing. Those four now fall back to `Config::salvage_global_session_root`, taking that one key
+  and warning that nothing else in the file is in effect. `run`, `mcp`, and `build` read the file
+  for everything in it and still refuse it, which the warning says. The fallback does not guess:
+  it uses only a root the damaged file states outright, falls back to the default only for a file
+  whose text cannot be declaring the key, and otherwise still fails the command -- a parse error
+  may have swallowed the declaration, a repaired escape or unterminated string yields a path
+  nobody has, a key the file mentions twice says nothing about which was meant, and `clean`
+  pointed at a root holding no records reads every labeled container as a stray. (#384)
+- **A security error on a sidecar names the sidecar, and a whitespace-only `image-name` is
+  refused.** A `[sidecars.<sc>.security]` block reuses the image blocks' `[security]` rules, and
+  it reused their errors too by passing the string `sidecars.<sc>` where an image-config name was
+  expected -- so a relative device path in `[sidecars.tools.security]` reported ``image
+  "sidecars.tools": `devices` entry ... must be an absolute path``, naming an `[images.<name>]`
+  block that does not exist and sending the reader to the wrong part of their config. The rules
+  now produce a `SecurityRuleViolation` that names no block, which the image caller restates as
+  the per-image variant it always used and a sidecar carries in `SidecarSecurity`, so the message
+  opens with `sidecar "tools": `. Separately, `image-name = "  "` passed validation where a
+  sidecar's `image = "  "` was refused, because only the latter trimmed; both now use the trimmed
+  test, and a reference of nothing but blanks is refused at load instead of reaching podman as an
+  `image not known` at launch. Purely additive: no existing variant loses a field, so this ships
+  in a patch release. (#378)
+- **An `env` or `build-args` key that podman would misread is refused where it was written.**
+  podman and buildah read each entry as `KEY=value` and split it at the first `=`, so
+  `env = { "A=B" = "c" }` set `A` to `B=c` -- a variable nobody named, holding a value nobody
+  wrote -- and an empty key reached podman as `--env =x`, which failed the first MCP connect
+  with the engine's own message, naming neither the key nor the file that declared it.
+  `Config::validate` now holds every `[images.<name>.mcp]` `env` key and every `build-args` key
+  to `config::is_env_key`, naming the image, the server, the key, and the file. The grammar is
+  wider than a `${VAR}` reference's, which is upper-case only: a key names a variable inside the
+  container, where `http_proxy` is ordinary. Every image-config is checked, whoever declared it
+  -- a key grants no access to the host environment, so unlike a reference it is not a question
+  of trust. An image's `org.outrig.mcp` label and a standalone `image.toml` are held to the same
+  rule, so `outrig image build` refuses a key before stamping it and a session refuses a label
+  that carries one. The fallback that kept a reference's value on the command line for a key
+  podman could not take by name is unchanged, and is now unreachable from a config file. (#369)
+- **`embedded::merged_mcp` answers for the image its container is running, not for whatever that
+  container's tag names now.** The label was read with `podman image inspect <tag>`, taking the
+  tag off the handle -- and a tag is a pointer. A pull of a re-pushed `registry/x:latest`
+  re-points the ref while every container already started from the old image goes on running it,
+  so between a container's start and this read the two can name different images. The merge then
+  returned the *new* image's servers for a container that cannot run them: commands it does not
+  have installed, and `env` from an image its operator never approved. The read now goes through
+  the engine's id for the image the container was created from (`podman inspect {{.Image}}`,
+  asked once per handle and cached, since a container's image is fixed at creation), which no
+  pull can move. An inspect that reports no id is an error rather than a fall back to the tag:
+  the tag is the thing being avoided, so falling back would quietly answer about a different
+  image. Content-addressed repo-build tags were never affected. `read_standalone_image_mcp` and
+  the CLI's startup merge move with it; `Container::image_tag` is unchanged and remains what the
+  container was asked for, which is what banners, session records, and error messages
+  report. (#370)
+- **A bind-mount path containing `:` is refused by validation instead of by podman at launch.**
+  A mount renders as one `-v <host>:<container>:<options>` value, so a `:` in either path made a
+  fourth field podman rejected when it created the container -- after the image was built or
+  pulled, and naming neither the key nor the file that declared it. `Config::validate` and
+  `Config::validate_workspace_mounts` now refuse one in `workspace.host-path`,
+  `workspace.container-path`, and either half of every `[[workspace.mounts]]` or
+  `[sidecars.<sc>.mounts]` entry, naming the path and the file. The rule is applied to each
+  path as the config spelled it: what a clean relative path *resolves through* is a fact about
+  the machine rather than the config, and a caller that serializes no mount at all must not be
+  stopped by it, so that half belongs to the launcher. `Container::start` and
+  `Container::create_initialized` hold a hand-built `ContainerLaunchSpec` to the same rule, as
+  they already do for a malformed capability entry -- the `view = "primary"` helper bind, whose
+  host side comes from the session directory, included. Not an injection:
+  podman reads options only from the third field of a `-v`, which a path cannot reach. A host
+  directory whose name contains `:` is now unmountable rather than unmountable with a worse
+  error -- podman's `-v` has no escape for one. (#365)
+
 ## [0.2.2](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.2) - 2026-10-20
 
 The second patch release since 0.2.0. Every change to the public surface is additive, and no
@@ -1093,34 +1587,6 @@ each described below.
   `[section.sub]` header for a section this build does not know no longer draw it. (#507)
 
 ### Fixed
-
-- **A child whose rounds keep failing before its code runs stops after five, and fails what it
-  holds.** Such a round was opened again with what it opened with, for as long as the session
-  lived: the wait between rounds was capped at 60 s, the count of rounds never was, and the
-  conversation keeps nothing of a round that failed, so each one sent the provider the same
-  request. One a provider refuses on every attempt -- an empty reply with finish reason
-  `content_filter` -- cost a round a minute, and the parent heard nothing. In one session a
-  single child ran 603 rounds over 5.8 hours on a view that never changed, about 82M input
-  tokens, and four others did the same. Now the fifth round in a row to fail ends the child's
-  model as one that can answer nothing, as a key its provider refuses does: what the child holds
-  open, and anything sent to it after, ends `failed` with the error named, finish reason
-  included, and no call is made again. A round that runs ends the count. A request the host
-  ends before its child has read it -- for this, a key the provider refuses, or a spent budget --
-  is also taken out of the child's queue, where its copy had stayed for a child that would never
-  read it, so a parent that goes on sending leaves nothing behind. A provider outage that
-  outlasts the five rounds, about 30 s of waiting plus each call's own retries, ends the child
-  the same way, where it used to wait the outage out. (#757)
-
-- **`help(runtime)` in a child names only what that child has.** A work child's runtime carried a
-  two-line docstring deferring to `help(Runtime)`, and `Runtime` is bound in no kernel, so
-  following it raised `NameError`; the text deferred to described `runtime.channels["user"]`,
-  which no child has. Each kind of agent now has a runtime class with a docstring of its own, the
-  shared text around one paragraph that names that agent's channels: the primary's user channel,
-  a work child's `complete` and `progress`, and a request child's own channels, which says it has
-  no `complete`. Request children get `RequestRuntime`, where they used to share the primary's
-  `Runtime`. A runtime also takes `__slots__`, which keeps `__dict__` and `__weakref__` -- a
-  tenth of the 8 KiB `help` bound, and of no use to the agent -- off the page, so all three fit
-  whole as `0003-10` decided `help(runtime)` should. (#686)
 
 - **An image's `org.outrig.mcp` label may reference only the host variables the global config
   allows.** A `${VAR}` in the `env` of a server a label declares resolved any variable in the

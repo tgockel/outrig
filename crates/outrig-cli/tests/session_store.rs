@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use outrig::error::OutrigError;
 use outrig_cli::error::CliError;
-use outrig_cli::session::{SessionId, SessionStore};
+use outrig_cli::session::{self, SessionId, SessionStore};
 
 mod common;
 use common::{
@@ -22,7 +22,7 @@ fn auto_path_creates_session_json() {
     let dir = root.path().join(sid.as_str());
     let mut session = sample_session(&sid);
 
-    let returned = store.create(&sid, None, &mut session).expect("create");
+    let returned = store.create(&sid, None, &mut session).expect("create").0;
     assert_eq!(returned, dir);
     assert_eq!(
         session.session_dir, dir,
@@ -50,7 +50,8 @@ fn explicit_path_creates_session_and_symlink() {
 
     let returned = store
         .create(&sid, Some(explicit.path()), &mut session)
-        .expect("create");
+        .expect("create")
+        .0;
     assert_eq!(returned, canon_explicit);
     assert_eq!(session.session_dir, canon_explicit);
 
@@ -144,7 +145,8 @@ fn explicit_path_that_does_not_exist_is_created() {
 
     let returned = store
         .create(&sid, Some(&explicit), &mut session)
-        .expect("create");
+        .expect("create")
+        .0;
     let canon = std::fs::canonicalize(&explicit).expect("the directory should be created");
     assert_eq!(returned, canon);
     assert!(canon.join("session.json").exists());
@@ -229,6 +231,282 @@ fn concurrent_creates_on_one_explicit_dir_claim_it_once() {
                 .count(),
             1,
             "the loser leaves no temp file behind"
+        );
+    }
+}
+
+/// #382: `create` made an auto-allocated directory with `create_dir_all`, which
+/// succeeds on one that exists, so a second launch given the same id wrote its
+/// record over the first's. Making the directory is the claim now: the second is
+/// refused and the first's record is as it was.
+#[test]
+fn a_second_create_for_one_auto_id_is_refused_and_the_first_record_kept() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261026T101500-3f2a1c9e".into());
+    let mut first = sample_session(&sid);
+    first.image_tag = "first".into();
+    let (dir, _lock) = store.create(&sid, None, &mut first).expect("first create");
+
+    let mut second = sample_session(&sid);
+    second.image_tag = "second".into();
+    let err = store
+        .create(&sid, None, &mut second)
+        .expect_err("the id is taken");
+
+    assert!(
+        matches!(&err, CliError::SessionIdTaken(taken) if *taken == dir),
+        "expected SessionIdTaken for {}, got: {err:?}",
+        dir.display()
+    );
+    assert_eq!(
+        store.get_by_path(&dir).expect("read").image_tag,
+        "first",
+        "the first launch's record is not replaced"
+    );
+    assert!(
+        session::owner_is_live(&dir),
+        "the first launch still holds its claim"
+    );
+    assert_eq!(
+        std::fs::read_dir(&dir).expect("read dir").count(),
+        1,
+        "the refused launch leaves no temp file behind"
+    );
+}
+
+/// The same hole through a link: `create_dir_all` follows a `--session-dir` link
+/// to the directory behind it and calls that the directory it made, so the
+/// record went into the user's directory over the one already there.
+#[test]
+fn an_auto_id_held_by_an_explicit_link_is_refused() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261026T101501-3f2a1c9e".into());
+    let mut first = sample_session(&sid);
+    first.image_tag = "first".into();
+    let (dir, _lock) = store
+        .create(&sid, Some(explicit.path()), &mut first)
+        .expect("first create");
+
+    let mut second = sample_session(&sid);
+    second.image_tag = "second".into();
+    let err = store
+        .create(&sid, None, &mut second)
+        .expect_err("the link holds the id");
+
+    let link = root.path().join(sid.as_str());
+    assert!(
+        matches!(&err, CliError::SessionIdTaken(taken) if *taken == link),
+        "expected SessionIdTaken for {}, got: {err:?}",
+        link.display()
+    );
+    assert_eq!(
+        store.get_by_path(&dir).expect("read").image_tag,
+        "first",
+        "the record in the explicit directory is not replaced"
+    );
+    assert!(
+        std::fs::symlink_metadata(root.path().join(sid.as_str()))
+            .expect("stat link")
+            .file_type()
+            .is_symlink(),
+        "the link is still a link"
+    );
+}
+
+/// Two launches drawing one id at the same moment, which is what #382 is about,
+/// and not one after the other: the directory is the claim, so exactly one wins
+/// and the rest are refused with its record intact.
+#[test]
+fn concurrent_creates_of_one_auto_id_claim_it_once() {
+    const LAUNCHES: usize = 4;
+    let sid = SessionId("20261026T101502-3f2a1c9e".into());
+    for _ in 0..10 {
+        let root = tempfile::tempdir().expect("tempdir root");
+        let store = SessionStore::new(root.path().to_path_buf());
+        let barrier = Barrier::new(LAUNCHES);
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let launches: Vec<_> = (0..LAUNCHES)
+                .map(|n| {
+                    let (store, barrier, sid) = (&store, &barrier, &sid);
+                    scope.spawn(move || {
+                        let mut session = sample_session(sid);
+                        session.image_tag = format!("launch-{n}");
+                        barrier.wait();
+                        store
+                            .create(sid, None, &mut session)
+                            .map(|(_dir, lock)| (n, lock))
+                    })
+                })
+                .collect();
+            launches
+                .into_iter()
+                .map(|launch| launch.join().expect("create thread"))
+                .collect()
+        });
+
+        let (won, lost): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
+        assert_eq!(won.len(), 1, "exactly one launch claims the id");
+        for loser in lost {
+            let err = loser.expect_err("partitioned as lost");
+            assert!(
+                matches!(err, CliError::SessionIdTaken(_)),
+                "a loser is refused for the id, got: {err:?}"
+            );
+        }
+        let (winner, _lock) = won.into_iter().next().expect("one winner").expect("won");
+        let (dir, record) = store.get_by_id(&sid).expect("the claimed session");
+        assert_eq!(
+            record.image_tag,
+            format!("launch-{winner}"),
+            "the record is the winner's"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("read dir").count(),
+            1,
+            "the losers leave no temp file behind"
+        );
+    }
+}
+
+/// #382: a launch whose draw another launch holds draws again, and the record
+/// it keeps is the one built for the id that stuck, not for the draws before.
+#[test]
+fn create_fresh_draws_again_when_the_id_is_taken() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let taken = SessionId("20261026T101503-aaaaaaaa".into());
+    let fresh = SessionId("20261026T101503-bbbbbbbb".into());
+    let mut holder = sample_session(&taken);
+    holder.image_tag = "holder".into();
+    let (taken_dir, _holder_lock) = store.create(&taken, None, &mut holder).expect("holder");
+
+    let mut script = vec![taken.clone(), taken.clone(), fresh.clone()].into_iter();
+    let mut built = Vec::new();
+    let (session, dir, _lock) = store
+        .create_fresh(
+            || script.next().expect("drew past the script"),
+            None,
+            |sid| {
+                built.push(sid.clone());
+                sample_session(sid)
+            },
+        )
+        .expect("create_fresh");
+
+    assert_eq!(
+        built,
+        [taken.clone(), taken.clone(), fresh.clone()],
+        "a record is built for every draw"
+    );
+    assert_eq!(session.id, fresh);
+    assert_eq!(session.container_name, format!("outrig-{fresh}"));
+    assert_eq!(dir, root.path().join(fresh.as_str()));
+    assert_eq!(session.session_dir, dir);
+    assert_eq!(
+        store.get_by_path(&dir).expect("read").id,
+        fresh,
+        "the record on disk is the kept session's"
+    );
+    assert_eq!(
+        store.get_by_path(&taken_dir).expect("read").image_tag,
+        "holder",
+        "the id that was taken is still its holder's"
+    );
+}
+
+/// A root that answers every draw with "exists" is not bad luck, so the loop
+/// ends instead of drawing for ever, with the last refusal as its error.
+#[test]
+fn create_fresh_gives_up_when_every_draw_is_taken() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let taken = SessionId("20261026T101504-aaaaaaaa".into());
+    let (taken_dir, _holder_lock) = store
+        .create(&taken, None, &mut sample_session(&taken))
+        .expect("holder");
+
+    let mut draws = 0;
+    let err = store
+        .create_fresh(
+            || {
+                draws += 1;
+                taken.clone()
+            },
+            None,
+            sample_session,
+        )
+        .expect_err("every id is taken");
+
+    assert_eq!(draws, session::SESSION_ID_DRAWS);
+    assert!(
+        matches!(&err, CliError::SessionIdTaken(path) if *path == taken_dir),
+        "the last refusal is the error, got: {err:?}"
+    );
+}
+
+/// `setup` goes through `create_fresh` for `--session-dir` launches too, so it
+/// has to carry an explicit directory through to `create` unchanged.
+#[test]
+fn create_fresh_makes_an_explicit_directory_session_too() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261026T101505-cccccccc".into());
+    let canon = std::fs::canonicalize(explicit.path()).expect("canon");
+
+    let (session, dir, _lock) = store
+        .create_fresh(|| sid.clone(), Some(explicit.path()), sample_session)
+        .expect("create_fresh");
+
+    assert_eq!(dir, canon);
+    assert_eq!(session.session_dir, canon);
+    let (linked, record) = store.get_by_id(&sid).expect("the link resolves");
+    assert_eq!(linked, canon);
+    assert_eq!(record.id, sid);
+}
+
+/// What `new` draws: eight hex digits after the timestamp, and a name
+/// `started_at` reads back, which is how a `clean` that cannot parse the record
+/// still ages the directory.
+#[test]
+fn a_drawn_id_has_eight_random_digits() {
+    let sid = SessionId::new();
+    let (ts, rand) = sid.as_str().split_once('-').expect("a dash");
+
+    assert_eq!(ts.len(), "yyyymmddTHHMMSS".len());
+    assert_eq!(rand.len(), 8);
+    assert!(rand.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(
+        SessionId::started_at(sid.as_str()).is_some(),
+        "{sid} reads back"
+    );
+}
+
+/// Four digits is what outrig 0.2.2 and earlier wrote, so those sessions are on
+/// disk and keep reading. Any other width is not an id.
+#[test]
+fn started_at_reads_both_widths_ids_have_had() {
+    let four = SessionId::started_at("20260501T134412-3f2a").expect("four digits");
+    let eight = SessionId::started_at("20260501T134412-3f2a1c9e").expect("eight digits");
+    assert_eq!(four, eight, "the timestamp reads the same either way");
+
+    for name in [
+        "20260501T134412-3f2",
+        "20260501T134412-3f2a1",
+        "20260501T134412-3f2a1c",
+        "20260501T134412-3f2a1c9",
+        "20260501T134412-3f2a1c9e0",
+        "20260501T134412-3f2g",
+        "20260501T134412-",
+        "20260501T134412",
+        "notes",
+    ] {
+        assert!(
+            SessionId::started_at(name).is_none(),
+            "{name} is not a session id"
         );
     }
 }
@@ -384,7 +662,8 @@ fn remove_by_id_symlinked_removes_the_whole_directory() {
     let sid = SessionId("20261003T120000-aaaa".into());
     let canon = store
         .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     write_outrig_entries(&canon);
     write_other_files(&canon);
 
@@ -403,7 +682,8 @@ fn remove_by_id_auto_removes_the_whole_directory() {
     let sid = SessionId("20261003T120000-aaaa".into());
     let dir = store
         .create(&sid, None, &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     write_outrig_entries(&dir);
     write_other_files(&dir);
 
@@ -419,7 +699,8 @@ fn remove_by_path_removes_the_whole_directory() {
     let sid = SessionId("20261003T120000-aaaa".into());
     let canon = store
         .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     write_outrig_entries(&canon);
     write_other_files(&canon);
 
@@ -444,7 +725,8 @@ fn remove_by_id_unlinks_a_symlink_without_following_it() {
     let sid = SessionId("20261003T120000-aaaa".into());
     let canon = store
         .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     std::fs::create_dir_all(canon.join("outrig-enter/inside")).expect("mkdir");
     std::os::unix::fs::symlink(elsewhere.path(), canon.join("logs")).expect("symlink");
 
@@ -467,7 +749,8 @@ fn remove_by_path_through_the_link_removes_the_record_it_names() {
     let sid = SessionId("20261003T110000-dddd".into());
     let canon = store
         .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     write_outrig_entries(&canon);
     let link = root.path().join(sid.as_str());
 
@@ -581,13 +864,20 @@ fn remove_by_id_follows_a_relative_link_from_the_root_not_the_cwd() {
     let decoy_run = decoy.path().join("run-x");
     std::fs::create_dir_all(decoy_run.join("logs")).expect("decoy logs");
 
+    // Built by hand rather than through `create`, which now refuses an
+    // explicit directory under the root (#429); this fixture is what one
+    // looked like before that existed, and is exactly what the relative link
+    // below needs to exercise.
     let real = root.join(&name).join("run-x");
-    store
-        .create(&sid, Some(&real), &mut sample_session(&sid))
-        .expect("create");
-    // Replace the absolute link with the relative spelling of the same one.
+    std::fs::create_dir_all(&real).expect("mkdir real");
+    let mut session = sample_session(&sid);
+    session.session_dir = real.clone();
+    std::fs::write(
+        real.join("session.json"),
+        serde_json::to_string(&session).expect("to_string"),
+    )
+    .expect("write session.json");
     let link = root.join(sid.as_str());
-    std::fs::remove_file(&link).expect("unlink");
     std::os::unix::fs::symlink(std::path::Path::new(&name).join("run-x"), &link)
         .expect("relative link");
 
@@ -781,4 +1071,484 @@ fn frozen_on_disk_records_still_load() {
             "fixture {name} must not be skipped"
         );
     }
+}
+
+// -------- #366: the claim that says a session is live --------
+
+#[test]
+/// The window the issue is about: a record exists, `ended_at` is `None`, and
+/// no container has been created yet because the image is still building.
+/// The claim `create` hands back is the only thing that can say the session
+/// is live, and it says so for as long as it is held.
+fn create_claims_the_directory_until_the_lock_is_dropped() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let (dir, lock) = store
+        .create(&sid, None, &mut sample_session(&sid))
+        .expect("create");
+
+    assert!(lock.is_some(), "a tempdir supports the claim");
+    assert!(
+        session::owner_is_live(&dir),
+        "the launch still holds the session"
+    );
+
+    drop(lock);
+    assert!(
+        !session::owner_is_live(&dir),
+        "the claim ends with the launch, as teardown's drop does"
+    );
+}
+
+#[test]
+/// The same for a `--session-dir` session: the claim is on the directory the
+/// record is in, which is the link's target, not the link.
+fn an_explicit_directory_is_claimed_too() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T141907-9b1c".into());
+    let (dir, lock) = store
+        .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
+        .expect("create");
+
+    assert!(session::owner_is_live(&dir), "the target is claimed");
+    drop(lock);
+    assert!(!session::owner_is_live(&dir));
+}
+
+#[test]
+/// Every update to the record renames a new file over `session.json`, so a
+/// claim on *that* would be left behind on the replaced inode. The claim is
+/// on the directory, which survives the rename.
+fn the_claim_survives_updates_to_the_record() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let (dir, _lock) = store
+        .create(&sid, None, &mut sample_session(&sid))
+        .expect("create");
+
+    store
+        .set_sidecar_containers(&sid, &["outrig-20260501T134412-3f2a-tools".to_string()])
+        .expect("set sidecars");
+    assert!(
+        session::owner_is_live(&dir),
+        "a record rewritten under the claim is still claimed"
+    );
+
+    store
+        .finalize(&sid, SystemTime::now(), 0)
+        .expect("finalize");
+    assert!(
+        session::owner_is_live(&dir),
+        "finalize does not release the claim; teardown drops it afterwards"
+    );
+}
+
+#[test]
+/// A record with no live owner -- what a session that ended, or one whose
+/// process was killed outright, leaves behind. The kernel drops the claim
+/// with the process, so these stay removable.
+fn a_record_without_a_live_owner_is_not_claimed() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let dir = store
+        .create(&sid, None, &mut sample_session(&sid))
+        .expect("create")
+        .0;
+
+    assert!(
+        !session::owner_is_live(&dir),
+        "nothing holds the claim once create's caller drops it"
+    );
+    assert!(
+        !session::owner_is_live(&root.path().join("20260501T134412-0000")),
+        "a directory that does not exist has no live owner"
+    );
+}
+
+#[test]
+/// Two launches at once each claim their own directory, and neither reads as
+/// the owner of the other's.
+fn claims_are_per_directory() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let a = SessionId("20260501T134412-3f2a".into());
+    let b = SessionId("20260501T134413-44d2".into());
+    let (dir_a, lock_a) = store
+        .create(&a, None, &mut sample_session(&a))
+        .expect("create a");
+    let (dir_b, _lock_b) = store
+        .create(&b, None, &mut sample_session(&b))
+        .expect("create b");
+
+    assert!(session::owner_is_live(&dir_a));
+    assert!(session::owner_is_live(&dir_b));
+    drop(lock_a);
+    assert!(!session::owner_is_live(&dir_a));
+    assert!(
+        session::owner_is_live(&dir_b),
+        "one launch ending does not release another's claim"
+    );
+}
+
+/// #429: `--session-dir` naming a path at or under the session root used to
+/// link `<root>/<sid>` to `<root>/x` on top of `<root>/x` itself, so `list`
+/// read the one record twice. `create` now refuses this before writing
+/// anything.
+#[test]
+fn explicit_dir_under_the_root_is_refused() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261005T200230-5c0d".into());
+    let nested = root.path().join("x");
+    std::fs::create_dir_all(&nested).expect("mkdir x");
+
+    let err = store
+        .create(&sid, Some(&nested), &mut sample_session(&sid))
+        .expect_err("create should refuse a directory under the root");
+    match err {
+        CliError::Outrig(OutrigError::Configuration(msg)) => {
+            assert!(
+                msg.contains("is inside the session root"),
+                "expected the root named, got: {msg}"
+            );
+        }
+        other => panic!("expected Configuration error, got: {other:?}"),
+    }
+    assert!(
+        std::fs::read_dir(&nested)
+            .expect("read nested")
+            .next()
+            .is_none(),
+        "nothing is written into the refused directory"
+    );
+    assert!(
+        std::fs::symlink_metadata(root.path().join(sid.as_str())).is_err(),
+        "a refused directory gets no link"
+    );
+}
+
+/// `--session-dir <root>` itself falls under the same rule as a path nested
+/// inside it (#429).
+#[test]
+fn explicit_dir_equal_to_the_root_is_refused() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261005T200230-5c0d".into());
+
+    let err = store
+        .create(&sid, Some(root.path()), &mut sample_session(&sid))
+        .expect_err("create should refuse the root itself");
+    match err {
+        CliError::Outrig(OutrigError::Configuration(msg)) => {
+            assert!(msg.contains("is inside the session root"), "got: {msg}");
+        }
+        other => panic!("expected Configuration error, got: {other:?}"),
+    }
+}
+
+/// A root that does not exist yet -- the first session any root ever holds --
+/// still refuses a nested `--session-dir`; the containment check cannot lean
+/// on either side already being on disk (#429).
+#[test]
+fn explicit_dir_under_a_not_yet_created_root_is_refused() {
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let root = parent.path().join("sessions");
+    let store = SessionStore::new(root.clone());
+    let sid = SessionId("20261005T200230-5c0d".into());
+    let nested = root.join("x");
+
+    let err = store
+        .create(&sid, Some(&nested), &mut sample_session(&sid))
+        .expect_err("create should refuse");
+    match err {
+        CliError::Outrig(OutrigError::Configuration(msg)) => {
+            assert!(msg.contains("is inside the session root"), "got: {msg}");
+        }
+        other => panic!("expected Configuration error, got: {other:?}"),
+    }
+    assert!(
+        !root.exists(),
+        "the root is not created by a refused create"
+    );
+}
+
+/// A directory just outside the root, even one sharing its name as a prefix
+/// (`sessions-extra` next to `sessions`), is unaffected.
+#[test]
+fn explicit_dir_beside_the_root_is_allowed() {
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let root = parent.path().join("sessions");
+    let beside = parent.path().join("sessions-extra");
+    std::fs::create_dir_all(&beside).expect("mkdir beside");
+    let store = SessionStore::new(root);
+    let sid = SessionId("20261005T200230-5c0d".into());
+
+    store
+        .create(&sid, Some(&beside), &mut sample_session(&sid))
+        .expect("create should allow a directory merely beside the root");
+}
+
+/// A record written before `create` refused a directory under the root (or
+/// built by hand, standing in for one): `list` now drops the plain-directory
+/// row that the `<sid>` link also resolves to, keeping the linked one, so one
+/// record is one row (#429).
+#[test]
+fn list_drops_a_plain_directory_a_link_also_resolves_to() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let sid = SessionId("20261005T200230-5c0d".into());
+    let dir = root.path().join("x");
+    std::fs::create_dir_all(&dir).expect("mkdir x");
+    let mut session = sample_session(&sid);
+    session.session_dir = dir.clone();
+    std::fs::write(
+        dir.join("session.json"),
+        serde_json::to_string(&session).expect("to_string"),
+    )
+    .expect("write session.json");
+    let canon_dir = std::fs::canonicalize(&dir).expect("canon");
+    std::os::unix::fs::symlink(&canon_dir, root.path().join(sid.as_str()))
+        .expect("symlink sid -> x");
+
+    let store = SessionStore::new(root.path().to_path_buf());
+    let listed = store.list().expect("list").sessions;
+    assert_eq!(listed.len(), 1, "one record, one row, not two");
+    assert_eq!(listed[0].id, sid);
+    assert_eq!(listed[0].link_target.as_deref(), Some(canon_dir.as_path()));
+}
+
+/// A `--session-dir` that steps through a directory that does not exist yet
+/// via `..` -- `<parent>/missing/../run`, which `fs::create_dir_all` resolves
+/// by creating `missing` as an ordinary intermediate directory and ending up
+/// at `<parent>/run` -- resolves the same way for the containment check, and
+/// is accepted when `<parent>/run` sits outside the session root. Caught in
+/// review of #429: the per-component ancestor walk gave up on the trailing
+/// `..` instead of canceling it against the `missing` component next to it.
+#[test]
+fn explicit_dir_through_a_missing_directory_outside_the_root_is_allowed() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261005T200230-5c0d".into());
+    let dotted = parent.path().join("missing").join("..").join("run");
+
+    let (dir, _lock) = store
+        .create(&sid, Some(&dotted), &mut sample_session(&sid))
+        .expect("create should accept a dotted path that lands outside the root");
+
+    let canon_parent = std::fs::canonicalize(parent.path()).expect("canon");
+    assert_eq!(dir, canon_parent.join("run"));
+    assert!(dir.join("session.json").exists());
+}
+
+/// The same shape of path, but one whose `..` cancels back to a directory at
+/// or under the session root: still refused, naming the root (#429).
+#[test]
+fn explicit_dir_through_a_missing_directory_inside_the_root_is_refused() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261005T200230-5c0d".into());
+    let dotted = root.path().join("missing").join("..").join("x");
+
+    let err = store
+        .create(&sid, Some(&dotted), &mut sample_session(&sid))
+        .expect_err("create should refuse a dotted path that lands inside the root");
+    match err {
+        CliError::Outrig(OutrigError::Configuration(msg)) => {
+            assert!(msg.contains("is inside the session root"), "got: {msg}");
+        }
+        other => panic!("expected Configuration error, got: {other:?}"),
+    }
+    assert!(
+        !root.path().join("missing").exists(),
+        "nothing is written for a refused directory"
+    );
+}
+
+/// A `--session-dir` with more than one trailing `..` after a missing
+/// directory -- `<root's-grandparent>/sessions/missing/../../run`, where
+/// `sessions` is the session root -- lands at `<grandparent>/run`, outside
+/// the root, and is accepted. Caught in review of #429: shrinking the whole
+/// suffix backward one component at a time, as an earlier version of this
+/// walk did, could not tell that the second `..` reaches past the root
+/// itself and misjudged the result as still inside it.
+#[test]
+fn explicit_dir_through_a_missing_directory_with_two_parents_outside_the_root_is_allowed() {
+    let grandparent = tempfile::tempdir().expect("tempdir grandparent");
+    let root = grandparent.path().join("sessions");
+    std::fs::create_dir_all(&root).expect("mkdir root");
+    let store = SessionStore::new(root.clone());
+    let sid = SessionId("20261005T200230-5c0d".into());
+    let dotted = root.join("missing").join("..").join("..").join("run");
+
+    let (dir, _lock) = store
+        .create(&sid, Some(&dotted), &mut sample_session(&sid))
+        .expect("create should accept a path two '..' put outside the root");
+
+    let canon_grandparent = std::fs::canonicalize(grandparent.path()).expect("canon");
+    assert_eq!(dir, canon_grandparent.join("run"));
+    assert!(dir.join("session.json").exists());
+}
+
+/// A `..` right after a name that *does* exist, reached only once an earlier
+/// `..` has already canceled an earlier missing directory, still resolves
+/// through that name for real -- symlink included -- rather than lexically
+/// canceling it the way a `..` after something still missing would. Caught
+/// in review of #429: an earlier version of this walk, once it had seen any
+/// missing component at all, stopped checking the real filesystem for the
+/// rest of the path and would have canceled `alias` away without ever
+/// resolving it.
+#[test]
+fn explicit_dir_through_a_missing_directory_then_a_real_symlink_resolves_through_it() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let elsewhere = tempfile::tempdir().expect("tempdir elsewhere");
+    let target = elsewhere.path().join("target");
+    std::fs::create_dir_all(&target).expect("mkdir target");
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&target, &alias).expect("symlink alias -> target");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261005T200230-5c0d".into());
+    let dotted = root
+        .path()
+        .join("missing")
+        .join("..")
+        .join("alias")
+        .join("..")
+        .join("run");
+
+    let (dir, _lock) = store
+        .create(&sid, Some(&dotted), &mut sample_session(&sid))
+        .expect("create should accept a path resolving through alias's real target");
+
+    let canon_elsewhere = std::fs::canonicalize(elsewhere.path()).expect("canon");
+    assert_eq!(dir, canon_elsewhere.join("run"));
+    assert!(dir.join("session.json").exists());
+}
+
+/// #431: `create`'s explicit-directory branch writes `session.json` before it
+/// links `<root>/<sid>` to the directory. A link that fails -- here, because
+/// the root already holds something under that id -- used to leave the
+/// directory holding an unregistered record that `ls`/`clean`/`discard <id>`
+/// could not reach, and that then refused a retry into the same directory.
+/// `create` now undoes the write when the link fails, so the directory is
+/// left as it was found and a retry succeeds once the blocker is gone.
+///
+/// The root is occupied rather than made unwritable: a permission check is
+/// what the real bug reports as one trigger, but chmod alone is not a
+/// reliable way to force a failure in a test -- a process with
+/// `CAP_DAC_OVERRIDE`, root included, ignores it, and the symlink would
+/// succeed regardless (caught in review of #431).
+#[test]
+fn explicit_dir_undoes_its_write_when_the_root_link_fails() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261005T205327-160f".into());
+    let mut session = sample_session(&sid);
+
+    let blocker = root.path().join(sid.as_str());
+    std::fs::write(&blocker, b"").expect("occupy the id under root");
+
+    let err = store
+        .create(&sid, Some(explicit.path()), &mut session)
+        .expect_err("symlink over an occupied name should fail");
+    match err {
+        CliError::Outrig(OutrigError::Path { op, source, .. }) => {
+            assert_eq!(op, "symlink");
+            assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
+        }
+        other => panic!("expected a symlink Path error, got: {other:?}"),
+    }
+
+    assert!(
+        !explicit.path().join("session.json").exists(),
+        "the write the failed link could not register should be undone"
+    );
+    let names: Vec<_> = std::fs::read_dir(explicit.path())
+        .expect("read explicit")
+        .collect();
+    assert!(
+        names.is_empty(),
+        "the explicit directory, which predates the call, should be left as found"
+    );
+
+    // Retrying into the same directory, once whatever blocked the link is
+    // gone, is no longer refused by the record the first attempt left.
+    std::fs::remove_file(&blocker).expect("clear the blocker");
+    let mut retry_session = sample_session(&sid);
+    store
+        .create(&sid, Some(explicit.path()), &mut retry_session)
+        .expect("retry into the same directory should now succeed");
+    assert!(explicit.path().join("session.json").exists());
+}
+
+/// Same failure, but the explicit directory does not exist until `create`
+/// makes it: undoing the write removes the directory too, so a launch that
+/// cannot register leaves nothing on disk at all.
+#[test]
+fn explicit_dir_created_by_create_is_removed_when_the_root_link_fails() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let explicit = parent.path().join("run");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261005T205327-9a01".into());
+    let mut session = sample_session(&sid);
+
+    let blocker = root.path().join(sid.as_str());
+    std::fs::write(&blocker, b"").expect("occupy the id under root");
+
+    store
+        .create(&sid, Some(&explicit), &mut session)
+        .expect_err("symlink over an occupied name should fail");
+    assert!(
+        !explicit.exists(),
+        "a directory create made for this call should not outlive its failure"
+    );
+}
+
+/// A directory reached only by canceling a missing name with a later `..`
+/// (`<parent>/missing/../existing`, `missing` absent, `existing` real and
+/// already there) is not told from one `create` made itself by
+/// `dir.exists()`: the kernel refuses to resolve `..` past a name that is
+/// not there, so that call reports `false` for a target that plainly
+/// exists. A failed link used to take that `false` at face value and
+/// `rmdir` what it names, destroying a directory that predates the call
+/// entirely (caught in review of #431). `create` now reads prior existence
+/// off `canonicalize_prefix`, which resolves `missing/..` the same way the
+/// kernel resolves the rest of the path, and keeps `existing` either way.
+#[test]
+fn explicit_dir_reached_through_a_cancelled_missing_segment_survives_a_failed_link() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let base = tempfile::tempdir().expect("tempdir base");
+    let existing = base.path().join("existing");
+    std::fs::create_dir(&existing).expect("mkdir existing");
+    let dotted = base.path().join("missing").join("..").join("existing");
+    assert!(
+        !dotted.exists(),
+        "a literal stat of the dotted path should not resolve, which is the bug"
+    );
+
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261005T205327-c0d1".into());
+    let mut session = sample_session(&sid);
+
+    let blocker = root.path().join(sid.as_str());
+    std::fs::write(&blocker, b"").expect("occupy the id under root");
+
+    store
+        .create(&sid, Some(&dotted), &mut session)
+        .expect_err("symlink over an occupied name should fail");
+
+    assert!(
+        existing.is_dir(),
+        "a directory that predates the call must survive its failure"
+    );
+    assert!(
+        !existing.join("session.json").exists(),
+        "the write the failed link could not register should still be undone"
+    );
 }

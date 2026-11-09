@@ -43,7 +43,12 @@ directories        = { workspace = true, default-features = true }
 futures-util       = { workspace = true, default-features = true }
 heck               = { workspace = true, default-features = true }
 jiff               = { workspace = true, default-features = true }
-nix                = { workspace = true, features = ["fs", "resource", "term", "user"] }
+# `fs` carries `fcntl`, which `session.rs` takes the owner-liveness lock with
+# and the line editor sets its terminal non-blocking with, `flock`, which
+# `run-new` reserves its session directory with, and the `fchmod`/`open(O_PATH)`
+# that `cli/mcp.rs` publishes a listening Unix socket with. `socket` carries the
+# nonblocking bind and liveness probe there.
+nix                = { workspace = true, features = ["fs", "resource", "socket", "term", "user"] }
 rand               = { workspace = true, default-features = true }
 # `scrolling-regions` lets `run-new`'s screen scroll the conversation above it without
 # redrawing it. crossterm comes with it, and is used only through `ratatui::crossterm`, so
@@ -70,6 +75,11 @@ toml_edit          = { workspace = true, default-features = true }
 tracing            = { workspace = true, default-features = true }
 tracing-subscriber = { workspace = true, default-features = true, features = ["env-filter", "fmt"] }
 unicode-segmentation = { workspace = true }
+# `outrig ls` pads its columns to a display width, which is neither a byte
+# count nor a `char` count. No `cjk`: the table is not rendered differently in
+# an East Asian locale, and the feature only changes how *ambiguous*-width
+# characters are counted -- a context this has no way to know it is in.
+unicode-width      = { workspace = true, default-features = false }
 
 [dev-dependencies]
 # A dependency on self, so the integration tests -- separate crates -- see the

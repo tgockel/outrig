@@ -71,14 +71,22 @@ outrig run [--agent <name>]
 - `--network <default|audit|filter>` (default: config `[network].mode`, else `default`):
   choose Podman's default networking, network audit logging, or global network filtering for
   this run.
+  Audit and filter modes wait up to 750 ms for a connection's first client bytes, to read the
+  name it asks for, so a protocol where the server speaks first -- SMTP, IMAP, FTP, or MySQL,
+  or an SSH client that waits for the server's banner on a port other than 22 -- pays that wait
+  on every connection. Port 22 is exempt. A program that opens many short connections to such
+  a server should reuse them.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): this run's specific session
-  directory, which must be empty or not exist yet; symlinked from the root.
+  directory, which must be empty or not exist yet, and outside the session root; symlinked
+  from the root.
 - `--session-root <path>` (default: global config's `session-root`, else XDG): root directory
   containing all sessions.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
   container, on top of the default workspace mount. Access defaults to read-only; append `:rw`
-  for read-write. The host directory must exist; relative host paths resolve against the
-  workspace root, and a leading `~` is your home directory.
+  for read-write. The host directory must exist; a relative host path resolves against the
+  directory you ran outrig from, the way your shell reads one, and a leading `~` is your home
+  directory. A config file's `[[workspace.mounts]]` resolves against that file instead -- see
+  [path resolution](../reference/config.md#path-resolution).
 - `--verbose` (default: off): adds buildah/podman command transcripts to stderr and
   `container.log`.
 
@@ -110,7 +118,7 @@ the exact command it is waiting on, which is the fastest way to reproduce the st
 
 ```sh
 $ RUST_LOG=debug outrig run
-[outrig] starting container outrig-20260726T170454-da0c
+[outrig] starting container outrig-20260726T170454-da0c6367
 DEBUG outrig::process: spawn command=podman run -d --rm --name outrig-... sleep infinity
 ```
 
@@ -131,7 +139,9 @@ $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
 
 `<path>` has to be empty or not exist yet; outrig creates it, with any missing parents. A path
 that already holds anything -- even a `.gitkeep`, or an earlier run's `session.json` -- is
-refused, because `outrig discard` removes the directory along with the session. See
+refused, because `outrig discard` removes the directory along with the session. A path at or
+under `<session-root>` is refused too: it would give the session both the symlink and a
+directory entry of its own there, and `outrig ls` would show it twice (#429). See
 [Sessions](sessions.md#outrig-discard).
 
 ## Config-less runs
@@ -190,9 +200,10 @@ pay that up front rather than inside your first session, see
 
 Two caveats. `outrig-default`, `outrig-default-fs`, and `outrig-default-shell` are reserved
 names -- declare any of them yourself and outrig steps aside entirely, with a note saying so.
-And if outrig was built without the `<arch>-unknown-linux-musl` target, the `outrig-enter`
-launcher is missing: `fs` then falls back to a read-write bind mount of the workspace (same
-tools) and `shell` is unavailable. Full details in
+And if outrig was built without the `outrig-enter` launcher -- no `<arch>-unknown-linux-musl`
+target, and no static C library for the fallback build (see
+[Building without the musl target](no-musl.md)) -- `fs` falls back to a read-write bind mount
+of the workspace (same tools) and `shell` is unavailable. Full details in
 [Reference -> Config](../reference/config.md#the-built-in-default-image-config).
 
 ## What happens, in order
@@ -221,11 +232,15 @@ tools) and `shell` is unavailable. Full details in
    become additional `-v` binds. The trailing `sleep infinity` is the container's command and
    overrides the image's `CMD`; an image that sets an `ENTRYPOINT` gets it appended instead, so
    a primary image should not set one (see
-   [Concepts -> Containers](../concepts/containers.md#dont-set-an-entrypoint)).
+   [Concepts -> Containers](../concepts/containers.md#dont-set-an-entrypoint)). With network
+   interception on (step 7), the same flags go on a `podman create` followed by `podman init`,
+   and `podman start` runs the container once the interceptor is attached to it, so even an
+   image's `ENTRYPOINT` runs under it.
 5. **Bootstrap the user.** From the host, inside the container's namespaces: ensure a group with
    `$(id -g)` and a user with `$(id -u)` exist -- appending the entries to `/etc/group` and
    `/etc/passwd` if not -- and that `/home/<user>` exists, is owned by them, and is the home
-   their `/etc/passwd` entry names. The image needs no `useradd`/`groupadd` for this. See
+   their `/etc/passwd` entry names. (For uid 0 the home is the one the image's `root` entry
+   already names, normally `/root`.) The image needs no `useradd`/`groupadd` for this. See
    [Concepts -> Workspace](../concepts/workspace.md#uidgid-runtime-user-mapping) for the full
    logic.
 6. **Merge MCP config and start sidecars.** Read the primary image's `org.outrig.mcp` label,
@@ -238,7 +253,8 @@ tools) and `shell` is unavailable. Full details in
 7. **Start network interception, if enabled.** `--network audit`, `--network filter`, or
    matching `[network].mode` config installs the per-session interceptor and opens
    `<session_dir>/logs/network.jsonl`. Filter mode also enforces global `[network]` policy.
-   The default mode skips this step entirely.
+   It attaches to the primary before the primary's process starts (step 4), then to each
+   sidecar. The default mode skips this step entirely.
 8. **Connect MCP servers.** For each entry in `[images.<name>.mcp]`,
    `podman exec -i --user=$(id -u):$(id -g)` the configured command, run the MCP `initialize`
    handshake, and discover tools via `tools/list`. Each of those two gets 120 seconds; a server
@@ -273,8 +289,8 @@ A typical startup looks like:
 [outrig] image tag computed: coding:8c2a4f7e91d6b5a3 (32ms)
 [outrig] ensuring image coding:8c2a4f7e91d6b5a3
 [outrig] image ready: coding:8c2a4f7e91d6b5a3 (cache hit) (18ms)
-[outrig] starting container outrig-20260502T103412-3f2a
-[outrig] container ready: outrig-20260502T103412-3f2a (620ms)
+[outrig] starting container outrig-20260502T103412-3f2a98ac
+[outrig] container ready: outrig-20260502T103412-3f2a98ac (620ms)
 [outrig] bootstrapping container user
 [outrig] container user ready (141ms)
 [outrig] reading and merging MCP configuration
@@ -291,11 +307,11 @@ A typical startup looks like:
 [outrig] tool-result max:   262144 bytes
 [outrig] image-config:  coding
 [outrig] image:             coding:8c2a4f7e91d6b5a3
-[outrig] container started: outrig-20260502T103412-3f2a
+[outrig] container started: outrig-20260502T103412-3f2a98ac
 [outrig] mcp fs:    initialized (3 tools)
 [outrig] mcp shell: initialized (1 tool)
 [outrig] tools available: fs__read_file, fs__list_directory, fs__write_file, shell__exec
-[outrig] session id: 20260502T103412-3f2a   (Ctrl-D to exit, /help for slash commands)
+[outrig] session id: 20260502T103412-3f2a98ac   (Ctrl-D to exit, /help for slash commands)
 [outrig] entering REPL
 >
 ```
@@ -420,16 +436,17 @@ calls that already ran, where a resent prompt could have it run them a second ti
 [LLM providers](../concepts/llm-providers.md) for which failures count as transient.
 
 A provider that answers with nothing usable is handled the same way, down to what the
-conversation keeps. The call is retried twice before outrig gives up:
+conversation keeps. The call is retried twice before outrig gives up. When the provider named
+a finish reason for the reply, such as `content_filter` or `length`, it leads the message:
 
 ```
-[outrig] model returned an unusable response (Response contained no message or tool call
-        (empty)); retry in 1.4s (attempt 2/3)
+[outrig] model returned an unusable response (finish reason content_filter: Response
+        contained no message or tool call (empty)); retry in 1.4s (attempt 2/3)
 ```
 
 ```
-[outrig] the model returned a response outrig could not use (Response contained no message
-        or tool call (empty)); ending turn
+[outrig] the model returned a response outrig could not use (finish reason content_filter:
+        Response contained no message or tool call (empty)); ending turn
 [outrig] history unchanged -- send the prompt again to retry, or "/quit" to stop.
 ```
 
@@ -452,7 +469,16 @@ the prompt.
 The editor needs a terminal it can drive. When stdin is a pipe or a file, or a terminal other
 than the one you are typing at (`outrig run < /dev/pts/7`), or `TERM` is `dumb`, `cons25`, or
 `emacs`, the prompt falls back to reading one line at a time with no editing and no recall, which
-is what keeps scripted use (`echo "..." | outrig run`) working unchanged.
+is what keeps scripted use (`echo "..." | outrig run`) working unchanged. `outrig init`,
+`config init`, and `image add` treat those three `TERM` values the same way, asking plain line
+questions instead of opening arrow-key pickers.
+
+Lines outrig writes to stderr on its own account -- a subagent finishing or failing, a retry
+notice, a `warn`-level log record, the session watcher reporting a dead container -- never land
+on the prompt you are typing at. While the prompt is up they are held, and they are written when
+you press `Enter` (or the session ends), after the line you typed and before the next prompt. A
+notice raised while you sit at the prompt is therefore late, not garbled; with stdin piped there
+is no editor and lines are written as they happen.
 
 Input is read as UTF-8. A line from a pipe or a file with bytes that are not UTF-8 -- a Latin-1
 `é` in a prompts file -- is still sent, with U+FFFD (`�`) in place of each bad sequence. The line
@@ -507,7 +533,7 @@ sidecars are errors, and there is no `/sidecar stop` in v0.
 [outrig] sidecars:
   tools   not started   servers: search
 > /sidecar add tools
-[outrig] sidecar tools started: outrig-20260504T141907-a83f-tools
+[outrig] sidecar tools started: outrig-20260504T141907-a83f6eda-tools
 [outrig] 1 MCP server connected (search); 2 tools available on the next turn
 > /sidecar add tools
 [outrig] sidecar "tools" is already running
@@ -521,9 +547,12 @@ with Ctrl-C changes nothing either, and either one can simply be run again.
 
 The agent can hand scoped work to subagents that share this session's container and tools, using
 the built-in `outrig__` tools. They are on by default; `subagents = false` on the
-`[agents.<name>]` block leaves them out. Their tool calls appear on stderr labeled by name, and
-each one's transcript is written to `<session_dir>/logs/subagent-<name>.log` -- or, for one a
-subagent launched, under a `subagent-<parent>/` directory there.
+`[agents.<name>]` block leaves them out. Their tool calls appear on stderr labeled by name
+(`parent/child` for a nested one), as do the lines about their model calls -- the retries and
+chain moves shown above -- so a fan-out's waits are attributable to the round having them. The
+primary agent's own lines are unlabeled. Each subagent's transcript is written to
+`<session_dir>/logs/subagent-<name>.log` -- or, for one a subagent launched, under a
+`subagent-<parent>/` directory there.
 
 ```
 > audit the config and the mcp wiring in parallel
@@ -636,7 +665,7 @@ The selected `[images.<name>]` block is incomplete. See
 $ outrig run
 [outrig] image-config: coding
 [outrig] image:            coding:8c2a4f7e91d6b5a3 (cache hit)
-[outrig] container started: outrig-20260501T134412-3f2a
+[outrig] container started: outrig-20260501T134412-3f2ad11c
 [outrig] mcp fs: error: failed to spawn `mcp-server-filesystem` in container
 [outrig] caused by: exec: "mcp-server-filesystem": executable file not found in $PATH
 ```
@@ -660,11 +689,11 @@ place of `(from --image)`.
 $ outrig run
 [outrig] image-config: coding
 [outrig] image:            coding:8c2a4f7e91d6b5a3 (cache hit)
-[outrig] container started: outrig-20260501T134412-3f2a
+[outrig] container started: outrig-20260501T134412-3f2ad11c
 [outrig] mcp fs: initialized
 [outrig] mcp shell: initialized
 [outrig] model: gpt-4o-mini
-[outrig] session id: 20260501T134412-3f2a
+[outrig] session id: 20260501T134412-3f2ad11c
 > hi
 error: LLM call failed: 401 Unauthorized
 caused by: provider returned: invalid_api_key

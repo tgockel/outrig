@@ -5,6 +5,7 @@ on:
     branches: [trunk]
     paths:
       - 'doc/**'
+      - 'crates/outrig-cli/src/mcp_self/docs/**'
       - 'book.toml'
       - 'scripts/mermaid*.js'
       - '.github/workflows/docs.yml'

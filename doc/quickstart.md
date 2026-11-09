@@ -15,6 +15,10 @@ crates publish from this repository.
 - Linux on x86-64 or AArch64. Both are covered by a live end-to-end run in CI, not only by a
   build. WSL2 counts; macOS and native Windows are not supported.
 - Rust toolchain (you'll need it to install outrig itself).
+- `git`, on `PATH`. Every image build probes the context with `git -C <context> rev-parse
+  --git-dir` to decide whether to key it by git's listing or by walking the directory itself
+  (see [Concepts -> Containers](concepts/containers.md#image-caching)), so this runs even for
+  a context that is not itself a git repository.
 - [podman](https://podman.io) **4.3 or newer**, installed and working in rootless mode.
   Verify with `podman info` -- it should print without errors. The floor is 4.3 because
   outrig's cancellation cleanup removes containers with `podman rm --filter`, which older
@@ -40,7 +44,7 @@ Install the CLI package to get the `outrig` command:
 ```sh
 $ cargo install outrig-cli
 $ outrig --version
-outrig 0.2.2
+outrig 0.2.3
 ```
 
 ## Try it before configuring anything
@@ -255,11 +259,11 @@ Diagnostics arrive on stderr:
 [outrig] tool-result max:   262144 bytes
 [outrig] image-config:  hello-outrig-standard
 [outrig] image:             hello-outrig-standard:8c2a4f7e91d6b5a3 (cache hit)
-[outrig] container started: outrig-20260502T103412-3f2a
+[outrig] container started: outrig-20260502T103412-3f2a98ac
 [outrig] mcp fs:    initialized (3 tools)
 [outrig] mcp shell: initialized (1 tool)
 [outrig] tools available: fs__read_file, fs__list_directory, fs__write_file, shell__exec
-[outrig] session id: 20260502T103412-3f2a   (Ctrl-D to exit, /help for slash commands)
+[outrig] session id: 20260502T103412-3f2a98ac   (Ctrl-D to exit, /help for slash commands)
 > 
 ```
 
@@ -314,7 +318,7 @@ Press `Ctrl-D` to end the session. outrig stops the container, finalizes the ses
 and exits.
 
 ```
-[outrig] session 20260502T103412-3f2a ended (duration 2m18s, exit 0)
+[outrig] session 20260502T103412-3f2a98ac ended (duration 2m18s, exit 0)
 $
 ```
 
@@ -333,8 +337,8 @@ b41af3a append agent line
 12c0a99 add outrig config
 
 $ outrig ls
-ID                       STARTED              DURATION  CONTAINER              EXIT
-20260502T103412-3f2a    2026-05-02 10:34:12  2m18s     hello-outrig-standard  0
+ID                          STARTED              DURATION  CONTAINER              EXIT
+20260502T103412-3f2a98ac    2026-05-02 10:34:12  2m18s     hello-outrig-standard  0
 ```
 
 If you don't like what the agent did, the rollback is whatever you'd normally do with git:

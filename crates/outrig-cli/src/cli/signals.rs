@@ -21,18 +21,18 @@
 //!   session -- or a Ctrl-C typed at the REPL -- is not mistaken for a second
 //!   one asking cleanup to hurry.
 //!
-//! Notices go through `writeln!` with the error dropped, never `eprintln!`:
-//! after SIGHUP the terminal may be gone, and `eprintln!` panics when the
-//! write fails. That write waits for a stderr nobody reads, and for as long as
-//! something else holds the stream -- a build's output, written from tokio's
-//! blocking pool, can be stuck in it -- so the task racing a step would wait
-//! with it and never reach the step's cleanup. A command with a writer of its
-//! own says its notices there instead, through the `_saying` forms.
+//! Notices go through [`crate::notice`], which drops a failed write, never
+//! `eprintln!`: after SIGHUP the terminal may be gone, and `eprintln!` panics
+//! when the write fails. That write waits for a stderr nobody reads, and for
+//! as long as something else holds the stream -- a build's output, written
+//! from tokio's blocking pool, can be stuck in it -- so the task racing a step
+//! would wait with it and never reach the step's cleanup. A command with a
+//! writer of its own says its notices there instead, through the `_saying`
+//! forms.
 
 use std::cell::Cell;
 use std::fmt;
 use std::future::Future;
-use std::io::Write as _;
 
 use outrig::Abandonable;
 use tokio::signal::unix::{Signal, SignalKind, signal};
@@ -304,5 +304,5 @@ async fn unless_signaled_saying(
 }
 
 fn notice(line: &str) {
-    let _ = writeln!(std::io::stderr(), "{line}");
+    crate::notice::notice!("{line}");
 }

@@ -243,10 +243,12 @@ impl McpClient {
             .path_ctx("create", &stderr_path)?;
         let stderr_std = stderr_file.into_std().await;
 
-        if let Some(transcript) = transcript {
-            transcript
+        if let Some(transcript) = transcript
+            && let Err(e) = transcript
                 .line("podman", &format!("$ {}", cmd.render()))
-                .await?;
+                .await
+        {
+            crate::process::warn_transcript_failed("podman", &e);
         }
 
         // Through the shared spawn chokepoint rather than a hand-rolled

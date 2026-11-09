@@ -69,6 +69,9 @@ impl Place {
 #[derive(Debug)]
 pub(super) struct Resolver {
     place: Place,
+    /// The container every refusal from here on names -- a staged create
+    /// fails as an attach refusal, the same as the open did.
+    container: String,
     /// `None` when the container has no resolver file at all.
     file: Option<File>,
     /// What the file held, to put back.
@@ -142,6 +145,7 @@ impl Resolver {
         );
         Ok(Self {
             place,
+            container: container.to_string(),
             file,
             original,
         })
@@ -158,7 +162,7 @@ impl Resolver {
     pub(super) fn stage(self, installed: Vec<u8>) -> std::result::Result<Restore, Box<NotCreated>> {
         let file = match self.file {
             Some(file) => file,
-            None => create_at(&self.place)?,
+            None => create_at(&self.place, &self.container)?,
         };
         Ok(Restore {
             file,
@@ -178,8 +182,16 @@ fn refuse(container: &str, why: impl Display) -> OutrigError {
 }
 
 /// Creates the resolver a container did not have, open read-write.
-fn create_at(place: &Place) -> std::result::Result<File, Box<NotCreated>> {
-    let not_created = |source: io::Error, maybe_left: bool| {
+///
+/// A failure is an attach refusal, worded like [`Resolver::open`]'s: the
+/// container by name, and -- where the cause is the container's own `/etc` --
+/// what that `/etc` has to be. See [`why_not_created`].
+fn create_at(place: &Place, container: &str) -> std::result::Result<File, Box<NotCreated>> {
+    let not_created = |source: io::Error, hint: Option<&str>, maybe_left: bool| {
+        let why = match hint {
+            Some(hint) => format!("{source}: {hint}"),
+            None => source.to_string(),
+        };
         Box::new(NotCreated {
             left: maybe_left.then(|| {
                 OutrigError::Configuration(format!(
@@ -187,18 +199,16 @@ fn create_at(place: &Place) -> std::result::Result<File, Box<NotCreated>> {
                  so nothing can tell it from one this attach did not create: {source}"
                 ))
             }),
-            error: OutrigError::Path {
-                op: "create",
-                path: path().to_path_buf(),
-                source,
-            },
+            error: refuse(container, why),
         })
     };
     // The child never answered, so whether it got as far as the `open` is
     // unknown.
-    let (status, fds) = run_in(place, create).map_err(|e| not_created(e, true))?;
+    let (status, fds) = run_in(place, create).map_err(|e| not_created(e, None, true))?;
     if status != Status::OK {
-        return Err(not_created(step_failure(status), false));
+        let failed = step_failure(status);
+        let hint = why_not_created(&failed);
+        return Err(not_created(failed, Some(hint), false));
     }
     fds.into_iter().next().map(File::from).ok_or_else(|| {
         not_created(
@@ -206,9 +216,29 @@ fn create_at(place: &Place) -> std::result::Result<File, Box<NotCreated>> {
                 io::ErrorKind::InvalidData,
                 "the helper reported creating it and returned no descriptor",
             ),
+            None,
             true,
         )
     })
+}
+
+/// What a failed create asks of the container, said beside the errno.
+///
+/// A container with no resolver gets one made, so this is where an image's
+/// `/etc` is first asked for: missing, read-only, or closed to outrig, and
+/// there is nowhere to put the file. Nothing from the image is ever run --
+/// see this module's header -- so that `/etc`, and a resolver this can read
+/// and write, is the whole of what interception asks an image for, and a
+/// refusal that named only the errno would leave the operator to guess it. A
+/// file that appeared since the probe found none is the exception: the
+/// exclusive create refuses a race, not something the container lacks.
+fn why_not_created(source: &io::Error) -> &'static str {
+    if source.kind() == io::ErrorKind::AlreadyExists {
+        "a resolver that appeared since the probe found none is not written through"
+    } else {
+        "interception creates the resolver a container does not have, so the image needs an \
+         /etc that outrig can write /etc/resolv.conf into"
+    }
 }
 
 /// [`Resolver::stage`] failing to create a resolver.
@@ -950,15 +980,43 @@ mod tests {
         let err = resolver
             .stage(INSTALLED.to_vec())
             .expect_err("an exclusive create cannot succeed over a file");
+        let rendered = err.error.to_string();
+        assert!(rendered.contains("could not create"), "{rendered}");
         assert!(
-            err.error.to_string().contains("could not create"),
-            "{}",
-            err.error
+            rendered.contains("not written through"),
+            "a race says so, rather than asking the image for an /etc it has: {rendered}"
         );
         assert!(err.left.is_none(), "a refused create made nothing");
         assert_eq!(
             std::fs::read(&path).expect("untouched"),
             b"nameserver 10.0.2.3\n"
+        );
+    }
+
+    /// A container whose `/etc` has nowhere for a resolver is refused by what
+    /// it has to supply, not by an errno alone: nothing from the image runs,
+    /// so a writable `/etc` is most of what interception asks of one.
+    #[test]
+    fn a_resolver_that_cannot_be_created_names_what_the_container_owes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("no-etc").join("resolv.conf");
+        let resolver = open(&path).expect("nothing at the path is a container with no resolver");
+
+        let err = resolver
+            .stage(INSTALLED.to_vec())
+            .expect_err("there is no directory to create it in");
+        let rendered = err.error.to_string();
+        assert!(
+            rendered.contains("cannot be network-intercepted"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("write /etc/resolv.conf into"),
+            "{rendered}"
+        );
+        assert!(
+            err.left.is_none(),
+            "a create that never happened left nothing"
         );
     }
 

@@ -7,7 +7,7 @@ use tracing_subscriber::filter::Directive;
 
 use crate::cli::build::{self, BuildArgs};
 use crate::cli::clean::{self, CleanArgs};
-use crate::cli::design_prompt::{self, DesignArgs};
+use crate::cli::design_prompt::{self, DesignArgs, DesignCommand};
 use crate::cli::discard::{self, DiscardArgs};
 use crate::cli::log_divert::LogWriter;
 use crate::cli::logs::{self, LogsArgs};
@@ -17,7 +17,7 @@ use crate::cli::mcp_self as mcp_self_cli;
 use crate::cli::program;
 use crate::cli::run::{self, RunArgs};
 use crate::cli::run_new::{self, RunNewArgs};
-use crate::error::{CliError, Result};
+use crate::error::{CliError, OutrigError, Result};
 use crate::paths::{
     RepoConfig, resolve_global_config, resolve_repo_config, resolve_repo_config_optional,
 };
@@ -143,7 +143,7 @@ enum ImageCmd {
         /// Project directory. Defaults to the current directory; its name
         /// becomes the image ref.
         dir: Option<PathBuf>,
-        /// Overwrite the generated files if they already exist.
+        /// Overwrite Dockerfile and image.toml if present; preserve an existing README.md.
         #[arg(long)]
         force: bool,
     },
@@ -209,16 +209,115 @@ pub fn run() -> ExitCode {
 /// about a binding a repository declared, which a signal answers by ending the
 /// start that asked it, and a build's output written to a stderr nobody reads.
 /// Every session has finished its own teardown by the time `fut` resolves.
+///
+/// The runtime lives in a [`ShutdownOnDrop`] guard rather than a local
+/// binding so that a panic out of `fut` gets the same treatment as a normal
+/// return. `block_on` propagates such a panic by unwinding out of this
+/// function, and a bare local would then be dropped the ordinary way --
+/// `Runtime::drop` waits, with no timeout, for that same blocking read, which
+/// is the hang this function exists to avoid (#517). The guard's `Drop` runs
+/// on that unwind path and calls `shutdown_background()` just as the return
+/// path below does, so either way out stops waiting on blocking work.
 fn block_on_session(
     runtime: tokio::runtime::Runtime,
     fut: impl Future<Output = Result<i32>>,
 ) -> Result<i32> {
-    let result = runtime.block_on(fut);
-    runtime.shutdown_background();
+    let mut guard = ShutdownOnDrop(Some(runtime));
+    let result = guard
+        .0
+        .as_ref()
+        .expect("guard holds the runtime until shutdown")
+        .block_on(fut);
+    guard
+        .0
+        .take()
+        .expect("guard holds the runtime until shutdown")
+        .shutdown_background();
     result
 }
 
+/// Holds a [`tokio::runtime::Runtime`] and, if it is still there when this
+/// drops, shuts it down in the background instead of letting `Runtime::drop`
+/// wait on blocking work. See [`block_on_session`].
+struct ShutdownOnDrop(Option<tokio::runtime::Runtime>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+/// The subcommand `--config` is not read by, spelled as `outrig <name>`,
+/// paired with the line that says what it reads instead. `None` is one of the
+/// commands that do read the flag: `run` (and `run-legacy`), `run-new`, `mcp`
+/// as a server, and `build`.
+fn config_ignored_by(cmd: &Cmd) -> Option<(&'static str, &'static str)> {
+    /// `image add`, which finds the repo config the way a command without
+    /// `--config` finds one: `repo::resolve_or_bootstrap` walks up from cwd.
+    const WALKS_UP: &str = "it writes the repo config it finds by walking up from the current \
+         directory, so run it from the repo you mean";
+    /// `init`, which does not walk: `init::run_with` sets up the directory it
+    /// was run in, whatever an ancestor holds.
+    const CWD_ONLY: &str = "it sets up the current directory, writing \
+         .agents/outrig/config.toml there";
+    const NO_REPO_CONFIG: &str = "it reads no repo config";
+    const GLOBAL_ONLY: &str = "it writes the global config, which --global-config names";
+
+    match cmd {
+        Cmd::Run(_) | Cmd::RunLegacy(_) | Cmd::RunNew(_) | Cmd::Build(_) => None,
+        // Only the server reads a config; `mcp self` describes outrig itself.
+        Cmd::Mcp(args) => args
+            .is_self_description()
+            .then_some(("mcp self", NO_REPO_CONFIG)),
+        // Matched through to the leaf, so a subcommand added beside these
+        // has to say its own spelling rather than inherit a wrong one.
+        Cmd::Design(args) => Some(match &args.cmd {
+            DesignCommand::Prompt(_) => ("design prompt", NO_REPO_CONFIG),
+        }),
+        Cmd::Config(args) => Some(match &args.cmd {
+            ConfigCmd::Init { .. } => ("config init", GLOBAL_ONLY),
+        }),
+        Cmd::Init { .. } => Some(("init", CWD_ONLY)),
+        Cmd::Image(args) => Some(match &args.cmd {
+            ImageCmd::Add { .. } => ("image add", WALKS_UP),
+            ImageCmd::Init { .. } => ("image init", NO_REPO_CONFIG),
+            ImageCmd::Build { .. } => ("image build", NO_REPO_CONFIG),
+            ImageCmd::Inspect { .. } => ("image inspect", NO_REPO_CONFIG),
+        }),
+        Cmd::Ls(_) => Some(("ls", NO_REPO_CONFIG)),
+        Cmd::Logs(_) => Some(("logs", NO_REPO_CONFIG)),
+        Cmd::Discard(_) => Some(("discard", NO_REPO_CONFIG)),
+        Cmd::Clean(_) => Some(("clean", NO_REPO_CONFIG)),
+    }
+}
+
+/// Stop a command that would ignore the `--config` it was given.
+///
+/// The flag is global, so every subcommand accepts it, but only `run`,
+/// `run-new`, `mcp`, and `build` read one. The rest used to take it and go on
+/// as if it were absent, which for the commands that write a config meant
+/// writing somewhere else: `outrig --config ci/outrig.toml image add foo` put
+/// `[images.foo]` into the repo's own `.agents/outrig/config.toml`, and the
+/// next `outrig --config ci/outrig.toml build --image foo` read the named file
+/// and reported no such image (#412). Refusing makes the flag mean one thing --
+/// the file the command reads -- and says which commands that is, rather than
+/// leaving the mistake to be noticed a command later.
+fn refuse_ignored_config(cli: &Cli) -> Result<()> {
+    let (Some(path), Some((name, reason))) = (&cli.config, config_ignored_by(&cli.cmd)) else {
+        return Ok(());
+    };
+    Err(OutrigError::Configuration(format!(
+        "`outrig {name}` does not read --config {path}: {reason}\n\
+         help: only `run`, `run-new`, `mcp`, and `build` read the repo config --config names",
+        path = path.display(),
+    ))
+    .into())
+}
+
 fn dispatch(cli: &Cli) -> Result<i32> {
+    refuse_ignored_config(cli)?;
     match &cli.cmd {
         Cmd::Run(args) | Cmd::RunLegacy(args) => {
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
@@ -386,11 +485,18 @@ fn raise_descriptor_limit() {
     }
 }
 
+/// The filter in force when neither `OUTRIG_LOG` nor `RUST_LOG` is set: outrig's own records at
+/// `info`, with rig's agent-loop instrumentation (a line per turn, the tool arguments and result,
+/// `Agent run finished`) held at `warn` so it does not land between the prompt and the reply.
+/// rig 0.45 raises those lines from two crates, `rig_agent`'s engine and `rig_core`. Naming
+/// either crate in either variable is the opt-in.
+const DEFAULT_LOG_FILTER: &str = "info,rig_core=warn,rig_agent=warn";
+
 fn init_tracing(verbose: u8) {
     let outrig_log = std::env::var("OUTRIG_LOG").ok();
     let rust_log = std::env::var("RUST_LOG").ok();
     let spec = log_filter_spec(outrig_log.as_deref(), rust_log.as_deref());
-    let mut filter = EnvFilter::try_new(spec).unwrap_or_else(|_| EnvFilter::new("info"));
+    let mut filter = EnvFilter::try_new(spec).unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
     if let Some(directive) = quiet_rustyline(spec) {
         filter = filter.add_directive(directive);
     }
@@ -403,8 +509,10 @@ fn init_tracing(verbose: u8) {
     }
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        // stderr, unless `run-new`'s screen holds the terminal and has taken
-        // the records for itself.
+        // stderr through `crate::notice`, so a record raised while `outrig
+        // run`'s prompt is up waits for the read to end rather than landing on
+        // the prompt's row -- unless `run-new`'s screen holds the terminal and
+        // has taken the records for itself.
         .with_writer(LogWriter::global().clone())
         // Its default, true, reports an event that could not be written with an
         // `eprintln!` of its own, which panics when stderr's reader has gone:
@@ -417,7 +525,7 @@ fn init_tracing(verbose: u8) {
 }
 
 fn log_filter_spec<'a>(outrig_log: Option<&'a str>, rust_log: Option<&'a str>) -> &'a str {
-    outrig_log.or(rust_log).unwrap_or("info")
+    outrig_log.or(rust_log).unwrap_or(DEFAULT_LOG_FILTER)
 }
 
 /// Hold rustyline's own records at `warn` unless the filter names it.
@@ -475,7 +583,48 @@ fn repo_cmd_ctx(
 mod tests {
     use clap::{Parser, error::ErrorKind};
 
-    use super::{Cli, Cmd, EnvFilter, ImageCmd, log_filter_spec, quiet_rustyline};
+    use super::{Cli, Cmd, EnvFilter, ImageCmd, config_ignored_by, log_filter_spec, quiet_rustyline};
+
+    /// The guard in [`super::block_on_session`] has to catch the unwind path,
+    /// not just the return path: a panic out of the session future must
+    /// reach the caller without first waiting on blocking work still parked
+    /// in the runtime's blocking pool (#517). `park_rx.recv()` never returns
+    /// on its own -- `_park_tx` stays alive for the whole test -- so an
+    /// ordinary `Runtime::drop` here would hang, and `recv_timeout` below
+    /// would time out instead of observing the unwind.
+    #[test]
+    fn block_on_session_unwind_does_not_wait_on_blocking_work() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (_park_tx, park_rx) = mpsc::channel::<()>();
+        let (unwound_tx, unwound_rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime builds");
+            runtime.spawn_blocking(move || {
+                let _ = park_rx.recv();
+            });
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::block_on_session(runtime, async { panic!("injected session panic") })
+            }));
+            assert!(
+                result.is_err(),
+                "the injected panic should propagate out of block_on_session"
+            );
+            let _ = unwound_tx.send(());
+        });
+
+        unwound_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect(
+                "the unwind should reach the caller without waiting on the parked blocking task",
+            );
+    }
 
     /// The `outrig ...` lines of the README's `## Commands` fence, with
     /// trailing comments dropped and an `a|b` alternation in the final word
@@ -697,8 +846,41 @@ mod tests {
     }
 
     #[test]
-    fn log_filter_defaults_to_info() {
-        assert_eq!(log_filter_spec(None, None), "info");
+    fn log_filter_defaults_to_info_with_rig_held_at_warn() {
+        assert_eq!(
+            log_filter_spec(None, None),
+            "info,rig_core=warn,rig_agent=warn"
+        );
+    }
+
+    /// rig's `info!` calls are the noise -- rig 0.45 raises the per-turn lines from `rig_agent`'s
+    /// engine, the rest from `rig_core` -- and its `warn!`s and anything outrig logs stay, and
+    /// `OUTRIG_LOG=debug` brings rig's lines back.
+    #[test]
+    fn the_default_filter_quiets_rigs_info_only() {
+        use tracing_subscriber::filter::LevelFilter;
+        let default = EnvFilter::new(log_filter_spec(None, None));
+        assert_eq!(default.max_level_hint(), Some(LevelFilter::INFO));
+        let rendered = default.to_string();
+        assert!(rendered.contains("rig_core=warn"), "{rendered}");
+        assert!(rendered.contains("rig_agent=warn"), "{rendered}");
+        let opted_in = EnvFilter::new(log_filter_spec(Some("debug"), None));
+        assert_eq!(opted_in.max_level_hint(), Some(LevelFilter::DEBUG));
+        assert!(!opted_in.to_string().contains("rig_"));
+    }
+
+    /// `--config` means the repo config, and `mcp` is the one subcommand that
+    /// reads it in one mode and not in the other: serving a repo reads it,
+    /// `mcp self` describes outrig itself and has nothing to read it for
+    /// (#412).
+    #[test]
+    fn mcp_reads_config_as_a_server_but_not_as_self() {
+        let serving = Cli::try_parse_from(["outrig", "mcp"]).expect("`mcp` parses");
+        assert_eq!(config_ignored_by(&serving.cmd), None);
+
+        let described = Cli::try_parse_from(["outrig", "mcp", "self"]).expect("`mcp self` parses");
+        let (name, _) = config_ignored_by(&described.cmd).expect("`mcp self` reads no config");
+        assert_eq!(name, "mcp self");
     }
 
     #[test]

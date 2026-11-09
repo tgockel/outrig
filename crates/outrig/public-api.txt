@@ -78,6 +78,10 @@ pub outrig::config::ConfigValidationError::BindingNameTaken::taken: &'static str
 pub outrig::config::ConfigValidationError::BindingRequires::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::BindingRequires::name: alloc::string::String
 pub outrig::config::ConfigValidationError::BindingRequires::reason: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::BuildArgKeyInvalid
+pub outrig::config::ConfigValidationError::BuildArgKeyInvalid::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::BuildArgKeyInvalid::image: alloc::string::String
+pub outrig::config::ConfigValidationError::BuildArgKeyInvalid::key: alloc::string::String
 #[non_exhaustive] pub outrig::config::ConfigValidationError::BuildImageNameInvalid
 pub outrig::config::ConfigValidationError::BuildImageNameInvalid::image: alloc::string::String
 pub outrig::config::ConfigValidationError::BuildImageNameInvalid::reason: outrig::config::BuildImageNameError
@@ -161,6 +165,11 @@ pub outrig::config::ConfigValidationError::McpCallTimeoutSecsTooLarge::value: u6
 pub outrig::config::ConfigValidationError::McpCallTimeoutSecsZero
 pub outrig::config::ConfigValidationError::McpCallTimeoutSecsZero::max: u64
 pub outrig::config::ConfigValidationError::McpCallTimeoutSecsZero::path: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::McpEnvKeyInvalid
+pub outrig::config::ConfigValidationError::McpEnvKeyInvalid::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::McpEnvKeyInvalid::image: alloc::string::String
+pub outrig::config::ConfigValidationError::McpEnvKeyInvalid::key: alloc::string::String
+pub outrig::config::ConfigValidationError::McpEnvKeyInvalid::server: alloc::string::String
 pub outrig::config::ConfigValidationError::McpInlineImageEmpty
 pub outrig::config::ConfigValidationError::McpInlineImageEmpty::image: alloc::string::String
 pub outrig::config::ConfigValidationError::McpInlineImageEmpty::server: alloc::string::String
@@ -247,8 +256,16 @@ pub outrig::config::ConfigValidationError::SidecarNameCollision::image: alloc::s
 pub outrig::config::ConfigValidationError::SidecarNameCollision::name: alloc::string::String
 pub outrig::config::ConfigValidationError::SidecarNameInvalid
 pub outrig::config::ConfigValidationError::SidecarNameInvalid::sidecar: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::SidecarSecurity
+pub outrig::config::ConfigValidationError::SidecarSecurity::sidecar: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarSecurity::violation: outrig::config::SecurityRuleViolation
+#[non_exhaustive] pub outrig::config::ConfigValidationError::SidecarViewCapDrop
+pub outrig::config::ConfigValidationError::SidecarViewCapDrop::capability: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarViewCapDrop::sidecar: alloc::string::String
 pub outrig::config::ConfigValidationError::SidecarViewDropsCaps
 pub outrig::config::ConfigValidationError::SidecarViewDropsCaps::sidecar: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::SidecarViewNoNewPrivsOff
+pub outrig::config::ConfigValidationError::SidecarViewNoNewPrivsOff::sidecar: alloc::string::String
 pub outrig::config::ConfigValidationError::SidecarViewRequiresEntrypoint
 pub outrig::config::ConfigValidationError::SidecarViewRequiresEntrypoint::image: alloc::string::String
 pub outrig::config::ConfigValidationError::SidecarViewRequiresEntrypoint::server: alloc::string::String
@@ -313,9 +330,14 @@ pub outrig::config::ConfigValidationError::UnmaskPathListSeparator::path: alloc:
 pub outrig::config::ConfigValidationError::UnmaskPathRelative
 pub outrig::config::ConfigValidationError::UnmaskPathRelative::image: alloc::string::String
 pub outrig::config::ConfigValidationError::UnmaskPathRelative::path: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceContainerFieldSeparator
+pub outrig::config::ConfigValidationError::WorkspaceContainerFieldSeparator::path: std::path::PathBuf
 #[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceContainerNotAbsolute
 pub outrig::config::ConfigValidationError::WorkspaceContainerNotAbsolute::path: std::path::PathBuf
 #[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceContainerRoot
+#[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceHostFieldSeparator
+pub outrig::config::ConfigValidationError::WorkspaceHostFieldSeparator::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::WorkspaceHostFieldSeparator::path: std::path::PathBuf
 #[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceHostMissing
 pub outrig::config::ConfigValidationError::WorkspaceHostMissing::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::WorkspaceHostMissing::path: std::path::PathBuf
@@ -325,6 +347,9 @@ pub outrig::config::ConfigValidationError::WorkspaceHostNotDirectory::path: std:
 #[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate
 pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate::path: std::path::PathBuf
+#[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountContainerFieldSeparator
+pub outrig::config::ConfigValidationError::WorkspaceMountContainerFieldSeparator::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::WorkspaceMountContainerFieldSeparator::path: std::path::PathBuf
 #[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountContainerNotAbsolute
 pub outrig::config::ConfigValidationError::WorkspaceMountContainerNotAbsolute::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::WorkspaceMountContainerNotAbsolute::path: std::path::PathBuf
@@ -333,6 +358,9 @@ pub outrig::config::ConfigValidationError::WorkspaceMountContainerRoot::declared
 #[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountHostDuplicate
 pub outrig::config::ConfigValidationError::WorkspaceMountHostDuplicate::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::WorkspaceMountHostDuplicate::path: std::path::PathBuf
+#[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountHostFieldSeparator
+pub outrig::config::ConfigValidationError::WorkspaceMountHostFieldSeparator::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::WorkspaceMountHostFieldSeparator::path: std::path::PathBuf
 #[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountHostMissing
 pub outrig::config::ConfigValidationError::WorkspaceMountHostMissing::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::WorkspaceMountHostMissing::path: std::path::PathBuf
@@ -458,11 +486,17 @@ pub outrig::config::MountAccess::ReadWrite
 #[non_exhaustive] pub outrig::config::MountRuleViolation::ContainerDuplicate
 pub outrig::config::MountRuleViolation::ContainerDuplicate::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::MountRuleViolation::ContainerDuplicate::path: std::path::PathBuf
+#[non_exhaustive] pub outrig::config::MountRuleViolation::ContainerFieldSeparator
+pub outrig::config::MountRuleViolation::ContainerFieldSeparator::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::MountRuleViolation::ContainerFieldSeparator::path: std::path::PathBuf
 #[non_exhaustive] pub outrig::config::MountRuleViolation::ContainerNotAbsolute
 pub outrig::config::MountRuleViolation::ContainerNotAbsolute::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::MountRuleViolation::ContainerNotAbsolute::path: std::path::PathBuf
 #[non_exhaustive] pub outrig::config::MountRuleViolation::ContainerRoot
 pub outrig::config::MountRuleViolation::ContainerRoot::declared_in: core::option::Option<std::path::PathBuf>
+#[non_exhaustive] pub outrig::config::MountRuleViolation::HostFieldSeparator
+pub outrig::config::MountRuleViolation::HostFieldSeparator::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::MountRuleViolation::HostFieldSeparator::path: std::path::PathBuf
 #[non_exhaustive] pub outrig::config::MountRuleViolation::HostMissing
 pub outrig::config::MountRuleViolation::HostMissing::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::MountRuleViolation::HostMissing::path: std::path::PathBuf
@@ -491,6 +525,38 @@ pub outrig::config::RepoInstructions::None
 #[non_exhaustive] pub enum outrig::config::RoleAlternation
 pub outrig::config::RoleAlternation::Relaxed
 pub outrig::config::RoleAlternation::Strict
+#[non_exhaustive] pub enum outrig::config::SecurityRuleViolation
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::CapabilityDropAddConflict
+pub outrig::config::SecurityRuleViolation::CapabilityDropAddConflict::capability: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::CapabilityNameDuplicate
+pub outrig::config::SecurityRuleViolation::CapabilityNameDuplicate::capability: alloc::string::String
+pub outrig::config::SecurityRuleViolation::CapabilityNameDuplicate::field: &'static str
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::CapabilityNameEmpty
+pub outrig::config::SecurityRuleViolation::CapabilityNameEmpty::field: &'static str
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::CapabilityNameInvalid
+pub outrig::config::SecurityRuleViolation::CapabilityNameInvalid::capability: alloc::string::String
+pub outrig::config::SecurityRuleViolation::CapabilityNameInvalid::field: &'static str
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::DevicePathDuplicate
+pub outrig::config::SecurityRuleViolation::DevicePathDuplicate::device: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::DevicePathEmpty
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::DevicePathMalformed
+pub outrig::config::SecurityRuleViolation::DevicePathMalformed::detail: alloc::string::String
+pub outrig::config::SecurityRuleViolation::DevicePathMalformed::device: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::DevicePathRelative
+pub outrig::config::SecurityRuleViolation::DevicePathRelative::device: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::UnmaskAllNotAlone
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::UnmaskAllNotCanonical
+pub outrig::config::SecurityRuleViolation::UnmaskAllNotCanonical::path: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::UnmaskPathBadGlob
+pub outrig::config::SecurityRuleViolation::UnmaskPathBadGlob::detail: &'static str
+pub outrig::config::SecurityRuleViolation::UnmaskPathBadGlob::path: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::UnmaskPathDuplicate
+pub outrig::config::SecurityRuleViolation::UnmaskPathDuplicate::path: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::UnmaskPathEmpty
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::UnmaskPathListSeparator
+pub outrig::config::SecurityRuleViolation::UnmaskPathListSeparator::path: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::UnmaskPathRelative
+pub outrig::config::SecurityRuleViolation::UnmaskPathRelative::path: alloc::string::String
 #[non_exhaustive] pub enum outrig::config::SidecarOnFailure
 pub outrig::config::SidecarOnFailure::Abort
 pub outrig::config::SidecarOnFailure::Warn
@@ -596,6 +662,7 @@ pub fn outrig::config::Config::load_from_str(&str) -> outrig::error::Result<Self
 pub fn outrig::config::Config::load_global(&std::path::Path) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_unvalidated(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::model_candidates<'a>(&'a self, &str) -> core::result::Result<alloc::vec::Vec<&'a str>, outrig::config::ConfigValidationError>
+pub fn outrig::config::Config::salvage_global_session_root(&std::path::Path) -> outrig::error::Result<core::option::Option<std::path::PathBuf>>
 pub fn outrig::config::Config::validate(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>
 pub fn outrig::config::Config::validate_as_repo(&self) -> outrig::error::Result<()>
 pub fn outrig::config::Config::validate_for_build(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>
@@ -788,6 +855,7 @@ pub fn outrig::config::EnvSecrets::resolve(&self, &str) -> core::result::Result<
 impl<F> outrig::config::Secrets for F where F: core::ops::function::Fn(&str) -> core::option::Option<alloc::string::String> + core::marker::Send + core::marker::Sync
 pub fn F::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
 pub fn outrig::config::check_build_image_name(&str) -> core::result::Result<(), outrig::config::BuildImageNameError>
+pub fn outrig::config::is_env_key(&str) -> bool
 pub fn outrig::config::merge(outrig::config::Config, outrig::config::Config) -> outrig::config::Config
 pub mod outrig::container
 pub mod outrig::container::embedded
@@ -800,6 +868,9 @@ pub outrig::container::embedded::EmbeddedImageConfigError::CallTimeoutOutOfRange
 pub outrig::container::embedded::EmbeddedImageConfigError::CallTimeoutOutOfRange::value: u64
 pub outrig::container::embedded::EmbeddedImageConfigError::EmptyMcpCommand
 pub outrig::container::embedded::EmbeddedImageConfigError::EmptyMcpCommand::server: alloc::string::String
+pub outrig::container::embedded::EmbeddedImageConfigError::EnvKeyInvalid
+pub outrig::container::embedded::EmbeddedImageConfigError::EnvKeyInvalid::key: alloc::string::String
+pub outrig::container::embedded::EmbeddedImageConfigError::EnvKeyInvalid::server: alloc::string::String
 pub outrig::container::embedded::EmbeddedImageConfigError::InvalidMcpServerName
 pub outrig::container::embedded::EmbeddedImageConfigError::InvalidMcpServerName::server: alloc::string::String
 pub outrig::container::embedded::EmbeddedImageConfigError::Json(serde_json::error::Error)
@@ -824,6 +895,9 @@ pub outrig::container::embedded::StandaloneImageTomlError::CallTimeoutOutOfRange
 pub outrig::container::embedded::StandaloneImageTomlError::CallTimeoutOutOfRange::value: u64
 pub outrig::container::embedded::StandaloneImageTomlError::EmptyMcpCommand
 pub outrig::container::embedded::StandaloneImageTomlError::EmptyMcpCommand::server: alloc::string::String
+pub outrig::container::embedded::StandaloneImageTomlError::EnvKeyInvalid
+pub outrig::container::embedded::StandaloneImageTomlError::EnvKeyInvalid::key: alloc::string::String
+pub outrig::container::embedded::StandaloneImageTomlError::EnvKeyInvalid::server: alloc::string::String
 pub outrig::container::embedded::StandaloneImageTomlError::InvalidMcpServerName
 pub outrig::container::embedded::StandaloneImageTomlError::InvalidMcpServerName::server: alloc::string::String
 pub outrig::container::embedded::StandaloneImageTomlError::McpEmpty
@@ -866,6 +940,7 @@ pub async fn outrig::container::embedded::merged_mcp(&outrig::container::Contain
 pub fn outrig::container::embedded::parse_standalone_image_labels(&str, &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> outrig::error::Result<outrig::container::embedded::StandaloneImageLabels>
 pub fn outrig::container::embedded::parse_standalone_image_toml(&str) -> core::result::Result<outrig::container::embedded::StandaloneImageToml, outrig::container::embedded::StandaloneImageTomlError>
 pub async fn outrig::container::embedded::read_embedded_mcp(&outrig::image::ImageTag, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>>
+pub async fn outrig::container::embedded::read_embedded_mcp_of(&outrig::container::Container) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>>
 pub async fn outrig::container::embedded::read_standalone_image_mcp(&outrig::container::Container) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>>
 pub fn outrig::container::embedded::standalone_config_to_labels(&outrig::container::embedded::StandaloneImageToml) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
 pub mod outrig::container::enter
@@ -928,10 +1003,12 @@ pub async fn outrig::container::Container::inspect_existing(&str, core::option::
 pub async fn outrig::container::Container::is_running(&str) -> outrig::error::Result<bool>
 pub fn outrig::container::Container::name(&self) -> &str
 pub async fn outrig::container::Container::pid(&self) -> outrig::error::Result<u32>
+pub async fn outrig::container::Container::release(&self) -> outrig::error::Result<()>
 pub fn outrig::container::Container::selector(&self) -> &str
 pub fn outrig::container::Container::session_suffix(&self) -> &str
 pub async fn outrig::container::Container::start(&outrig::image::ImageTag, outrig::container::ContainerLaunchSpec) -> outrig::error::Result<Self>
 pub async fn outrig::container::Container::start_named(&outrig::image::ImageTag, outrig::container::ContainerLaunchSpec, alloc::string::String, core::option::Option<outrig::Transcript>) -> outrig::error::Result<Self>
+pub async fn outrig::container::Container::start_named_held(&outrig::image::ImageTag, outrig::container::ContainerLaunchSpec, alloc::string::String, core::option::Option<outrig::Transcript>) -> outrig::error::Result<Self>
 pub async fn outrig::container::Container::stop(self, core::time::Duration) -> outrig::error::Result<()>
 pub async fn outrig::container::Container::stop_or_keep(self, core::time::Duration) -> core::option::Option<(outrig::error::OutrigError, Self)>
 pub fn outrig::container::Container::transcript(&self) -> core::option::Option<outrig::Transcript>
@@ -1040,12 +1117,18 @@ pub outrig::error::OutrigError::BootstrapNamespace::step: alloc::string::String
 pub outrig::error::OutrigError::BuildArgResolveFailed::image: alloc::string::String
 pub outrig::error::OutrigError::BuildArgResolveFailed::key: alloc::string::String
 pub outrig::error::OutrigError::BuildArgResolveFailed::source: outrig::config::EnvValueError
+#[non_exhaustive] pub outrig::error::OutrigError::BuildContextChanged
+pub outrig::error::OutrigError::BuildContextChanged::image: alloc::string::String
+pub outrig::error::OutrigError::BuildContextChanged::tag: alloc::string::String
 #[non_exhaustive] pub outrig::error::OutrigError::Canceled
 pub outrig::error::OutrigError::Canceled::argv: alloc::vec::Vec<std::ffi::os_str::OsString>
 pub outrig::error::OutrigError::Canceled::program: &'static str
 pub outrig::error::OutrigError::Config(toml::de::error::Error)
 #[non_exhaustive] pub outrig::error::OutrigError::ConfigDottedKey
 pub outrig::error::OutrigError::ConfigDottedKey::source: toml::de::error::Error
+#[non_exhaustive] pub outrig::error::OutrigError::ConfigFile
+pub outrig::error::OutrigError::ConfigFile::path: std::path::PathBuf
+pub outrig::error::OutrigError::ConfigFile::source: alloc::boxed::Box<outrig::error::OutrigError>
 pub outrig::error::OutrigError::ConfigValidation(outrig::config::ConfigValidationError)
 pub outrig::error::OutrigError::Configuration(alloc::string::String)
 #[non_exhaustive] pub outrig::error::OutrigError::ContainerPidNotLocal
@@ -2244,6 +2327,7 @@ pub async fn outrig::network::NetworkInterceptor::attach(&mut self, &outrig::con
 pub async fn outrig::network::NetworkInterceptor::detach(&mut self, &str) -> outrig::error::Result<()>
 pub fn outrig::network::NetworkInterceptor::drop_attachment(&mut self, &str) -> bool
 pub async fn outrig::network::NetworkInterceptor::new(&std::path::Path, &str, outrig::config::NetworkPolicy) -> outrig::error::Result<Self>
+pub fn outrig::network::NetworkInterceptor::retire_attachment(&mut self, &str) -> bool
 pub async fn outrig::network::NetworkInterceptor::shutdown(self) -> outrig::error::Result<()>
 pub async fn outrig::network::NetworkInterceptor::start(&outrig::container::Container, &std::path::Path, &str) -> outrig::error::Result<Self>
 pub async fn outrig::network::NetworkInterceptor::start_with_policy(&outrig::container::Container, &std::path::Path, &str, outrig::config::NetworkPolicy) -> outrig::error::Result<Self>
@@ -2567,6 +2651,7 @@ impl outrig::WorkspaceSpec
 pub fn outrig::WorkspaceSpec::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub const outrig::PUBLIC_DOC_BASE_URL: &str
 pub const outrig::RESERVED_SERVER: &str
+pub fn outrig::assign_tool_names(&[(&str, &str)], &[&str]) -> alloc::vec::Vec<core::option::Option<alloc::string::String>>
 pub fn outrig::load_project(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<(outrig::config::Config, std::path::PathBuf)>
 pub fn outrig::resolve_mcp_env(&str, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>, &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ResolvedEnvValue>>
 pub fn outrig::sanitize_tool_name(&str, &str) -> alloc::string::String

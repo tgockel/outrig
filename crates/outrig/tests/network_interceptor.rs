@@ -548,6 +548,76 @@ async fn curl_http_host_writes_allow_audit_record() {
     container.stop(Duration::from_secs(2)).await.expect("stop");
 }
 
+/// The primary under interception is created and initialized, attached, and
+/// only then started (#395): attaching neither needs nor causes the image's
+/// process to run, the redirect is complete before it does, and `release` is
+/// what runs it. The resolver the interceptor would install by exec in a
+/// running container is baked in instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_container_is_attached_before_it_runs() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_curl_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let name = format!("outrig-test-held-{}", std::process::id());
+    let mut container = Container::start_named_held(
+        &image,
+        ContainerLaunchSpec::workspace(workspace.path(), PathBuf::from("/workspace")),
+        name,
+        None,
+    )
+    .await
+    .expect("start container held");
+    assert!(
+        !Container::is_running(container.name())
+            .await
+            .expect("probe"),
+        "a held container has its namespaces and has run nothing"
+    );
+
+    let interceptor = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect("attach the interceptor to the held container");
+    assert!(
+        !Container::is_running(container.name())
+            .await
+            .expect("probe"),
+        "attaching does not start the container"
+    );
+    assert!(
+        netns_has_complete_redirect(container_root_pid(&container)),
+        "the redirect is in place before the container's process has run"
+    );
+
+    container.release().await.expect("release the container");
+    assert!(
+        Container::is_running(container.name())
+            .await
+            .expect("probe")
+    );
+    container.bootstrap_user().await.expect("bootstrap user");
+
+    let resolv = read_resolv_conf(&container);
+    assert!(
+        String::from_utf8_lossy(&resolv).contains("nameserver 127.0.0.1"),
+        "the resolver baked in at create points at the interceptor: {}",
+        String::from_utf8_lossy(&resolv)
+    );
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
 /// Every IPv4 address the host has, loopback included.
 fn host_ipv4_addresses() -> Vec<Ipv4Addr> {
     let mut found: Vec<Ipv4Addr> = nix::ifaddrs::getifaddrs()
@@ -872,6 +942,53 @@ async fn a_dropped_interceptor_has_put_the_resolver_back() {
         "the resolver is back before the drop returns"
     );
     wait_for_table_reaped(pid).await;
+    assert_no_host_shell_ran(&container);
+
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// `retire_attachment` frees the name the way `drop_attachment` does, but it
+/// ends nothing: a container whose removal is only requested stays intercepted
+/// until the retired attachment is torn down, which `shutdown` does in order
+/// (#501).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retired_attachment_keeps_intercepting_until_shutdown() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let container = start_recording_shell_container(dir.path()).await;
+    let before = read_resolv_conf(&container);
+
+    let mut interceptor = NetworkInterceptor::start(
+        &container,
+        &dir.path().join("logs"),
+        container.session_suffix(),
+    )
+    .await
+    .expect("start interceptor");
+    let intercepted = read_resolv_conf(&container);
+    assert_ne!(intercepted, before);
+
+    assert!(interceptor.retire_attachment(container.name()));
+    assert!(
+        !interceptor.retire_attachment(container.name()),
+        "nothing is left attached to retire"
+    );
+    assert_eq!(
+        read_resolv_conf(&container),
+        intercepted,
+        "retiring does not put the resolver back while the container lives"
+    );
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown tears the retired attachment down");
+    assert_eq!(read_resolv_conf(&container), before);
     assert_no_host_shell_ran(&container);
 
     container
@@ -2087,4 +2204,176 @@ async fn a_container_holding_sys_admin_is_still_attached() {
         .stop(Duration::from_secs(2))
         .await
         .expect("stop container");
+}
+
+/// A container started directly through `podman run` rather than through
+/// `Container::start` -- the shape [`Container::attach`] borrows, so this
+/// crate's own `--cap-add`/`--cap-drop` lowering has no say in what it holds.
+/// Removed on drop, including past a panicking assertion: nothing else would
+/// clean it up, since a borrowed container is never removed by `Drop for
+/// Container` (#549).
+struct RawContainer {
+    name: String,
+}
+
+static RAW_CONTAINER_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl RawContainer {
+    /// `podman run -d --name <generated> <extra_args> <image> sleep 600`.
+    fn start(image: &ImageTag, extra_args: &[&str]) -> Self {
+        let name = format!(
+            "outrig-probe-borrowed-{}-{}",
+            std::process::id(),
+            RAW_CONTAINER_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let mut cmd = Command::new("podman");
+        cmd.args(["run", "-d", "--name", &name, "--pull=never"]);
+        cmd.args(extra_args);
+        cmd.arg(image.as_str()).args(["sleep", "600"]);
+        run_capture(&mut cmd);
+        Self { name }
+    }
+}
+
+impl Drop for RawContainer {
+    fn drop(&mut self) {
+        let _ = Command::new("podman")
+            .args(["rm", "-f", &self.name])
+            .output();
+    }
+}
+
+/// A borrowed container (`Container::attach`) holding `CAP_NET_ADMIN` through
+/// a `--cap-add` outrig never issued is refused exactly as one outrig itself
+/// launched with the same flag is: `attached_holds_net_admin` asks the engine
+/// directly, since there is no launch here for `holds_net_admin` to read
+/// (#549).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_borrowed_container_holding_net_admin_through_cap_add_is_refused() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let context = dir.path().join("image");
+    std::fs::create_dir_all(&context).expect("image context dir");
+    write_curl_image_context(&context);
+    let image = ensure_curl_image(&context).await;
+    let log_dir = dir.path().join("logs");
+
+    let raw = RawContainer::start(&image, &["--cap-add=NET_ADMIN"]);
+    let container = Container::attach(raw.name.clone(), image.clone(), None, None);
+    let pid = container_root_pid(&container);
+
+    let refused = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect_err("a borrowed container holding NET_ADMIN is not attached");
+    let message = refused.to_string();
+    assert!(
+        message.contains("CAP_NET_ADMIN") && message.contains("podman"),
+        "the refusal names the capability and how it was found: {message}"
+    );
+    assert!(
+        !netns_has_outrig_table(pid),
+        "a refused attach installs no table"
+    );
+}
+
+/// `--privileged` grants `CAP_NET_ADMIN` among everything else, with no
+/// `--cap-add` for a launch-derived check to have read even if this
+/// container had one. Only the engine's own report of its effective
+/// capabilities catches this (#549).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_borrowed_privileged_container_is_refused() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let context = dir.path().join("image");
+    std::fs::create_dir_all(&context).expect("image context dir");
+    write_curl_image_context(&context);
+    let image = ensure_curl_image(&context).await;
+    let log_dir = dir.path().join("logs");
+
+    let raw = RawContainer::start(&image, &["--privileged"]);
+    let container = Container::attach(raw.name.clone(), image.clone(), None, None);
+    let pid = container_root_pid(&container);
+
+    let refused = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect_err("a borrowed, privileged container is not attached");
+    assert!(
+        refused.to_string().contains("CAP_NET_ADMIN"),
+        "the refusal names the capability: {refused}"
+    );
+    assert!(
+        !netns_has_outrig_table(pid),
+        "a refused attach installs no table"
+    );
+}
+
+/// `SYS_ADMIN` is not `NET_ADMIN` for a borrowed container either, so the
+/// nested-runtime recipe keeps working when the container holding it is one
+/// outrig only attached to (#549; see `a_container_holding_sys_admin_is_still_attached`
+/// for the owned case).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_borrowed_container_holding_sys_admin_still_attaches() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let context = dir.path().join("image");
+    std::fs::create_dir_all(&context).expect("image context dir");
+    write_curl_image_context(&context);
+    let image = ensure_curl_image(&context).await;
+    let log_dir = dir.path().join("logs");
+
+    let raw = RawContainer::start(&image, &["--cap-add=SYS_ADMIN"]);
+    let container = Container::attach(raw.name.clone(), image.clone(), None, None);
+    let pid = container_root_pid(&container);
+
+    let interceptor = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect("a borrowed container holding SYS_ADMIN attaches");
+    assert!(
+        netns_has_complete_redirect(pid),
+        "a borrowed container holding SYS_ADMIN should still get a whole redirect table"
+    );
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+}
+
+/// A borrowed container with no extra capabilities attaches as it always
+/// could -- the baseline the three refusals above are measured against
+/// (#549).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_borrowed_container_with_no_extra_capabilities_attaches() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let context = dir.path().join("image");
+    std::fs::create_dir_all(&context).expect("image context dir");
+    write_curl_image_context(&context);
+    let image = ensure_curl_image(&context).await;
+    let log_dir = dir.path().join("logs");
+
+    let raw = RawContainer::start(&image, &[]);
+    let container = Container::attach(raw.name.clone(), image.clone(), None, None);
+    let pid = container_root_pid(&container);
+
+    let interceptor = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect("a borrowed container with no extra capabilities attaches");
+    assert!(
+        netns_has_complete_redirect(pid),
+        "a borrowed container with no extra capabilities should get a whole redirect table"
+    );
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
 }

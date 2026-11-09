@@ -11,7 +11,7 @@ it happens:
 ```
 
 0002-49 pinned the banner half (`crates/outrig-cli/src/cli/run.rs`, `render_banner` and its
-tests). The announcement half is still unasserted. A refactor that drops the `eprintln!` leaves
+tests). The announcement half is still unasserted. A refactor that drops the `notice!` leaves
 a session silently switching vendors mid-reply with every test green, which is the exact
 condition 0002-36 decided was unacceptable.
 
@@ -22,6 +22,9 @@ needs either a global stderr redirect, which races every other test in the binar
 injected into `FailoverModel`, which is production surface existing only for a test.
 
 ## Sketch
+
+The wording is now pinned: `move_announcement` (`failover.rs`) holds the text and has a unit
+test. What remains is the second option below, proving `completion` still prints it.
 
 Two options, neither obviously right:
 
@@ -45,4 +48,4 @@ paying for a binary-level failover fixture.
 `0003-15`'s copy in `crates/outrig/src/agent/failover.rs` announces a move through `tracing` and
 records it as a `model.failover` event. `each_move_is_recorded` and the round tests in
 `agent/agent_tests.rs` assert the event, which a refactor that dropped the move's report would
-fail. The CLI's `eprintln!` is still unasserted.
+fail. The CLI's `notice!` of it is still unasserted.

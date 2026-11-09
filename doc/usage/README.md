@@ -24,5 +24,7 @@ like in practice, what comes back when something goes wrong.
   `outrig clean`.
 - **[Recipes](recipes.md)** -- common patterns (multiple image-configs, capturing
   transcripts, scripted single-prompt runs).
+- **[Building without the musl target](no-musl.md)** -- how outrig builds the launcher
+  `view = "primary"` sidecars need, and what to install when it could not.
 
 For exhaustive flag-by-flag reference, see [Reference -> CLI](../reference/cli.md).

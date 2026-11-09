@@ -82,6 +82,7 @@ use rig::providers::openai::extension::OpenAiOptions;
 use rig::serve::{Dispatch, Reply, Serve};
 
 use super::retry::{self, RetryPolicy, RetryingModel, candidate_failure_label};
+use crate::notice::notice;
 
 /// The label the chain is registered under in the agent's handler table, which
 /// is what rig names the agent's model.
@@ -465,12 +466,14 @@ impl FailoverModel {
                         // sent again without asking, as every later call to it
                         // is.
                         if refuses_binding(&error) && candidate.unbind() {
-                            eprintln!(
-                                "[outrig] model {} refused the request that asked for \
-                                 drop_block ({}); sending it and every later call without \
-                                 asking",
-                                candidate.model_name(),
-                                candidate_failure_label(&error),
+                            notice!(
+                                "{}",
+                                super::labeled_line(format!(
+                                    "model {} refused the request that asked for drop_block \
+                                     ({}); sending it and every later call without asking",
+                                    candidate.model_name(),
+                                    candidate_failure_label(&error),
+                                ))
                             );
                             continue;
                         }
@@ -484,11 +487,9 @@ impl FailoverModel {
             // work, which is the stronger version of the same hazard and wants
             // the same mitigation.
             if let Some(next) = self.candidates.get(index + 1) {
-                eprintln!(
-                    "[outrig] model {} failed ({}); trying {}",
-                    candidate.model_name(),
-                    candidate_failure_label(&error),
-                    next.model_name(),
+                notice!(
+                    "{}",
+                    move_announcement(candidate.model_name(), &error, next.model_name())
                 );
             }
             abandoned.push(Abandoned {
@@ -574,6 +575,14 @@ pub struct ChainExhaustion<'a> {
     /// the failure has to end the process exactly as it does for a lone
     /// candidate.
     pub recoverable: bool,
+}
+
+/// The line printed as the chain moves from one candidate to the next.
+fn move_announcement(from: &str, error: &ProviderError, to: &str) -> String {
+    super::labeled_line(format!(
+        "model {from} failed ({}); trying {to}",
+        candidate_failure_label(error),
+    ))
 }
 
 /// The failure a chain returns when every candidate has been abandoned, carried
@@ -741,6 +750,50 @@ mod tests {
     use rig::completion::{AssistantContent, Usage};
 
     use super::*;
+
+    /// A non-success status with `body`, as rig classifies one the HTTP loop
+    /// handed back.
+    fn status(code: u16, body: &str) -> ProviderError {
+        ProviderError::from_http_response(
+            reqwest::StatusCode::from_u16(code).expect("status"),
+            body.to_string(),
+        )
+    }
+
+    /// The bodies of retried statuses stay out of the `tried` rows (#298): an
+    /// HTML error page would otherwise spread one candidate over many lines.
+    #[test]
+    fn the_tried_report_is_one_row_per_candidate_without_bodies() {
+        let html = "<html>\n<head><title>503</title></head>\n<body>nginx</body>\n</html>\n";
+        let json = "{\"error\": {\"message\": \"Rate limit reached\"}}";
+        let report = Exhausted {
+            abandoned: vec![
+                Abandoned {
+                    model_name: "head".into(),
+                    error: status(503, html),
+                },
+                Abandoned {
+                    model_name: "next".into(),
+                    error: status(429, json),
+                },
+            ],
+        }
+        .to_string();
+        let rows: Vec<_> = report.lines().skip(1).collect();
+        assert_eq!(rows.len(), 2, "{report}");
+        assert!(rows[0].contains("HTTP 503 Service Unavailable"), "{report}");
+        assert!(rows[1].contains("HTTP 429 Too Many Requests"), "{report}");
+        assert!(!report.contains("nginx") && !report.contains("Rate limit"), "{report}");
+    }
+
+    #[test]
+    fn the_move_announcement_names_the_status_without_the_body() {
+        let line = move_announcement("a", &status(429, "{\"error\":\n\"slow down\"}"), "b");
+        assert_eq!(
+            line,
+            "[outrig] model a failed (HTTP 429 Too Many Requests); trying b"
+        );
+    }
 
     /// A candidate that answers however the test says, and counts its calls.
     struct Scripted {

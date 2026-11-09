@@ -150,7 +150,7 @@ const MODEL_MAX_TOKENS_FIELD: Field = Field {
                   every request, and outrig knows the published ceiling only \
                   for current Claude identifiers -- any other one falls back \
                   to a conservative default without this. An agent's own \
-                  max-tokens still wins. Blank to omit.",
+                  max-tokens still wins. Enter `-` to omit.",
     options: &[],
     doc_link: "doc/reference/config.md",
 };
@@ -193,7 +193,7 @@ const USE_DEFAULT_FIELD: Field = Field {
 
 const DEFAULT_MODEL_FIELD: Field = Field {
     name: "Default model name",
-    description: "Name of an existing model to set as `default-model`. Blank for none.",
+    description: "Name of an existing model to set as `default-model`. Enter `-` for none.",
     options: &[],
     doc_link: "doc/reference/config.md",
 };
@@ -491,9 +491,15 @@ async fn ask_optional_u32(
     min: u32,
 ) -> Result<Option<u32>> {
     loop {
-        let Some(answer) = blank_to_none(prompt.ask_string(field, default).await?) else {
+        let answer = prompt.ask_string(field, default).await?;
+        // A non-empty default means Enter yields that default, not a blank
+        // line, so a blank-line sentinel alone can't reach "omit" here. `-`
+        // is always reachable regardless of the default; an empty answer
+        // (reachable when the default itself is blank, e.g. context-length)
+        // is accepted the same way for backward compatibility.
+        if answer.is_empty() || answer == "-" {
             return Ok(None);
-        };
+        }
         match answer.parse::<u32>() {
             Ok(n) if n >= min => return Ok(Some(n)),
             _ if min > 0 => {
@@ -525,11 +531,16 @@ pub(crate) async fn prompt_default_model(
             let answer = prompt
                 .ask_string(&DEFAULT_MODEL_FIELD, suggestion.as_str())
                 .await?;
-            if answer.is_empty() {
-                return Ok(None);
-            }
+            // A real model name wins over the sentinels below: `-` is a
+            // legal model name (bare TOML keys allow it), so a model
+            // actually named `-` stays reachable by typing or accepting it
+            // as a suggestion. Only once it names nothing does `-` (or, for
+            // backward compatibility, a blank answer) mean "none".
             if models.contains_key(&answer) {
                 return Ok(Some(answer));
+            }
+            if answer.is_empty() || answer == "-" {
+                return Ok(None);
             }
             eprintln!(
                 "[outrig] no model named `{answer}`; defined: {}",
@@ -564,10 +575,6 @@ fn render(
     };
     toml::to_string_pretty(&view)
         .map_err(|e| OutrigError::Configuration(format!("rendering global config: {e}")).into())
-}
-
-fn blank_to_none(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
 }
 
 /// Asks `field` for a name `taken` holds no entry under, asking again after a

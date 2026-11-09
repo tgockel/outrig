@@ -92,6 +92,15 @@ const DNS_PORT: u16 = 53;
 /// the attachment's bound on those. Past it the listener stops reading and
 /// the backlog waits in its receive buffer.
 const DNS_IN_FLIGHT: usize = 64;
+/// The largest a UDP datagram can be on any IPv4 or IPv6 path: 65535 minus
+/// the UDP header, which is itself above what either protocol can actually
+/// carry in one packet (65507 for IPv4, 65527 for IPv6 without a jumbogram,
+/// which UDP does not use). Sized here rather than to a resolver's own
+/// payload limit, because `recv_dns_answer` reads before it has parsed
+/// anything -- what the resolver was asked for is not evidence yet of what it
+/// sent. See #543: a 4096-byte buffer silently discarded the rest of a larger
+/// answer instead of refusing to forward it.
+const DNS_UDP_MAX_DATAGRAM: usize = 65535;
 /// How many connections one attachment carries at once. Each holds two of the
 /// process's descriptors -- the container's end and the upstream one -- and
 /// the usual soft limit on those is 1024, so this keeps one container from
@@ -182,12 +191,16 @@ impl PolicyDecision {
 /// The names this attachment's own DNS listener validated for one destination
 /// address. Resolved identity is the only evidence that may grant a hostname
 /// rule.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 struct ResolvedNames(Vec<String>);
 
 impl ResolvedNames {
     fn iter(&self) -> impl Iterator<Item = &str> {
         self.0.iter().map(String::as_str)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     fn first(&self) -> Option<&str> {
@@ -607,6 +620,13 @@ pub struct NetworkInterceptor {
     /// under something a later attachment of the same name cannot be.
     generation: u64,
     attachments: BTreeMap<String, Attachment>,
+    /// Attachments [`retire_attachment`](Self::retire_attachment) took out of
+    /// `attachments`: still intercepting and still recording, but no longer
+    /// holding their container's name. Held until `shutdown`, which tears them
+    /// down in order: a teardown awaited anywhere else could be cancelled with
+    /// the attachments it had taken, and their unwritten audit records would
+    /// go uncounted.
+    retired: Vec<(String, Attachment)>,
 }
 
 /// Per-container interception state: the container's loops, the undo log for
@@ -676,6 +696,7 @@ impl NetworkInterceptor {
             session_id: session_id.to_string(),
             generation: 0,
             attachments: BTreeMap::new(),
+            retired: Vec::new(),
         })
     }
 
@@ -691,17 +712,19 @@ impl NetworkInterceptor {
     /// authority over that address to any other attachment.
     ///
     /// Also works on a container in the created+initialized state
-    /// (`Container::create_initialized`), whose entrypoint has not yet
-    /// executed -- `podman init` materializes the PID and namespaces this
-    /// needs. Attaching before `podman start` is what closes the
-    /// entrypoint-stdio race: policy is live in the netns before the
+    /// (`Container::create_initialized`, `Container::start_named_held`), whose
+    /// entrypoint has not yet executed -- `podman init` materializes the PID
+    /// and namespaces this needs. Attaching before `podman start` is what
+    /// closes the entrypoint race: policy is live in the netns before the
     /// entrypoint's first packet.
     ///
     /// A container launched holding `CAP_NET_ADMIN` -- `cap-add` of
     /// `NET_ADMIN`, or of `ALL` with no `NET_ADMIN` in `cap-drop` -- is
     /// refused before anything is changed: whatever it runs as root could
-    /// delete the table this installs and leave no record. Only the launch is
-    /// consulted, so a borrowed container is never refused.
+    /// delete the table this installs and leave no record. A borrowed
+    /// container (`Container::attach`) has no launch to read, so it is
+    /// refused the same way if the engine reports it currently holds the
+    /// capability, however that came to be (#549).
     pub async fn attach(&mut self, container: &Container) -> Result<()> {
         let name = container.name();
         if self.attachments.contains_key(name) {
@@ -714,6 +737,15 @@ impl NetworkInterceptor {
                 "container {name:?} holds CAP_NET_ADMIN through `cap-add`, which would let it \
                  remove the nftables redirect that network interception installs; remove \
                  NET_ADMIN (or ALL) from `cap-add`, or run with `[network] mode = \"default\"`"
+            )));
+        }
+        if container.attached_holds_net_admin().await? {
+            return Err(OutrigError::Configuration(format!(
+                "container {name:?} currently holds CAP_NET_ADMIN (reported by `podman \
+                 inspect`), which would let it remove the nftables redirect that network \
+                 interception installs; outrig did not launch this borrowed container, so \
+                 remove whatever grants it the capability, or run with `[network] \
+                 mode = \"default\"`"
             )));
         }
 
@@ -878,16 +910,42 @@ impl NetworkInterceptor {
         self.attachments.remove(container).is_some()
     }
 
+    /// Frees `container`'s name for a later [`attach`](Self::attach) without
+    /// ending its interception. Its loops keep running and its nft table stays
+    /// in place, so a container that is still alive -- one whose removal has
+    /// been requested but not confirmed -- stays filtered, and its connections
+    /// still write their audit records. The attachment is torn down in order by
+    /// [`shutdown`](Self::shutdown), which also accounts for any audit record it
+    /// could not write. Returns whether `container` was attached.
+    ///
+    /// For a caller that cannot await and cannot yet say the container is
+    /// gone -- a destructor unwinding an attach that was never committed, say.
+    /// [`detach`](Self::detach) is the form to use wherever awaiting is
+    /// possible, and [`drop_attachment`](Self::drop_attachment) the one for a
+    /// caller that knows the container is as good as gone.
+    pub fn retire_attachment(&mut self, container: &str) -> bool {
+        match self.attachments.remove_entry(container) {
+            Some(entry) => {
+                self.retired.push(entry);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Detaches every attachment, reporting what none of them could
     /// discharge. One container's failure does not skip another's teardown.
     pub async fn shutdown(mut self) -> Result<()> {
         self.cancel.cancel();
         // Attachments live in disjoint namespaces, so their grace periods,
         // resolver restores and nft deletes can overlap.
+        let attachments = std::mem::take(&mut self.attachments)
+            .into_iter()
+            .chain(std::mem::take(&mut self.retired));
         let failures =
-            futures_util::future::join_all(std::mem::take(&mut self.attachments).into_iter().map(
-                |(name, attachment)| async move { teardown_attachment(&name, attachment).await },
-            ))
+            futures_util::future::join_all(attachments.map(|(name, attachment)| async move {
+                teardown_attachment(&name, attachment).await
+            }))
             .await;
         let mut causes: Vec<NetworkTeardownCause> = failures.into_iter().flatten().collect();
         // Quiesced before the sweep, not after. An attachment whose drain
@@ -1785,13 +1843,30 @@ struct AuditRecord {
     outrig_host: String,
     /// Where `outrig.host` came from: `resolved` for a name this attachment's
     /// DNS listener validated for the address, `asserted` for one the client
-    /// claimed. Only a resolved name can have granted an allow.
+    /// claimed. Only a resolved name can have granted an allow, which is why
+    /// `outrig.resolved` is written too: `outrig.host` shows one name, and
+    /// the one that granted may not be it.
     #[serde(rename = "outrig.host_source", skip_serializing_if = "Option::is_none")]
     outrig_host_source: Option<&'static str>,
+    /// Every name this attachment's DNS listener validated for the
+    /// destination address when the connection was decided: the evidence
+    /// the `allow` entries were matched against. Without it a grant cannot be
+    /// read back from the log whenever a client's claim takes `outrig.host`.
+    #[serde(
+        rename = "outrig.resolved",
+        skip_serializing_if = "ResolvedNames::is_empty"
+    )]
+    outrig_resolved: ResolvedNames,
     #[serde(rename = "outrig.action")]
     outrig_action: &'static str,
     #[serde(rename = "outrig.rule")]
     outrig_rule: String,
+    /// Why an allowed connection's upstream connect failed, in words. Absent
+    /// when the upstream opened or was never dialed, which is what tells a
+    /// destination that could not be reached from a connection that opened and
+    /// moved nothing.
+    #[serde(rename = "outrig.error", skip_serializing_if = "Option::is_none")]
+    outrig_error: Option<String>,
 }
 
 impl AuditRecord {
@@ -1822,8 +1897,10 @@ impl AuditRecord {
             outrig_container: container.to_string(),
             outrig_host: host,
             outrig_host_source: host_source,
+            outrig_resolved: event.resolved,
             outrig_action: event.decision.action.as_str(),
             outrig_rule: event.decision.rule,
+            outrig_error: event.error,
         }
     }
 }
@@ -1845,6 +1922,9 @@ struct AuditEvent {
     bytes_tx: u64,
     bytes_rx: u64,
     decision: PolicyDecision,
+    /// Why the upstream connection never opened, when it did not. See
+    /// [`ConnOutcome::error`].
+    error: Option<String>,
 }
 
 fn zeek_timestamp(ts: SystemTime) -> f64 {
@@ -2196,6 +2276,7 @@ async fn record_refused(
                 action: NetworkAction::Deny,
                 rule: rule.to_string(),
             },
+            error: None,
         },
     );
     if let Err(e) = audit.queue_unless(&record, cancel).await {
@@ -2228,7 +2309,10 @@ fn note_joined(joined: std::result::Result<(), JoinError>, panics: &ConnPanics) 
 /// Whether the server on `port` is expected to write first. Sniffing such a
 /// connection would stall it: there are no client bytes to read until the
 /// server's greeting has been delivered. Only ssh is recognized today; its
-/// banner is read from upstream instead, in [`proxy`].
+/// banner is read from upstream instead, in [`proxy`]. Other server-first
+/// protocols (smtp, imap, ftp, mysql) pay the whole [`SNIFF_TIMEOUT`] per
+/// connection: listing a port skips the host-claim sniff for it, which is a
+/// policy change, not a latency fix.
 fn server_speaks_first(port: u16) -> bool {
     port == 22
 }
@@ -2290,7 +2374,8 @@ async fn read_opening<S: AsyncRead + Unpin>(
 }
 
 /// What the audit record for one connection is built from. [`proxy`] updates
-/// it as bytes move and as a late client assertion changes the decision.
+/// it as bytes move, as a late client assertion changes the decision, and when
+/// the upstream connect fails.
 #[derive(Debug)]
 struct ConnOutcome {
     assertion: ClientAssertion,
@@ -2298,6 +2383,11 @@ struct ConnOutcome {
     decision: PolicyDecision,
     bytes_tx: u64,
     bytes_rx: u64,
+    /// Why the upstream connection never opened, when it did not. The decision
+    /// still says the connection was allowed and no bytes moved either way, so
+    /// nothing else in the record tells a connect that failed from one that
+    /// opened and stayed quiet.
+    error: Option<String>,
 }
 
 /// Bridges one accepted connection to `dst` and records it. `dst` is the
@@ -2329,6 +2419,7 @@ async fn handle_tcp(
         assertion: ClientAssertion::default(),
         bytes_tx: 0,
         bytes_rx: 0,
+        error: None,
     };
 
     // Cancellation cuts the connection wherever it is parked -- the sniff
@@ -2382,6 +2473,7 @@ async fn handle_tcp(
             bytes_tx: outcome.bytes_tx,
             bytes_rx: outcome.bytes_rx,
             decision: outcome.decision,
+            error: outcome.error,
         },
     )
     .await;
@@ -2483,14 +2575,13 @@ async fn proxy(
     } else {
         format!(" via {dial}")
     };
-    let mut upstream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dial)).await {
-        Ok(Ok(upstream)) => upstream,
-        Ok(Err(e)) => {
-            tracing::warn!(target: "outrig::network", "connect upstream {dst}{via} failed: {e}");
-            return;
-        }
-        Err(e) => {
-            tracing::warn!(target: "outrig::network", "connect upstream {dst}{via} timed out: {e}");
+    let mut upstream = match connect_within_timeout(TcpStream::connect(dial)).await {
+        Ok(upstream) => upstream,
+        Err(why) => {
+            tracing::warn!(target: "outrig::network", "connect upstream {dst}{via} failed: {why}");
+            // The connection was allowed, so its record would otherwise read
+            // as one that opened and moved nothing.
+            outcome.error = Some(format!("upstream connect{via} failed: {why}"));
             return;
         }
     };
@@ -2520,6 +2611,20 @@ async fn proxy(
         policy,
     });
     bridge(client, &mut upstream, initial, recheck, outcome).await;
+}
+
+/// Awaits `connect`, giving up after [`CONNECT_TIMEOUT`]. The error is the
+/// reason in words, for the log and the audit record. Takes the connect rather
+/// than an address so a test can hand it one that never finishes.
+async fn connect_within_timeout<F>(connect: F) -> std::result::Result<TcpStream, String>
+where
+    F: Future<Output = io::Result<TcpStream>>,
+{
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+        Ok(Ok(upstream)) => Ok(upstream),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("timed out after {CONNECT_TIMEOUT:?}")),
+    }
 }
 
 /// What a late client assertion is re-evaluated against.
@@ -2558,6 +2663,7 @@ async fn bridge(
         decision,
         bytes_tx,
         bytes_rx,
+        ..
     } = outcome;
     let bridged = {
         let downstream = async {
@@ -2858,6 +2964,7 @@ async fn resolve_dns(
             bytes_tx: raw.len() as u64,
             bytes_rx: 0,
             decision,
+            error: None,
         },
     )
     .await;
@@ -3257,13 +3364,20 @@ async fn serve_dns_connection(mut stream: TcpStream, peer: SocketAddr, context: 
 /// discarding everything else. Returning the first datagram to arrive would
 /// let anything able to land a packet on this ephemeral port decide what a
 /// name resolves to.
+///
+/// The receive buffer is [`DNS_UDP_MAX_DATAGRAM`], not whatever the query's
+/// own `OPT` record advertised: the interceptor forwards that record
+/// unchanged, so the resolver sizes its answer to it, but reading less than
+/// the datagram actually sent would discard the rest without an error --
+/// `recv_from` does not surface `MSG_TRUNC` -- and hand the client a message
+/// whose header still claims the full record count.
 async fn recv_dns_answer(
     socket: &UdpSocket,
     query: Option<&DnsQuery>,
     resolver: SocketAddr,
 ) -> io::Result<Vec<u8>> {
     let deadline = tokio::time::Instant::now() + DNS_TIMEOUT;
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; DNS_UDP_MAX_DATAGRAM];
     loop {
         let (n, peer) = match tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await {
             Ok(Ok(received)) => received,
@@ -3937,8 +4051,9 @@ fn http_host(bytes: &[u8]) -> Option<String> {
 }
 
 fn strip_host_port(host: &str) -> &str {
-    if host.starts_with('[') {
-        return host.trim_matches(|c| c == '[' || c == ']');
+    if let Some(rest) = host.strip_prefix('[') {
+        // `[addr]` or `[addr]:port`: the address is what sits inside.
+        return rest.split_once(']').map_or(rest, |(addr, _port)| addr);
     }
     host.rsplit_once(':')
         .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
@@ -4947,6 +5062,7 @@ mod tests {
             bytes_tx: 0,
             bytes_rx: 0,
             decision: PolicyDecision::allow_default(),
+            error: None,
         }
     }
 
@@ -6540,6 +6656,99 @@ mod tests {
         assert_eq!(record["orig_bytes"], 0);
         assert_eq!(record["resp_bytes"], 0);
         assert_eq!(record["conn_state"], "S0");
+        // Nothing failed, so there is no reason to give: the record a refused
+        // connect used to share with this one now differs by exactly this.
+        assert!(record.get("outrig.error").is_none());
+    }
+
+    /// #389: an allowed connection whose upstream refuses the connect says so
+    /// in its record. It used to be the record above -- allowed, nothing
+    /// moved, `S0` -- with the cause only in a log line. Where the host alias
+    /// sent the dial somewhere other than the destination, the message names
+    /// where.
+    #[tokio::test]
+    async fn an_upstream_that_refuses_the_connect_is_recorded_with_its_reason() {
+        // A port nothing listens on: bound to be handed one, then released.
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind")
+            .local_addr()
+            .expect("addr");
+        let alias = HostAlias {
+            stand_in: PASTA_HOST_STAND_IN,
+            host: Ipv4Addr::LOCALHOST,
+        };
+        let stand_in = SocketAddr::from((PASTA_HOST_STAND_IN, closed.port()));
+
+        // Where the client asked to go, the alias that may send it elsewhere,
+        // and how the record says the dial was made.
+        for (dst, host_alias, via) in [
+            (closed, None, String::new()),
+            (stand_in, Some(alias), format!(" via {closed}")),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (mut client, intercepted, orig) = accepted_connection().await;
+            let connection = tokio::spawn(handle_tcp(
+                intercepted,
+                orig,
+                dst,
+                host_alias,
+                audit_sink(dir.path()).await,
+                empty_bindings(),
+                allow_all_policy(),
+                CancellationToken::new(),
+            ));
+
+            // Said at once, so the sniff does not wait out its window for it.
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: refused.example\r\n\r\n")
+                .await
+                .expect("write request");
+            tokio::time::timeout(Duration::from_secs(5), connection)
+                .await
+                .expect("a connection whose connect failed ends")
+                .expect("connection task");
+
+            let record = only_audit_record(dir.path());
+            assert_eq!(record["outrig.action"], "allow");
+            assert_eq!(record["orig_bytes"], 0);
+            assert_eq!(record["resp_bytes"], 0);
+            assert_eq!(record["conn_state"], "S0");
+            let error = record["outrig.error"]
+                .as_str()
+                .expect("the record says why");
+            assert!(
+                error.starts_with(&format!("upstream connect{via} failed: ")),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("os error {}", libc::ECONNREFUSED)),
+                "{error}"
+            );
+        }
+    }
+
+    /// The other ways a connect fails are said too: one nothing answers is
+    /// given up on after `CONNECT_TIMEOUT`, and one with no route carries the
+    /// OS's account of it. Neither can be had on loopback, so the connect is
+    /// handed in.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_nothing_answers_or_with_no_route_says_why() {
+        let silent = connect_within_timeout(std::future::pending::<io::Result<TcpStream>>()).await;
+        assert_eq!(
+            silent.expect_err("a connect nothing answers does not finish"),
+            format!("timed out after {CONNECT_TIMEOUT:?}")
+        );
+
+        let unroutable = connect_within_timeout(async {
+            Err::<TcpStream, _>(io::Error::from_raw_os_error(libc::ENETUNREACH))
+        })
+        .await;
+        let why = unroutable.expect_err("a connect with no route fails");
+        assert!(
+            why.contains(&format!("os error {}", libc::ENETUNREACH)),
+            "{why}"
+        );
     }
 
     /// #353's case end to end: under `default = "allow"`, a `ClientHello`
@@ -6582,6 +6791,70 @@ mod tests {
         assert_eq!(record["outrig.host"], "www.evil.example");
         assert_eq!(record["outrig.host_source"], "asserted");
         assert_eq!(record["orig_bytes"], 0);
+    }
+
+    /// #390 end to end: an address the container resolved `allowed.test` to
+    /// is reached announcing `other.test`. The allow is the resolved name's,
+    /// the record's host is the claim, and the name that granted has to be in
+    /// the record too -- it is the only place the grant can be read back.
+    #[tokio::test]
+    async fn a_grant_by_a_resolved_name_is_recorded_beside_the_name_claimed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut client, intercepted, orig) = accepted_connection().await;
+        let (dst, upstream) = upstream_once().await;
+        let bindings = empty_bindings();
+        bindings.lock().expect("bindings").bind(
+            dst.ip(),
+            "allowed.test",
+            Duration::from_secs(60),
+            Instant::now(),
+        );
+        let policy = Arc::new(compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Deny)
+                .allow_host("allowed.test")
+                .build()
+                .expect("policy"),
+        ));
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(returning_ok(handle_tcp(
+            intercepted,
+            orig,
+            dst,
+            None,
+            audit_sink(dir.path()).await,
+            bindings,
+            policy,
+            cancel.clone(),
+        )));
+
+        let request = http_request("other.test");
+        client.write_all(&request).await.expect("write request");
+        // The request reaching the upstream is what says the connection was
+        // allowed, and so that the decision is the one recorded below.
+        let mut upstream = tokio::time::timeout(Duration::from_secs(5), upstream)
+            .await
+            .expect("an allowed connection should reach the upstream")
+            .expect("upstream accepted");
+        let mut forwarded = vec![0u8; request.len()];
+        upstream
+            .read_exact(&mut forwarded)
+            .await
+            .expect("the bridge should carry the request");
+
+        cancel.cancel();
+        stop_tasks(&mut tasks).await;
+
+        let record = only_audit_record(dir.path());
+        assert_eq!(record["outrig.action"], "allow");
+        assert_eq!(record["outrig.rule"], "allow[0]");
+        assert_eq!(record["outrig.host"], "other.test");
+        assert_eq!(record["outrig.host_source"], "asserted");
+        assert_eq!(
+            record["outrig.resolved"],
+            serde_json::json!(["allowed.test"])
+        );
     }
 
     /// Only the stand-in moves, and only to the alias's host.
@@ -8171,6 +8444,111 @@ mod tests {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
+    /// #543: a response larger than the old 4096-byte receive buffer reached
+    /// the client clipped, header unchanged (`ancount` still counting every
+    /// record, `TC` still clear). 300 A records for one name, at ~28 bytes
+    /// apiece, comfortably clears the old buffer; the receive buffer now
+    /// holds any UDP datagram, so nothing is lost in the forward.
+    #[tokio::test]
+    async fn a_resolver_answer_past_the_old_buffer_size_reaches_the_client_whole() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let bindings = empty_bindings();
+        let (listener, cancel, mut tasks) = spawned_dns_loop(
+            vec![resolver.local_addr().expect("resolver addr")],
+            bindings.clone(),
+        )
+        .await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        send_query(&client, listener, 0x5555, "big.test").await;
+        let (query, from) = forwarded_query(&resolver, DNS_TIMEOUT)
+            .await
+            .expect("the query should reach the resolver");
+
+        let answers: Vec<Rr> = (0..300)
+            .map(|i| Rr::A("big.test", [10, 0, (i >> 8) as u8, i as u8], 60))
+            .collect();
+        let answer = dns_packet(query.txid, DNS_RESPONSE_FLAGS, "big.test", &answers);
+        assert!(
+            answer.len() > 4096,
+            "fixture must exceed the old buffer to reproduce #543: {} bytes",
+            answer.len()
+        );
+        resolver.send_to(&answer, from).await.expect("send answer");
+
+        let mut reply = vec![0u8; DNS_UDP_MAX_DATAGRAM];
+        let n = tokio::time::timeout(Duration::from_secs(1), client.recv(&mut reply))
+            .await
+            .expect("no reply arrived")
+            .expect("receive reply");
+        assert_eq!(
+            &reply[..n],
+            &answer[..],
+            "the client must receive the resolver's answer byte-for-byte, not clipped"
+        );
+
+        // Every record parsed, not just however many fit in the old buffer:
+        // the last one, which a 4096-byte read never reached, is bound.
+        assert_eq!(
+            resolved_names(&bindings, ip("10.0.1.43")),
+            resolved(&["big.test"])
+        );
+
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// An answer as large as a UDP/IPv4 datagram can actually be -- 65535
+    /// minus the 8-byte UDP header and 20-byte IPv4 header, which is as
+    /// close to the buffer's size as a real datagram reaches -- is still
+    /// forwarded whole, not mistaken for a clip of something larger.
+    #[tokio::test]
+    async fn a_resolver_answer_at_the_largest_real_datagram_size_reaches_the_client_whole() {
+        const MAX_IPV4_UDP_PAYLOAD: usize = 65535 - 8 - 20;
+
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let (listener, cancel, mut tasks) = spawned_dns_loop(
+            vec![resolver.local_addr().expect("resolver addr")],
+            empty_bindings(),
+        )
+        .await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        send_query(&client, listener, 0x6666, "exact.test").await;
+        let (query, from) = forwarded_query(&resolver, DNS_TIMEOUT)
+            .await
+            .expect("the query should reach the resolver");
+
+        let mut answer = dns_packet(
+            query.txid,
+            DNS_RESPONSE_FLAGS,
+            "exact.test",
+            &[Rr::A("exact.test", [198, 51, 100, 11], 60)],
+        );
+        // Padded with a trailing, unparsed tail to land on the largest
+        // datagram the kernel will actually carry. `answered_by` only looks
+        // at the header and question, both ahead of the padding, so the
+        // datagram still passes as this query's answer.
+        answer.resize(MAX_IPV4_UDP_PAYLOAD, 0);
+        resolver.send_to(&answer, from).await.expect("send answer");
+
+        let mut reply = vec![0u8; DNS_UDP_MAX_DATAGRAM];
+        let n = tokio::time::timeout(Duration::from_secs(1), client.recv(&mut reply))
+            .await
+            .expect("no reply arrived")
+            .expect("receive reply");
+        assert_eq!(
+            &reply[..n],
+            &answer[..],
+            "an answer this large must still arrive whole"
+        );
+
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
     /// An IPv4 client reaches the dual-stack listener as a v4-mapped IPv6
     /// peer, and is recorded by the address it actually connected from.
     #[tokio::test]
@@ -8660,6 +9038,12 @@ mod tests {
         }
 
         tokio::time::sleep(DNS_TCP_IDLE * 2).await;
+        // The waits that needed a clock of their own are over; what follows is
+        // the kernel delivering bytes and a close, in real time. Left paused,
+        // the runtime advances the clock the moment it has nothing ready and
+        // one look at I/O found nothing, so a read waiting on a busy machine's
+        // kernel would time out at once and blame a listener that did close.
+        tokio::time::resume();
 
         // Whatever the server had already queued arrives, and then it ends:
         // closed, not parked.
@@ -8679,22 +9063,34 @@ mod tests {
     /// The port a closed attach's connections still hold in `TIME_WAIT` can
     /// be bound again at once, which a re-attach to the same container does;
     /// a port a listener holds still cannot be.
+    ///
+    /// The port is an ephemeral one, so between the listener's close and the
+    /// second bind another test in this binary can draw it for a socket of its
+    /// own. That refusal is not this one: a port `TIME_WAIT` holds is refused on
+    /// every try, so a few fresh ports in a row cannot all be taken that way.
     #[tokio::test]
     async fn the_fixed_listener_port_binds_again_after_a_server_first_close() {
-        let first = std::net::TcpListener::from(bind_any(SockType::Stream, 0).expect("bind"));
-        let port = first.local_addr().expect("addr").port();
-        let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        let (served, _) = first.accept().expect("accept");
-        // The server closes first, which is what leaves it holding the port.
-        drop(served);
-        drop(client);
+        let rebound = |_| {
+            let first = std::net::TcpListener::from(bind_any(SockType::Stream, 0).expect("bind"));
+            let port = first.local_addr().expect("addr").port();
+            let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            let (served, _) = first.accept().expect("accept");
+            // The server closes first, which is what leaves it holding the port.
+            drop(served);
+            drop(client);
 
+            assert!(
+                bind_any(SockType::Stream, port).is_err(),
+                "a live listener's port must stay refused"
+            );
+            drop(first);
+            bind_any(SockType::Stream, port)
+        };
+        let tries: Vec<_> = (0..5).map(rebound).collect();
         assert!(
-            bind_any(SockType::Stream, port).is_err(),
-            "a live listener's port must stay refused"
+            tries.iter().any(|bound| bound.is_ok()),
+            "bind again with the old connection lingering: {tries:?}"
         );
-        drop(first);
-        bind_any(SockType::Stream, port).expect("bind again with the old connection lingering");
     }
 
     /// The script's shape: `create table` first, then nothing but flat
@@ -8945,6 +9341,7 @@ options edns0
                 bytes_tx: 517,
                 bytes_rx: 1298,
                 decision: PolicyDecision::allow_default(),
+                error: None,
             },
         );
         let json = serde_json::to_value(record).expect("record json");
@@ -8968,6 +9365,7 @@ options edns0
         assert_eq!(json["outrig.host"], "example.com");
         assert_eq!(json["outrig.action"], "allow");
         assert_eq!(json["outrig.rule"], "default");
+        assert!(json.get("outrig.error").is_none());
         assert!(json.get("host").is_none());
         assert!(json.get("bytes_tx").is_none());
         assert!(json.get("duration_ms").is_none());
@@ -8991,6 +9389,7 @@ options edns0
                     bytes_tx: 0,
                     bytes_rx: 0,
                     decision: PolicyDecision::allow_default(),
+                    error: None,
                 },
             );
             serde_json::to_value(record).expect("record json")
@@ -9002,14 +9401,71 @@ options edns0
         );
         assert_eq!(claimed["outrig.host"], "evil.example");
         assert_eq!(claimed["outrig.host_source"], "asserted");
+        assert!(claimed.get("outrig.resolved").is_none());
 
         let looked_up = record(resolved(&["allowed.example"]), ClientAssertion::default());
         assert_eq!(looked_up["outrig.host"], "allowed.example");
         assert_eq!(looked_up["outrig.host_source"], "resolved");
+        assert_eq!(
+            looked_up["outrig.resolved"],
+            serde_json::json!(["allowed.example"])
+        );
 
         let unknown = record(ResolvedNames::default(), ClientAssertion::default());
         assert!(unknown.get("outrig.host").is_none());
         assert!(unknown.get("outrig.host_source").is_none());
+        assert!(unknown.get("outrig.resolved").is_none());
+    }
+
+    /// #390: a claim takes `outrig.host`, and only a resolved name can have
+    /// granted an allow, so the names that could have are written beside it.
+    /// With several of them, `outrig.host` is at most one, so they are all
+    /// written whichever of the two names the host came from.
+    #[test]
+    fn audit_record_keeps_the_resolved_names_a_claim_hides() {
+        fn record(resolved: ResolvedNames, assertion: ClientAssertion) -> serde_json::Value {
+            let record = AuditRecord::new(
+                "sid",
+                "outrig-test",
+                AuditEvent {
+                    proto: "tcp",
+                    opened: UNIX_EPOCH,
+                    duration: Duration::from_millis(1),
+                    orig: addr("10.0.2.100:50123"),
+                    dst: addr("203.0.113.66:443"),
+                    service: assertion.service(),
+                    resolved,
+                    assertion,
+                    bytes_tx: 0,
+                    bytes_rx: 0,
+                    decision: PolicyDecision::new(NetworkAction::Allow, "allow[0]"),
+                    error: None,
+                },
+            );
+            serde_json::to_value(record).expect("record json")
+        }
+
+        let both = record(
+            resolved(&["allowed.example"]),
+            ClientAssertion::tls("evil.example".to_string()),
+        );
+        assert_eq!(both["outrig.host"], "evil.example");
+        assert_eq!(both["outrig.host_source"], "asserted");
+        assert_eq!(
+            both["outrig.resolved"],
+            serde_json::json!(["allowed.example"])
+        );
+
+        let several = record(
+            resolved(&["a.example", "b.example"]),
+            ClientAssertion::default(),
+        );
+        assert_eq!(several["outrig.host"], "a.example");
+        assert_eq!(several["outrig.host_source"], "resolved");
+        assert_eq!(
+            several["outrig.resolved"],
+            serde_json::json!(["a.example", "b.example"])
+        );
     }
 
     /// A lookup is recorded as the UDP exchange with the DNS listener it is,
@@ -9032,6 +9488,7 @@ options edns0
                     bytes_tx: 29,
                     bytes_rx: 0,
                     decision: PolicyDecision::new(NetworkAction::Deny, "default"),
+                    error: None,
                 },
             );
             serde_json::to_value(record).expect("record json")
@@ -9110,6 +9567,7 @@ options edns0
                     action: NetworkAction::Deny,
                     rule: "deny[0]".to_string(),
                 },
+                error: None,
             },
         );
         let json = serde_json::to_value(record).expect("record json");
@@ -9267,6 +9725,24 @@ options edns0
 
         assert_eq!(decision.action, NetworkAction::Deny);
         assert_eq!(decision.rule, "default");
+    }
+
+    /// A bracketed IPv6 literal carries its port after the `]`; the claim is
+    /// the address alone, with or without one.
+    #[test]
+    fn a_host_header_claim_drops_the_port_and_the_brackets() {
+        for (host, claim) in [
+            ("[2001:db8::1]:443", "2001:db8::1"),
+            ("[2001:db8::1]", "2001:db8::1"),
+            ("example.com:8080", "example.com"),
+            ("example.com", "example.com"),
+        ] {
+            assert_eq!(
+                http_host(&http_request(host)).as_deref(),
+                Some(claim),
+                "Host: {host}"
+            );
+        }
     }
 
     #[test]
@@ -10607,6 +11083,7 @@ options edns0
             decision: PolicyDecision::allow_default(),
             bytes_tx: 0,
             bytes_rx: 0,
+            error: None,
         }
     }
 
@@ -10847,6 +11324,7 @@ options edns0
                 bytes_tx: 0,
                 bytes_rx: 0,
                 decision: PolicyDecision::allow_default(),
+                error: None,
             }
         }
 
@@ -10888,6 +11366,7 @@ options edns0
             session_id: "sid-1".to_string(),
             generation: 0,
             attachments: BTreeMap::new(),
+            retired: Vec::new(),
         };
         let container = Container::holding_net_admin();
 
@@ -10911,5 +11390,84 @@ options edns0
             );
         }
         assert!(interceptor.attachments.is_empty());
+    }
+
+    /// A *borrowed* container (`Container::attach`) has no launch for
+    /// `holds_net_admin` to read, so before #549 it was never refused however
+    /// much `CAP_NET_ADMIN` its engine state actually granted. `attach` now
+    /// also asks the engine directly, through `Container::attached_holds_net_admin`,
+    /// and refuses on what that reports.
+    #[tokio::test]
+    async fn a_borrowed_container_holding_net_admin_is_refused_by_its_effective_capabilities() {
+        let _emitting = crate::process::process_tests::emitting().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = AuditSink::open(dir.path().join(NETWORK_LOG), "sid-1".to_string())
+            .await
+            .expect("open sink");
+        let mut interceptor = NetworkInterceptor {
+            cancel: CancellationToken::new(),
+            policy: Arc::new(compiled(NetworkPolicy::allow_all())),
+            audit,
+            session_id: "sid-1".to_string(),
+            generation: 0,
+            attachments: BTreeMap::new(),
+            retired: Vec::new(),
+        };
+        let container = Container::attached_reporting_effective_caps("[CAP_CHOWN CAP_NET_ADMIN]");
+        assert!(
+            !container.holds_net_admin(),
+            "a borrowed container's launch-derived flag has nothing to say"
+        );
+
+        let refused = interceptor
+            .attach(&container)
+            .await
+            .expect_err("the engine reported CAP_NET_ADMIN, so the attach is refused");
+
+        let OutrigError::Configuration(message) = refused else {
+            panic!("expected a configuration error, got {refused:?}");
+        };
+        assert!(
+            message.contains("CAP_NET_ADMIN") && message.contains("podman"),
+            "the refusal names the capability and how it was found: {message}"
+        );
+        assert!(interceptor.attachments.is_empty());
+    }
+
+    /// The same borrowed container, with no `CAP_NET_ADMIN` in what the
+    /// engine reports, is not refused by the new check -- it still has to get
+    /// past every other step `attach` takes, which this stand-in container
+    /// cannot answer, so the only thing asserted is that the refusal this
+    /// test is about does not fire.
+    #[tokio::test]
+    async fn a_borrowed_container_without_net_admin_is_not_refused_by_effective_capabilities() {
+        let _emitting = crate::process::process_tests::emitting().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = AuditSink::open(dir.path().join(NETWORK_LOG), "sid-1".to_string())
+            .await
+            .expect("open sink");
+        let mut interceptor = NetworkInterceptor {
+            cancel: CancellationToken::new(),
+            policy: Arc::new(compiled(NetworkPolicy::allow_all())),
+            audit,
+            session_id: "sid-1".to_string(),
+            generation: 0,
+            attachments: BTreeMap::new(),
+            retired: Vec::new(),
+        };
+        let container = Container::attached_reporting_effective_caps("[CAP_CHOWN CAP_SYS_CHROOT]");
+
+        let refused = interceptor
+            .attach(&container)
+            .await
+            .expect_err("this stand-in container has no real pid to continue past");
+
+        let OutrigError::Configuration(message) = refused else {
+            panic!("expected a configuration error, got {refused:?}");
+        };
+        assert!(
+            !message.contains("CAP_NET_ADMIN"),
+            "the NET_ADMIN refusal did not fire: {message}"
+        );
     }
 }

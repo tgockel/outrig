@@ -94,6 +94,7 @@ pub struct RunArgs {
 
     /// Mount an extra host directory into the container. Repeatable. Format
     /// `HOST:CONTAINER[:ro|rw]` (default read-only; the host dir must exist).
+    /// A relative host path resolves against the current directory.
     #[arg(long = "volume", value_name = "HOST:CONTAINER[:ro|rw]", action = ArgAction::Append, value_parser = parse_volume)]
     pub volume: Vec<CliVolume>,
 
@@ -163,12 +164,14 @@ pub async fn execute(
         watcher,
         used_builtin_default,
         mut signals,
+        session_lock,
         attached: _,
         session: _,
     } = setup;
     // Nothing between here and `teardown` may return early: `teardown` is
-    // the only thing that finalizes the session record.
-    let mut runtime = SessionRuntime::new(watcher, network, containers);
+    // the only thing that finalizes the session record -- and the only thing
+    // that releases the claim saying this session is live.
+    let mut runtime = SessionRuntime::new(watcher, network, containers, session_lock);
     // Shared from here on: the subagent registry keeps a handle so a launch can
     // re-resolve the agent against another `[models.<name>]`, against the same
     // merged config the session resolved from.
@@ -276,25 +279,37 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         .await?;
     runtime.mcp_arcs.extend(connected);
 
-    let mut all_tools: Vec<SessionTool> = Vec::new();
-    let mut per_server_counts: Vec<(String, usize)> = Vec::new();
+    // Every server's adapters are named in one call, so a clash between two
+    // servers, or within one, resolves as it does on `outrig mcp`.
+    let mut adapters: Vec<McpToolAdapter> = Vec::new();
     for arc in runtime.mcp_arcs.iter() {
         let span = ProgressSpan::start(format!("MCP {}: listing tools", arc.name()));
-        let adapters = signals
+        let listed = signals
             .race(McpToolAdapter::from_client_tools(
                 arc.clone(),
                 resolved.tool_result_max_bytes,
             ))
             .await?;
-        let tool_count = adapters.len();
+        let tool_count = listed.len();
         let tool_word = plural(tool_count, "tool", "tools");
         span.done(format!(
             "MCP {}: tools ready: {tool_count} {tool_word}",
             arc.name()
         ));
-        per_server_counts.push((arc.name().to_string(), tool_count));
-        all_tools.extend(session_tool::erase(adapters));
+        adapters.extend(listed);
     }
+    let adapters = session_tool::name_adapters(adapters, &builtin_tool::reserved_names());
+    // Counted after naming: a tool left without a name is not one the model
+    // can call, and the banner says what it can.
+    let per_server_counts: Vec<(String, usize)> = runtime
+        .mcp_arcs
+        .iter()
+        .map(|arc| {
+            let n = adapters.iter().filter(|a| a.client.name() == arc.name()).count();
+            (arc.name().to_string(), n)
+        })
+        .collect();
+    let all_tools: Vec<SessionTool> = session_tool::erase(adapters);
 
     // Shared by the primary and every subagent registry, so a sidecar added
     // later reaches the launches after it; see `SharedTools`.
@@ -961,7 +976,15 @@ async fn connect_added_sidecar_servers(
         }
     }
     match failure {
-        None => Ok((arcs, session_tool::erase(adapters))),
+        None => {
+            // Names the model has already seen cannot move, so the added tools
+            // are the ones widened. `outrig mcp` instead awards a contested
+            // name by canonical order, which it can because it names every
+            // tool at once; here the existing list is fixed first.
+            let reserved: Vec<String> = state.agent.tools().iter().map(|t| t.name().to_string()).collect();
+            let adapters = session_tool::name_adapters(adapters, &reserved);
+            Ok((arcs, session_tool::erase(adapters)))
+        }
         Some(e) => {
             // Adapters hold client Arc clones; drop them first so the
             // unwrap below reaches each client.
@@ -1542,6 +1565,7 @@ mod tests {
                             instance_salt: "test-salt".to_string(),
                             primary,
                         },
+                        None,
                     ),
                     agent: llm::RebuildingAgent::new(
                         rig_agent,

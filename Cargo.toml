@@ -89,13 +89,10 @@ reqwest            = { version = "0.13.4",  default-features = false }
 # hooks, `reqwest` the HTTP transport. Neither crate uses `derive`.
 rig                = { version = "0.45.0",  default-features = false, features = ["agent", "reqwest", "rustls"] }
 rmcp               = { version = "3.4.1",   default-features = false }
-# Carries kkawakam/rustyline#985, unmerged, so invalid UTF-8 input does not end a `readline`.
-# `cargo publish` drops `git` and resolves `version` from crates.io, which lacks the fix, so a
-# published build's line editor ends the session on such input, as 0.2.2's does (#516).
-rustyline          = { version = "18.0.0",  default-features = false, git = "https://github.com/tgockel/rustyline", branch = "invalid-utf8-lossy" }
+rustyline          = { version = "18.0.1",  default-features = false }
 ruzstd             = { version = "0.9.0",   default-features = false }
 saphyr-parser      = { version = "0.2.2",   default-features = false }
-schemars          = { version = "1.2.2",   default-features = false }
+schemars           = { version = "1.2.2",   default-features = false }
 serde              = { version = "1.0.229", default-features = false }
 serde_json         = { version = "1.0.151", default-features = false }
 sha2               = { version = "0.11.0",  default-features = false }
@@ -110,6 +107,7 @@ tracing-subscriber = { version = "0.3.23",  default-features = false }
 trybuild           = { version = "1.0.121", default-features = false }
 unicode-segmentation = { version = "1.13.3", default-features = false }
 tokio-util         = { version = "0.7.19",  default-features = false }
+unicode-width      = { version = "0.2.2",   default-features = false }
 ureq               = { version = "3.4.2",   default-features = false }
 vt100              = { version = "0.16.2",  default-features = false }
 walkdir            = { version = "2.5.0",   default-features = false }

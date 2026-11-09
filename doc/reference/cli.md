@@ -10,7 +10,9 @@ outrig --help
 
 ## Global flags
 
-These are accepted by every subcommand.
+Every subcommand accepts these, with one exception: `--config` names the repo config, and only
+`run`, `run-new`, `mcp` (serving a repo), and `build` read one. Any other subcommand refuses the
+flag, naming itself, rather than accepting a flag it would ignore.
 
 | Flag                     | Description                                                 |
 |--------------------------|-------------------------------------------------------------|
@@ -47,6 +49,18 @@ config-less run. Which repo the command then runs against depends on where the f
   as a `--global-config` file's do (see [path resolution](config.md#path-resolution)). Where the
   file sits never decides which directory is mounted as the workspace.
 
+Every other subcommand stops with an error naming itself -- `` `outrig image add` does not read
+--config <path> `` -- before it prompts or writes anything. `init`, `config init`, `image add`,
+`image init`, `image build`, `image inspect`, `design prompt`, `mcp self`, `ls`, `logs`,
+`discard`, and `clean` all read no repo config through the flag, and taking it silently meant
+acting on a different file than the one named: `outrig --config ci/outrig.toml image add foo`
+wrote `[images.foo]` into the repo's own `.agents/outrig/config.toml`, which the following
+`outrig --config ci/outrig.toml build --image foo` did not read. `image add` writes the config it
+finds by walking up from the current directory, so run it from the repo whose config is meant;
+`init` does not walk at all -- it sets up the directory it is run in, writing
+`.agents/outrig/config.toml` there even when an ancestor has one -- and `config init` writes the
+global config, which `--global-config` names.
+
 `--global-config` resolves in this order: this flag, then `<XDG_CONFIG_HOME>/outrig/config.toml`
 when `XDG_CONFIG_HOME` is set to an absolute path, then `~/.outrig/config.toml` (the
 outrig-specific fallback -- note this is `~/.outrig/`, not `~/.config/outrig/`). As the XDG Base
@@ -65,9 +79,32 @@ file the flag names, so for them it need not exist yet.
 
 `--session-root` resolves in this order: this flag, then `session-root` in the global config, then
 `<XDG_DATA_HOME>/outrig/sessions/`. The config key is global-only, so `ls`, `logs`, `discard`, and
-`clean` read no repo config at all and ignore `--config`: they find the same root from any
+`clean` read no repo config at all and refuse `--config`: they find the same root from any
 directory. Given `--session-root`, or `--session-dir` for `logs`, they read no
 global config either, so a `--global-config` path is not checked.
+
+Those four commands need one key out of the global config, so a global config that does not load
+in full does not stop them. When the whole-file read fails -- a TOML syntax error, or a value
+refused rather than set aside, such as a bad `[network].mode` -- outrig re-reads the file for
+`session-root` alone, warns on stderr that nothing else in it is in effect, and carries on. The
+fault is not thereby fixed: `run`, `run-new`, `mcp`, and `build` read the file for everything in
+it and still refuse it.
+
+The degraded read never guesses a root. It uses only a `session-root` the damaged file still
+states outright: one plain, non-empty string, declared once, with nothing the parser had to
+repair. A file whose text cannot be declaring the key at all falls back to the default, which is
+the usual case for a file broken while a model or provider was being edited. Anything between the
+two -- the parse error landed on the value, the value holds an invalid escape or an unterminated
+string, the key is declared twice -- stops the command and reports the parse error. A root that is
+not the one the operator chose is worse than no answer: `clean` turned loose on a directory
+holding no records reads every container outrig labeled as a stray.
+
+"Declared once" is judged from the file's text rather than from what the parser managed to read,
+because a syntax error can stop its recovery part-way and hide a second declaration below. So a
+damaged file that so much as mentions `session-root` anywhere outside the one declaration -- in a
+comment, inside another value, or behind a `\` escape the broken file leaves unresolvable --
+stops the command too. The test is coarse on purpose: the alternative to refusing is acting on a
+root the operator did not choose.
 
 `--verbose` adds buildah/podman command transcripts to stderr and to
 `<session_dir>/logs/container.log` for `outrig run` / `outrig mcp`. Repeat it (`-vv`) to also
@@ -96,7 +133,7 @@ outrig init [--force]
 
 | Flag      | Default | Description                                                                |
 |-----------|---------|----------------------------------------------------------------------------|
-| `--force` | off     | Overwrite existing files. Propagates to `config init` and `image add`.     |
+| `--force` | off     | Overwrite an existing global config; see "Re-running" in usage/init.md.   |
 
 See [Usage -> outrig init](../usage/init.md).
 
@@ -159,17 +196,18 @@ See [Usage -> outrig image](../usage/image.md).
 
 Noninteractively scaffold a standalone image project: writes a `Dockerfile`, an authoring
 `image.toml`, and a `README.md` into a target directory. The directory name becomes the image ref;
-other repos consume the built image via `image-name`.
+other repos consume the built image via `image-name`. An existing README is always preserved,
+even with `--force`.
 
 ```
 outrig image init [<dir>]
                   [--force]
 ```
 
-| Argument / flag | Default     | Description                                          |
-|-----------------|-------------|------------------------------------------------------|
+| Argument / flag | Default     | Description                                         |
+|-----------------|-------------|-----------------------------------------------------|
 | `<dir>`         | current dir | Project directory; its name becomes the image ref.  |
-| `--force`       | off         | Overwrite the generated files if they already exist. |
+| `--force`       | off         | Overwrite `Dockerfile` and `image.toml` if present. |
 
 See [Usage -> outrig image](../usage/image.md#outrig-image-init).
 
@@ -269,7 +307,9 @@ outrig run [--agent <name>]
   the `${VAR}` host-env-reference syntax described in
   [config.md#mcp-env-value-syntax](config.md#mcp-env-value-syntax); you typed them, so they are
   not held to the global config's [`[repo]` `env-allow`](config.md#repo) list, which governs
-  the references in a repo config and in an image's label. Within a scope, last wins on
+  the references in a repo config and in an image's label. The key is held to
+  `^[A-Za-z_][A-Za-z0-9_]*$`, as a config file's `env` key is: the split is at the first `=`,
+  so a value may hold one but a key may not. Within a scope, last wins on
   duplicate keys. Precedence per key: config-file env < global `--env` < per-server `--env`.
 - `--max-tool-calls <n>` (default: resolved `tool-call-max`, else `50`): the most tool calls
   in one turn, one prompt and the agent's work on it.
@@ -282,9 +322,13 @@ outrig run [--agent <name>]
   choose Podman's default networking, network audit logging, or global network filtering for
   this session.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): specific directory for this run;
-  must be empty or not exist yet.
+  must be empty or not exist yet, and must be outside the session root.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
-  container, beyond the default workspace mount. Read-only unless `:rw`; host dir must exist.
+  container, beyond the default workspace mount. Read-only unless `:rw`; host dir must exist. A
+  relative host path resolves against the current directory, and a leading `~` is your home
+  directory; a config file's mounts resolve against that file instead. `:` separates the
+  fields, so neither path can contain one -- including one a relative host path only *resolves*
+  through, which is refused before the image is built, as a `[[workspace.mounts]]` entry is.
 - `-v`, `--verbose` (default: off): print container lifecycle traces.
 
 When `--session-dir` is given, outrig writes this run's `session.json`, `logs/`, and
@@ -292,8 +336,9 @@ When `--session-dir` is given, outrig writes this run's `session.json`, `logs/`,
 additionally creates a symlink `<session-root>/<sid> -> <path>` so
 `outrig ls`/`logs`/`discard`/`clean` still find it. A `<path>` that does not exist is created,
 with any missing parents; one that already holds anything is refused, as is the second of two
-launches started at once with one `<path>`. When omitted, outrig
-auto-generates a session id and writes to `<session-root>/<sid>/` directly.
+launches started at once with one `<path>`. A `<path>` at or under the session root is refused
+too -- it would give the one record both the symlink and a directory entry of its own (#429).
+When omitted, outrig auto-generates a session id and writes to `<session-root>/<sid>/` directly.
 
 Reads the global and repo configs, resolves agent -> model -> provider, builds the image
 (cache-hit if possible), starts the container, attaches every MCP server, opens the REPL. Exits
@@ -788,11 +833,19 @@ declared servers without serving MCP. All non-protocol output stays off stdout.
 
 When `--listen <addr>` is set, `outrig mcp` serves Streamable HTTP instead of stdio.
 TCP addresses are socket addresses such as `127.0.0.1:7331` or `0.0.0.0:7331`;
-Unix sockets use `unix:/tmp/outrig.sock`. The HTTP MCP endpoint is always `/mcp`.
+Unix sockets use `unix:/tmp/outrig.sock`, created `0600` regardless of umask, and a
+path another `outrig mcp` is still serving is refused rather than taken over. The HTTP
+MCP endpoint is always `/mcp`.
 Loopback TCP is local-only by default. Non-loopback TCP binds are allowed but print a
 warning because this v1 surface has no built-in auth; use an authenticated reverse proxy
 before exposing it broadly. Each HTTP MCP client gets its own rmcp session backed by the
 same shared outrig proxy and backing MCP processes.
+
+Requests are screened on two headers first. A loopback listener accepts only loopback `Host`
+values and only the `Origin` values naming itself, port included; any other bind accepts any
+`Host` and no `Origin` at all. A request carrying no `Origin` -- what every non-browser client
+sends -- is always served. See
+[Usage -> outrig mcp](../usage/mcp.md#browser-defenses).
 
 `--network audit` and `--network filter` are supported only for fresh-container `outrig mcp`
 sessions. Attach mode cannot retrofit a borrowed container with a new interceptor.
@@ -904,8 +957,9 @@ session's directory whole, a rendered `report.html` and anything else in it incl
 inside it is unlinked, not followed. A session whose `session.json` cannot be read is discarded
 the same way after the confirmation, which names why it is unreadable; with no record to name
 the container, the check for a running one uses `outrig-<sid>`, and `discard` warns on stderr,
-`--yes` or not, when the record did not name its container. Refuses if the session's container
-is still running.
+`--yes` or not, when the record did not name its container. Refuses if the session is still
+running: either a live process holds the session directory, which covers a launch whose
+container does not exist yet, or the session's container is up.
 
 ### `outrig clean`
 
@@ -930,18 +984,22 @@ outrig clean [--older-than <duration>]
 
 Durations are positive integers with `s`, `m`, `h`, or `d` units, for example `12h` or `7d`.
 The command previews matching sessions and asks once before deleting unless `--yes` is set.
-Running sessions are skipped. Symlinks whose directory is gone, older than the cutoff by the
-link's own modification time, are removed too. Sessions created with `--session-dir` remove both
-the symlink target and the symlink under the session root, each directory whole, as `discard`
-does. A record that cannot be read is aged by the start time in
-its directory name and is removed only with `--unreadable`: without it, even `--yes` leaves the
-record and names it, since what is in it cannot be shown. An entry whose name is not a session
-id is never removed, and an unreadable record keeps its container from being swept as a stray
-until the record itself is gone. A record cut off before it names its container is kept too,
-since an `outrig mcp --attach` session borrows a container that is not `outrig-<sid>`; `discard`
-removes it. Alongside the record walk, `clean` sweeps
+Running sessions are skipped, by the same test `discard` uses: a live process holding the
+session directory, or the session's container being up. The first is what keeps a short
+`--older-than` from sweeping a session whose image is still building. Symlinks whose directory
+is gone, older than the cutoff by the link's own modification time, are removed too. Sessions
+created with `--session-dir` remove both the symlink target and the symlink under the session
+root, each directory whole, as `discard` does. A record that cannot be read is aged by the start
+time in its directory name and is removed only with `--unreadable`: without it, even `--yes`
+leaves the record and names it, since what is in it cannot be shown. An entry whose name is not
+a session id is never removed, and an unreadable record keeps its container from being swept as
+a stray until the record itself is gone. A record cut off before it names its container is kept
+too, since an `outrig mcp --attach` session borrows a container that is not `outrig-<sid>`;
+`discard` removes it. Alongside the record walk, `clean` sweeps
 *stray containers*: containers carrying `org.outrig.session` whose session record is gone.
-Stopped strays older than the cutoff are removed; running ones are only reported.
+Stopped strays older than the cutoff are removed; running ones are only reported. A stray whose
+creation time cannot be read has no age to compare with the cutoff, so it is reported and left
+alone.
 
 `--session <id>` narrows both sweeps to one session: only that session's record is considered
 for removal, and only containers labeled `org.outrig.session=<id>` are stray candidates.
@@ -992,6 +1050,8 @@ could not be proven stopped, whatever the program's status was.
 - `[providers.<name>].api-key` references via `${VAR}`: provider API key.
 - `OUTRIG_LOG`: preferred `tracing-subscriber` filter, e.g. `OUTRIG_LOG=debug`. When set it
   shadows `RUST_LOG` completely, including a value that filters out more than `RUST_LOG` would.
+  With neither set the filter is `info,rig_core=warn,rig_agent=warn`: outrig's own `info` lines,
+  without the per-turn `info` lines of the agent library; `OUTRIG_LOG=debug` brings those back.
 - `RUST_LOG`: fallback tracing filter when `OUTRIG_LOG` is unset. At `debug`, adds one line per
   buildah/podman invocation (target `outrig::process`) naming the command, its exit status, and
   how long it took.

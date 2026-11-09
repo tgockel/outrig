@@ -4,7 +4,7 @@
 //! `.agents/outrig/images/<name>/` and mutates the repo `config.toml`), `init`
 //! creates an *independent* project whose build output is a reusable container
 //! image. It writes three files into a target directory -- `Dockerfile`,
-//! `image.toml`, and `README.md` -- and touches nothing else.
+//! `image.toml`, and (if absent) `README.md` -- and touches nothing else.
 //!
 //! The Dockerfile body is the same one `outrig image add` would render for a
 //! Debian-slim base with the filesystem MCP server. The generated `image.toml`
@@ -22,9 +22,9 @@ use outrig::config::check_build_image_name;
 /// itself when `dir` is `None`). The project name -- used as the `image.ref`
 /// and in the README's consuming config -- is the target directory's basename.
 ///
-/// Refuses to clobber any of the three generated files unless `force` is set;
+/// Refuses to clobber `Dockerfile` or `image.toml` unless `force` is set;
 /// the existence probe runs before any write so a re-run reports the conflict
-/// without leaving a half-written project.
+/// without leaving a half-written project. An existing README is always preserved.
 pub fn run(cwd: &Path, dir: Option<&Path>, force: bool) -> Result<()> {
     let target_dir = dir.map_or_else(|| cwd.to_path_buf(), |d| cwd.join(d));
     let name = derive_name(&target_dir)?;
@@ -34,7 +34,7 @@ pub fn run(cwd: &Path, dir: Option<&Path>, force: bool) -> Result<()> {
     let readme_path = target_dir.join("README.md");
 
     if !force {
-        let existing: Vec<String> = [&dockerfile_path, &image_toml_path, &readme_path]
+        let existing: Vec<String> = [&dockerfile_path, &image_toml_path]
             .into_iter()
             .filter(|p| p.exists())
             .map(|p| display_rel(p, cwd).to_string())
@@ -50,7 +50,11 @@ pub fn run(cwd: &Path, dir: Option<&Path>, force: bool) -> Result<()> {
 
     write_and_report(&dockerfile_path, &render_dockerfile(), cwd)?;
     write_and_report(&image_toml_path, &render_image_toml(&name), cwd)?;
-    write_and_report(&readme_path, &render_readme(&name), cwd)?;
+    if readme_path.exists() || readme_path.is_symlink() {
+        eprintln!("[outrig] keeping existing {}", display_rel(&readme_path, cwd));
+    } else {
+        write_and_report(&readme_path, &render_readme(&name), cwd)?;
+    }
 
     eprintln!("[outrig] next: build this image with `outrig image build`");
     Ok(())
@@ -175,14 +179,16 @@ mod tests {
 
     #[test]
     fn init_with_dir_arg_creates_three_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        run(tmp.path(), Some(Path::new("rust-dev")), false).unwrap();
+        for force in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            run(tmp.path(), Some(Path::new("rust-dev")), force).unwrap();
 
-        let proj = tmp.path().join("rust-dev");
-        assert!(proj.join("Dockerfile").is_file());
-        assert!(proj.join("image.toml").is_file());
-        assert!(proj.join("README.md").is_file());
-        assert!(read(&proj.join("image.toml")).contains("ref = \"rust-dev\""));
+            let proj = tmp.path().join("rust-dev");
+            assert!(proj.join("Dockerfile").is_file());
+            assert!(proj.join("image.toml").is_file());
+            assert_eq!(read(&proj.join("README.md")), render_readme("rust-dev"));
+            assert!(read(&proj.join("image.toml")).contains("ref = \"rust-dev\""));
+        }
     }
 
     #[test]
@@ -312,6 +318,58 @@ mod tests {
     }
 
     #[test]
+    fn existing_readme_does_not_block_init_and_is_never_overwritten() {
+        for force in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let proj = tmp.path().join("rust-dev");
+            std::fs::create_dir(&proj).unwrap();
+            // Preserve arbitrary bytes, not just valid UTF-8 or a known template.
+            let original = b"# My project\nHand-written notes\n\xff";
+            std::fs::write(proj.join("README.md"), original).unwrap();
+
+            run(tmp.path(), Some(Path::new("rust-dev")), force).unwrap();
+
+            assert_eq!(std::fs::read(proj.join("README.md")).unwrap(), original);
+            assert_eq!(read(&proj.join("Dockerfile")), render_dockerfile());
+            assert_eq!(read(&proj.join("image.toml")), render_image_toml("rust-dev"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_readme_symlink_is_preserved_even_when_dangling() {
+        for force in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let proj = tmp.path().join("rust-dev");
+            std::fs::create_dir(&proj).unwrap();
+            let readme = proj.join("README.md");
+            std::os::unix::fs::symlink("notes.md", &readme).unwrap();
+
+            run(tmp.path(), Some(Path::new("rust-dev")), force).unwrap();
+
+            assert_eq!(std::fs::read_link(&readme).unwrap(), Path::new("notes.md"));
+            assert!(!proj.join("notes.md").exists());
+        }
+    }
+
+    #[test]
+    fn each_required_file_conflict_is_reported_before_any_write() {
+        for filename in ["Dockerfile", "image.toml"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let proj = tmp.path().join("rust-dev");
+            std::fs::create_dir(&proj).unwrap();
+            std::fs::write(proj.join(filename), "keep me").unwrap();
+
+            let err = run(tmp.path(), Some(Path::new("rust-dev")), false).unwrap_err();
+
+            assert!(err.to_string().contains(filename), "{err}");
+            assert!(err.to_string().contains("--force"), "{err}");
+            assert_eq!(read(&proj.join(filename)), "keep me");
+            assert_eq!(std::fs::read_dir(&proj).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
     fn force_overwrites_only_generated_files() {
         let tmp = tempfile::tempdir().unwrap();
         run(tmp.path(), Some(Path::new("rust-dev")), false).unwrap();
@@ -319,12 +377,16 @@ mod tests {
         let proj = tmp.path().join("rust-dev");
         let sentinel = proj.join("keep.txt");
         std::fs::write(&sentinel, "keep me").unwrap();
-        // Clobber a generated file to prove --force regenerates it.
+        // Force regenerates build inputs but preserves even a generated README.
+        let readme = read(&proj.join("README.md"));
+        std::fs::write(proj.join("Dockerfile"), "custom Dockerfile").unwrap();
         std::fs::write(proj.join("image.toml"), "garbage").unwrap();
 
         run(tmp.path(), Some(Path::new("rust-dev")), true).unwrap();
 
         assert_eq!(read(&sentinel), "keep me");
+        assert_eq!(read(&proj.join("README.md")), readme);
+        assert_eq!(read(&proj.join("Dockerfile")), render_dockerfile());
         assert!(read(&proj.join("image.toml")).contains("ref = \"rust-dev\""));
     }
 

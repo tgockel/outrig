@@ -21,6 +21,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::llm::{ANTHROPIC_FALLBACK_MAX_TOKENS, EffectiveCeiling, TurnUndo};
+use crate::notice::notice;
 use crate::rig_tool::truncate_for_llm;
 use crate::session_tool::OutrigTool;
 use crate::subagent::state::{GaveUp, Outcome, SubagentShared};
@@ -46,6 +47,29 @@ pub(crate) fn parse_args<T: for<'de> Deserialize<'de>>(
 
 pub(crate) fn name_of(tool: &str) -> String {
     outrig::sanitize_tool_name(outrig::RESERVED_SERVER, tool)
+}
+
+/// Every name the built-ins can advertise, whether or not this session turned a
+/// given one on. MCP tools are named around these so none can take one, which
+/// is what the reserved `outrig` server name promises but cannot enforce for a
+/// tool whose lossy name happens to land on one.
+pub(crate) fn reserved_names() -> Vec<String> {
+    const OWN: [&str; 6] = [
+        "subagent",
+        "subagent_send",
+        "wait_results",
+        "get_result",
+        "subagent_release",
+        "set_result",
+    ];
+    OWN.iter()
+        .map(|t| name_of(t))
+        .chain(
+            crate::self_tool::self_tools()
+                .iter()
+                .map(|t| t.name().to_string()),
+        )
+        .collect()
 }
 
 // ---------------------------------------------------------------- launch ---
@@ -177,7 +201,10 @@ impl OutrigTool for SubagentTool {
                 let suffix = launched_as.map_or(String::new(), |label| {
                     format!(" (model: {})", label.display_name())
                 });
-                eprintln!("[outrig] subagent {} started{suffix}", args.name);
+                notice!(
+                    "[outrig] subagent {} started{suffix}",
+                    self.registry.path_of(&args.name)
+                );
                 Ok(ToolOutput::text(format!(
                     "subagent {:?} started{suffix}; collect it with outrig__get_result",
                     args.name
@@ -619,7 +646,7 @@ const LEAVE_THE_REPORT: &str = "\
 #[derive(Clone)]
 pub struct SetResultTool {
     shared: Arc<SubagentShared>,
-    /// This subagent's handle, for the trace prefix, matching the shape the
+    /// This subagent's whole path, for the trace prefix, matching the shape the
     /// agent loop's own traces use.
     label: Arc<str>,
     /// The agent whose turns hit the ceiling. Carried only to name the fix
@@ -750,7 +777,7 @@ impl SetResultTool {
             self.agent_name.as_deref(),
             self.ceilings.get().map_or(&[], Vec::as_slice),
         );
-        eprintln!(
+        notice!(
             "[outrig]   [{}] set_result was cut off before `body`: the model's \
              output-token ceiling is too low for this report. {remedy}.",
             self.label

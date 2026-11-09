@@ -724,6 +724,40 @@ pub fn utf8(path: &Path) -> &str {
     path.to_str().expect("utf-8")
 }
 
+/// An empty global config in a tempdir of its own, removed on drop.
+///
+/// A spawned `outrig` given no `--global-config` reads
+/// `<XDG_CONFIG_HOME>/outrig/config.toml`, else `~/.outrig/config.toml`, so the
+/// test passes or fails with whatever the developer's own file holds (#446,
+/// #479). Pass [`path`](Self::path) as `--global-config`, and keep the guard
+/// until the child exits.
+///
+/// Pointing `XDG_CONFIG_HOME` at a tempdir instead would also move Podman's
+/// `storage.conf` and `containers.conf`, so outrig's containers could land in a
+/// different store than the one the harness's own `podman` calls query (#840).
+/// The file has a directory to itself so it is never inside the repo a test
+/// mounts read-write, which `run` and `mcp` refuse (#609).
+#[allow(dead_code)]
+pub struct EmptyGlobalConfig {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+#[allow(dead_code)]
+impl EmptyGlobalConfig {
+    pub fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir global config");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("write empty global config");
+        Self { path, _dir: dir }
+    }
+
+    /// The file, for `--global-config`.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// A `PATH` whose `podman` and `buildah` exit non-zero immediately, so image
 /// probes and pulls fail instantly instead of hitting the network. Each call
 /// is appended to `<dir>/runtime.log`, so a test can say none was made.
