@@ -40,6 +40,7 @@ use crate::error::{CliError, OutrigError, Result};
 use crate::llm;
 use crate::paths::{
     RepoConfig, default_session_root, pin_default_workspace, pin_repo_declared_mounts,
+    warn_if_global_config_is_hard_linked,
     recheck_pinned_mounts, refuse_mount_field_separators, refuse_workspace_field_separator,
     repo_config_path,
 };
@@ -366,6 +367,9 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     // config. An attached session mounts nothing.
     let mut pinned_mounts = Vec::new();
     if attach.is_none() {
+        // The guards below compare pathnames, which a hard link to the global
+        // config inside the workspace slips past (#622).
+        warn_if_global_config_is_hard_linked(args.global_cfg_path);
         // Spelled without the default `.` it joins to the root.
         let workspace: PathBuf = cfg
             .workspace

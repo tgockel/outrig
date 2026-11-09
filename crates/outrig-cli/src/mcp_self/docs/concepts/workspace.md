@@ -177,6 +177,12 @@ file `--global-config` names. Run from a project directory that does not hold it
 agent the global config on purpose, pass `--volume` for it, or declare `host-path` in the global
 config, which sets the workspace of every session whose repo config declares none.
 
+The check compares pathnames, so it cannot see a hard link: a second name for the global config
+inside a read-write mount lets an agent rewrite the file by writing through it. Keep the global
+config a single-link file. A session warns when its link count is above 1, because finding the
+other names would take a walk of the filesystem and a file can have several names for reasons that
+have nothing to do with a project.
+
 Extra `workspace.mounts` entries are for supporting directories: sibling repos, generated docs,
 SDK checkouts, model artifacts, or caches. A relative host path resolves against the repo root
 when the repo config declares it, and beside the file that declares it otherwise -- the global

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A global config with a hard link now gets a warning.** The global-config guards compare
+  pathnames, so a second name for the file inside a read-write workspace or mount is invisible to
+  them, and a write through it (`>>`) rewrites the global config. Finding the aliases would take a
+  filesystem walk and refusing would have to apply to every session, so a session that mounts
+  now warns on stderr when the file's link count is above 1, and the config reference and workspace
+  page say the file must be single-link. (#622)
+
 - **A default workspace is mounted as the path the guards checked.** The home-directory and
   global-config guards canonicalized an undeclared workspace and threw the result away; Podman was
   later handed the spelled path (`<root>/.`) and resolved it again at start, after image work that

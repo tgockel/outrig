@@ -957,6 +957,11 @@ redirect it): the repo config sits inside the workspace, so an agent could other
 global config for the next session. Declare such a mount in the global config if you mean it. A
 workspace no config declares is held to the same two rules.
 
+Those rules compare pathnames, so they cannot see a second name for the global config: a hard link
+to it inside a read-write mount, through which a write (`>>`) rewrites the file. Keep the global
+config a single-link file. A session warns on stderr when its link count is above 1; it does not
+search for the other names or refuse to start.
+
 The primary workspace bind-mount is always read-write and uses `--userns=keep-id` so files
 written inside the container appear with your host UID/GID. Extra mounts default to read-only;
 set `access = "read-write"` only for directories the agent should be able to modify. See

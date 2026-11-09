@@ -623,6 +623,37 @@ impl GlobalConfigReach {
     }
 }
 
+/// The warning for a global config with more than one name, if it has them.
+///
+/// The guards compare pathnames (see [`GlobalConfigReach`]), and a hard link is
+/// another directory entry for the same inode: one inside a read-write mount is
+/// invisible to them, and a write through it (`>>`, or `open(O_WRONLY)` without
+/// replacing the file) rewrites the global config. Finding the other names
+/// takes a walk of the filesystem, which a startup check should not do, and
+/// refusing would have to apply to every session because the alias's location
+/// is unknown -- a file can have several names for reasons that have nothing to
+/// do with a project. So this says so and leaves the launch alone. A missing
+/// file, or one that cannot be examined, has nothing to say.
+fn global_config_link_warning(global: &Path) -> Option<String> {
+    let links = fs::metadata(global).ok().filter(|m| m.is_file())?.nlink();
+    (links > 1).then(|| {
+        format!(
+            "the global config ({}) has {links} hard links; outrig cannot tell whether one is \
+             inside a read-write mount, where an agent could rewrite the file through it \
+             (keep the global config a single-link file)",
+            global.display()
+        )
+    })
+}
+
+/// Print [`global_config_link_warning`] for `global` as an `[outrig] warning:`
+/// line on stderr, which `outrig mcp` leaves free of JSON-RPC.
+pub(crate) fn warn_if_global_config_is_hard_linked(global: Option<&Path>) {
+    if let Some(warning) = global.and_then(global_config_link_warning) {
+        eprintln!("[outrig] warning: {warning}");
+    }
+}
+
 /// Refuse a workspace no config declared when it is read-write over the global
 /// config: its file, its directory, or a directory its path is looked up
 /// through (see [`GlobalConfigReach`]). A file that is not there yet counts,
@@ -2011,6 +2042,24 @@ mod tests {
         }
         assert_eq!(workspace_refusal(&conf, None), None);
         assert_eq!(workspace_refusal(&conf, Some(Path::new("/dev/null"))), None);
+    }
+
+    /// A hard link is a second name the pathname guards cannot see, so a global
+    /// config with one gets a warning (#622); a single-link file, a missing one,
+    /// and `/dev/null` do not.
+    #[test]
+    fn a_global_config_with_a_second_name_is_warned_about() {
+        let tmp = tempdir().unwrap();
+        let global = tmp.path().join("config.toml");
+        assert_eq!(global_config_link_warning(&global), None);
+        fs::write(&global, "").unwrap();
+        assert_eq!(global_config_link_warning(&global), None);
+        assert_eq!(global_config_link_warning(Path::new("/dev/null")), None);
+
+        fs::hard_link(&global, tmp.path().join("alias.toml")).unwrap();
+        let warning = global_config_link_warning(&global).expect("two links must warn");
+        assert!(warning.contains("2 hard links"), "{warning}");
+        assert!(warning.contains(&global.display().to_string()), "{warning}");
     }
 
     /// The refusal says which default put the workspace there, as the home
