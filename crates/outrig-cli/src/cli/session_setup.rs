@@ -39,9 +39,9 @@ use crate::cli::watcher::{LABEL_INSTANCE, SessionWatcher, SidecarRef};
 use crate::error::{CliError, OutrigError, Result};
 use crate::llm;
 use crate::paths::{
-    RepoConfig, default_session_root, refuse_home_workspace, refuse_mount_field_separators,
-    pin_repo_declared_mounts, recheck_pinned_mounts, refuse_workspace_covering_global_config,
-    refuse_workspace_field_separator, repo_config_path,
+    RepoConfig, default_session_root, pin_default_workspace, pin_repo_declared_mounts,
+    recheck_pinned_mounts, refuse_mount_field_separators, refuse_workspace_field_separator,
+    repo_config_path,
 };
 use crate::session::{self, Session, SessionId, SessionLock, SessionStore};
 use outrig::config::{
@@ -373,19 +373,35 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             .components()
             .collect();
         let declared = cfg.workspace.declared_host_path().is_some();
-        if !declared {
-            refuse_home_workspace(&workspace, &repo_root)?;
-            refuse_workspace_covering_global_config(&workspace, &repo_root, args.global_cfg_path)?;
-        }
+        // The guards judge the canonical path, and that path is what gets
+        // mounted: Podman would resolve the spelled one again at start, after
+        // image work that can take minutes (#621).
+        let pinned_default = if declared {
+            None
+        } else {
+            Some(pin_default_workspace(
+                &workspace,
+                &repo_root,
+                args.global_cfg_path,
+            )?)
+        };
         // A `:` in a path *as written* is a config error, refused when the
         // config was read. These two ask the other question, which only a
         // launch that mounts can answer: whether what a clean path resolves
         // through carries one. Attaching is excluded above -- it borrows a
         // container and serializes no `-v` -- so a session started from a
         // directory with a `:` in its name can still be attached to (#365).
-        refuse_workspace_field_separator(&workspace, &cfg.workspace, &repo_root)?;
+        refuse_workspace_field_separator(
+            pinned_default.as_ref().map_or(&workspace, |p| p.host()),
+            &cfg.workspace,
+            &repo_root,
+        )?;
         refuse_mount_field_separators(&cfg, &repo_root)?;
         pinned_mounts = pin_repo_declared_mounts(&mut cfg, &repo_root, args.global_cfg_path)?;
+        if let Some(pinned) = pinned_default {
+            cfg.workspace.set_host_path(pinned.host());
+            pinned_mounts.push(pinned);
+        }
         // No config of its own at the root, and no declared host path, means
         // the working directory by default, whether or not `--config`
         // supplied the settings.

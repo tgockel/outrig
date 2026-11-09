@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A default workspace is mounted as the path the guards checked.** The home-directory and
+  global-config guards canonicalized an undeclared workspace and threw the result away; Podman was
+  later handed the spelled path (`<root>/.`) and resolved it again at start, after image work that
+  can take minutes. A concurrent session's agent that could write a parent of the workspace could
+  swap in a symlink to the global config's directory (or `$HOME`) in between and have it mounted
+  read-write. The canonical path is now what is bound, and is checked again right before the
+  container starts: a component replaced after the check refuses the launch. (#621)
+
 - **The global-config guard now sees the directories a symlink's target passes through.** The
   #605 rule resolved each name of the global config's path with one `canonicalize`, so a link that
   pointed at another link was seen as a single hop: with `links/cfg -> mid/hop -> real`, a

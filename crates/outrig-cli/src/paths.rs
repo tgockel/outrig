@@ -696,7 +696,48 @@ pub(crate) fn refuse_mount_field_separators(cfg: &Config, repo_root: &Path) -> R
 pub(crate) struct PinnedMount {
     what: String,
     host: PathBuf,
-    source: PathBuf,
+    /// The config file that declared the mount, or `None` for the default
+    /// workspace, which no file declared.
+    source: Option<PathBuf>,
+}
+
+impl PinnedMount {
+    /// The canonical host path the guard validated.
+    pub(crate) fn host(&self) -> &Path {
+        &self.host
+    }
+}
+
+/// Run the guards for a workspace no config declared, and pin it: the returned
+/// mount names the canonical path the guards saw, which the caller binds in
+/// place of the spelled one. Podman resolves a spelled path again when the
+/// container starts, and a concurrent session's agent that can write one of its
+/// components could swap in a symlink to the home directory or the global
+/// config's by then (#621). A component replaced outright is what
+/// [`recheck_pinned_mounts`] catches, just before the container starts.
+pub(crate) fn pin_default_workspace(
+    workspace: &Path,
+    repo_root: &Path,
+    global_cfg: Option<&Path>,
+) -> Result<PinnedMount> {
+    let canonical = canonical_or_normalized(workspace)?;
+    refuse_home_workspace(&canonical, repo_root)?;
+    refuse_workspace_covering_global_config(&canonical, repo_root, global_cfg)?;
+    if canonical.to_str().is_none() {
+        // The bind is serialized through `display()`, which would name a
+        // different directory than the one checked.
+        return Err(OutrigError::Configuration(format!(
+            "refusing to mount {} as the workspace: it resolves to a path that is not valid \
+             UTF-8, which cannot be bound faithfully\n\
+             help: run outrig from a project directory whose path is valid UTF-8",
+            canonical.display()
+        )));
+    }
+    Ok(PinnedMount {
+        what: "workspace".to_string(),
+        host: canonical,
+        source: None,
+    })
 }
 
 /// Refuse a repo-declared host path that reaches the operator's own files. The
@@ -759,7 +800,7 @@ fn pin_repo_declared_mounts_with(
             pinned.push(PinnedMount {
                 what: what.to_string(),
                 host: host.clone(),
-                source: source.config_path(),
+                source: Some(source.config_path()),
             });
             return Ok(Some(host));
         };
@@ -816,12 +857,15 @@ pub(crate) fn recheck_pinned_mounts(pinned: &[PinnedMount]) -> Result<()> {
     for p in pinned {
         let now = canonical_or_normalized(&p.host)?;
         if now != p.host {
+            let declared = p
+                .source
+                .as_ref()
+                .map_or_else(String::new, |s| format!(" declared in {}", s.display()));
             return Err(OutrigError::Configuration(format!(
-                "refusing {} {} declared in {}: it now resolves to {}, so a component of it \
+                "refusing {} {}{declared}: it now resolves to {}, so a component of it \
                  was replaced after it was checked",
                 p.what,
                 p.host.display(),
-                p.source.display(),
                 now.display()
             )));
         }
@@ -1561,6 +1605,53 @@ mod tests {
         std::os::unix::fs::symlink(&other, &safe).unwrap();
         let err = recheck_pinned_mounts(&pinned).unwrap_err().to_string();
         assert!(err.contains(&other.display().to_string()), "{err}");
+    }
+
+    /// The default workspace is pinned to the canonical path the guards saw: a
+    /// name swapped for a symlink to the global config's directory afterwards
+    /// is neither mounted nor started (#621).
+    #[test]
+    fn a_default_workspace_swapped_for_a_symlink_to_the_global_config_is_not_mounted() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let (proj, conf) = (root.join("proj"), root.join("conf"));
+        fs::create_dir_all(&proj).unwrap();
+        fs::create_dir_all(&conf).unwrap();
+        let global = conf.join("config.toml");
+        let spelled = proj.join(".");
+
+        let pinned = pin_default_workspace(&spelled, &proj, Some(&global)).unwrap();
+        assert_eq!(pinned.host(), proj);
+        recheck_pinned_mounts(std::slice::from_ref(&pinned)).unwrap();
+
+        // The name now leads to the global config's directory.
+        fs::rename(&proj, root.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&conf, &proj).unwrap();
+        assert_eq!(pinned.host(), proj, "the pin is not re-spelled");
+        let err = recheck_pinned_mounts(&[pinned]).unwrap_err().to_string();
+        assert!(err.contains(&conf.display().to_string()), "{err}");
+        assert!(err.contains("a component of it was replaced"), "{err}");
+        assert!(!err.contains("declared in"), "{err}");
+
+        // Spelled that way to begin with, the guard refuses it.
+        let err = pin_default_workspace(&proj, &proj, Some(&global)).unwrap_err();
+        assert!(err.to_string().contains("covers the global config"), "{err}");
+    }
+
+    /// A link through the spelled workspace is mounted as its target, and the
+    /// home directory is judged by where it leads.
+    #[test]
+    fn a_default_workspace_is_pinned_through_a_symlink_and_judged_by_its_target() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let real = root.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let pinned = pin_default_workspace(&link, &link, None).unwrap();
+        assert_eq!(pinned.host(), real);
+        recheck_pinned_mounts(&[pinned]).unwrap();
     }
 
     /// How a refusal names a directory the global config path is looked up
