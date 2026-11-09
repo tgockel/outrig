@@ -81,6 +81,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `view = "primary"` payload's own libraries now come from the sidecar, not the primary.**
+  After `outrig-enter` joins the primary's namespace the loader resolves every absolute name it
+  builds for itself in the primary's rootfs, which let three things escape: a `DT_NEEDED` library
+  that is an absolute symlink in the sidecar failed to start, a library the sidecar lacked was
+  silently supplied by the primary's copy, and the entries of the sidecar's own musl
+  `/etc/ld-musl-<arch>.path` meant the primary's directories. The launcher now resolves the
+  payload's `DT_NEEDED` closure in the sidecar before the join and stages a link per library at
+  the head of the loader's `--library-path`. **Behavior change:** a dependency the sidecar does
+  not ship now fails the launch naming the library, where it used to start on the primary's copy.
+  Libraries loaded with `dlopen`, slash-bearing `DT_NEEDED` names and absolute `DT_RPATH` entries
+  still reach the primary; see "Primary filesystem view" in the MCP servers concept doc. (#595)
+
 - **The Dockerfile a cache key hashes is now framed, so one cannot share a key with another whose
   tail spells the first's build-arg lines.** `CacheKey::compute` and `compute_with_labels` hashed
   the Dockerfile's raw bytes straight into the resolved build-arg block that follows, with nothing

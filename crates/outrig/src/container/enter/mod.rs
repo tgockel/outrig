@@ -20,14 +20,23 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{IoPathExt, OutrigError, Result};
 
-// The ELF parser, the `PATH` expansion and the symlink resolution are
+// The ELF parser, the `PATH` expansion and the symlink resolution and the library closure are
 // unit-tested on the host; `launcher.rs` pulls the same files in with
 // `include!` for the musl build. None has a non-test consumer in the library,
-// so all three are compiled only under `cfg(test)`.
+// so all four are compiled only under `cfg(test)`.
 #[cfg(test)]
 mod canon;
 #[cfg(test)]
 mod elf;
+// `libs.rs` borrows the other two files' items, which under `include!` share
+// one scope; here they are siblings, so the imports are made around it.
+#[cfg(test)]
+mod libs {
+    use super::canon::*;
+    use super::elf::*;
+
+    include!("libs.rs");
+}
 #[cfg(test)]
 mod path_search;
 

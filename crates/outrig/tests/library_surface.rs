@@ -1163,7 +1163,9 @@ async fn primary_view_sidecar_without_dac_override_masks_an_unreadable_ld_so_pre
 /// with `Error loading shared library liblzma.so.5`. The primary has the
 /// library only in `/opt/pmark`, which its path file names, and nowhere the
 /// loader's built-in directories reach. Were the primary's path file read, the
-/// loader would find the library there and `xz` would start instead.
+/// loader would find the library there and `xz` would start instead. The
+/// launcher now settles the payload's libraries itself (task 0003-01), so the
+/// failure is its own message naming the library, not the loader's.
 #[tokio::test]
 async fn primary_view_musl_sidecar_does_not_read_the_primarys_library_path_file() {
     let _guard = E2E_LOCK.lock().await;
@@ -1217,9 +1219,11 @@ async fn primary_view_musl_sidecar_does_not_read_the_primarys_library_path_file(
         .expect_err("a library only the primary's path file names must not be found");
     let stderr = std::fs::read_to_string(session_dir.path().join("logs/pathfile.stderr"))
         .expect("the server's stderr file");
+    // The launcher refuses before the exec, since the sidecar has no copy the
+    // loader could use -- the primary's, which its path file names, is not one.
     assert!(
-        stderr.contains("Error loading shared library liblzma.so.5"),
-        "the payload should fail to find liblzma.so.5, got: {stderr:?}",
+        stderr.contains("DT_NEEDED liblzma.so.5 (needed by /usr/bin/xz) is not in the sidecar"),
+        "the launch should name the missing liblzma.so.5, got: {stderr:?}",
     );
 
     assert_eq!(
@@ -1228,6 +1232,90 @@ async fn primary_view_musl_sidecar_does_not_read_the_primarys_library_path_file(
         "a failed add should leave no container"
     );
     outrig.shutdown().await.expect("shutdown");
+}
+
+/// What the three #595 escapes have in common: the sidecar's own `liblzma.so.5`
+/// is only reachable through something the loader resolves after the setns --
+/// an absolute symlink, or a directory its own musl path file names -- and the
+/// primary holds a *different* copy of the library in the same place, or none.
+/// `xz` must start on the sidecar's copy; `--no-such-option` makes a start show
+/// on stderr.
+async fn primary_view_own_library_case(label: &str, sidecar_dockerfile: &str) {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let primary_tag = format!(
+        "localhost/outrig-library-surface-view-{label}-primary-{}:latest",
+        std::process::id(),
+    );
+    // The primary's lookalike must not be what the payload runs on: it has no
+    // `liblzma.so.5` in the loader's reach, only a decoy in `/opt/hidden`.
+    build_image_from_dockerfile(
+        &primary_tag,
+        "FROM docker.io/library/alpine:latest\n\
+         RUN mkdir -p /opt/hidden && echo decoy > /opt/hidden/liblzma.so.5\n",
+    );
+    let sidecar_tag = format!(
+        "localhost/outrig-library-surface-view-{label}-sidecar-{}:latest",
+        std::process::id(),
+    );
+    build_image_from_dockerfile(&sidecar_tag, sidecar_dockerfile);
+
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let spec = LaunchSpec::from_image(
+        primary_tag,
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    );
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+    // `xz` is not an MCP server, so the add fails either way; stderr says how far
+    // the payload got.
+    let _ = outrig
+        .add_sidecar(
+            SidecarSpec::from_image(label, sidecar_tag.as_str())
+                .with_view(SidecarView::Primary)
+                .with_entrypoint_server(label, ["--no-such-option"]),
+        )
+        .await;
+    let stderr = std::fs::read_to_string(session_dir.path().join(format!("logs/{label}.stderr")))
+        .expect("the server's stderr file");
+    assert!(
+        stderr.contains("unrecognized option"),
+        "xz should start on the sidecar's own liblzma.so.5, got: {stderr:?}",
+    );
+    outrig.shutdown().await.expect("shutdown");
+}
+
+/// #595 case 1: the library is an absolute symlink inside the sidecar.
+#[tokio::test]
+async fn primary_view_sidecar_library_behind_an_absolute_symlink_is_found() {
+    primary_view_own_library_case(
+        "abslink",
+        "FROM docker.io/library/alpine:latest\n\
+         RUN apk add --no-cache xz \
+         && mkdir /opt/real \
+         && mv /usr/lib/liblzma.so.5.* /opt/real/ \
+         && rm /usr/lib/liblzma.so.5 \
+         && ln -s /opt/real/$(ls /opt/real) /usr/lib/liblzma.so.5\n\
+         ENTRYPOINT [\"/usr/bin/xz\"]\n",
+    )
+    .await;
+}
+
+/// #595 case 3: the library is only in a directory the sidecar's own musl path
+/// file names, over a primary whose same-named file in that directory is a decoy.
+#[tokio::test]
+async fn primary_view_sidecar_library_named_by_its_own_path_file_is_found() {
+    primary_view_own_library_case(
+        "ownpath",
+        "FROM docker.io/library/alpine:latest\n\
+         RUN apk add --no-cache xz \
+         && mkdir /opt/hidden \
+         && mv /usr/lib/liblzma.so.5* /opt/hidden/ \
+         && echo /opt/hidden:/lib:/usr/local/lib:/usr/lib > /etc/ld-musl-$(uname -m).path\n\
+         ENTRYPOINT [\"/usr/bin/xz\"]\n",
+    )
+    .await;
 }
 
 /// A `view = "primary"` sidecar whose `ENTRYPOINT` names a program no `PATH`

@@ -253,6 +253,16 @@ One that starts copies of itself cannot take `view = "primary"` unless it is a s
 executes the literal path `/proc/self/exe`; run it as an entrypoint sidecar in its own image,
 with the project mounted through `workspace` instead.
 
+**A dynamic payload's libraries come from the sidecar, and only the ones it declares.** Before
+joining the primary, the launcher walks the payload's `DT_NEEDED` libraries, and theirs in turn,
+in the sidecar's own rootfs -- through its absolute symlinks, and the directories its own musl
+`/etc/ld-musl-<arch>.path` names -- and has the loader find each one there first. A library the
+sidecar does not ship fails startup, naming it and the directories searched, rather than running
+on the primary's copy. The walk follows `DT_NEEDED` only, so three things can still reach the
+primary's files: a library the payload loads at run time with `dlopen`, a `DT_NEEDED` name that
+contains a `/`, and an absolute `DT_RPATH` entry, which the loader searches before anything the
+launcher passes.
+
 A program named without a `/` -- `ENTRYPOINT ["node", "/app/dist/index.js"]`, which is what
 the quickstart image above declares -- is searched along the **sidecar image's** `PATH`, in
 that same pre-join instant and for the same reason: the program is one of the sidecar's own

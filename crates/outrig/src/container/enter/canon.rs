@@ -12,8 +12,9 @@
 // in both rootfs views. It settles the paths the launcher hands over, and only
 // those: what the loader goes on to find for itself -- a `DT_NEEDED` library
 // that is an absolute symlink, its built-in search directories, the entries of
-// musl's `/etc/ld-musl-<arch>.path` -- escapes by the identical mechanism and
-// is not fixed here (#595).
+// musl's `/etc/ld-musl-<arch>.path` -- escapes by the identical mechanism, and
+// `libs.rs` closes it by settling the payload's libraries here instead
+// (task 0003-01).
 //
 // The one file in this directory that does I/O -- resolution *is* a sequence of
 // `readlink`s. Like `elf.rs` and `path_search.rs` it is the single source of
@@ -33,7 +34,7 @@ const ELOOP: i32 = 40;
 /// `bytes` as a path, without importing `OsStrExt`: `launcher.rs` imports it
 /// already, and under `include!` a second import of the same trait is a
 /// collision.
-fn as_path(bytes: &[u8]) -> &std::path::Path {
+pub(crate) fn as_path(bytes: &[u8]) -> &std::path::Path {
     std::path::Path::new(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(bytes))
 }
 
@@ -65,7 +66,7 @@ fn pending_components(path: &[u8]) -> Vec<Vec<u8>> {
 /// here can name a working directory, and a relative path could not be
 /// graft-prefixed anyway), `ELOOP` past `SYMLOOP_MAX` hops, and whatever
 /// `readlink` reported for anything else.
-fn canonicalize_under_root(root: &[u8], path: &[u8]) -> Result<Vec<u8>, i32> {
+pub(crate) fn canonicalize_under_root(root: &[u8], path: &[u8]) -> Result<Vec<u8>, i32> {
     if !path.starts_with(b"/") {
         return Err(EINVAL);
     }
