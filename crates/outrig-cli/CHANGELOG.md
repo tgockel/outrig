@@ -5,7 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.3](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.3) - 2026-11-09
+
+The third patch release since 0.2.0, nearly all fixes. Several refuse input that used to be
+accepted: `--config` on a subcommand other than `run`, `mcp` and `build`; a `view = "primary"`
+sidecar that sets `no-new-privileges = false` or drops a capability the launcher needs; an `env` or
+`build-args` key podman would misread; and a mount path containing `:`. `outrig mcp --listen`
+refuses a request whose `Origin` is not its own (a client that sends none is unaffected), and
+`--listen unix:<path>` refuses a socket another instance is serving. A relative `--volume` path is
+read from the current directory, not the repo root, and the `image add` bootstrap defaults to no
+outside a git repository. `outrig clean` and `outrig discard` look again before removing a
+session's record. A build without the musl target keeps the default image's `fs` and `shell`
+servers when the host has a static C library (#868). One known issue remains: at the line editor, a
+byte that is not UTF-8 ends the session (#516). Piped and redirected input is unaffected.
 
 ### Changed
 

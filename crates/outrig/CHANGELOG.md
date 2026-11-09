@@ -5,7 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.3](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.3) - 2026-11-09
+
+The third patch release since 0.2.0. Every change to the public surface is additive, and no
+requirement moves. Several fixes change what a consumer sees without asking. A config file's error
+is now an `OutrigError::ConfigFile` that wraps the `Config`, `ConfigDottedKey` or
+`ConfigValidation` error a caller used to match on, so match on its `source`. These configs are
+refused now: a `view = "primary"` sidecar that sets `no-new-privileges = false` or drops a
+capability the `outrig-enter` launcher needs, an `env` or `build-args` key podman would misread,
+and a mount path containing `:`. `Outrig::launch` keeps a cache miss's build output off the
+embedder's stdout and, in `audit` and `filter` mode, attaches the network interceptor before the
+primary's process runs. `NetworkInterceptor::attach` refuses a borrowed container that holds
+`CAP_NET_ADMIN`. A build whose context changed while it ran is discarded, as
+`OutrigError::BuildContextChanged`, rather than saved under the old key. A build without the musl
+target now tries to compile the launcher statically for its own target, which needs the host's
+static C library; when that fails too, the launcher is missing as before. The rest are fixes, each
+described below.
 
 ### Added
 
