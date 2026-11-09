@@ -514,41 +514,69 @@ fn implicit_workspace_origin(repo_root: &Path) -> String {
     }
 }
 
+/// Symbolic links [`resolve_lenient`] follows before it gives up: the kernel's
+/// own limit (`MAXSYMLINKS`).
+const MAX_SYMLINKS: usize = 40;
+
 /// Canonicalize `p` even when it does not exist. Components are resolved left
 /// to right, so a symlink is followed before any `..` after it is applied; a
 /// component that does not exist is kept as written, and a later `..` pops it.
-fn canonical_or_normalized(p: &Path) -> PathBuf {
-    resolve_lenient(p).0
+/// Fails when `p` passes through more than [`MAX_SYMLINKS`] links.
+pub(crate) fn canonical_or_normalized(p: &Path) -> Result<PathBuf> {
+    Ok(resolve_lenient(p)?.0)
 }
 
-/// [`canonical_or_normalized`], plus the directory each name in `p` is looked
-/// up in.
-fn resolve_lenient(p: &Path) -> (PathBuf, Vec<PathBuf>) {
-    use std::path::Component;
+/// [`canonical_or_normalized`], plus the directory each name `p` passes
+/// through is looked up in.
+///
+/// The walk expands links itself, one name at a time, instead of handing each
+/// to `std::fs::canonicalize`: that call resolves a whole chain behind a link
+/// at once, so the directories a link's *target* passes through would go
+/// unseen. Here a link's target is spliced in front of the names still to
+/// come, and each name in it is looked up -- and recorded -- like one spelled
+/// in `p`. A link whose target is missing is followed the same way, which puts
+/// the directory its target would be created in on the list. Running out of
+/// links is an error, not a guess at where the path ends up.
+pub(crate) fn resolve_lenient(p: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+
     let absolute = if p.is_absolute() {
         p.to_path_buf()
     } else {
         std::env::current_dir().map_or_else(|_| p.to_path_buf(), |cwd| cwd.join(p))
     };
+    let mut pending: VecDeque<OsString> = absolute.iter().map(OsString::from).collect();
     let mut resolved = PathBuf::new();
     let mut lookups = Vec::new();
-    for c in absolute.components() {
-        match c {
-            Component::ParentDir => {
-                resolved.pop();
-            }
-            Component::CurDir => {}
-            Component::Normal(name) => {
-                lookups.push(resolved.clone());
-                resolved.push(name);
-                if let Ok(real) = std::fs::canonicalize(&resolved) {
-                    resolved = real;
+    let mut links = 0;
+    while let Some(part) = pending.pop_front() {
+        if part == "/" {
+            resolved = PathBuf::from("/");
+        } else if part == "." {
+        } else if part == ".." {
+            resolved.pop();
+        } else {
+            let next = resolved.join(&part);
+            lookups.push(resolved.clone());
+            if fs::symlink_metadata(&next).is_ok_and(|m| m.is_symlink()) {
+                links += 1;
+                if links > MAX_SYMLINKS {
+                    return Err(OutrigError::Configuration(format!(
+                        "{} passes through more than {MAX_SYMLINKS} symbolic links",
+                        p.display()
+                    )));
                 }
+                let target = fs::read_link(&next).path_ctx("read symlink", &next)?;
+                for piece in target.iter().rev() {
+                    pending.push_front(piece.to_os_string());
+                }
+            } else {
+                resolved = next;
             }
-            c => resolved.push(c),
         }
     }
-    (resolved, lookups)
+    Ok((resolved, lookups))
 }
 
 /// Where a read-write mount lets an agent rewrite the global config, from the
@@ -561,19 +589,19 @@ struct GlobalConfigReach {
     /// The directory each name in the path is looked up in. An agent that can
     /// write one can replace that name with a symlink, a missing one (which a
     /// `..` after it pops without the agent in the way) and `config.toml`
-    /// itself included. A link followed to another link counts as one hop, so
-    /// only the directory holding the first is listed.
+    /// itself included. A name inside a symlink's target counts too, as does
+    /// the name a dangling target would be created under.
     lookups: Vec<PathBuf>,
 }
 
 impl GlobalConfigReach {
-    fn of(spelled: &Path) -> Self {
-        let (resolved, lookups) = resolve_lenient(spelled);
-        Self {
+    fn of(spelled: &Path) -> Result<Self> {
+        let (resolved, lookups) = resolve_lenient(spelled)?;
+        Ok(Self {
             spelled: spelled.to_path_buf(),
             resolved,
             lookups,
-        }
+        })
     }
 
     /// Why an agent with `host` mounted read-write could rewrite the global
@@ -608,10 +636,10 @@ pub(crate) fn refuse_workspace_covering_global_config(
     repo_root: &Path,
     global_cfg: Option<&Path>,
 ) -> Result<()> {
-    let Some(global) = global_cfg.map(GlobalConfigReach::of) else {
+    let Some(global) = global_cfg.map(GlobalConfigReach::of).transpose()? else {
         return Ok(());
     };
-    let workspace = canonical_or_normalized(workspace);
+    let workspace = canonical_or_normalized(workspace)?;
     let Some(reason) = global.rewritable_through(&workspace) else {
         return Ok(());
     };
@@ -704,8 +732,8 @@ fn pin_repo_declared_mounts_with(
     home: Option<&Path>,
     global_cfg: Option<&Path>,
 ) -> Result<Vec<PinnedMount>> {
-    let home = home.map(canonical_or_normalized);
-    let global = global_cfg.map(GlobalConfigReach::of);
+    let home = home.map(canonical_or_normalized).transpose()?;
+    let global = global_cfg.map(GlobalConfigReach::of).transpose()?;
     let mut pinned = Vec::new();
     let mut check = |what: &str,
                      source: Option<&ConfigSource>,
@@ -715,7 +743,7 @@ fn pin_repo_declared_mounts_with(
         let Some(source) = source.filter(|s| !matches!(s, ConfigSource::Global { .. })) else {
             return Ok(None);
         };
-        let host = canonical_or_normalized(&host);
+        let host = canonical_or_normalized(&host)?;
         let reason = if home.as_ref().is_some_and(|h| h.starts_with(&host)) {
             "it is your home directory or above it".to_string()
         } else if access == MountAccess::ReadWrite
@@ -786,7 +814,7 @@ fn pin_repo_declared_mounts_with(
 /// agent replacing a parent directory is seen here.
 pub(crate) fn recheck_pinned_mounts(pinned: &[PinnedMount]) -> Result<()> {
     for p in pinned {
-        let now = canonical_or_normalized(&p.host);
+        let now = canonical_or_normalized(&p.host)?;
         if now != p.host {
             return Err(OutrigError::Configuration(format!(
                 "refusing {} {} declared in {}: it now resolves to {}, so a component of it \
@@ -1413,7 +1441,7 @@ mod tests {
         let root = fs::canonicalize(tmp.path()).unwrap();
         fs::create_dir_all(root.join("cache")).unwrap();
         let absent = root.join("cache/../conf/config.toml");
-        let got = canonical_or_normalized(&absent);
+        let got = canonical_or_normalized(&absent).unwrap();
         assert_eq!(got, root.join("conf/config.toml"));
         assert!(!got.starts_with(root.join("cache")));
     }
@@ -1428,7 +1456,7 @@ mod tests {
         fs::create_dir_all(root.join("private/sub")).unwrap();
         std::os::unix::fs::symlink(root.join("private/sub"), root.join("cache/link")).unwrap();
         let spelled = root.join("cache/link/absent/../../conf/outrig/config.toml");
-        let got = canonical_or_normalized(&spelled);
+        let got = canonical_or_normalized(&spelled).unwrap();
         assert_eq!(got, root.join("private/conf/outrig/config.toml"));
         assert!(!got.starts_with(root.join("cache")));
     }
@@ -1437,6 +1465,16 @@ mod tests {
     /// declaring one mount of `host`, against a `global` config path and no
     /// home rule. The refusal's text, if there is one.
     fn refusal(root: &Path, host: &Path, access: &str, global: &Path) -> Option<String> {
+        refusal_result(root, host, access, global).err()
+    }
+
+    /// [`refusal`], with the success kept: `Err` carries the refusal's text.
+    fn refusal_result(
+        root: &Path,
+        host: &Path,
+        access: &str,
+        global: &Path,
+    ) -> std::result::Result<(), String> {
         let repo = root.join("repo");
         let file = repo_config_path(&repo);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -1451,8 +1489,8 @@ mod tests {
         .unwrap();
         let mut cfg = Config::load_unvalidated(&repo, None).unwrap();
         pin_repo_declared_mounts_with(&mut cfg, &repo, None, Some(global))
-            .err()
-            .map(|e| e.to_string())
+            .map(drop)
+            .map_err(|e| e.to_string())
     }
 
     /// A repo config declaring one read-write mount of `host`, loaded under
@@ -1590,6 +1628,101 @@ mod tests {
         let err = refusal(&root, &links, "read-write", &links.join("config.toml"))
             .expect("the symlink's directory");
         assert!(err.contains(&looked_up_through(&links)), "{err}");
+    }
+
+    /// A link that points at another link: the directory holding the second
+    /// is a name the kernel looks up too, though `links` is the only one the
+    /// spelled path names (#608).
+    #[test]
+    fn a_repo_mount_covering_a_link_in_a_chain_is_refused() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let (links, mid, real) = (root.join("links"), root.join("mid"), root.join("real"));
+        fs::create_dir_all(real.join("outrig")).unwrap();
+        fs::write(real.join("outrig/config.toml"), "").unwrap();
+        fs::create_dir_all(&links).unwrap();
+        fs::create_dir_all(&mid).unwrap();
+        std::os::unix::fs::symlink(mid.join("hop"), links.join("cfg")).unwrap();
+        std::os::unix::fs::symlink(&real, mid.join("hop")).unwrap();
+        let global = links.join("cfg/outrig/config.toml");
+
+        for dir in [&links, &mid] {
+            let err = refusal(&root, dir, "read-write", &global).expect("a lookup directory");
+            assert!(err.contains(&looked_up_through(dir)), "{err}");
+        }
+    }
+
+    /// A relative link in a chain is looked up from the directory that holds
+    /// it, and a `..` in its target pops from there.
+    #[test]
+    fn a_relative_link_chain_is_walked_from_the_directory_holding_each_link() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("c/real")).unwrap();
+        std::os::unix::fs::symlink("../../c/hop", root.join("a/b/first")).unwrap();
+        std::os::unix::fs::symlink("real", root.join("c/hop")).unwrap();
+
+        let (resolved, lookups) = resolve_lenient(&root.join("a/b/first/x")).unwrap();
+        assert_eq!(resolved, root.join("c/real/x"));
+        for dir in [root.join("a/b"), root.join("c"), root.join("c/real")] {
+            assert!(lookups.contains(&dir), "{} in {lookups:?}", dir.display());
+        }
+    }
+
+    /// A link whose target does not exist yet: the directory the target would
+    /// be created in is where an agent plants the config (#608).
+    #[test]
+    fn a_repo_mount_covering_a_dangling_links_target_is_refused() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let (dang, future) = (root.join("dang"), root.join("future"));
+        fs::create_dir_all(&dang).unwrap();
+        std::os::unix::fs::symlink(future.join("dir"), dang.join("cfg")).unwrap();
+        let global = dang.join("cfg/outrig/config.toml");
+
+        let err = refusal(&root, &dang, "read-write", &global).expect("the link's directory");
+        assert!(err.contains(&looked_up_through(&dang)), "{err}");
+        let err = refusal(&root, &future, "read-write", &global).expect("the target's directory");
+        assert!(err.contains("covers the global config ("), "{err}");
+        assert_eq!(
+            resolve_lenient(&global).unwrap().0,
+            future.join("dir/outrig/config.toml")
+        );
+    }
+
+    /// A dangling target with a `..` after the missing name pops it, and the
+    /// directory it lands in is still on the list.
+    #[test]
+    fn a_dangling_links_target_with_parent_traversal_is_followed() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let dang = root.join("dang");
+        fs::create_dir_all(&dang).unwrap();
+        std::os::unix::fs::symlink("missing/../elsewhere", dang.join("cfg")).unwrap();
+
+        let (resolved, lookups) = resolve_lenient(&dang.join("cfg/config.toml")).unwrap();
+        assert_eq!(resolved, dang.join("elsewhere/config.toml"));
+        assert!(lookups.contains(&dang.join("elsewhere")), "{lookups:?}");
+    }
+
+    /// A loop is refused rather than followed forever or guessed at, whether
+    /// it is a link to itself or two links to each other.
+    #[test]
+    fn a_symlink_loop_in_the_global_config_path_is_refused() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        std::os::unix::fs::symlink(root.join("loop"), root.join("loop")).unwrap();
+        std::os::unix::fs::symlink(root.join("pong"), root.join("ping")).unwrap();
+        std::os::unix::fs::symlink(root.join("ping"), root.join("pong")).unwrap();
+
+        for looped in [root.join("loop"), root.join("ping")] {
+            let global = looped.join("outrig/config.toml");
+            let err = resolve_lenient(&global).unwrap_err().to_string();
+            assert!(err.contains("symbolic links"), "{err}");
+            let err = refusal_result(&root, &root.join("other"), "read-write", &global).unwrap_err();
+            assert!(err.contains("symbolic links"), "{err}");
+        }
     }
 
     /// A workspace resolving through a directory whose name carries `:` is

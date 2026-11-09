@@ -225,7 +225,7 @@ fn resolve_target(args: &DiscardArgs, store: &SessionStore) -> Result<Target> {
         if !dir.exists() {
             // No record to read, so the container comes from the links that
             // name the directory. Nothing naming it is a mistyped path.
-            let dir = normalize_missing(dir)?;
+            let dir = crate::paths::canonical_or_normalized(dir)?;
             let links: Vec<_> = store
                 .list()?
                 .dangling
@@ -290,49 +290,6 @@ fn resolve_target(args: &DiscardArgs, store: &SessionStore) -> Result<Target> {
         },
         super::Found::Unreadable(skipped) => Target::from_unreadable(skipped.dir.clone(), *skipped),
     })
-}
-
-/// `dir` as `SessionStore::create` would have recorded it had it existed:
-/// absolute against the cwd, symlinks resolved as far as the path exists.
-/// A symlink whose destination is gone is followed too, so a path through
-/// one lands where the session's own link points; what is missing past that
-/// is appended as written.
-fn normalize_missing(dir: &Path) -> Result<PathBuf> {
-    use std::ffi::OsString;
-
-    const MAX_LINKS: usize = 40;
-    let abs = std::path::absolute(dir).path_ctx("resolve", dir)?;
-    let mut pending: std::collections::VecDeque<OsString> =
-        abs.iter().map(OsString::from).collect();
-    let mut resolved = PathBuf::new();
-    let mut links = 0;
-    while let Some(part) = pending.pop_front() {
-        if part == "/" {
-            resolved = PathBuf::from("/");
-        } else if part == "." {
-        } else if part == ".." {
-            resolved.pop();
-        } else {
-            let next = resolved.join(&part);
-            if std::fs::symlink_metadata(&next).is_ok_and(|m| m.is_symlink()) {
-                links += 1;
-                if links > MAX_LINKS {
-                    return Err(OutrigError::Configuration(format!(
-                        "--session-dir {} passes through too many symlinks",
-                        dir.display()
-                    ))
-                    .into());
-                }
-                let target = std::fs::read_link(&next).path_ctx("read symlink", &next)?;
-                for piece in target.iter().rev() {
-                    pending.push_front(piece.to_os_string());
-                }
-            } else {
-                resolved = next;
-            }
-        }
-    }
-    Ok(resolved)
 }
 
 impl Target {

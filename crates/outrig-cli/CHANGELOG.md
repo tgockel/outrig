@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The global-config guard now sees the directories a symlink's target passes through.** The
+  #605 rule resolved each name of the global config's path with one `canonicalize`, so a link that
+  pointed at another link was seen as a single hop: with `links/cfg -> mid/hop -> real`, a
+  read-write repo mount of `mid` was accepted, and an agent could replace `hop` to redirect the
+  path. A link whose target did not exist yet (`dang/cfg -> future/dir`) was kept as written, so a
+  mount of `future` was accepted and an agent could create the config there. The path is now
+  walked one name at a time, a link's target spliced in front of the names still to come and each
+  name looked up like one the path spells. A path that passes through more than 40 links (the
+  kernel's limit) is refused rather than guessed at. `outrig discard --session-dir` shares the
+  walk. (#608)
+
 ## [0.2.3](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.3) - 2026-11-09
 
 The third patch release since 0.2.0, nearly all fixes. Several refuse input that used to be
