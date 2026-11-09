@@ -4068,7 +4068,8 @@ class Runtime:
                 "facilities": None if facilities is None else _manifest(facilities),
                 "channels": said,
                 "invocations": [] if _skills is None else _skills._current(),
-                "instance": None if instance is None else instance.said}
+                "instance": None if instance is None else {**instance.said,
+                                                           "aliases": list(instance.aliases)}}
         if call is not None:
             d = call.declaration
             line["call"] = {"signature": d.signature,
@@ -4077,7 +4078,11 @@ class Runtime:
         _refuse_long(line, "spawn", "shorten the prompt, or give fewer inputs or channels")
         _spawning[spawn] = {"parent": kernel, "name": name, "kind": kind, "channels": channels,
                             "inputs": copies, "classes": bound, "facilities": facilities,
-                            "record": None if instance is None else instance.record}
+                            "record": None if instance is None else instance.record,
+                            # What the child binds at boot: an agent class instance, as `self`,
+                            # and each of its aliases beside it.
+                            "boot": {} if instance is None else {"self": instance.instance,
+                                                                 **instance.aliases}}
         try:
             # Inside the `try`, so a line that could not be written leaves no entry behind.
             ask = kernel.ask(line)
@@ -4705,9 +4710,9 @@ class _Work:
         # A typed call's validator, and the call's arguments it is called with; `None` otherwise.
         self.validate = None
         self.arguments = None
-        # The agent class instance a request was made through, held until it ends, so the
-        # instance is not collected -- and its child released -- with a request in flight; and
-        # whether its handle was collected while it was held, to be said once it is sent.
+        # The agent class instance a request was made through, held until it ends, through which
+        # a handle collected while the request is open is said; and whether its handle was
+        # collected while it was held, to be said once it is sent.
         self.instance = None
         self.dropped = False
         # A root child's request: the program on the host's number for it; the future of its
@@ -4773,8 +4778,8 @@ class _Work:
             # A reply waiting on the program's verdict hears that it has ended instead.
             with contextlib.suppress(RuntimeError):
                 self.verdict.get_loop().call_soon_threadsafe(_resolve, self.verdict, None)
-        # Last, once the host has heard the request ended: letting go may collect the instance,
-        # whose release is then said after it.
+        # Last, once the host has heard the request ended: nothing is left to say through the
+        # instance.
         self.instance = None
         return True
 
@@ -5281,15 +5286,17 @@ def _call(declaration, arguments):
 
 
 class _Instance:
-    """What the runtime keeps of an agent class instance (`outrig.Agent`), apart from the
-    instance, which nothing here holds: its being collected is what releases its child.
+    """What the runtime keeps of an agent class instance (`outrig.Agent`), the instance among it:
+    the launch gives it to the child's kernel, which binds it as `self` (`_open`), so nothing
+    collects it while the child lives, and it ends only as it is released -- by
+    `release()` or `async with`, by the end of the kernel that made it, whose children end with
+    it, or by the session's close.
 
     The child's record is made with it, and holds the requests made before the child exists,
     which the launch -- a spawn, as a task of the constructing kernel's loop -- sends, in order,
     once it does. The host settles `ready()` as the child's orienting round ends, unless what ends
     the instance first does: its launch failing, its release, the session's close, or the end of
-    the kernel that made it, whose children end with it. The release runs on that loop too, once,
-    however it began.
+    the kernel that made it. The release runs on that loop too, once, however it began.
     """
 
     def __init__(self, agent, inputs, model, session, facilities):
@@ -5303,7 +5310,8 @@ class _Instance:
         bound = list(dict.fromkeys(c for method in methods.values() for c in method.classes))
         _agents.one_name_each(bound, copies)
         named = bound + sorted(classes, key=_type_qualname)
-        _agents.one_name_each(named)
+        # In the child the instance is `self`, which no class bound there may be named.
+        _agents.one_name_each(named, ["self"], "the instance")
         if facilities is not None:
             _attached(facilities, copies, named)
         elif kernel.facilities is not None:
@@ -5312,12 +5320,16 @@ class _Instance:
             facilities = vars(agent)["_outrig_facilities"] = _inherited(kernel.facilities)
         self.facilities = facilities
         self.id = next(_ids)
+        # The instance itself, which the child's kernel binds as `self`; and what it binds beside
+        # it, each a name and the object of the constructor argument it names (`alias`).
+        self.instance, self.aliases = agent, {}
         self.kernel, self.loop, self.inputs, self.model = kernel, kernel.loop, copies, model
+        self.classes = named
         self.prompt = inspect.cleandoc(cls.__doc__)
         self.requests = {name: _agents.Request(m.request_type, m.reply_type, doc=m.doc)
                          for name, m in methods.items()}
         self.said = {"id": self.id, "module": cls.__module__, "qualname": cls.__qualname__,
-                     "digest": cls._outrig_digest}
+                     "digest": cls._outrig_digest, "self": True}
         self.record = _Child(None, f"{cls.__name__[:48]}-{self.id}", "request", kernel,
                              {name: _Channel(m.request_type, m.reply_type, m.request, m.reply,
                                              m.doc) for name, m in methods.items()},
@@ -5325,19 +5337,31 @@ class _Instance:
         self.record.holding = True
         self.lock = threading.Lock()
         self.how = self.child = self.error = self.task = self.ending = None
-        # Whether the instance was collected, and whether the close's release of it was said: a
-        # collection the close's release follows is said with it, and one after it alone.
-        self.gone = self.closed = False
         # Each settled once, from any thread, and awaited from any loop: running, so that a
         # waiter that is cancelled cancels neither.
         self.oriented, self.released = concurrent.futures.Future(), concurrent.futures.Future()
         self.oriented.set_running_or_notify_cancel()
         self.released.set_running_or_notify_cancel()
-        # Its registry holds this, and through it the constructing kernel, whose namespace may
-        # hold the instance: detached once nothing is left to say of a collection.
-        self.finalizer = weakref.finalize(agent, _collected, self)
         _instances[self.id] = self
         kernel.loop.call_soon_threadsafe(self.start, contextvars.copy_context())
+
+    def alias(self, aliases):
+        """Bind each of `aliases` -- a name, and the object the constructor argument of that name
+        was -- beside `self` in the child, as the object itself: what a construction that names
+        aliases asks, before its launch runs. An instance a kernel constructs names none. Raises,
+        naming the alias, for one the child could not take: a name an input's could not be,
+        `outrig`, `self`, or an input's, a facility's or a bound class's name."""
+        if self.task is not None:
+            raise RuntimeError(f"{self.record} has begun launching; aliases are named before")
+        for name in aliases:
+            if not _agents.variable_name(name) or name in _FACILITY_RESERVED:
+                raise ValueError(f"alias {name!r} cannot name a variable in the child")
+            if name in self.inputs:
+                raise ValueError(f"alias {name!r} is also an input's name")
+            if self.facilities is not None and name in self.facilities:
+                raise ValueError(f"alias {name!r} is also a facility's name")
+        _agents.one_name_each(self.classes, list(aliases), "an alias")
+        self.aliases = dict(aliases)
 
     def start(self, context):
         self.task = asyncio.Task(self.launch(), loop=self.loop, context=context,
@@ -5361,7 +5385,6 @@ class _Instance:
     def retire(self):
         """End the instance, which has no child to release: its launch failed, or the kernel that
         made it has ended, and the child with it."""
-        self.finalizer.detach()
         _instances.pop(self.id, None)
         self.unhold(False)
 
@@ -5397,18 +5420,27 @@ class _Instance:
             self.oriented.set_result(error)
 
     async def ready(self):
-        # The error is kept as the result and raised as a copy: one raised would hold, in its
-        # traceback, the frames that awaited it -- the instance's among them -- for as long as
-        # this lives, and the finalizer that would release the instance keeps this alive.
+        # The error is kept as the result and raised as a copy: one raised would gather, in its
+        # traceback, the frames that awaited it, and keep them, and what they hold, for as long
+        # as this lives.
         error = await asyncio.wrap_future(self.oriented)
         if error is not None:
             raise copy.copy(error)
 
     def request(self, agent, name, message):
         """Send `message` on channel `name` as `agent`'s request, which holds `agent` until it
-        ends -- held itself, before the child exists -- and return its handle."""
+        ends -- held itself, before the child exists -- and return its handle. Refused in the
+        child's own kernel, where `agent` is `self`: a request is how its maker asks it."""
         if self.error is not None:
             raise copy.copy(self.error)
+        kernel = self.record.kernel
+        if kernel is not None and _calling() is kernel:
+            raise TypeError(
+                f"{type(agent).__qualname__}.{name}() would send a request on channel {name!r}, "
+                f"which is yours: request methods are how the agent that made you asks you for "
+                f"something, so nothing was sent. Take what arrives on it with `await "
+                f"runtime.channels[{name!r}].receive()`"
+            )
         handle = ChildChannel(self.record, name).request(message)
         work = handle._work
         work.instance = agent
@@ -5451,9 +5483,9 @@ class _Instance:
         await asyncio.wrap_future(self.begin(how))
 
     async def _release(self, how):
-        """Release the instance `how` -- `explicit`, `async_with`, `collected` or `closing` -- and
-        record it once its child is known: one whose launch failed records nothing, and so does
-        one begun once the kernel that made it has ended, whose child ended with it."""
+        """Release the instance `how` -- `explicit`, `async_with` or `closing` -- and record it
+        once its child is known: one whose launch failed records nothing, and so does one begun
+        once the kernel that made it has ended, whose child ended with it."""
         try:
             if self.kernel.ended:
                 self.retire()
@@ -5461,11 +5493,9 @@ class _Instance:
             self.unhold(False)
             if self.task is not None:
                 await asyncio.wait([self.task])
-            if self.child is not None and how == "closing":
-                self.said_closed()
-            elif self.child is not None:
-                if how == "collected":
-                    _notify({"t": "agent.instance.collected", **self.said_of()})
+            if self.child is not None:
+                # Once the session is closing, which a release `closing` comes only after, the
+                # close ends the child, and the host is asked nothing.
                 if _closing is None:
                     with contextlib.suppress(Exception):
                         await self.kernel.runtime.release([self.child])
@@ -5473,8 +5503,6 @@ class _Instance:
         finally:
             _instances.pop(self.id, None)
             self.released.set_result(None)
-            if how != "closing":
-                self.finalizer.detach()
 
     def said_of(self):
         return {"agent": self.kernel.agent, "instance": self.id, "child": self.child.id}
@@ -5492,39 +5520,9 @@ class _Instance:
             if first:
                 self.how = "closing"
         if first:
-            self.said_closed()
+            _notify({"t": "agent.instance.released", "how": "closing", **self.said_of()})
             _instances.pop(self.id, None)
             self.released.set_result(None)
-
-    def said_closed(self):
-        """Say the close released the instance, whose child is known: after its collection, when
-        that came first."""
-        with self.lock:
-            self.closed, gone = True, self.gone
-        if gone:
-            _notify({"t": "agent.instance.collected", **self.said_of()})
-        _notify({"t": "agent.instance.released", "how": "closing", **self.said_of()})
-
-    def collected(self):
-        """The instance was collected: released as one, unless a release had begun. After the
-        session's close released it, the collection is recorded, and nothing more: here, once
-        that release was said, or with it."""
-        with self.lock:
-            self.gone, closed = True, self.closed
-        if closed:
-            _notify({"t": "agent.instance.collected", **self.said_of()})
-        else:
-            self.begin("collected")
-
-
-def _collected(instance):
-    """An agent class instance was collected, on whatever thread dropped it -- perhaps inside a
-    protocol write -- so this only schedules."""
-    try:
-        instance.loop.call_soon_threadsafe(instance.collected)
-    except RuntimeError:
-        # Its kernel has ended, and every agent that kernel launched with it.
-        _instances.pop(instance.id, None)
 
 
 class _ProgressOut(Endpoint):
@@ -6814,7 +6812,8 @@ _KINDS = {
     "binding": _Kind(_resolve_binding, _binding_brief, True),
     "service": _Kind(_resolve_service, _service_brief, True),
 }
-# What a facility's key may not be, beyond what an input's may not: the package, and the instance.
+# What a facility's key, or an alias, may not be, beyond what an input's may not: the package,
+# and the instance.
 _FACILITY_RESERVED = frozenset({"outrig", "self"})
 
 
@@ -6951,8 +6950,9 @@ def _open(agent, main, child=None):
     is served on a thread of its own.
 
     `child`, for a child agent's kernel, names the spawn waiting for it -- whose parent's inputs
-    are bound in its namespace, and whose classes under their names -- and its `requests_max`. A
-    root child's spawn waits on the host, and `child` brings its `root` instead (`_rooted`).
+    are bound in its namespace, its classes under their names, and an agent class instance's
+    instance as `self`, with its aliases -- and its `requests_max`. A root child's spawn waits on
+    the host, and `child` brings its `root` instead (`_rooted`).
     """
     global _primary
     if not _valid_agent(agent):
@@ -6983,6 +6983,11 @@ def _open(agent, main, child=None):
             kernel.globals[name] = value
         for cls in spec["classes"]:
             kernel.globals[cls.__name__] = cls
+        # An agent class instance, as `self`, and its aliases: each the object itself, never a
+        # copy, and among the names bound at boot, which the inventory leaves out until agent
+        # code rebinds one.
+        for name, value in spec.get("boot", {}).items():
+            kernel.globals[name] = kernel._boot[name] = value
     if main:
         kernel.thread = threading.main_thread()
     else:

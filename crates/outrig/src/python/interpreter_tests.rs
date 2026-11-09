@@ -7389,6 +7389,63 @@ fn an_agent_class_is_constructed_then_attached() {
     assert_eq!(asked["channels"][0]["name"], "register");
 }
 
+/// `self` is the instance in its child, and no other name the child binds may take it: an input
+/// named `self` never reaches the constructor's inputs, since `self=` is its first parameter's; a
+/// facility keyed `self` is refused naming the key; and so is a class the child would bind under
+/// `self`, an input's class or a channel's type. Nothing refused asks the host anything.
+#[test]
+fn self_names_the_instance_alone_in_its_child() {
+    let mut k = Interpreter::start();
+    let (said, notices) = k.noted(
+        PRIMARY,
+        1,
+        &py(r#"
+            import dataclasses
+            import outrig
+            Odd = dataclasses.make_dataclass('self', [('n', int)])
+            class Plain(outrig.Agent):
+                "doc"
+                @outrig.agent
+                async def fizz(self, message: str) -> int:
+                    "doc"
+            class Typed(outrig.Agent):
+                "doc"
+                @outrig.agent
+                async def fizz(self, message: str) -> Odd:
+                    "doc"
+            for make in (lambda: Plain(self=1), lambda: Plain(facilities={'self': 1}),
+                         lambda: Plain(odd=Odd(1)), lambda: Typed()):
+                try:
+                    make()
+                except (TypeError, ValueError) as e:
+                    print(type(e).__name__, "'self'" in str(e))
+            "#),
+    );
+    assert_eq!(
+        said,
+        "TypeError True\nValueError True\nTypeError True\nTypeError True\n"
+    );
+    assert!(notices.is_empty(), "nothing asked: {notices:?}");
+}
+
+/// `help(outrig.Agent)` says what the instance is in its child -- `self`, the same object, shared
+/// between two threads, ended only as it is released -- within the bound `help()` answers in.
+#[test]
+fn help_on_an_agent_class_says_what_self_is() {
+    let mut k = Interpreter::start();
+    let told = k.output(1, "import outrig\nhelp(outrig.Agent)");
+    assert!(!told.contains("[help cut at"), "{told}");
+    for said in [
+        "the instance is `self`: the same object, not a copy",
+        "an ordinary method runs in whichever agent calls it",
+        "one attribute read or write is atomic",
+        "keep per-agent state on `self`",
+        "nothing collects an instance while its child lives",
+    ] {
+        assert!(told.contains(said), "{said:?} in {told}");
+    }
+}
+
 impl Interpreter {
     /// Answer `asked`, an agent class instance's spawn, as the host does: open its child's
     /// kernel as `child`, then say the spawn launched it.
@@ -7466,18 +7523,18 @@ fn a_released_child_that_made_an_instance_is_reclaimed() {
     assert_eq!(said, "True {} 0\n");
 }
 
-/// An instance a child's task holds as the child is released, dropped by the cleanup the task's
+/// An instance a child's task holds as the child is released, released by the cleanup the task's
 /// cancellation runs, releases nothing and is recorded neither collected nor released: its child
 /// ended with the subtree, as the parent's release says.
 #[test]
-fn an_instance_dropped_as_its_kernel_ends_records_nothing() {
+fn an_instance_released_as_its_kernel_ends_records_nothing() {
     let mut k = Interpreter::start();
     k.output(1, &py(FOO_AGENT));
     let (_, notices) = k.noted(PRIMARY, 2, "outer = FooAgent()");
     let asked = k.until("agent.spawn", notices).1;
     k.instance_launched(&asked, "c1");
-    // The only reference is a task's, dropped in the cleanup its cancellation runs, which then
-    // awaits: the collection lands while c1's kernel is ending.
+    // The cleanup its cancellation runs releases it: the release begins while c1's kernel is
+    // ending.
     let hold = py(r#"
         async def hold():
             global launched
@@ -7486,8 +7543,7 @@ fn an_instance_dropped_as_its_kernel_ends_records_nothing() {
             try:
                 await asyncio.Event().wait()
             finally:
-                del inner
-                await asyncio.sleep(0.5)
+                await inner.release()
         held = asyncio.ensure_future(hold())
         await asyncio.sleep(0)
         "#);
@@ -7580,11 +7636,12 @@ fn a_launch_failing_after_its_kernel_opened_ends_what_was_held_with_its_error() 
     assert!(notices.is_empty(), "nothing held was told of: {notices:?}");
 }
 
-/// An instance collected after the session's close released it is recorded collected, and
-/// nothing more; one collected while the close waits on its launch is recorded collected, then
-/// released by the close, once its child exists; one whose launch is refused, not at all.
+/// The session's close releases each instance once: one whose child exists at once, one whose
+/// launch the close meets once its child exists, and one whose launch is refused not at all. None
+/// is ever recorded collected, dropped or not: the child that exists holds its instance as
+/// `self`, and an instance whose launch is still to answer is the runtime's to hold.
 #[test]
-fn an_instance_collected_after_the_close_is_recorded_once_its_child_exists() {
+fn the_close_releases_each_instance_once_its_child_exists() {
     let mut k = Interpreter::start();
     k.output(1, &py(FOO_AGENT));
     let mut asked = Vec::new();
@@ -7592,30 +7649,26 @@ fn an_instance_collected_after_the_close_is_recorded_once_its_child_exists() {
         let (_, notices) = k.noted(PRIMARY, n, &format!("{name} = FooAgent()"));
         asked.push(k.until("agent.spawn", notices).1);
     }
-    // What the interpreter says of instance `n`, whose child is `child`.
-    let said = |t: &str, n: usize, child: &str| {
+    // What the interpreter says of instance `n`'s release by the close, its child `child`.
+    let closed = |n: usize, child: &str| {
         let instance = &asked[n]["instance"]["id"];
-        json!({"t": t, "agent": PRIMARY, "instance": instance, "child": child})
+        json!({"t": "agent.instance.released", "agent": PRIMARY, "instance": instance,
+               "child": child, "how": "closing"})
     };
     k.instance_launched(&asked[0], "c1");
-    // A cycle, which only the collector frees.
-    k.output(5, "import gc\nawait a._outrig.task\na.me = a");
+    k.output(5, "import gc\nawait a._outrig.task");
     k.send(json!({"t": "close", "reason": "the owner closed it"}));
-    k.until("agent.instance.released", Vec::new());
+    let (_, said) = k.until("agent.instance.released", Vec::new());
+    assert_eq!(said, closed(0, "c1"));
     let (_, notices) = k.noted(PRIMARY, 6, "del a\ngc.collect()\nawait asyncio.sleep(0)");
-    assert_eq!(notices, [said("agent.instance.collected", 0, "c1")]);
+    assert!(notices.is_empty(), "never collected: {notices:?}");
 
-    let collect = "releases = [b._outrig.released, c._outrig.released]\ndel b, c";
-    let (_, notices) = k.noted(PRIMARY, 7, &format!("{collect}\nawait asyncio.sleep(0)"));
+    let drop = "releases = [b._outrig.released, c._outrig.released]\ndel b, c\ngc.collect()";
+    let (_, notices) = k.noted(PRIMARY, 7, &format!("{drop}\nawait asyncio.sleep(0)"));
     assert!(notices.is_empty(), "{notices:?}");
     k.instance_launched(&asked[1], "c2");
     let (_, notices) = k.noted(PRIMARY, 8, "await asyncio.wrap_future(releases[0])");
-    let mut released = said("agent.instance.released", 1, "c2");
-    released["how"] = json!("closing");
-    assert_eq!(
-        notices,
-        [said("agent.instance.collected", 1, "c2"), released]
-    );
+    assert_eq!(notices, [closed(1, "c2")]);
     k.send(json!({
         "t": "spawned", "agent": PRIMARY, "id": asked[2]["id"],
         "error": {"kind": "closed", "message": "the session is closing"},

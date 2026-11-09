@@ -465,3 +465,7 @@ mod owned_tests;
 #[cfg(test)]
 #[path = "facilities_tests.rs"]
 mod facilities_tests;
+
+#[cfg(test)]
+#[path = "self_tests.rs"]
+mod self_tests;

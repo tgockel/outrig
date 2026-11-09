@@ -176,9 +176,10 @@ await runtime.release([w])
 "#;
 
 /// The reviewer's launch round: its view, a call of its own, two helpers --
-/// one given the reviewer's own reference and a plain object, one given
-/// nothing -- a work child made with no mapping, and a sub-object put in its
-/// mapping, which the next read refuses; then an entry added for good.
+/// one given the reviewer's own reference, read through `self`, and a plain
+/// object, one given nothing -- a work child made with no mapping, and a
+/// sub-object put in its mapping, which the next read refuses; then an entry
+/// added for good.
 const REVIEWER: &str = r#"
 import __main__, outrig
 me = runtime._kernel
@@ -196,7 +197,7 @@ class Helper(outrig.Agent):
     @outrig.agent
     async def help(self, q: str) -> str:
         """Help with `q`."""
-given = Helper(facilities={'files': me.facilities['files'], 'tally': Tally()})
+given = Helper(facilities={'files': self.facilities['files'], 'tally': Tally()})
 inherited = Helper()
 await given.ready()
 await inherited.ready()
@@ -205,13 +206,13 @@ await inherited.release()
 s = await runtime.spawn('s', prompt='ROLE spawned. Report what you see.')
 print(await s.submit({}, result=str))
 await runtime.release([s])
-me.facilities['rows'] = files.list_records(1)
+self.facilities['rows'] = files.list_records(1)
 try:
     runtime.bindings
 except TypeError as e:
     print("'rows'" in str(e))
-del me.facilities['rows']
-me.facilities['extra'] = 5
+del self.facilities['rows']
+self.facilities['extra'] = 5
 "#;
 
 /// The reviewer's later round: one review, answered with its view as it now

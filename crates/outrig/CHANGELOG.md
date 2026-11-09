@@ -634,13 +634,17 @@ without touching each other, from one ensured image. [The container facade besid
   the child exists is held, counted against `requests-max`, and sent once the child exists. What
   the launch meets -- an unknown model, `subagent-depth-max`, `children-max`, the session
   closing -- raises at `ready()` and at each request, never in the constructor. The child keeps
-  its names and conversation from one request to the next. `await foo.release()` ends it and
-  everything it launched, settling what is open on it `AgentReleased`; `async with` waits for
-  `ready()` and releases on exit; an instance collected unreleased is released once the requests
-  made of it have ended, one a child made ends with that child, and the session's close releases
-  every one alive. Five events record each instance under its child's subject:
-  `agent.instance.started`, `.ready`, `.released` with how and the child's usage, `.collected`,
-  and `.handle.collected` for a handle dropped before its request ended.
+  its names and conversation from one request to the next, and has the instance as `self`: the
+  object its parent holds, whose attributes are what `__init__` stored and whose ordinary methods
+  run in whichever agent calls them, while a request method called on `self` there raises
+  `TypeError`. Holding `self`, the child keeps the instance from being collected while it lives,
+  so release is explicit: `await foo.release()` ends it and everything it launched, settling what
+  is open on it `AgentReleased`; `async with` waits for `ready()` and releases on exit; one a
+  child made ends with that child; and the session's close releases every one alive. Five events
+  record each instance under its child's subject: `agent.instance.started`, whose `self` says
+  whether the child has the instance as `self`, `.ready`, `.released` with how and the child's
+  usage, `.collected` for a host program's instance, and `.handle.collected` for a handle dropped
+  before its request ended.
 - **An agent class is given its facilities: `FooAgent(**inputs, facilities={"files": repo})`.**
   The instance keeps a copy of the dict as `foo.facilities`, a read-only property, and its child's
   view follows that mapping: its instructions list each entry by name and kind and no other
@@ -674,10 +678,12 @@ without touching each other, from one ensured image. [The container facade besid
   `status`, and `cancel()`, which returns once the request has ended. Each reply comes back as
   JSON and is decoded in the program into its own class; what the decoding finds goes back to the
   child's `reply`, which raises it, and the child's interpreter decides how the request ends, so a
-  reply racing a cancel or the close has one outcome. The session's exit releases each instance
-  still alive, and `ShutdownReport.requests` in the Python mirror, new, lists the requests open at
-  the close. Every request the program sends is answered, and each it made ends, however the
-  interpreter ends. The owner protocol is version 2, with lines of up to 1 MiB.
+  reply racing a cancel or the close has one outcome. The instance stays in the program, and its
+  child has no `self`: one the program drops unreleased is released as it is collected, the
+  session's exit releases each instance still alive, and `ShutdownReport.requests` in the Python
+  mirror, new, lists the requests open at the close. Every request the program sends is answered,
+  and each it made ends, however the interpreter ends. The owner protocol is version 2, with lines
+  of up to 1 MiB.
 - **A host program serves its own objects to a session's agents: `session.inject(name, obj,
   serialize=False)`.** Synchronous, before the session's entry or after, it returns `None` once
   every agent can reach the object -- `outrig.bindings[name]` in every kernel, and the global `name`

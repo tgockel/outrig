@@ -322,10 +322,46 @@ Constructing one returns at once and launches its child in the background, whose
 for getting ready; `await reviewer.ready()` waits for it, and `async with` waits on entry. A call
 of a marked method sends a request and returns its handle. The child keeps its names and its
 conversation from one request to the next, so the second review can use what the first one read.
-`await reviewer.release()`, or leaving `async with`, ends it; an instance collected while
-unreleased is released then. A host program declares and drives agent classes the same way, its
-replies decoded into its own classes: see
+`await reviewer.release()`, or leaving `async with`, ends it. A host program declares and drives
+agent classes the same way, its replies decoded into its own classes: see
 [Host programs -> Agent classes](../usage/host-programs.md#agent-classes).
+
+### The instance is the child's `self`
+
+In the child's kernel the instance is `self`: the object the parent constructed, not a copy.
+
+```python
+class Reviewer(outrig.Agent):
+    """You review the change your task describes."""
+
+    def __init__(self, task):
+        super().__init__()
+        self._task = task                    # the child reads it as self._task
+
+    def describe(self) -> str:               # ordinary: runs where it is called
+        return f"review of {self._task.title}"
+
+    @outrig.agent
+    async def review(self, path: str) -> list[Finding]:
+        """Review the file at `path`."""
+```
+
+`self._task` in the child's code is the task object the parent's `__init__` stored, and
+`self.describe()` runs in the child when the child calls it, as `reviewer.describe()` runs in the
+parent. A request method is the parent's to call: on `self`, in the child, it raises `TypeError`
+and sends nothing. Two instances of one class have their own attributes, kernels and
+conversations, and one module, the object in `sys.modules`: a module's globals are shared by every
+agent that imports it, and per-agent state belongs on `self`.
+
+The parent and the child read and write `self` from two threads. One attribute read or write is
+atomic; a compound update, such as `self.count += 1`, is not. A change the parent makes while the
+child works reaches the child only when its code next reads the attribute: a request is how the
+parent asks it for something.
+
+The child's kernel holds `self`, so an instance is never collected while its child lives. It ends
+as it is released: by `release()` or `async with`, by the release of the agent that constructed
+it, or by the session's close. A program's instance is different: it stays in the program, its
+child has no `self`, and one the program drops unreleased is released as it is collected.
 
 ### Facilities
 

@@ -256,10 +256,11 @@ Four more tasks add events beside them that are execution diagnostics, not integ
   and hosted calls made inside it carry as context, not as authority. Invocation events are not an
   audit of what a skill did; only boundary events record every crossing (`skills.md`);
 - `0003-34`, built: each agent instance -- `agent.instance.started`, `ready`, `released` and
-  `collected`, the last when the runtime releases an instance that was collected unreleased --
-  and `agent.instance.handle.collected` for the handle of a request made of one, collected before
-  the request ended. Execution diagnostics like the rest, with any body they carry as a bounded
-  preview, under the subject of the instance's child.
+  `collected`, the last when the runtime releases an instance that was collected unreleased, which
+  since `0003-45` is only one a host program constructed -- and `agent.instance.handle.collected`
+  for the handle of a request made of one, collected before the request ended. Execution
+  diagnostics like the rest, with any body they carry as a bounded preview, under the subject of
+  the instance's child. `0003-45` adds `self` to `agent.instance.started`.
 - `0003-51` through `0003-53`: the external channel events, `channel.*`, and `message.*` generalized
   to a backend's end (`external-channels.md`, "Events").
 

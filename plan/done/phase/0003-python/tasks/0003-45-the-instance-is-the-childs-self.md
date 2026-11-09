@@ -168,3 +168,95 @@ Each is a mock-driven test.
   `## Decisions` on `_Instance` and the finalizer.
 - `crates/outrig/src/python/outrig/_interpreter.py` (`_Instance`, `_collected`, `_open`, `Kernel`),
   `crates/outrig/src/python/outrig/_agents.py`.
+
+## Decisions
+
+Forks 1 through 3 were taken as recommended. What the task left to execution is recorded here.
+
+- **The reversal.** `agent-classes.md`, "The declaration" -- "The child's namespace holds the
+  inputs the constructor was given and the message and reply types, nothing of the instance" --
+  no longer holds for an instance a kernel constructs: `_open` binds it as `self` in the child's
+  kernel, the object the parent holds, so its ordinary methods, properties and state are reachable
+  from both kernels. `messages.md`'s rule stands for what crosses a channel:
+  the instance is not a message, and inputs still cross as deep copies. A class a host program
+  declares keeps the sentence (`0003-35`): its instance stays in the program, and
+  `agent.instance.started.self` is `false` for it.
+- **Explicit release, and the interpreter's finalizer removed outright.** `_Instance` keeps the
+  instance from attachment, since the launch hands it to the child's kernel, and `_instances` keeps
+  the `_Instance` until a release, the session's close or the end of the kernel that made it. A
+  finalizer on the instance could therefore never run while there was anything to release, so
+  none is registered, and what only it used went: `_collected`, `_Instance.collected`, the
+  `collected` branch of the release and the collection half of the close's notice. The task kept
+  the backstop for "an instance whose launch failed": under `0003-34` that instance's `retire()`
+  detached its finalizer and a refused launch records nothing, so the backstop had nothing to do
+  for it, and dropping it changes nothing observable. A host program's instance keeps `0003-35`'s
+  backstop in `outrig._host`, untouched. `0003-34`'s "`_Instance` keeps no reference to the
+  instance" is superseded for an instance a kernel constructs. `weakref.proxy` is rejected as
+  `task-agents.md` records: it would keep the backstop and break identity -- `self is reviewer`
+  false, `type(self)` the proxy's type, `isinstance` false -- and raise `ReferenceError` in a round
+  once the referent was gone. An instance dropped by everything but its child lives until it is
+  released, its maker is, or the session closes; after its release, the instance, its record and
+  the ended kernel form a cycle the collector frees, which a weak reference in
+  `a_dropped_instance_lives_until_it_is_released` shows. `_Work.instance` is unchanged and
+  harmless: it holds what is held anyway.
+- **Shared mutable state is documented, not policed**, in `help(outrig.Agent)`, the concepts page
+  and the orientation's `self` sentence: one attribute read or write is atomic, a compound update
+  is not, a request is how the parent asks, and a module's globals are shared by every agent that
+  imports it, so per-agent state belongs on `self`.
+- **Two construction sites, one contract.** The seam `0003-46` builds on is what a child binds
+  at boot: a spawn's record carries `boot`, the instance as `self` and its aliases, which `_open`
+  binds into the kernel's globals and `_boot`; an owner-constructed root's kernel will bind the
+  same names on itself, the one assignment `_open` makes, or a helper once it is a second caller.
+- **Fork 1: refused.** `_Instance.request` raises `TypeError` when the calling kernel is the
+  instance's own child's, naming `Class.channel()` and the channel and saying request methods are
+  how the agent that made it asks, before anything is counted or sent. Each request method's
+  `help()` says so too.
+- **Fork 2: hidden.** `self` and each alias go into the kernel's `_boot`, so `runtime.names()` and
+  the inventory leave them out until agent code binds the name to something else.
+- **Fork 3: no default alias, and the mechanism with no driver.** `_Instance.alias({name:
+  object})` names aliases before the launch runs, checked as they are named: a name an input's
+  could not be, `outrig`, `self`, an input's name, a key of the instance's mapping, given or
+  inherited, or a bound class's name is refused, naming it; and once the launch has begun, naming
+  one raises `RuntimeError`, since the spawn has already carried what it binds. The spawn's record
+  carries them to `_open`, each the object itself, never a copy, and the spawn line's `instance`
+  names them for the orientation's `self` sentence, one sentence each. Nothing in a kernel calls
+  `alias`: an in-VM child's dict keys are already its convenience globals, and `0003-46`'s
+  construct record is the first caller. The acceptance test names one through
+  `aliased._outrig.alias(...)`, standing in for that record.
+- **`self` is refused as a name the child binds otherwise.** A facility key `self` was refused
+  already (`0003-42`). A class the child would bind under `self` -- a channel's type or an input's
+  class -- is refused at attachment with `TypeError`, as two classes of one name are. An input
+  named `self` never reaches `Agent.__init__`'s `**inputs`: Python binds `self=` to its first
+  parameter and raises `TypeError` ("got multiple values for argument 'self'"), which the test
+  pins; no code was added for it.
+- **The event.** `agent.instance.started` gains `self` -- `has_self` in Rust -- read from the spawn
+  line's `instance.self`, which the interpreter's instances send; a host program's line, which
+  carries none, reads `false`.
+- **The orientation's sentence** comes after the input list and before the channels, where
+  `0003-47`'s order puts it, for an instance whose child has it as `self`: what `self` is, that
+  ordinary methods run here, that a request method on `self` raises, each alias, the shared-state
+  rule, that its own state belongs on `self`, and that it runs until released.
+- **`help(outrig.Agent)`** was 7,927 characters of `help()`'s 8,192 before this task. To fit the
+  `self` paragraph, the facilities paragraph and the `facilities` property's docstring were
+  tightened, and `__init_subclass__` has a docstring of its own in place of the `object` one pydoc
+  showed. With the title `help()` adds, the answer is 8,019 characters.
+- **Tests that changed.** `0003-34`'s `a_dropped_instance_is_released_once_its_requests_end`
+  became `a_dropped_instance_lives_until_it_is_released`, and
+  `the_close_ends_launching_and_working_instances` asserts no collection. The interpreter's
+  `an_instance_collected_after_the_close_is_recorded_once_its_child_exists` became
+  `the_close_releases_each_instance_once_its_child_exists`; and
+  `an_instance_dropped_as_its_kernel_ends_records_nothing`, whose finalizer race is gone, became
+  `an_instance_released_as_its_kernel_ends_records_nothing`, a release begun in the cleanup as the
+  kernel ends. `0003-35`'s test of a program's collected instance keeps its body, renamed so that
+  it no longer claims a kernel's instance is collected the same way. `0003-42`'s facilities test
+  reads the reviewer's mapping through `self.facilities` in place of its stand-in.
+- **`/simplify` adopted part of an independent implementation.** Built from the same requirement,
+  it carried `self` and the aliases to `_open` as one `boot` mapping with no method on `Kernel`;
+  folded the close's release into the general one, since a release `closing` begins only once
+  `_closing` is set, so it asks the host nothing and says the same notice; and composed the `self`
+  sentence inline in `child_preamble`, one sentence per alias, with no struct and no plural form.
+  Those were adopted, about half the logic the first version had. This version's guard against
+  naming an alias once the launch has begun, its event and `_Work` comments, and its fuller ending
+  of the `self` sentence were kept. It also found two `_Work` comments still saying a request
+  holds its instance so that the instance is not collected; `_Work.instance` stays, since a
+  handle collected while its request is open is said through it, and the comments now say that.

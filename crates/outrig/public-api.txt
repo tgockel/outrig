@@ -1262,6 +1262,7 @@ pub outrig::harness::event::Payload::AgentInstanceReleased::usage: core::option:
 pub outrig::harness::event::Payload::AgentInstanceStarted::channels: alloc::vec::Vec<outrig::harness::event::ChannelBrief>
 pub outrig::harness::event::Payload::AgentInstanceStarted::digest: core::option::Option<alloc::string::String>
 pub outrig::harness::event::Payload::AgentInstanceStarted::facilities: core::option::Option<alloc::vec::Vec<outrig::harness::event::FacilityBrief>>
+pub outrig::harness::event::Payload::AgentInstanceStarted::has_self: bool
 pub outrig::harness::event::Payload::AgentInstanceStarted::inputs: alloc::vec::Vec<outrig::harness::event::InputBrief>
 pub outrig::harness::event::Payload::AgentInstanceStarted::instance: outrig::harness::event::AgentInstanceId
 pub outrig::harness::event::Payload::AgentInstanceStarted::module: alloc::string::String

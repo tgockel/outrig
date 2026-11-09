@@ -92,7 +92,8 @@ _CALL_NOTE = (
 _REQUEST_NOTE = (
     "A call sends its arguments as a request to the instance's child agent and returns the "
     "request's handle at once: await the handle for the reply, or keep it for its status and "
-    "cancel(). The body is never run."
+    "cancel(). The body is never run. In that child, where the instance is `self`, a call "
+    "raises `TypeError`."
 )
 
 
@@ -930,8 +931,8 @@ class Agent(metaclass=_Attaching):
     call checks its arguments and sends them as one request -- none as `None`, one as itself,
     several as a frozen dataclass the class holds, `<Class><Method>Message` -- and returns the
     request's handle at once: await it for the reply, of the return type. The body is never run.
-    Methods not marked are ordinary ones, which run here. What a class cannot declare raises
-    `TypeError` as the class is made, naming the member.
+    Methods not marked are ordinary ones. What a class cannot declare raises `TypeError` as the
+    class is made, naming the member.
 
     `Reviewer(**inputs, model=None)` runs the class's `__init__` to its end, then its
     `__outrig_attach__`, and only then attaches the instance: binds each input, which must be
@@ -940,23 +941,27 @@ class Agent(metaclass=_Attaching):
     child exists waits for it. The child's first round is its own, to get ready in: `await
     reviewer.ready()` returns once it has ended, and raises what the launch met instead. `await
     reviewer.release()` ends the child and every request still open on it; `async with
-    Reviewer() as reviewer:` waits for `ready()` on entry and releases on leaving. An instance
-    collected unreleased is released then.
+    Reviewer() as reviewer:` waits for `ready()` on entry and releases on leaving.
+
+    In the child, the instance is `self`: the same object, not a copy, so `self._task` there is
+    what `__init__` stored, and an ordinary method runs in whichever agent calls it. A request
+    method called on `self` there raises `TypeError`: requests are how its maker asks. The two
+    agents share `self` from two threads: one attribute read or write is atomic, a compound
+    update is not, and a request is how to ask the child for something. A module's globals are
+    shared by every agent that imports it; keep per-agent state on `self`. The child holds
+    `self`, so nothing collects an instance while its child lives: it ends as it is released, as
+    the agent that made it is, or as the session ends.
 
     `Reviewer(**inputs, facilities={"files": files})` gives the child, beside its data, the
-    objects it acts through, by name: the instance keeps a copy of the dict as
-    `reviewer.facilities`. A name follows an input's rules, and is not `outrig`, `self`, an
-    input's name or a class bound in the child. As the instance is attached, a binding's proxy --
-    the global the session bound it as -- becomes a reference to that binding (see
-    `help(outrig.Facility)`), which resolves in each kernel to that kernel's own proxy, so the
-    child's calls are its own; a proxy of an object a binding returned, a coroutine and a
-    generator are refused, naming the entry; anything else is the object itself, shared, and a
-    call on it is plain Python in the calling agent. The child is told of these and of no other
-    binding: its instructions list them, each is a global under its name where the name is free,
-    `outrig.bindings[name]` reaches each, and `runtime.bindings` lists the mapping as it stands.
-    Without `facilities=`, the child sees what this agent sees: the facilities it was given, or
-    the session's bindings. What any agent can reach is the session's either way: the mapping
-    decides what an agent is told, not what it may do.
+    objects it acts through, by name, kept as `reviewer.facilities`; a name follows an input's
+    rules, and is not `outrig`, `self`, an input's name or a class bound in the child. A
+    binding's proxy becomes a reference to that binding (`help(outrig.Facility)`), which
+    resolves in each kernel to that kernel's own proxy; a proxy of an object a binding returned,
+    a coroutine and a generator are refused, naming the entry; anything else is the object
+    itself, shared. The child is told of these and of no other binding -- in its instructions,
+    as globals where the name is free, by `outrig.bindings` and `runtime.bindings` -- and
+    without `facilities=` sees what this agent sees. The mapping decides what an agent is told,
+    not what it may reach, which is the session's either way.
 
     A subclass's `__init__` passes the base its keywords with `super().__init__(**inputs,
     model=...)`, which launches nothing; one that does not raises `TypeError` once it returns.
@@ -967,19 +972,19 @@ class Agent(metaclass=_Attaching):
     that raises launches nothing, and its exception is the constructor call's; what it did to
     your own objects stands, since OutRig rolls nothing back. An agent constructed inside
     `__init__` or `__outrig_attach__` is attached at once, and its child runs on if the
-    constructor then raises, until something releases it. The class's metaclass derives from
-    `abc.ABCMeta`: a subclass that leaves an abstract method unimplemented raises `TypeError` at
-    the call, before its `__init__`; and mixing in a class whose metaclass is another, not
-    derived from it, raises `TypeError` as the class is made.
+    constructor then raises, until its maker is released or the session ends. The class's
+    metaclass derives from `abc.ABCMeta`: a subclass that leaves an abstract method
+    unimplemented raises `TypeError` at the call, before its `__init__`; and mixing in a class
+    whose metaclass is another, not derived from it, raises `TypeError` as the class is made.
 
-    In a program `outrig run-new` runs on the host, `Reviewer(**inputs, model=None, session=None)`
-    is constructed on the running event loop its handles belong to, and its child is a root child
-    of `session`, the current `outrig.Session` when not given: its model is `model`, or
-    `default-model`, and no `[agents.<name>]` table applies. Its types reach the child as data,
-    made into classes again there, and each reply is decoded here, into this program's own.
-    Construct it, and leave its `async with`, inside the session's; the session's exit releases
-    it. In an agent's kernel, `session=` is refused: the child is in the kernel's own session.
-    `facilities=` is refused on the host, with `NotImplementedError`.
+    In a program `outrig run-new` runs on the host, `Reviewer(**inputs, model=None,
+    session=None)` is constructed on the running event loop its handles belong to, and its child
+    is a root child of `session`, the current `outrig.Session` when not given, on `model` or
+    `default-model`. Its types reach the child as data, made into classes again there, and each
+    reply is decoded here, into this program's own. The instance stays here, so its child has no
+    `self`, and one collected unreleased is released then. Construct it, and leave its `async
+    with`, inside the session's; the session's exit releases it. In an agent's kernel,
+    `session=` is refused; on the host, `facilities=` is, with `NotImplementedError`.
     """
 
     # What the runtime keeps of the instance, once it is attached; and the request channels its
@@ -988,6 +993,7 @@ class Agent(metaclass=_Attaching):
     _outrig_channels = {}
 
     def __init_subclass__(cls, **kwargs):
+        """Check the subclass's declaration as it is made."""
         super().__init_subclass__(**kwargs)
         _declare_class(cls)
 
@@ -1014,13 +1020,11 @@ class Agent(metaclass=_Attaching):
     @property
     def facilities(self):
         """This agent's facilities, by name: a copy of the dict its constructor was given as
-        `facilities=`, and the one mapping its child's view follows. Read-only as an attribute;
-        the dict is the agent's to change, and its child reads it as it stands.
-
-        Once the instance is attached, a binding's proxy in it is a reference to that binding
-        (`outrig.Facility`). An agent constructed without `facilities=` by an agent that was given
-        some has a copy of its maker's, taken as it is attached; one constructed where the view is
-        the session's has `None`, and its child sees every binding.
+        `facilities=`, the one mapping its child's view follows, read as it stands. Read-only as
+        an attribute; the dict is the agent's to change. Once the instance is attached, a
+        binding's proxy in it is a reference to that binding (`outrig.Facility`). Without
+        `facilities=`, it is a copy of its maker's, taken as it is attached, or `None` where its
+        maker's view is the session's, every binding, as its child's then is.
         """
         return self.__dict__.get("_outrig_facilities")
 

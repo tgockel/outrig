@@ -421,6 +421,3 @@ the loss of the declaration-as-data path for a class the owner does not want in 
 - No run against a real model is recorded for a child whose orientation names `self`; whether a
   model reaches for `self._task` rather than asking for the task is `0003-47`'s e2e-less risk,
   and the exit criterion is met by mock-driven tests.
-- The GC behavior under a kernel-side `self` -- that the child's kernel keeps the instance alive
-  until the kernel ends -- is reasoned from `_open` binding it into the module's `__dict__` and
-  that module's registration in `sys.modules`; `0003-45` tests it with `gc.collect()`.

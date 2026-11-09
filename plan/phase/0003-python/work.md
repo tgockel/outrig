@@ -410,7 +410,10 @@ collected unsettled is evented and not cancelled: nothing can read its result, b
 bare `await` is the common way to reach that state, and cancelling the request there would make a
 cancelled waiter cancel the work after all, which the handle's shielding exists to prevent. When
 the last request settles and no reference to the instance remains, the finalizer releases the
-child. A module-level instance in a reloaded skill lives until it is collected. However the
+child. A module-level instance in a reloaded skill lives until it is collected. Since `0003-45`
+the backstop is a host program's instance's alone: an instance a kernel constructs is its child's
+`self`, which nothing collects while the child lives, so it is released explicitly, with the
+agent that made it, or by the session's close (`agent-classes.md`, "Release"). However the
 release is reached, every request outstanding on the instance settles with `AgentReleased`.
 `0003-30` builds and tests the release and `0003-34` the instance. This page's part is the rule
 those depend on: every terminal outcome settles a request exactly once.

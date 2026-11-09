@@ -57,7 +57,7 @@ pub(super) fn subject(event: &Event) -> &str {
 
 /// The subject of the child that serves the instance of agent class
 /// `qualname`, from its `agent.instance.started`.
-fn child_of(events: &[Arc<Event>], qualname: &str) -> String {
+pub(super) fn child_of(events: &[Arc<Event>], qualname: &str) -> String {
     kind(events, "agent.instance.started", None)
         .into_iter()
         .find(|event| data(event)["qualname"] == qualname)
@@ -67,7 +67,7 @@ fn child_of(events: &[Arc<Event>], qualname: &str) -> String {
 
 /// `text` with every line but blank ones indented by `by` spaces, to sit in a
 /// test's Python, which `py` dedents.
-fn indented(text: &str, by: usize) -> String {
+pub(super) fn indented(text: &str, by: usize) -> String {
     let pad = " ".repeat(by);
     text.lines()
         .map(|line| {
@@ -92,7 +92,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// An agent class named `name`, its child marked `ROLE <role>`, with one
 /// request method, `fizz`, which takes a `str` and replies with a `Thing`.
-fn fizzing(name: &str, role: &str) -> String {
+pub(super) fn fizzing(name: &str, role: &str) -> String {
     format!(
         r#"
 class {name}(outrig.Agent):
@@ -106,7 +106,7 @@ class {name}(outrig.Agent):
 }
 
 /// What a child runs to answer one request on `fizz` with its id.
-const ANSWER_ONE: &str =
+pub(super) const ANSWER_ONE: &str =
     "d = await runtime.channels['fizz'].receive()\nawait d.reply(Thing(n=d.id))";
 
 /// `SomethingElse` and the maintainer's `FooAgent`, its child marked `ROLE
@@ -237,6 +237,7 @@ async fn the_maintainers_example_runs_against_a_mock_model() {
             {"name": "buzz", "request": "FooAgentBuzzMessage", "reply": "SomethingElse"},
         ])
     );
+    assert_eq!(started["self"], true, "its child has it as `self`");
     assert_eq!(
         data(kind(&events, "agent.instance.ready", child)[0])["error"],
         json!(null)
@@ -789,16 +790,18 @@ async fn release_settles_and_closes() {
     assert_eq!(released[1]["how"], "async_with");
 }
 
-/// An instance nothing holds is released once the requests made of it have
-/// ended: one dropped with a request in flight, its handle dropped too, stays
-/// until the request settles, and one dropped idle goes at once; each is
-/// recorded collected, then released.
+/// An instance its child has as `self` lives until it is released: dropped
+/// with a request in flight and its handle dropped too, and dropped again once
+/// the request has settled and the child is idle, it is neither collected nor
+/// released, and its child stays resident, taking the one place
+/// `children-max = 1` gives, so the next instance's launch is refused. Its
+/// explicit release is recorded as such, after which nothing keeps it.
 #[tokio::test]
-async fn a_dropped_instance_is_released_once_its_requests_end() {
+async fn a_dropped_instance_lives_until_it_is_released() {
     let flag = Flag::new();
     let mut tree = tree(
         "OUTRIG_TEST_INSTANCE_DROPPED",
-        "",
+        "children-max = 1",
         vec![
             (
                 "ROLE dropped",
@@ -810,63 +813,73 @@ async fn a_dropped_instance_is_released_once_its_requests_end() {
                     ),
                 ))),
             ),
-            ("ROLE idle", ready_then(scripted(vec![text_reply("nothing")]))),
             (
                 "",
                 primary_waits(&format!(
                     r#"
-                    import gc
+                    import gc, weakref
                     {dropped}
-                    {idle}
-                    Dropped().fizz('x')
-                    gc.collect()
-                    i = Idle()
-                    await i.ready()
-                    del i
-                    gc.collect()
+                    {other}
+                    d = Dropped()
+                    await d.ready()
+                    w = weakref.ref(d)
+                    d.fizz('x')
+                    del d
+                    _ = gc.collect()
+                    print('in flight', w() is not None)
+                    open({flag}, 'w').close()
+                    await until(lambda: w()._outrig.child.status == 'idle'
+                                and not w()._outrig.record.unsettled)
+                    _ = gc.collect()
+                    print('idle', w() is not None)
+                    o = Other()
+                    try:
+                        await o.ready()
+                    except outrig.AgentLimitReached as e:
+                        print('resident', 'children-max' in str(e))
+                    await w().release()
+                    for _ in range(200):
+                        _ = gc.collect()
+                        if w() is None:
+                            break
+                        await asyncio.sleep(0.01)
+                    print('gone', w() is None)
                     "#,
                     dropped = indented(&fizzing("Dropped", "dropped"), 20),
-                    idle = indented(&fizzing("Idle", "idle"), 20),
+                    other = indented(&fizzing("Other", "other"), 20),
+                    flag = flag.py(),
                 )),
             ),
         ],
     )
     .await;
     round(&mut tree.session, "go").await;
-    tree.seen("agent.instance.released", 1).await;
-    {
-        let events = tree.events.lock().expect("events");
-        let dropped = child_of(&events, "Dropped");
-        assert!(
-            position(&events, "agent.instance.released", |event| subject(event)
-                == dropped)
-            .is_empty(),
-            "not while its request is open"
-        );
-    }
-    flag.raise();
-    tree.seen("agent.instance.released", 2).await;
-    let (_, events, _) = tree.end().await;
-    for (class, handle) in [("Dropped", true), ("Idle", false)] {
-        let child = child_of(&events, class);
-        let at = |kind: &str| position(&events, kind, |event| subject(event) == child);
-        let (collected, released) = (
-            at("agent.instance.collected"),
-            at("agent.instance.released"),
-        );
-        assert_eq!((collected.len(), released.len()), (1, 1), "{child}");
-        assert!(collected[0] < released[0], "{child}");
-        assert_eq!(data(&events[released[0]])["how"], "collected", "{child}");
-        assert_eq!(
-            at("agent.instance.handle.collected").len(),
-            usize::from(handle)
-        );
-        if handle {
-            let settled = at("agent.request.settled");
-            assert_eq!(data(&events[settled[0]])["outcome"], "accepted");
-            assert!(settled[0] < collected[0], "the request first");
-        }
-    }
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(
+        printed(&requests, "p1"),
+        "in flight True\nidle True\nresident True\ngone True\n"
+    );
+    let dropped = child_of(&events, "Dropped");
+    let at = |kind: &str| position(&events, kind, |event| subject(event) == dropped);
+    assert!(
+        kind(&events, "agent.instance.collected", None).is_empty(),
+        "its child holds it"
+    );
+    let (settled, released) = (at("agent.request.settled"), at("agent.instance.released"));
+    assert_eq!((settled.len(), released.len()), (1, 1));
+    assert_eq!(data(&events[settled[0]])["outcome"], "accepted");
+    assert!(settled[0] < released[0], "the request first");
+    assert_eq!(data(&events[released[0]])["how"], "explicit");
+    assert_eq!(
+        at("agent.instance.handle.collected").len(),
+        1,
+        "its handle was collected open"
+    );
+    assert_eq!(
+        kind(&events, "agent.instance.started", None).len(),
+        1,
+        "the other's launch was refused"
+    );
 }
 
 /// What the launch meets surfaces at `ready()` and at a request, never in the
@@ -1409,8 +1422,8 @@ async fn a_held_request_cancelled_before_it_is_sent_is_not_kept() {
 /// The session closes while one instance is in its launch round and another
 /// holds two requests unanswered: both `ready()` calls and both handles raise
 /// the closing error within the test's deadline, each instance is released by
-/// the close, the report lists the two requests, and an instance collected
-/// after the close is recorded and released no further.
+/// the close, the report lists the two requests, and an instance dropped after
+/// the close, which its child holds as `self`, is never collected.
 #[tokio::test]
 async fn the_close_ends_launching_and_working_instances() {
     let (closing, finish) = (Flag::new(), Flag::new());
@@ -1465,7 +1478,6 @@ async fn the_close_ends_launching_and_working_instances() {
         closer.close_admission();
     });
     assert_eq!(end.reply, "done");
-    tree.seen("agent.instance.collected", 1).await;
     finish.raise();
     hold.go.notify_one();
     let (report, events, requests) = tree.end().await;
@@ -1500,9 +1512,10 @@ async fn the_close_ends_launching_and_working_instances() {
         (requests(&launching), requests(&working)),
         (Some(0), Some(2))
     );
-    let collected = kind(&events, "agent.instance.collected", None);
-    assert_eq!(collected.len(), 1);
-    assert_eq!(subject(collected[0]), launching);
+    assert!(
+        kind(&events, "agent.instance.collected", None).is_empty(),
+        "its child holds it as `self`"
+    );
     assert!(
         kind(&events, "agent.instance.ready", None).is_empty(),
         "neither was ready"

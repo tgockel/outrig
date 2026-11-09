@@ -237,6 +237,10 @@ asyncio.run(main())
         started[0]["channels"],
         json!([{"name": "explain", "request": "str", "reply": "str"}])
     );
+    assert_eq!(
+        started[0]["self"], false,
+        "the instance stays in the program"
+    );
     let sent = of_kind(&records, "agent.request.sent");
     assert_eq!(sent.len(), 2);
     assert!(
@@ -880,12 +884,13 @@ asyncio.run(main())
     assert_eq!(of_kind(&records, "agent.request.sent").len(), 1);
 }
 
-/// The instance events are a kernel's: an instance the program drops idle is collected and then
-/// released, and a handle dropped before its request ended is recorded; at the close, an
-/// instance still launching never becomes ready -- `ready()` raises the closing error, and no
-/// `agent.instance.ready` is recorded for it -- and it and the one still alive are released by it.
+/// A program's instance stays in the program, where nothing holds it but the program's own
+/// code: one the program drops idle is collected and then released, and a handle dropped before
+/// its request ended is recorded; at the close, an instance still launching never becomes ready
+/// -- `ready()` raises the closing error, and no `agent.instance.ready` is recorded for it -- and
+/// it and the one still alive are released by it.
 #[tokio::test]
-async fn collection_and_the_close_are_evented_as_for_a_kernel() {
+async fn collection_and_the_close_are_evented_for_a_programs_instance() {
     let hold = Arc::new(Hold::default());
     let script = format!(
         r#"

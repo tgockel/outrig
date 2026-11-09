@@ -196,7 +196,8 @@ fn rest(workspace: Option<&Path>, view: View<'_>, window: Window, begins: &str) 
 
 /// What a child agent is: the one that works on submissions, or the one that
 /// answers requests on its channels -- an agent class instance's among them,
-/// which has a round as it launches -- each with what its instructions say of
+/// which has a round as it launches, and has the instance as its `self` unless
+/// a host program constructed it -- each with what its instructions say of
 /// them.
 pub(crate) enum ChildBrief<'a> {
     Work,
@@ -207,7 +208,9 @@ pub(crate) enum ChildBrief<'a> {
         schema: &'a str,
     },
     Request(&'a [ChannelText]),
-    Instance(&'a [ChannelText]),
+    /// An agent class instance's child; when it has the instance as `self`,
+    /// the class's `__qualname__` and the names of the aliases bound beside it.
+    Instance(&'a [ChannelText], Option<(&'a str, &'a [&'a str])>),
 }
 
 /// One of a request child's channels, as its instructions describe it.
@@ -259,6 +262,27 @@ pub(crate) fn child_preamble(
         }
         text.push('\n');
     }
+    if let ChildBrief::Instance(_, Some((qualname, aliases))) = brief {
+        let _ = write!(
+            text,
+            "`self` is the `{qualname}` instance your parent's code constructed: the same object, \
+             not a copy. Its attributes hold what its constructor stored, and its ordinary methods \
+             run here when you call them; its request methods are how your parent asks you for \
+             something, so calling one on `self` raises `TypeError`."
+        );
+        for alias in *aliases {
+            let _ = write!(
+                text,
+                " `{alias}` is the `{alias}` its constructor was given, the same object."
+            );
+        }
+        text.push_str(
+            " Your parent's code holds `self` too, and can change it while yours runs: one attribute \
+             read or write is whole, a read followed by a write is not. Keep your own state on \
+             `self`, not in a module's globals, which every agent that imports the module shares. \
+             You run until you are released -- by your parent, with it, or as the session ends.\n\n",
+        );
+    }
     let begins = match brief {
         ChildBrief::Call {
             result_type,
@@ -302,7 +326,7 @@ pub(crate) fn child_preamble(
             text.push_str(WAIT);
             "each time a submission is given to you, or one stays open"
         }
-        ChildBrief::Request(channels) | ChildBrief::Instance(channels) => {
+        ChildBrief::Request(channels) | ChildBrief::Instance(channels, _) => {
             text.push_str("You answer requests, which arrive on these channels:\n");
             for channel in *channels {
                 let _ = write!(text, "\n- `runtime.channels[{:?}]`", channel.name);
@@ -340,7 +364,7 @@ pub(crate) fn child_preamble(
                  way, and each sender then gets an exception.\n\n"
             );
             match brief {
-                ChildBrief::Instance(_) => {
+                ChildBrief::Instance(..) => {
                     "as you are launched, to get ready in, then when requests are waiting, or \
                      one you took is unanswered"
                 }
@@ -1043,6 +1067,65 @@ mod tests {
         }
     }
 
+    /// A child that has its instance as `self` is told so after its inputs and before its
+    /// channels: the class, that `self` is the object its parent's code constructed, that a
+    /// request method on it raises, that the two share it, and that it runs until released; and
+    /// each alias, as its constructor's argument of that name. A host program's instance, which
+    /// has no `self`, is told nothing of one.
+    #[test]
+    fn a_child_is_told_of_its_self_and_its_aliases() {
+        let channels = [ChannelText {
+            name: "review".into(),
+            doc: None,
+            request_type: "str".into(),
+            reply_type: "Verdict".into(),
+            request: "{}".into(),
+            reply: "{}".into(),
+        }];
+        let inputs = [InputBrief {
+            name: "path".into(),
+            type_name: "str".into(),
+            preview: "\"src\"".into(),
+        }];
+        let told = |aliases: Option<&[&str]>| {
+            let own = aliases.map(|aliases| ("Reviewer", aliases));
+            preamble(&ChildBrief::Instance(&channels, own), &inputs)
+        };
+        let plain = told(Some(&[]));
+        let at = plain
+            .find("`self` is the `Reviewer` instance your parent's code constructed")
+            .unwrap_or_else(|| panic!("{plain}"));
+        let input = plain.find("- `path` (str)").expect("the input");
+        let answer = plain.find("You answer requests").expect("the channels");
+        assert!(input < at && at < answer, "{plain}");
+        for said in [
+            "the same object, not a copy",
+            "its ordinary methods run here",
+            "calling one on `self` raises `TypeError`",
+            "a read followed by a write is not",
+            "Keep your own state on `self`",
+            "You run until you are released",
+        ] {
+            assert!(plain.contains(said), "{said:?} in {plain}");
+        }
+        assert!(!plain.contains("its constructor was given"), "{plain}");
+        let one = told(Some(&["task"]));
+        assert!(
+            one.contains("`task` is the `task` its constructor was given, the same object."),
+            "{one}"
+        );
+        let two = told(Some(&["task", "repo"]));
+        assert!(
+            two.contains(
+                "`task` is the `task` its constructor was given, the same object. `repo` is the \
+                 `repo` its constructor was given, the same object."
+            ),
+            "{two}"
+        );
+        let hosted = told(None);
+        assert!(!hosted.contains("`self`"), "{hosted}");
+    }
+
     /// Every child's preamble states the rule: up to two more rounds, the last a warning, then the
     /// cancel, and that ending a round is not waiting. A request child is also told that only
     /// `d.reply` and `d.fail` answer, and that code left running keeps no request open; a work
@@ -1066,7 +1149,8 @@ mod tests {
             ChildBrief::Work,
             call,
             ChildBrief::Request(&channels),
-            ChildBrief::Instance(&channels),
+            ChildBrief::Instance(&channels, None),
+            ChildBrief::Instance(&channels, Some(("Reviewer", &[]))),
         ] {
             let text = preamble(&brief, &[]);
             assert!(
@@ -1075,7 +1159,7 @@ mod tests {
                     && text.contains("Ending your round is not waiting"),
                 "{text}"
             );
-            let request = matches!(brief, ChildBrief::Request(_) | ChildBrief::Instance(_));
+            let request = matches!(brief, ChildBrief::Request(_) | ChildBrief::Instance(..));
             assert_eq!(
                 text.contains("what you write yourself is not delivered"),
                 request,

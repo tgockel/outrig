@@ -852,7 +852,8 @@ pub enum Payload {
     /// An agent class's instance, made by `parent`'s code, launched its child,
     /// the event's subject: the class's `__module__` and `__qualname__`, the
     /// SHA-256 digest of the source that declared it, or `None` when none
-    /// could be read, the child's inputs, and its request channels.
+    /// could be read, the child's inputs, its request channels, and whether
+    /// the child has the instance as its `self`.
     #[non_exhaustive]
     AgentInstanceStarted {
         /// The instance's id, which its other events carry.
@@ -874,6 +875,12 @@ pub enum Payload {
         facilities: Option<Vec<FacilityBrief>>,
         /// The child's request channels, one per request method.
         channels: Vec<ChannelBrief>,
+        /// Whether the child has the instance as its `self`, which every
+        /// instance an agent's code constructs is: `false` for one a host
+        /// program constructed, which stays in the program. Serialized as
+        /// `self`.
+        #[serde(rename = "self")]
+        has_self: bool,
     },
     /// The instance's child ended its orienting round, the one it has as it
     /// launches, and is ready; or `error` says why it cannot have that round.
@@ -902,7 +909,8 @@ pub enum Payload {
         usage: Option<Usage>,
     },
     /// The instance was collected: its release follows, unless the session's
-    /// close had released it.
+    /// close had released it. Only an instance a host program constructed is
+    /// collected so; one whose child has it as `self` never is.
     #[non_exhaustive]
     AgentInstanceCollected {
         /// The instance that was collected.
@@ -2292,7 +2300,8 @@ pub enum InstanceRelease {
     Explicit,
     /// Its `async with` was left.
     AsyncWith,
-    /// It was collected unreleased.
+    /// It was collected unreleased: an instance a host program constructed,
+    /// since one whose child has it as `self` never is.
     Collected,
     /// The session closed.
     Closing,

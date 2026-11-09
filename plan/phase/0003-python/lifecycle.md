@@ -258,10 +258,13 @@ the session.
 - *Idle* -- ready, with no request waiting or unanswered. Outcome: released; its kernel ends with
   the interpreter at terminating. Invoked: not a boundary request. Effects: what its earlier
   rounds did stands; each hosted call they made has a row of its own.
-- *Collected during the close* -- the instance's last reference was dropped after admission
-  closed, so its finalizer scheduled a release. Outcome: nothing further; the close has already
-  done what the release would, and the collection is still recorded as `agent.instance.collected`
-  when the finalizer's notice reaches the host. Invoked: no. Effects: none beyond the rows above.
+- *Collected during the close* -- an instance without a kernel-side `self`, one a host program
+  constructed (`0003-35`), whose last reference was dropped after admission closed, so its
+  finalizer scheduled a release. Outcome: nothing further; the close has already done what the
+  release would, and the collection is still recorded as `agent.instance.collected` when the
+  finalizer's notice reaches the host. Invoked: no. Effects: none beyond the rows above. An
+  instance whose child has it as `self` is never collected while the child lives (`0003-45`), so
+  this row is never its.
 
 **Live-object calls** (`0003-36`)
 
@@ -401,9 +404,12 @@ whoever is watching stderr.
 A child is released explicitly, through `work.md`'s release; for a decorated call's fresh child,
 once that call's result settles (`typed-agents.md`); and for an agent class's instance
 (`agent-classes.md`), through `await foo.release()`, at the exit of `async with FooAgent() as
-foo:`, or by the runtime when the instance is collected unreleased. That last path is a backstop:
-a finalizer cannot await and runs on whatever thread dropped the last reference, so it schedules
-the release on the constructing kernel's event loop, and `agent.instance.collected` is recorded.
+foo:`, or with the subtree of the agent that constructed it. An instance a kernel constructed is
+its child's `self`, so nothing collects it while the child lives, and those are the only ways it
+ends besides the session's close (`0003-45`). An instance a host program constructed stays in the
+program, and is also released by the runtime when it is collected unreleased: a backstop, since a
+finalizer cannot await and runs on whatever thread dropped the last reference, so it schedules the
+release on the program's event loop, and `agent.instance.collected` is recorded.
 Whichever path releases a child, releasing it closes its subtree -- the child and every agent it
 launched -- the way a session close does, while the rest of the session runs on:
 
@@ -651,6 +657,7 @@ external channel, reattached by its durable id through the channel's backend and
   no longer waits out podman's default of ten.
 - The rows for executions, the interpreter and the container run, in `0003-19`'s tests; the rest
   of the close table has not, and neither has a release. Each row's behavior is acceptance for the
-  task that adds it; a release's is `0003-30`'s, and an instance's release, the finalizer path
-  included, is `0003-34`'s. The host-program rows run in `0003-29`'s tests, in containers and
-  on the host; the live-call rows are `0003-36`'s.
+  task that adds it; a release's is `0003-30`'s, an instance's release is `0003-34`'s, the
+  finalizer path for a host program's instance `0003-35`'s, and an instance that is its child's
+  `self` living until it is released `0003-45`'s. The host-program rows run in `0003-29`'s tests,
+  in containers and on the host; the live-call rows are `0003-36`'s.

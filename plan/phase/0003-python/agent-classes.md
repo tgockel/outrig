@@ -39,14 +39,15 @@ done, more = await runtime.wait({fizz, b1, b2})
 ```
 
 The class docstring is the first part of the child's instructions, and `_x` and `bar` are the
-caller's: they live in the parent and never reach the child ("The declaration"). `fizz` and `buzz`
+caller's: they live in the parent and never reach the child ("The declaration"; since `0003-45`
+they are the instance's, which the child has as `self`). `fizz` and `buzz`
 are request channels, marked `@outrig.agent`, whose message and reply types come from their
 signatures ("Message and reply types"). `FooAgent()` returns at once and launches the child in the
 background ("Construction and
 readiness"). Each of the three calls sends its request now and returns a handle, and
 `runtime.wait` takes the handles as it takes futures ("Calling"). One child answers all three, in
 rounds its runner starts as requests arrive ("The child's rounds"), until `foo` is released or
-collected ("Release").
+collected ("Release"; since `0003-45`, released only, as the child holds `foo` as `self`).
 
 ## The declaration
 
@@ -85,9 +86,12 @@ nothing of the instance. This is `messages.md`'s rule that object identity does 
 to the instance itself.
 
 `0003-45` reverses this paragraph for an agent constructed in a kernel: the instance is bound as
-`self` in the child's kernel, the same object, and an ordinary method runs where it is called, in
-the child's kernel too (`task-agents.md`, "The instance is the child's `self`"). `messages.md`'s
-rule stands for what crosses a channel.
+`self` in the child's kernel, the same object, so its ordinary methods, properties and state are
+reachable from both kernels, an ordinary method runs where it is called, and a request method
+called on `self` in the child raises `TypeError` (`task-agents.md`, "The instance is the child's
+`self`"; `0003-45`'s `## Decisions`). A class a host program declares keeps this paragraph: its
+instance stays in the program, and its child has no `self`. `messages.md`'s rule stands for what
+crosses a channel.
 
 **Channel names are method names.** `fizz` is `runtime.channels["fizz"]` in the child, which is
 what makes the method's docstring a description of that channel. `user` is refused: it is the user
@@ -161,7 +165,8 @@ constructed inside another's `__init__` or hook is attached at once (`0003-41`'s
 
 **Inputs reach the child as variables.** Each is bound under its name in the child's namespace,
 and the instructions carry a manifest -- name, type, bounded preview -- as a submission's do
-(`typed-agents.md`). Everything else on the instance stays in the parent.
+(`typed-agents.md`). Everything else on the instance stays in the parent -- and since `0003-45`
+the instance itself is the child's `self` ("The declaration").
 
 **The child's instructions** are the class docstring; the input manifest; one entry per channel,
 with its name, the method's docstring, and the schema text of its request and reply types; and how
@@ -533,9 +538,12 @@ release is evented as a collection. Three consequences:
   put the instance in a cycle, which defers it to the cyclic collector's next pass. It is a
   backstop, and explicit release is the rule.
 
-`0003-45`: for an instance with a kernel-side `self`, explicit release is the rule and the backstop
-does not run; it stays for an instance without one (`task-agents.md`, "The instance is the child's
-`self`").
+`0003-45`: an instance a kernel constructs is its child's `self`, which the child's kernel holds,
+so nothing collects it while the child lives and no finalizer is registered for it. Its release is
+explicit -- `release()`, `async with`, the release of the agent that made it, or the session's
+close -- and `agent.instance.collected` is recorded only for an instance a host program
+constructed, whose backstop is `0003-35`'s (`task-agents.md`, "The instance is the child's
+`self`"; `0003-45`'s `## Decisions`).
 
 **At the session's close**, a launching instance is never ready -- `ready()` and the first handle
 raise the closing error -- and an idle or working one is released with its requests settled, as
@@ -607,12 +615,14 @@ records none of them (`0003-34`).
 
 - `agent.instance.started` -- the instance's id, the class's `__module__` and `__qualname__` and
   its module's digest, the child's id, the parent -- a kernel's execution, or the owner -- the
-  input manifest, and the channels declared with their types;
+  input manifest, the channels declared with their types, and, since `0003-45`, `self`: whether
+  the child has the instance as its `self`;
 - `agent.instance.ready` -- the orienting round ended, or the child cannot have it -- the budget
   spent, a model that cannot answer -- and why;
 - `agent.instance.released` -- how: explicit, `async with`, collected, or the session closing; the
   requests settled by it; and the instance's usage total;
-- `agent.instance.collected` -- the finalizer ran, before the release it scheduled;
+- `agent.instance.collected` -- the finalizer ran, before the release it scheduled; since
+  `0003-45`, only for an instance a host program constructed;
 - `agent.instance.handle.collected` -- the handle of one of its requests was collected before the
   request ended;
 - the request family, shared with submissions (`work.md`): `agent.request.sent`, with the id, the

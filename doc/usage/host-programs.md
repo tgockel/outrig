@@ -166,11 +166,13 @@ asyncio.run(main())
   handles belong to, in `session`, or else the session whose block it runs in; with no session,
   or no running loop, it raises. Each input must be data -- a str, number, bool, `None`, a list
   or str-keyed dict of these, or a dataclass instance -- and is a variable of that name in the
-  agent's Python. The agent's first round, in which it reads its instructions, follows:
-  `await agent.ready()` waits for it, and `async with` waits for it on entry and releases the
-  agent on exit. A subclass's own `__init__` calls `super().__init__(**inputs, model=...)`. The
-  agent starts only after that `__init__` returns and after `__outrig_attach__(self)`, a method
-  the class may define to finish its setup, so either can raise without starting anything.
+  agent's Python. The instance itself stays in your program: the agent's Python has no `self`,
+  and the methods not marked run here. The agent's first round, in which it reads its
+  instructions, follows: `await agent.ready()` waits for it, and `async with` waits for it on
+  entry and releases the agent on exit. A subclass's own `__init__` calls
+  `super().__init__(**inputs, model=...)`. The agent starts only after that `__init__` returns and
+  after `__outrig_attach__(self)`, a method the class may define to finish its setup, so either
+  can raise without starting anything.
 - **Its model.** `model=` names a configured model or alias; without it, `default-model`. No
   `[agents.<name>]` table, `default-agent`, image or preamble applies: the class's docstring is
   the agent's instructions. An unknown model, a full `children-max`, or a session that has closed
@@ -187,9 +189,10 @@ asyncio.run(main())
   the agent with what is wrong, each problem with its path, and the agent corrects it without
   running anything again; after three, the request raises `outrig.CompletionRejected`.
 - **Releasing it.** `await agent.release()`, or leaving `async with`, ends the agent, each request
-  still open on it raising `outrig.AgentReleased`. Construct agents inside the session's block:
-  leaving the session releases each one still alive, ends its open requests with
-  `outrig.SessionClosing`, and lists them in `shutdown_report.requests`.
+  still open on it raising `outrig.AgentReleased`; so does dropping the instance, once it is
+  collected. Construct agents inside the session's block: leaving the session releases each one
+  still alive, ends its open requests with `outrig.SessionClosing`, and lists them in
+  `shutdown_report.requests`.
 
 The session's events record such an agent under a subject of its own, `agent/c1` and on, its
 parent `owner`, the program (see [the event log](../reference/events.md)). The calls an agent's

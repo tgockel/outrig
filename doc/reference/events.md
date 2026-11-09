@@ -553,26 +553,30 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
   `digest`, a SHA-256 of the source that declared the class -- its module's file, or the
   submission's source for a class declared in one, read through a function its body defines -- or
   `null` when none could be read, as for a class a submission declared with no function in its body;
-  `inputs`, each `{name, type, preview}`; `facilities`, as `agent.spawned` carries them; and
-  `channels`, one per request method, each `{name, request, reply}`. An instance whose launch was
-  refused, by a limit say, has no child and
-  records none of these events; its `ready()` and its requests raise the refusal. Nor does one
-  whose construction raised -- its class's `__init__` or `__outrig_attach__`, which run before the
-  launch -- whose exception is the constructor call's, in its execution's traceback.
+  `inputs`, each `{name, type, preview}`; `facilities`, as `agent.spawned` carries them;
+  `channels`, one per request method, each `{name, request, reply}`; and `self`, `true` when the
+  child has the instance as its `self`, as every instance an agent's code constructs is, and
+  `false` for one a program constructed, which stays in the program. An instance whose launch was
+  refused, by a limit say, has no child and records none of these events; its `ready()` and its
+  requests raise the refusal. Nor does one whose construction raised -- its class's `__init__` or
+  `__outrig_attach__`, which run before the launch -- whose exception is the constructor call's,
+  in its execution's traceback.
 - `agent.instance.ready` -- the child has had the round it gets as it launches, in which it reads
   its instructions and prepares: `instance`, and `error`, `null`, or why it cannot have that round
   -- the token budget spent, or a model that cannot answer. A request sent before this may already
   be among the child's other events.
 - `agent.instance.released` -- the instance was released, and its child, the subject, with it:
-  `instance`; `how`, which is `explicit`, `async_with`, `collected` when the instance was
-  collected unreleased, or `closing` when the session's close released it; `requests`, the
-  requests on the child that the release or the close ended; and `usage`, the sum over every model
-  request the child made, or `null` when none reported any. An instance a child made ends with that
-  child: the `agent.released` that ends it lists the instance's child in `ended`, and the instance
-  records nothing after it, `agent.instance.released` included, even when the cleanup of the
-  child's cancelled code drops or releases it.
-- `agent.instance.collected` -- the instance was collected unreleased: `instance`. Its
-  `agent.instance.released` follows, unless the session's close had released it already.
+  `instance`; `how`, which is `explicit`, `async_with`, `collected` when an instance a program
+  constructed was collected unreleased, or `closing` when the session's close released it;
+  `requests`, the requests on the child that the release or the close ended; and `usage`, the sum
+  over every model request the child made, or `null` when none reported any. An instance a child
+  made ends with that child: the `agent.released` that ends it lists the instance's child in
+  `ended`, and the instance records nothing after it, `agent.instance.released` included, even
+  when the cleanup of the child's cancelled code drops or releases it.
+- `agent.instance.collected` -- an instance a program constructed was collected unreleased:
+  `instance`. Its `agent.instance.released` follows, unless the session's close had released it
+  already. An instance an agent's code constructed is never collected while its child lives, since
+  the child has it as `self`, and records no such event: it ends only as it is released.
 - `agent.instance.handle.collected` -- the handle of a request made of the instance was collected
   before the request ended: `instance`, and `request`. The request runs on, and nothing reads its
   answer.

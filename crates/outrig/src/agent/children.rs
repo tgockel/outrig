@@ -836,6 +836,15 @@ impl Inner {
         // An agent class instance's child, which has a round of its own as it launches: a root
         // child's instance has the id its kernel gave it, which no other has.
         let instance = minted.or(line["instance"]["id"].as_u64());
+        // Whether its kernel has the instance as `self`, as an instance an agent's code
+        // constructed says; one a host program constructed stays in the program.
+        let has_self = line["instance"]["self"].as_bool().unwrap_or(false);
+        let aliases: Vec<&str> = line["instance"]["aliases"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
         let call = &line["call"];
         let brief = match kind {
             ChildKind::Work if call.is_object() => ChildBrief::Call {
@@ -843,7 +852,13 @@ impl Inner {
                 result_type: call["result"]["type"].as_str().unwrap_or_default(),
                 schema: call["result"]["schema"].as_str().unwrap_or_default(),
             },
-            ChildKind::Request if instance.is_some() => ChildBrief::Instance(&channels),
+            ChildKind::Request if instance.is_some() => ChildBrief::Instance(
+                &channels,
+                has_self.then(|| {
+                    let qualname = line["instance"]["qualname"].as_str().unwrap_or_default();
+                    (qualname, &aliases[..])
+                }),
+            ),
             ChildKind::Request => ChildBrief::Request(&channels),
             _ => ChildBrief::Work,
         };
@@ -949,6 +964,7 @@ impl Inner {
                         inputs,
                         facilities,
                         channels: briefed,
+                        has_self,
                     });
                 }
                 child.life = Life::Idle;
