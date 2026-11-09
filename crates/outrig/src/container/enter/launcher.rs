@@ -490,15 +490,34 @@ fn main() {
         die(&format!("open {}", named.to_string_lossy()), &hint);
     };
 
-    // Read enough of the head to classify; the file header, program headers and
-    // any PT_INTERP string live at the very start of every real binary.
-    let mut head = vec![0u8; 65536];
-    let n = unsafe { pread(prog_fd, head.as_mut_ptr() as *mut c_void, head.len(), 0) };
-    if n < 0 {
-        die(&format!("read {}", resolved.display()), "");
-    }
-    head.truncate(n as usize);
-    let kind = match elf_interp(&head) {
+    // Classify from the head of the file, which for linker output holds the
+    // program headers and any PT_INTERP string; a rewritten binary may put
+    // them anywhere, so `elf_interp` asks for what lies past it (#596).
+    let read_at = |off: usize, len: usize| -> Vec<u8> {
+        // No file reaches past `i64::MAX`, and `pread` refuses a range that
+        // would, with EINVAL rather than a short read. So the read stops there
+        // and comes back short, which `elf_interp` reports as the part it
+        // wanted lying past the end of the file.
+        let len = len.min((i64::MAX as usize).saturating_sub(off));
+        let mut buf = vec![0u8; len];
+        let mut got = 0;
+        while got < len {
+            let rest = &mut buf[got..];
+            let pos = (off + got) as i64;
+            let n = unsafe { pread(prog_fd, rest.as_mut_ptr() as *mut c_void, rest.len(), pos) };
+            if n < 0 {
+                die(&format!("read {}", resolved.display()), "");
+            }
+            if n == 0 {
+                break;
+            }
+            got += n as usize;
+        }
+        buf.truncate(got);
+        buf
+    };
+
+    let kind = match elf_interp(&read_at(0, 65536), read_at) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("outrig-enter: {}: {e}", resolved.display());

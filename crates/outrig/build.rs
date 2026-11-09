@@ -144,7 +144,7 @@ fn main() {
     // `+crt-static` on a target that cannot honor it, so only the output shows
     // whether the link really came out static.
     let built = compile(&rustc, &host, "target-feature=+crt-static", &dest)
-        .map(|()| elf_interp(&std::fs::read(&dest).unwrap_or_default()));
+        .map(|()| elf_interp(&std::fs::read(&dest).unwrap_or_default(), |_, _| Vec::new()));
     let why = match built {
         Ok(Ok(ElfKind::Static)) => {
             println!(

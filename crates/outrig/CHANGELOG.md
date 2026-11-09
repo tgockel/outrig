@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`outrig-enter` finds a payload's `PT_INTERP` wherever the file puts it.** The launcher
+  classified a `view = "primary"` payload from the first 64 KiB of the file and refused anything
+  whose program-header table or `PT_INTERP` string lay past that with `ELF header is truncated or
+  malformed`, though the binary was valid and ran on its own. `patchelf --add-needed` leaves a
+  binary that way: it moves the string to the end of the file. The launcher now reads both where
+  the headers place them, held to the kernel's own limits (a program-header table up to 64 KiB, an
+  interpreter path up to `PATH_MAX`). A file that really is cut short names the part that lies
+  past its end, and one the kernel would refuse says why. (#596)
+
 ## [0.2.3](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.3) - 2026-11-09
 
 The third patch release since 0.2.0. Every change to the public surface is additive, and no
