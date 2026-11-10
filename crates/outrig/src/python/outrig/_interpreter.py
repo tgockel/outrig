@@ -3300,6 +3300,9 @@ def _describe_awaited(fs, handles):
     described = []
     for f in fs:
         h = handles.get(id(f))
+        if h is not None and issubclass(type(f), asyncio.Task) and not _is_unnamed(f):
+            # A task stands for the handle it only awaits while nobody has named it.
+            h = None
         if type(h) is _agents.Handle:
             work = h._work
             if type(work) is _Call:
@@ -3328,6 +3331,29 @@ def _describe_awaited(fs, handles):
         described.append(d)
     described.sort(key=_awaited_order)
     return described[:TASKS_MAX], max(len(described) - TASKS_MAX, 0)
+
+
+def _is_unnamed(task):
+    """Whether nobody has named `task`: it is still called `Task-7`, as asyncio names one."""
+    # `asyncio.Task`'s own method, not an override a subclass of it may carry.
+    name = str.__str__(asyncio.Task.get_name(task))
+    return name.startswith("Task-") and name[5:].isascii() and name[5:].isdigit()
+
+
+def _wrapped_handles(fs):
+    """`{id(task): handle}` for each task in `fs` that only awaits a handle or a skill's
+    invocation, which is what `asyncio.ensure_future` makes of one, as it is no coroutine. Read
+    from types, fields and the task's own coroutine, so no agent code runs. A finished task keeps
+    its coroutine's code and its name, but not the frame that held what it awaited, so the tasks
+    are read before the wait, for the notice of its end as well."""
+    wrapped = {}
+    for f in fs:
+        code = _code_of(f) if issubclass(type(f), asyncio.Task) else None
+        if code and str.__str__(code.co_qualname) == "ensure_future.<locals>._wrap_awaitable":
+            awaited = inspect.getcoroutinelocals(asyncio.Task.get_coro(f)).get("awaitable")
+            if type(awaited) is _agents.Handle or type(awaited) is _skills.Invocation:
+                wrapped[id(f)] = awaited
+    return wrapped
 
 
 def _awaited_order(d):
@@ -4185,8 +4211,9 @@ class Runtime:
         can wait on them again. Nor are they cancelled when the code waiting here is, as a task it
         awaited directly would be.
 
-        `fs` holds futures -- tasks, usually -- not coroutines. Name them, as in
-        `asyncio.create_task(watch(), name="ci")`, so `done` says which is which.
+        `fs` holds futures -- tasks, usually -- or handles, not coroutines. A handle goes in as it
+        is. Name a task, as in `asyncio.create_task(watch(), name="ci")`, so `done` says which
+        is which.
         """
         # asyncio's own checks, in its own words, so what the mirror refuses is what asyncio does.
         if asyncio.isfuture(fs) or asyncio.iscoroutine(fs):
@@ -4209,6 +4236,15 @@ class Runtime:
             handles[id(f.future)] = f
             fs.discard(f)
             fs.add(f.future)
+        # What each future is described as, by identity: a handle's view is the handle, and so is a
+        # task that `asyncio.ensure_future` made to run one, until it is named. Read now, while
+        # those tasks still hold their handles, and used for the wait's end as well. Describing
+        # never fails a wait: a task that cannot be read is described as any other.
+        described_by = dict(handles)
+        try:
+            described_by.update(_wrapped_handles(fs))
+        except Exception as e:
+            _diag(f"reading a wait's tasks failed: {_plain_qualname(type(e))}")
         loop = asyncio.get_running_loop()
         # Woken for asyncio's reasons, as the waiter in `asyncio.tasks._wait` is: by the timer, or
         # by the one callback each future gets, which counts completions as they come. So `N`
@@ -4258,7 +4294,7 @@ class Runtime:
         def announce():
             nonlocal notice
             try:
-                on, more = _describe_awaited(fs, handles)
+                on, more = _describe_awaited(fs, described_by)
                 notice = {"wait": next(_ids), "exec": execution.id}
                 _notify({"t": "wait", "agent": kernel.agent, **notice, "on": on, "more": more,
                          "return_when": return_when, "timeout": timeout,
@@ -4314,7 +4350,7 @@ class Runtime:
                 # Best effort, and nothing agent code can override: the wait has ended as it
                 # ended, and a record without the end is the cost of one that cannot be read.
                 try:
-                    done, _ = _describe_awaited([f for f in fs if _is_done(f)], handles)
+                    done, _ = _describe_awaited([f for f in fs if _is_done(f)], described_by)
                     _notify({"t": "waited", "agent": kernel.agent, **notice, "how": how,
                              "done": done, "channels": channels, "error": error,
                              "elapsed": loop.time() - started})
@@ -4977,7 +5013,8 @@ class ChildChannel:
         The child receives a copy. Its reply is checked against the reply type, and one that fails
         counts one of `attempts`: past them the request ends `outrig.CompletionRejected`. A child
         holding its `requests-max` unsettled requests takes none: this raises
-        `outrig.AgentLimitReached`, sending nothing.
+        `outrig.AgentLimitReached`, sending nothing. `await` the handle, or give it to
+        `runtime.wait` as it is.
         """
         child, channel = self._child, self._child.channels[self._name]
         _refuse_closing()
@@ -5066,7 +5103,8 @@ class Child:
 
     def submit(self, inputs, *, result, attempts=3):
         """Give this work child `inputs`, a dict of names to values, to work on, its answer a
-        `result`; returns the submission's handle at once.
+        `result`; returns the submission's handle at once: `await` it, or give it to
+        `runtime.wait` as it is.
 
         Each input is bound in the child as a variable of its name, a copy: it must be data --
         `None`, a str, int, bool or float, a list or str-keyed dict of them, or a dataclass

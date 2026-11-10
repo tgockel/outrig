@@ -389,7 +389,10 @@ three times for one call before the rejection ends it.
     exists; `{kind: "call", id, function, child, name}`, a typed call of the `@outrig.agent`
     function `function`, by its qualified name, with its child once it exists;
     `{kind: "skill", id, skill}`, a skill's invocation; or `{kind: "future", type}`, any other
-    future, by its type's qualified name.
+    future, by its type's qualified name. A task nobody named, still called `Task-7`, whose only
+    work is `asyncio.ensure_future` of a handle or a skill's invocation is listed as that handle
+    or invocation, as it is when the code gives `runtime.wait` the handle itself; a task with a
+    name of its own, given before or while the wait runs, is listed by it.
   - `return_when`: asyncio's `FIRST_COMPLETED`, `FIRST_EXCEPTION`, or `ALL_COMPLETED`.
   - `timeout`: seconds, or `null`; and `elapsed`, how many seconds the wait had lasted when it
     was recorded, from which the timeout counts.

@@ -1958,6 +1958,9 @@ pub struct Held {
 #[non_exhaustive]
 pub enum Awaited {
     /// A task: its name, and its coroutine's qualified name when it has one.
+    /// A task nobody named whose only work is `asyncio.ensure_future` of a
+    /// handle or a skill's invocation is listed as that handle or invocation
+    /// instead.
     #[non_exhaustive]
     Task {
         /// Its name, as `asyncio.Task.get_name` gives it.

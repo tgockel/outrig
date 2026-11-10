@@ -73,6 +73,13 @@ without touching each other, from one ensured image. [The container facade besid
   `OpenWait`s, from another task while a round runs; it reads what the interpreter has said and
   never waits on it. Described from types and fields alone, so none of the agent's code runs for
   it. A wait that ends within the second records nothing. (#697)
+- **A wait names the handle `asyncio.ensure_future` wrapped.** A task nobody named whose only
+  work is `asyncio.ensure_future` of a handle or a skill's invocation is listed in
+  `exec.wait.started` and `exec.wait.ended` as that handle or invocation, as it is when the
+  code gives `runtime.wait` the handle itself, and no longer as asyncio's own
+  `ensure_future.<locals>._wrap_awaitable`; a task with a name of its own keeps it. The
+  docstrings of `runtime.wait`, `child.submit` and `child.channels[name].request` now say that
+  a handle goes into `runtime.wait` as it is. (#914)
 - **A model's own `style`.** `[models.<name>].style` overrides its provider's `style` for that
   model, so an endpoint that serves some models over Chat Completions and others over Anthropic's
   Messages API or the Responses API is one provider, its `style` the default. The request still

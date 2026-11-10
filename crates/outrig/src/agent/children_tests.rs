@@ -2391,6 +2391,98 @@ async fn handles_work_in_runtime_wait_and_asyncio_wait() {
     assert_eq!(data(refused[0])["ended"], "accepted");
 }
 
+/// A task nobody named that only awaits a handle, as `asyncio.ensure_future` makes of one, is told
+/// of in a wait as the handle is -- by its request and its child -- in what the wait is on and in
+/// what was done when it ended, though a finished task's frame no longer says. That holds for one
+/// that finished during the first second, before the wait was told of. A task the code named keeps
+/// its name, whether it was named before the wait or while it ran, and the sets `runtime.wait`
+/// returns hold the tasks.
+#[tokio::test]
+async fn a_wait_on_a_wrapped_handle_names_the_handle() {
+    let (quick, release) = (Flag::new(), Flag::new());
+    let mut tree = tree(
+        "OUTRIG_TEST_WRAPPED_WAIT",
+        "",
+        vec![
+            (
+                "ROLE held",
+                scripted(child_runs(
+                    "c1",
+                    &format!(
+                        r#"
+                        import os
+                        async def until(path):
+                            while not os.path.exists(path):
+                                await asyncio.sleep(0.01)
+                        d = await runtime.channels['fizz'].receive()
+                        await until({quick})
+                        await d.reply(Thing(n=1))
+                        d = await runtime.channels['fizz'].receive()
+                        await until({release})
+                        await d.reply(Thing(n=2))
+                        "#,
+                        quick = quick.py(),
+                        release = release.py()
+                    ),
+                )),
+            ),
+            (
+                "",
+                primary_waits(&format!(
+                    r#"
+                    await runtime.channels['user'].receive()
+                    child = await runtime.spawn('w', prompt='ROLE held', requests={{'fizz': (str, Thing)}})
+                    first = child.channels['fizz'].request('a')
+                    second = child.channels['fizz'].request('b')
+                    early = asyncio.ensure_future(first)
+                    bare = asyncio.ensure_future(second)
+                    named = asyncio.ensure_future(second)
+                    named.set_name('mine')
+                    renamed = asyncio.ensure_future(second)
+                    # The wait is told of once it has lasted a second: `early` is done by then, and
+                    # `bare`, `named` and `renamed` are done after. `renamed` is named while the
+                    # wait runs.
+                    loop = asyncio.get_running_loop()
+                    loop.call_later(0.2, lambda: renamed.set_name('late'))
+                    loop.call_later(0.3, lambda: open({quick}, 'w').close())
+                    loop.call_later(1.3, lambda: open({release}, 'w').close())
+                    fs = {{early, bare, named, renamed}}
+                    done, pending = await runtime.wait(fs)
+                    print(done == fs, pending == set(), (await first).n, (await second).n)
+                    "#,
+                    quick = quick.py(),
+                    release = release.py()
+                )),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(printed(&requests, "p1"), "True True 1 2\n");
+
+    let waited = |kind_of: &str, field: &str| -> Vec<Value> {
+        let found = kind(&events, kind_of, Some("agent/primary"));
+        assert_eq!(found.len(), 1, "{kind_of}: {found:?}");
+        data(found[0])[field].as_array().cloned().expect("a list")
+    };
+    let on = waited("exec.wait.started", "on");
+    assert_eq!(on, waited("exec.wait.ended", "done"));
+    assert_eq!(on.len(), 4, "{on:?}");
+    // Sorted by name: the two tasks the code named, then the two requests on the child `w`.
+    for (task, name) in on[..2].iter().zip(["late", "mine"]) {
+        assert_eq!(task["kind"], "task", "{on:?}");
+        assert_eq!(task["name"], name);
+    }
+    for request in &on[2..] {
+        assert_eq!(request["kind"], "request", "{on:?}");
+        assert_eq!(request["channel"], "fizz");
+        assert_eq!(request["child"], "c1");
+        assert_eq!(request["name"], "w");
+    }
+    assert!(on[2]["id"].is_u64() && on[2]["id"] != on[3]["id"], "{on:?}");
+}
+
 // ---------------------------------------------------------------------------- limits and the tree
 
 /// A request child's round that receives one request and replies with its id.
