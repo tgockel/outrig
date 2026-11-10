@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Output;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use std::time::Duration;
 use tokio::sync::OnceCell;
@@ -50,6 +50,7 @@ use crate::config::{
 use crate::engine_env;
 use crate::error::{OutrigError, Result};
 use crate::image::{ImageId, ImageTag, image_id};
+use crate::proc_pin::ProcPin;
 use crate::process::{self, Cmd, Transcript};
 use crate::supervise::Reissue;
 
@@ -131,9 +132,11 @@ pub struct Container {
     ///
     /// [`NetworkInterceptor::attach`]: crate::network::NetworkInterceptor::attach
     net_admin: bool,
-    /// Init PID, cached by [`Container::pid`] after the first `podman
-    /// inspect`.
-    pid: OnceCell<u32>,
+    /// A hold on the init process, cached by [`Container::pinned`] after the
+    /// first `podman inspect`. The number alone would not do: it is handed out
+    /// again once the container is gone, and this refers to the process that
+    /// held it when the engine named it, and to nothing after that.
+    pid: OnceCell<Arc<ProcPin>>,
     /// The engine's id for the image this container is running, cached by
     /// [`Container::image_id`] after the first `podman inspect`.
     ///
@@ -1040,18 +1043,43 @@ impl Container {
     /// Errors when the container is not running (`State.Pid == 0`): a created
     /// but unstarted container has no namespaces to join or intercept. Shared
     /// by the user bootstrap, the network interceptor, and `view = "primary"`
-    /// sidecars, which each want it during startup -- so the answer is cached
-    /// after the first success. It cannot go stale: a running container keeps
-    /// its init PID until it stops, and a stopped one is not restarted.
+    /// sidecars, which each want it during startup -- so the process is pinned
+    /// after the first success.
+    ///
+    /// The number is only as good as the moment it is read: a container that
+    /// exits gives it back to the kernel, which can hand it to any later
+    /// process. So the cached answer is not returned on faith. It is returned
+    /// only while the process pinned for it is still there, and an error says
+    /// the container has exited once it is not. Code that goes on to open
+    /// `/proc/<pid>/...` by path should expect the number to be only as good as
+    /// the moment it was checked; outrig's own users of it open through the
+    /// pinned process instead, which cannot be redirected in between.
     pub async fn pid(&self) -> Result<u32> {
-        if let Some(known) = self.pid.get() {
-            return Ok(*known);
-        }
-        let pid = self.inspect_pid().await?;
-        Ok(*self.pid.get_or_init(|| async { pid }).await)
+        Ok(self.pinned().await?.pid())
     }
 
-    async fn inspect_pid(&self) -> Result<u32> {
+    /// The init process, pinned (see [`ProcPin`]) when the engine first named
+    /// it, and checked to still be there now.
+    pub(crate) async fn pinned(&self) -> Result<Arc<ProcPin>> {
+        if let Some(pin) = self.pid.get() {
+            return self.still_there(pin);
+        }
+        let pin = Arc::new(self.inspect_pid().await?);
+        self.still_there(self.pid.get_or_init(|| async { pin }).await)
+    }
+
+    fn still_there(&self, pin: &Arc<ProcPin>) -> Result<Arc<ProcPin>> {
+        pin.ensure_live().map_err(|e| {
+            OutrigError::Configuration(format!(
+                "container {:?} has exited: its init process (pid {}) is gone ({e})",
+                self.name,
+                pin.pid()
+            ))
+        })?;
+        Ok(Arc::clone(pin))
+    }
+
+    async fn inspect_pid(&self) -> Result<ProcPin> {
         let text = self
             .inspect_format("{{.State.Pid}} {{.State.ConmonPid}}")
             .await?;
@@ -1084,16 +1112,19 @@ impl Container {
         // its conmon, so that parentage -- not `ServiceIsRemote`, which is true
         // of a working same-host socket too -- says the number means the same
         // process on both sides.
-        let parent = std::fs::read(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| parent_pid_from_stat(&stat));
+        //
+        // Read through a pin rather than by path, so that what is checked is
+        // what is kept: a number looked up twice can be two processes.
+        let not_local = || OutrigError::ContainerPidNotLocal {
+            container: self.name.clone(),
+            pid,
+        };
+        let pin = ProcPin::open(pid).map_err(|_| not_local())?;
+        let parent = pin.parent_pid().ok().flatten();
         if conmon == 0 || parent != Some(conmon) {
-            return Err(OutrigError::ContainerPidNotLocal {
-                container: self.name.clone(),
-                pid,
-            });
+            return Err(not_local());
         }
-        Ok(pid)
+        Ok(pin)
     }
 
     /// Whether podman networks the container with pasta, rootless podman 5's
@@ -1314,11 +1345,12 @@ impl Container {
             &format!("g{}", self.gid),
         );
 
-        let pid = self.pid().await?;
+        let pin = self.pinned().await?;
+        let pid = pin.pid();
         // Asked before the databases are opened: `passwd_changed` says why. Only
         // root's home comes from the entry, so only there can it be podman's.
         let planted = self.uid == 0 && self.passwd_changed().await;
-        let db = namespace::open_user_db(pid)
+        let db = namespace::open_user_db(&pin)
             .map_err(|e| self.bootstrap_failed(e.step.label_for(pid), e.source))?;
 
         let group_name = self.resolve_or_append(&db, namespace::Db::Group, &host_group)?;
@@ -1352,7 +1384,7 @@ impl Container {
             &user_name,
             &self.container_workspace,
         );
-        namespace::create_home(pid, Path::new(&home), self.uid, self.gid).map_err(|e| {
+        namespace::create_home(&pin, Path::new(&home), self.uid, self.gid).map_err(|e| {
             self.bootstrap_failed(format!("{} ({home})", e.step.label_for(pid)), e.source)
         })?;
         self.reconcile_home(&db, &raw, &home).await?;
@@ -2759,45 +2791,9 @@ fn diff_lists_passwd(diff: &[u8]) -> bool {
     !text.trim_start().starts_with('{') || text.contains("\"/etc/passwd\"")
 }
 
-/// The parent PID in the bytes of a `/proc/<pid>/stat`. `comm`, the second
-/// field, is the kernel's raw task name -- free bytes that may hold spaces,
-/// `)`, or a multibyte character cut mid-sequence by the 15-byte limit -- so
-/// the fields after it are found from the last `)` without decoding it.
-fn parent_pid_from_stat(stat: &[u8]) -> Option<u32> {
-    let after_comm = &stat[stat.iter().rposition(|&b| b == b')')? + 1..];
-    std::str::from_utf8(after_comm)
-        .ok()?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parent_pid_is_read_past_a_comm_with_parens_and_spaces() {
-        assert_eq!(
-            parent_pid_from_stat(b"1775180 (sleep) S 1775165 1 1 0"),
-            Some(1775165)
-        );
-        assert_eq!(parent_pid_from_stat(b"42 (a b) c) S 7 1 1 0"), Some(7));
-        assert_eq!(parent_pid_from_stat(b"42 (x) S"), None);
-        assert_eq!(parent_pid_from_stat(b"no parens"), None);
-    }
-
-    #[test]
-    fn parent_pid_is_read_past_a_comm_that_is_not_utf8() {
-        // A multibyte name truncated to the kernel's 15 bytes ends mid-character.
-        let mut stat = b"42 (".to_vec();
-        stat.extend_from_slice(&[b'a'; 13]);
-        stat.extend_from_slice(&"é".as_bytes()[..1]);
-        stat.extend_from_slice(b") S 7 1 1 0");
-        assert!(std::str::from_utf8(&stat).is_err());
-        assert_eq!(parent_pid_from_stat(&stat), Some(7));
-    }
 
     /// The release, like the stop, names the container the engine made: a
     /// `podman start <name>` could start whatever has taken the name since.

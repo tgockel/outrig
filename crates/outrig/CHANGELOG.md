@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A cached `Container::pid()` no longer outlives its container.** The init PID was read once and
+  then trusted for the life of the handle, so once the container exited and the kernel gave the
+  number to another process, `bootstrap_user` and the network interceptor would have opened that
+  process's namespaces and written its user databases and home directory. The process is now
+  pinned with a descriptor on `/proc/<pid>` when the engine names it, checked there against the
+  container's conmon, and the namespace files are opened through that descriptor. A handle whose
+  container has exited gets an error saying so. (#630)
+
 - **`outrig-enter` finds a payload's `PT_INTERP` wherever the file puts it.** The launcher
   classified a `view = "primary"` payload from the first 64 KiB of the file and refused anything
   whose program-header table or `PT_INTERP` string lay past that with `ELF header is truncated or

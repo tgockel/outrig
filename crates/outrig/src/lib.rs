@@ -41,6 +41,7 @@ pub mod mcp_proxy;
 pub mod network;
 mod nsfork;
 mod outrig_;
+mod proc_pin;
 mod process;
 mod repo;
 mod supervise;

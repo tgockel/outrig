@@ -27,6 +27,8 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 
 use nix::libc;
 
+use crate::proc_pin::ProcPin;
+
 /// The child's reply. `step` is zero on success; what a non-zero value means
 /// is the caller's to define. Travels as `[step: u32, errno: i32]`,
 /// little-endian -- a `SCM_RIGHTS` message needs a non-empty payload anyway,
@@ -338,9 +340,11 @@ pub(crate) struct UserMountNs {
 }
 
 impl UserMountNs {
-    pub(crate) fn open(pid: u32) -> Result<Self, (NsFile, io::Error)> {
-        let user = File::open(format!("/proc/{pid}/ns/user")).map_err(|e| (NsFile::User, e))?;
-        let mount = File::open(format!("/proc/{pid}/ns/mnt")).map_err(|e| (NsFile::Mount, e))?;
+    /// Opens them through `pin`, so they are the pinned process's and nobody
+    /// else's, whatever its pid has been handed to since.
+    pub(crate) fn open(pin: &ProcPin) -> Result<Self, (NsFile, io::Error)> {
+        let user = pin.open_file("ns/user").map_err(|e| (NsFile::User, e))?;
+        let mount = pin.open_file("ns/mnt").map_err(|e| (NsFile::Mount, e))?;
         Ok(Self { user, mount })
     }
 

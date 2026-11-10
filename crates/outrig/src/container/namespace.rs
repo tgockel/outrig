@@ -28,6 +28,7 @@ use std::path::Path;
 use nix::libc;
 
 use crate::nsfork;
+use crate::proc_pin::ProcPin;
 
 /// Where the child stopped. The numbering is the wire format between the
 /// child and its parent, so the values are stable.
@@ -228,8 +229,8 @@ impl UserDb {
 /// Pass 1: open the container's user databases from inside its namespaces.
 /// Reads nothing and writes nothing -- on any failure the container is exactly
 /// as it was.
-pub(super) fn open_user_db(pid: u32) -> Result<UserDb, NsError> {
-    let ns = open_ns(pid)?;
+pub(super) fn open_user_db(pin: &ProcPin) -> Result<UserDb, NsError> {
+    let ns = open_ns(pin)?;
     let passwd = CString::new(Db::Passwd.path()).expect("static path");
     let group = CString::new(Db::Group.path()).expect("static path");
 
@@ -271,8 +272,8 @@ pub(super) fn open_user_db(pid: u32) -> Result<UserDb, NsError> {
 /// `uid`:`gid`. Created inside the container's user namespace it would
 /// otherwise belong to the container's root. A home that already belongs to
 /// them is left as it is.
-pub(super) fn create_home(pid: u32, home: &Path, uid: u32, gid: u32) -> Result<(), NsError> {
-    let ns = open_ns(pid)?;
+pub(super) fn create_home(pin: &ProcPin, home: &Path, uid: u32, gid: u32) -> Result<(), NsError> {
+    let ns = open_ns(pin)?;
     let dirs = mkdir_p_paths(home)?;
     let overflow = (overflow_id("overflowuid"), overflow_id("overflowgid"));
 
@@ -398,8 +399,8 @@ fn overflow_id(sysctl: &str) -> u32 {
 
 /// The container's namespace files, opened in the parent so that a failure to
 /// open them never involves a child at all.
-fn open_ns(pid: u32) -> Result<nsfork::UserMountNs, NsError> {
-    nsfork::UserMountNs::open(pid).map_err(|(file, e)| NsError::new(file.into(), e))
+fn open_ns(pin: &ProcPin) -> Result<nsfork::UserMountNs, NsError> {
+    nsfork::UserMountNs::open(pin).map_err(|(file, e)| NsError::new(file.into(), e))
 }
 
 /// Report `step`, with `errno`, to the parent. Runs in the forked child:
@@ -451,7 +452,8 @@ mod tests {
         if nix::unistd::Uid::effective().is_root() {
             return; // root can join its own mount namespace; nothing to assert
         }
-        let err = open_user_db(std::process::id()).expect_err("own mount namespace");
+        let err = open_user_db(&ProcPin::open(std::process::id()).expect("pin ourselves"))
+            .expect_err("own mount namespace");
         assert_eq!(err.step, NsStep::SetnsMount, "unexpected step: {err}");
         assert_eq!(err.source.raw_os_error(), Some(libc::EPERM), "{err}");
     }
@@ -478,8 +480,12 @@ mod tests {
 
     #[test]
     fn a_missing_container_fails_before_forking() {
-        // pid 0 never has /proc entries, so this stops at the parent's open.
-        let err = open_user_db(0).expect_err("no such process");
+        // A reaped process has no namespaces to open, so this stops at the
+        // parent's open.
+        let mut child = std::process::Command::new("true").spawn().expect("spawn");
+        let pin = ProcPin::open(child.id()).expect("pin the child");
+        child.wait().expect("reap");
+        let err = open_user_db(&pin).expect_err("no such process");
         assert_eq!(err.step, NsStep::OpenUserNsFile);
     }
 

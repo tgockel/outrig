@@ -19,7 +19,6 @@
 //! that name.
 
 use std::collections::BTreeMap;
-use std::fs::File as StdFile;
 use std::future::Future;
 use std::io::{self, IoSlice, IoSliceMut, Write as _};
 
@@ -54,6 +53,7 @@ use crate::error::{
     Result,
 };
 use crate::nsfork;
+use crate::proc_pin::ProcPin;
 use crate::process::{self, Cmd, Transcript};
 use crate::supervise::{Reissue, detach_cleanup_chain};
 
@@ -757,8 +757,9 @@ impl NetworkInterceptor {
         // Before anything is changed, so a host with no resolver to forward to
         // refuses the attach with nothing to undo.
         let resolvers = host_resolvers()?;
-        let pid = container.pid().await?;
-        let sockets = bind_interceptor_sockets(pid)?;
+        let pin = container.pinned().await?;
+        let pid = pin.pid();
+        let sockets = bind_interceptor_sockets(&pin)?;
         // Before the redirect exists, so the probe leaves through pasta the way
         // a client's connection does without interception.
         let host_alias = if container.uses_pasta().await? {
@@ -781,7 +782,10 @@ impl NetworkInterceptor {
         let resolver = if container.dns_preconfigured() {
             None
         } else {
-            Some(Resolver::open(resolv_conf::Place::Container(pid), name)?)
+            Some(Resolver::open(
+                resolv_conf::Place::Container(Arc::clone(&pin)),
+                name,
+            )?)
         };
 
         // The undo log is this frame's, so a caller that drops this future
@@ -789,7 +793,7 @@ impl NetworkInterceptor {
         // the container back without needing a runtime to do it.
         // Before the first mutation, so a namespace that cannot be identified
         // is a refusal to start rather than an undo that cannot be trusted.
-        let mut rollback = Rollback::new(pid)?;
+        let mut rollback = Rollback::new(&pin)?;
         if let Err(e) = install_interception(
             &run,
             &mut rollback,
@@ -1202,9 +1206,16 @@ impl Rollback {
     /// an undo that cannot tell its namespace from a stranger's is one that
     /// must not run, and this is asked before the first mutation, so a refusal
     /// here means there is nothing to undo yet.
-    fn new(pid: u32) -> Result<Self> {
+    fn new(pin: &ProcPin) -> Result<Self> {
+        let pid = pin.pid();
+        // Through the pin, so the identity recorded is that of the process
+        // that was checked and not of whoever holds its pid by now.
+        let netns = pin.open_file("ns/net").and_then(|ns| {
+            use std::os::unix::fs::MetadataExt;
+            ns.metadata().map(|ns| (ns.dev(), ns.ino()))
+        });
         Ok(Self {
-            netns: match namespace_id(pid) {
+            netns: match classify_namespace(netns, || pin.ensure_live().is_err()) {
                 NamespaceAnswer::Is(netns) => netns,
                 NamespaceAnswer::Gone | NamespaceAnswer::Unknown => {
                     return Err(OutrigError::Configuration(format!(
@@ -4030,11 +4041,16 @@ fn require_tool(name: &str) -> Result<()> {
     )))
 }
 
-fn bind_interceptor_sockets(pid: u32) -> Result<InterceptorSockets> {
-    let user_ns_path = format!("/proc/{pid}/ns/user");
-    let net_ns_path = format!("/proc/{pid}/ns/net");
-    let user_ns = StdFile::open(&user_ns_path).path_ctx("open", &user_ns_path)?;
-    let net_ns = StdFile::open(&net_ns_path).path_ctx("open", &net_ns_path)?;
+fn bind_interceptor_sockets(pin: &ProcPin) -> Result<InterceptorSockets> {
+    // Through the pin: a descriptor on the namespace of the process that was
+    // checked, not whatever the number names by the time it is opened.
+    let pid = pin.pid();
+    let open = |which: &str| {
+        pin.open_file(&format!("ns/{which}"))
+            .path_ctx("open", format!("/proc/{pid}/ns/{which}"))
+    };
+    let user_ns = open("user")?;
+    let net_ns = open("net")?;
     let (tcp, dns, dns_tcp, probe) =
         bind_interceptor_socket_fds(user_ns.as_raw_fd(), net_ns.as_raw_fd())?;
     let tcp = std::net::TcpListener::from(tcp);
@@ -5047,6 +5063,12 @@ fn dns_label(bytes: &[u8]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File as StdFile;
+
+    /// An undo log keyed to this test process's own namespace.
+    fn this_process_rollback() -> Result<Rollback> {
+        Rollback::new(&ProcPin::open(std::process::id()).expect("pin this process"))
+    }
 
     /// [`run_step`], holding the tracing gate for as long as it emits.
     ///
@@ -5445,7 +5467,7 @@ mod tests {
     /// failed is the thing this reports.
     #[tokio::test]
     async fn a_non_zero_undo_reaches_the_caller() {
-        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        let mut rollback = this_process_rollback().expect("this process has a namespace");
         rollback.arm(Cmd::new("/bin/sh").arg("-c").arg("exit 3"));
 
         let run = |cmd: Cmd| run_step_gated(cmd, None);
@@ -5472,7 +5494,7 @@ mod tests {
     async fn every_undo_runs_after_one_fails_and_the_failures_are_reported() {
         let dir = tempfile::tempdir().expect("tempdir");
         let reached = dir.path().join("reached");
-        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        let mut rollback = this_process_rollback().expect("this process has a namespace");
         // Armed first, so it is discharged last: reaching it at all is the
         // claim.
         rollback.arm(touch(&reached));
@@ -5527,7 +5549,7 @@ mod tests {
         let resolver = FakeResolver::new();
         let fake = FakeRunner::watching(&resolver);
         let run = |cmd: Cmd| fake.run(cmd);
-        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        let mut rollback = this_process_rollback().expect("this process has a namespace");
 
         install(&run, &mut rollback, &target(), &resolver)
             .await
@@ -5823,7 +5845,7 @@ mod tests {
                 // that, so the abort window must not be the one that expires.
                 tasks: JoinSet::new(),
                 idle,
-                rollback: Rollback::new(std::process::id()).expect("a namespace"),
+                rollback: this_process_rollback().expect("a namespace"),
                 transcript: None,
                 audit: audit_sink(dir.path()).await,
                 panics: ConnPanics::default(),
@@ -6389,7 +6411,7 @@ mod tests {
         };
         let run = |cmd: Cmd| fake.run(cmd);
         let resolver = FakeResolver::new();
-        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        let mut rollback = this_process_rollback().expect("this process has a namespace");
         install(&run, &mut rollback, &target(), &resolver)
             .await
             .expect("install interception");
@@ -6426,7 +6448,7 @@ mod tests {
     #[tokio::test]
     async fn a_partly_discharged_rollback_keeps_its_arming_order() {
         let resolver = FakeResolver::new();
-        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        let mut rollback = this_process_rollback().expect("this process has a namespace");
         rollback.arm(resolver.failing_restore());
         rollback.arm(delete_nft_table(std::process::id(), "outrig_test"));
 
@@ -6456,7 +6478,7 @@ mod tests {
     #[tokio::test]
     async fn an_undo_that_fails_stays_armed_for_the_destructor() {
         let resolver = FakeResolver::new();
-        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        let mut rollback = this_process_rollback().expect("this process has a namespace");
         rollback.arm(resolver.failing_restore());
         rollback.arm(delete_nft_table(std::process::id(), "outrig_test"));
 
@@ -6488,7 +6510,7 @@ mod tests {
             ..FakeRunner::default()
         };
         let run = |cmd: Cmd| fake.run(cmd);
-        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        let mut rollback = this_process_rollback().expect("this process has a namespace");
 
         let resolver = FakeResolver::new();
         let cause = install(&run, &mut rollback, &target(), &resolver)
@@ -6528,7 +6550,7 @@ mod tests {
             ..FakeRunner::default()
         };
         let run = |cmd: Cmd| fake.run(cmd);
-        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        let mut rollback = this_process_rollback().expect("this process has a namespace");
 
         let installed = install(&run, &mut rollback, &target(), &resolver).await;
         assert!(installed.is_err(), "the nft apply was injected to fail");
@@ -6553,7 +6575,7 @@ mod tests {
         let run = |cmd: Cmd| fake.run(cmd);
         let target = target();
         let resolver = FakeResolver::new();
-        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        let mut rollback = this_process_rollback().expect("this process has a namespace");
         {
             let mut installing = Box::pin(install(&run, &mut rollback, &target, &resolver));
             assert!(
@@ -6577,7 +6599,7 @@ mod tests {
     async fn a_dns_preconfigured_container_has_no_resolver_to_restore() {
         let fake = FakeRunner::default();
         let run = |cmd: Cmd| fake.run(cmd);
-        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        let mut rollback = this_process_rollback().expect("this process has a namespace");
 
         install_interception(
             &run,
@@ -6609,7 +6631,7 @@ mod tests {
         let fake = FakeRunner::default();
         let run = |cmd: Cmd| fake.run(cmd);
         let resolver = FakeResolver::new();
-        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        let mut rollback = this_process_rollback().expect("this process has a namespace");
         install(&run, &mut rollback, &target(), &resolver)
             .await
             .expect("install interception");
@@ -6662,7 +6684,7 @@ mod tests {
         };
         let run = |cmd: Cmd| fake.run(cmd);
         let resolver = FakeResolver::new();
-        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        let mut rollback = this_process_rollback().expect("this process has a namespace");
         let target = target();
         {
             let installing = install(&run, &mut rollback, &target, &resolver);
@@ -6708,8 +6730,7 @@ mod tests {
             };
             let run = |cmd: Cmd| fake.run(cmd);
             let resolver = FakeResolver::new();
-            let mut rollback =
-                Rollback::new(std::process::id()).expect("this process has a namespace");
+            let mut rollback = this_process_rollback().expect("this process has a namespace");
 
             let failed = install(&run, &mut rollback, &target(), &resolver)
                 .await
@@ -6758,8 +6779,7 @@ mod tests {
             };
             let run = |cmd: Cmd| fake.run(cmd);
             let resolver = FakeResolver::new();
-            let mut rollback =
-                Rollback::new(std::process::id()).expect("this process has a namespace");
+            let mut rollback = this_process_rollback().expect("this process has a namespace");
 
             let failed = install(&run, &mut rollback, &target(), &resolver)
                 .await
@@ -6798,7 +6818,7 @@ mod tests {
         };
         let run = |cmd: Cmd| fake.run(cmd);
         let resolver = FakeResolver::new();
-        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        let mut rollback = this_process_rollback().expect("this process has a namespace");
 
         install(&run, &mut rollback, &target(), &resolver)
             .await
@@ -6837,8 +6857,7 @@ mod tests {
         let second = dir.path().join("second");
 
         {
-            let mut rollback =
-                Rollback::new(std::process::id()).expect("this process has a namespace");
+            let mut rollback = this_process_rollback().expect("this process has a namespace");
             rollback.arm(touch(&first));
             rollback.arm(touch(&second));
         }
@@ -6855,8 +6874,7 @@ mod tests {
     fn a_dropped_rollback_has_put_the_resolver_back_when_it_returns() {
         let resolver = FakeResolver::new();
         {
-            let mut rollback =
-                Rollback::new(std::process::id()).expect("this process has a namespace");
+            let mut rollback = this_process_rollback().expect("this process has a namespace");
             rollback.arm(resolver.restore());
         }
 
@@ -6988,8 +7006,11 @@ mod tests {
     /// discover that is while there is still nothing to undo.
     #[test]
     fn a_rollback_refuses_a_namespace_it_cannot_identify() {
-        // No process can hold pid 0, so nothing names a namespace here.
-        let refused = Rollback::new(0).expect_err("pid 0 has no namespace");
+        // A process that has been reaped has no namespace to name.
+        let mut child = std::process::Command::new("true").spawn().expect("spawn");
+        let pin = ProcPin::open(child.id()).expect("pin the child");
+        child.wait().expect("reap");
+        let refused = Rollback::new(&pin).expect_err("a reaped process has no namespace");
         assert!(
             refused.to_string().contains("could not be identified"),
             "{refused}"
@@ -8175,7 +8196,7 @@ mod tests {
                 cancel: CancellationToken::new(),
                 tasks: JoinSet::new(),
                 idle,
-                rollback: Rollback::new(std::process::id()).expect("a namespace"),
+                rollback: this_process_rollback().expect("a namespace"),
                 transcript: None,
                 audit: audit_sink(dir.path()).await,
                 panics,

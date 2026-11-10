@@ -27,11 +27,13 @@ use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::Path;
+use std::sync::Arc;
 
 use nix::libc;
 
 use crate::error::{IoPathExt as _, OutrigError, Result};
 use crate::nsfork::{self, EnterStep, NsFile, Status};
+use crate::proc_pin::ProcPin;
 
 /// Where the resolver is, inside the container.
 const RESOLV_CONF: &CStr = c"/etc/resolv.conf";
@@ -50,8 +52,10 @@ fn path() -> &'static Path {
 /// Where a resolver lives.
 #[derive(Debug, Clone)]
 pub(super) enum Place {
-    /// `/etc/resolv.conf` in the container whose init holds this pid.
-    Container(u32),
+    /// `/etc/resolv.conf` in the container whose init this pins. Pinned, not
+    /// numbered: the undo is issued long after the install, and by then the
+    /// number may name another container.
+    Container(Arc<ProcPin>),
     /// A file on this host: the same child, entering nothing. Test-only on
     /// purpose, so no production path can name the host's own resolver.
     #[cfg(test)]
@@ -440,8 +444,8 @@ where
     F: FnOnce(RawFd, &CStr),
 {
     let collected = match place {
-        Place::Container(pid) => {
-            let ns = nsfork::UserMountNs::open(*pid).map_err(|(file, e)| {
+        Place::Container(pin) => {
+            let ns = nsfork::UserMountNs::open(pin).map_err(|(file, e)| {
                 let which = match file {
                     NsFile::User => "user",
                     NsFile::Mount => "mount",
