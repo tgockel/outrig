@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A canceled build no longer strands its temporary tag behind a slow working-container
+  removal.** The label commit's working container and the build's `outrig-tmp-*` tag were owed by
+  two guards that, dropped by a canceled future, reissued their removals side by side. buildah
+  refuses the tag's `rmi` while the container exists, so the `rmi` could spend its whole retry
+  budget before a slow or refused `rm` finished, leaving the built image behind. Both are now
+  held by one owner and detached as a single ordered chain, `rm` then `rmi`, run by one shell in
+  its own process group. It outlives the process, starts the `rmi` as soon as the `rm` answers,
+  and is killed whole, command included, if it wedges. (#633)
+
 - **A cached `Container::pid()` no longer outlives its container.** The init PID was read once and
   then trusted for the life of the handle, so once the container exited and the kernel gave the
   number to another process, `bootstrap_user` and the network interceptor would have opened that

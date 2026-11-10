@@ -307,7 +307,7 @@ fn hand_back(unqueued: Wait, program: &'static str) {
         "the rest of a cleanup chain has no thread to sequence it; \
          waiting the head out in place"
     );
-    if !proved_gone(&mut head, WEDGED_CLEANUP) {
+    if !proved_gone(&mut head, &waiting.cmd, WEDGED_CLEANUP) {
         // Abandoned rather than run beside a head that may still be going.
         // This is the one outcome that is merely bad rather than wrong.
         tracing::debug!(
@@ -335,7 +335,7 @@ fn hand_back(unqueued: Wait, program: &'static str) {
 /// agent -- `podman exec`, whose container-side process outlives its killed
 /// client -- may still have work going on the other side, and no kill here can
 /// establish otherwise.
-fn proved_gone(head: &mut Child, patience: Duration) -> bool {
+fn proved_gone(head: &mut Child, cmd: &Cmd, patience: Duration) -> bool {
     let deadline = Instant::now() + patience;
     loop {
         match head.try_wait() {
@@ -355,7 +355,7 @@ fn proved_gone(head: &mut Child, patience: Duration) -> bool {
         "a cleanup head did not end within the wedged deadline; killing it so \
          the rest of its chain can run in order"
     );
-    if head.kill().is_err() {
+    if kill_cleanup(head, cmd).is_err() {
         return false;
     }
     let until = Instant::now() + patience;
@@ -399,9 +399,19 @@ fn spawn_orphaned_chain(then: std::collections::VecDeque<Cmd>) {
 
 /// The commands as a single `sh` that runs them in order.
 ///
-/// A sequencer that needs no runtime and no reaper, for the path where
-/// neither is available. Ordering still has to hold there, and launching the
-/// commands side by side is exactly that failure.
+/// A sequencer that needs no runtime and no reaper: it is an ordinary process,
+/// so it outlives outrig itself -- the later command still runs when the CLI
+/// exits on the error while an earlier one is slow -- and ordering holds on the
+/// path where neither is available, where launching the commands side by side
+/// is exactly that failure. It starts the next the moment the last one answers,
+/// "not known" included.
+///
+/// Wedging is bounded from outside, by [`kill_cleanup`]: the shell runs in a
+/// process group of its own, and the reaper's watchdog
+/// signals the group, shell and running command alike. Nothing in here signals
+/// anything by number, so no pid it names can have been recycled. What a kill
+/// gives up is the tail, which is no loss for a chain of removals: whatever
+/// wedged one of them is what the next one would have waited on.
 ///
 /// Every argv element is passed as a positional parameter and referenced by
 /// index, so nothing is interpolated into the script: an argument is bytes
@@ -433,6 +443,25 @@ fn ordered_shell(cmds: std::collections::VecDeque<Cmd>) -> Cmd {
         .arg(script)
         .arg("outrig")
         .args(argv)
+        .in_own_process_group()
+}
+
+/// Kill the process `child` is, and with it -- for a chain -- whatever it is
+/// running.
+///
+/// `child` is unreaped, which is what makes the signal safe to send: its pid is
+/// not free to be handed to anything else while the kernel still holds its
+/// status, and a group named by it is not free either.
+fn kill_cleanup(child: &mut Child, cmd: &Cmd) -> std::io::Result<()> {
+    if cmd.leads_process_group() {
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .map_err(std::io::Error::from)
+    } else {
+        child.kill()
+    }
 }
 
 /// Start one attempt at `cmd`, with stdio nulled.
@@ -666,7 +695,7 @@ impl Wait {
             // zombie.
             Ok(None) => {
                 if self.kill == Kill::Untried && self.since.elapsed() >= self.patience {
-                    match child.kill() {
+                    match kill_cleanup(child, &self.cmd) {
                         Ok(()) => {
                             self.kill = Kill::Sent;
                             tracing::debug!(
@@ -835,13 +864,23 @@ impl CleanupGuard {
     ///
     /// For removals where a later one cannot succeed until an earlier one has:
     /// dropped separately they run side by side, and the later one can spend
-    /// its whole retry budget while the earlier is still being refused. The
-    /// chain starts each after the last has finished, with a budget of its own.
+    /// its whole retry budget while the earlier is still being refused.
     ///
-    /// The chain is reissued only if every removal in it may be.
+    /// The sequencing is done by one `sh` that runs them in order
+    /// ([`ordered_shell`]), not by the reaper starting each after the last.
+    /// A process outlives outrig itself, so the later removal still runs when
+    /// the CLI exits on the error that canceled the build while an earlier one
+    /// is slow; a reaper thread dies with it. The shell also starts the later
+    /// removal the moment the earlier one answers -- including with "not
+    /// known", which is what a removal of something that was never created
+    /// says -- where a chained head would back off and retry first. The
+    /// shell's status is the last removal's, and a reissue runs the whole
+    /// sequence again, which is harmless because the chain is reissued only if
+    /// every removal in it may be. The reaper supervises the shell like any
+    /// cleanup, and its wedge kill reaches the whole group.
     pub(crate) fn detach_chain(guards: Vec<CleanupGuard>) {
         let mut reissue = Reissue::Safe;
-        let cmds = guards
+        let mut cmds: std::collections::VecDeque<Cmd> = guards
             .into_iter()
             .filter_map(|mut guard| guard.0.take())
             .map(|(cmd, each)| {
@@ -851,7 +890,11 @@ impl CleanupGuard {
                 cmd
             })
             .collect();
-        detach_cleanup_chain(cmds, reissue);
+        match cmds.len() {
+            0 => {}
+            1 => detach_cleanup(cmds.pop_front().expect("one command"), reissue),
+            _ => detach_cleanup(ordered_shell(cmds), reissue),
+        }
     }
 }
 
@@ -1351,7 +1394,7 @@ mod tests {
         // Patience far longer than the command needs, so reaching the kill at
         // all would be the failure.
         assert!(
-            proved_gone(&mut head, Duration::from_secs(5)),
+            proved_gone(&mut head, &Cmd::new("/bin/true"), Duration::from_secs(5)),
             "a head that exits has to be proved gone"
         );
         let status = head
@@ -1379,7 +1422,11 @@ mod tests {
             .spawn()
             .expect("spawn head");
 
-        let proved = proved_gone(&mut head, Duration::from_millis(100));
+        let proved = proved_gone(
+            &mut head,
+            &Cmd::new("/bin/sleep"),
+            Duration::from_millis(100),
+        );
         let status = head.try_wait().expect("collected");
         // Observed, then cleaned up, then asserted. An implementation that
         // answered without killing would otherwise leave a ten-minute process
@@ -1533,6 +1580,91 @@ mod tests {
 
         wait_for(&second, Duration::from_secs(10), "the chain to finish");
         assert!(first.exists(), "the first removal must have run");
+    }
+
+    /// A chain whose first removal finds nothing to remove goes on to the next
+    /// at once, rather than backing off and retrying the first. The first is
+    /// what a working container's `rm` says when canceled before `buildah
+    /// from` made it, and the next is the temporary tag's `rmi`, which the CLI
+    /// exiting would otherwise strand while the retry waited.
+    #[test]
+    fn a_chain_goes_on_past_a_first_removal_that_finds_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("log");
+        let done = dir.path().join("done");
+        let record = |what: &str, status: i32| {
+            Cmd::new("/bin/sh").arg("-c").arg(format!(
+                "echo {what} >> {}; [ {status} -eq 0 ] && : > {}; exit {status}",
+                log.display(),
+                done.display()
+            ))
+        };
+
+        CleanupGuard::detach_chain(vec![
+            CleanupGuard::arm(record("rm", 125), Reissue::Safe),
+            CleanupGuard::arm(record("rmi", 0), Reissue::Safe),
+        ]);
+
+        wait_for(&done, Duration::from_secs(10), "the chain to finish");
+        // Past the backoff a retried head would have waited out.
+        std::thread::sleep(RETRY_BACKOFF * 2);
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("log"),
+            "rm\nrmi\n",
+            "the first removal must run once, then the second"
+        );
+    }
+
+    /// A chain whose removal wedges is killed whole, and the reaper does it:
+    /// the shell and the command it is running both go, where signalling the
+    /// shell alone left the command running. The tail is abandoned, as a lone
+    /// wedged command is -- it is owed nothing the wedged one would have let go.
+    #[test]
+    fn a_wedged_chain_is_killed_with_the_command_it_is_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("pid");
+        let after = dir.path().join("after");
+
+        let shell = ordered_shell(
+            vec![
+                Cmd::new("/bin/sh")
+                    .arg("-c")
+                    .arg(format!("echo $$ > {}; exec sleep 30", pidfile.display())),
+                Cmd::new("/bin/sh")
+                    .arg("-c")
+                    .arg(format!(": > {}", after.display())),
+            ]
+            .into(),
+        );
+        let child = spawn_cleanup(&shell).expect("the shell starts");
+        let shell_pid = child.id() as i32;
+        let wedged = published_pid(&pidfile, "the wedged removal");
+
+        let mut waiting = Wait::running(shell, child, Reissue::Safe, Default::default());
+        waiting.patience = Duration::from_millis(100);
+        // Driven by hand rather than through the reaper thread, so the test
+        // reads the outcome off the same call that made it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while waiting.still_owed() {
+            assert!(
+                Instant::now() < deadline,
+                "the wedged chain was never ended"
+            );
+            std::thread::sleep(REAP_POLL);
+        }
+
+        // Gone, or a zombie that init has yet to collect: the sandbox's pid 1
+        // does not reap.
+        let dead = |pid: i32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z "))
+                || !std::path::Path::new(&format!("/proc/{pid}")).exists()
+        };
+        let until = Instant::now() + Duration::from_secs(10);
+        while !(dead(wedged) && dead(shell_pid)) {
+            assert!(Instant::now() < until, "the chain's processes still run");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!after.exists(), "the tail of a wedged chain is abandoned");
     }
 
     /// Kills the blocked cleanups however the test ends, so a failed assertion

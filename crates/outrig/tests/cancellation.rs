@@ -1674,6 +1674,49 @@ async fn a_temp_tag_removal_waits_for_the_working_container_removal() {
     expect_refusals_spent(journal, "rm", &token);
 }
 
+/// Issue #633: a build canceled while its working container exists still
+/// removes the temporary tag, however long the container's removal takes.
+///
+/// The cancellation lands in `buildah from`, so both the working container's
+/// guard and the tag's are armed and drop together. Dropped separately they
+/// run side by side, and the `rmi` -- refused as in use while the container
+/// exists -- spends its ~0.9 s of retries against an `rm` that is refused
+/// twice and takes 500 ms an attempt. Chained, the `rmi` starts after the `rm`
+/// is done, and the container's removal is what the fake's in-use refusal
+/// holds the tag's behind.
+#[tokio::test]
+async fn a_canceled_build_removes_its_tag_after_a_slow_working_container_removal() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+
+    let token = unique_name("cancel-chain");
+    return_immediately_for(journal, "build", &token);
+    refuse_for(journal, "rm", &token, 2);
+    slow_for(journal, "rm", &token, "0.5");
+
+    let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
+    let final_tag = keyed_tag(&token, &cfg, context.path()).await;
+    let build = outrig::image::build_image_for(&token, &cfg, context.path(), &final_tag, false);
+    let mut build = Box::pin(build);
+
+    let from = ["outrig-label-", token.as_str()];
+    let (client, from_argv) = tokio::select! {
+        _ = &mut build => panic!("the fake `buildah from` should not have returned"),
+        found = invocation(journal, "from", &from) => found,
+    };
+    let builder = flag_value(&from_argv, "--name");
+    // The parent stays alive, so the reaper runs what the drop detaches.
+    drop(build);
+    expect_gone(client).await;
+
+    let (_, build_argv) = invocation(journal, "build", &[token.as_str()]).await;
+    let temp_tag = flag_value(&build_argv, "--tag");
+    expect_removed(journal, &builder).await;
+    expect_removed(journal, &temp_tag).await;
+    expect_refusals_spent(journal, "rm", &token);
+}
+
 /// A tag the build never created is not removed again.
 ///
 /// Every build that fails before tagging reaches the `rmi` of a tag that does

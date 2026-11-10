@@ -210,6 +210,12 @@ impl Cmd {
         self
     }
 
+    /// Whether the child leads a process group of its own; see
+    /// [`Cmd::in_own_process_group`].
+    pub(crate) fn leads_process_group(&self) -> bool {
+        self.own_process_group
+    }
+
     /// The argv as executed. For deciding what runs, never for display.
     pub(crate) fn exec_args(&self) -> &[OsString] {
         &self.args
