@@ -176,6 +176,55 @@ println!("{} ({:?})", code.digest, code.label);
 # }
 ```
 
+A session with no primary agent runs the application's own agent instead: its owner constructs a
+root from a class the application code holds, in a kernel of its own, where the instance is
+`self`. The arguments are data, as JSON, or the session's facilities by the names they were bound
+under -- a service `SessionBuilder::serve` bound, a binding -- and never an object of the owner's.
+What comes back is a `RootHandle`, never the Python object: `ready()` once the root's orienting
+round has ended, or what its launch met instead -- a constructor that raised, with its traceback,
+included; `release()`; and, for each method the class marks `@outrig.agent`, `request()`, whose
+outcome is the reply as JSON text the root's kernel checked against the method's return type, for
+the owner to deserialize into a type of its own. The root's rounds open through its own runner, on
+its orienting round and on each request, and never through `Session::round`:
+
+```rust,no_run
+# async fn example(config: outrig::config::Config, spec: outrig::harness::ApplicationSpec,
+#     task: std::sync::Arc<dyn outrig::harness::Service>)
+#     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+use outrig::harness::{Argument, ConstructSpec, Facility, SessionBuilder};
+use serde_json::json;
+
+let session = SessionBuilder::new(config, None, None)
+    .no_primary()
+    .application(spec)
+    .serve("task", task)
+    .start()
+    .await?;
+let root = session
+    .construct(
+        ConstructSpec::new("review.agents:Reviewer", "fast")
+            .arg("task", Argument::Facility(Facility::service("task")))
+            .alias("task"),
+    )
+    .await?;
+root.ready().await?;
+#[derive(serde::Deserialize)]
+struct Verdict {
+    path: String,
+    ok: bool,
+}
+let reply = root.request("review", json!("src/main.py"))?.outcome().await?;
+let verdict: Verdict = serde_json::from_str(&reply)?;
+println!("{}: {}", verdict.path, verdict.ok);
+root.release().await;
+# Ok(())
+# }
+```
+
+`SessionBuilder::construct` constructs the root as the session starts, failing the start when it
+cannot be, and `SessionBuilder::check` resolves its model and keys before any container exists;
+`Session::constructed` is its handle, and `Session::root` finds any root by its instance id.
+
 ## The container facade beside `harness`
 
 An application can run an engine of its own over the container facade beside one over `harness`,

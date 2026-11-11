@@ -63,6 +63,15 @@ impl Fixture {
         Self::described(Self::methods())
     }
 
+    /// A task's service, as an application binds one: `update_progress(note)` records a note.
+    pub(crate) fn task() -> Arc<Self> {
+        Self::described(vec![MethodDescription::new(
+            "update_progress",
+            "Record progress on the task.",
+            object(json!({"note": {"type": "string"}}), &["note"]),
+        )])
+    }
+
     fn described(methods: Vec<MethodDescription>) -> Arc<Self> {
         let mut description = ServiceDescription::new("The test service.");
         description.methods = methods;

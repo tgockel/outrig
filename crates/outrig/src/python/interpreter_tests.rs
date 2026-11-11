@@ -7254,6 +7254,108 @@ fn an_instance_holds_what_is_asked_of_it_until_its_child_exists() {
     assert!(notices.is_empty(), "nothing sent: {notices:?}");
 }
 
+/// What the session's owner constructs, as the interpreter sees it: a root's kernel, opened with
+/// a construct record, constructs the class it is told to on its own loop -- the arguments made
+/// from what the owner described -- and answers with what the host makes its child of; the
+/// instance is that kernel's `self`, and an alias the argument itself. An argument that is
+/// neither data nor a facility is refused naming it, and a constructor that names a model other
+/// than the owner's is refused naming both.
+#[test]
+fn a_root_is_constructed_in_its_own_kernel() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        &py(r#"
+            import outrig
+            class Thing(outrig.Agent):
+                """ROLE thing."""
+                def __init__(self, note, *, model=None):
+                    super().__init__(model=model)
+                    self.note = note
+                @outrig.agent
+                async def ask(self, question: str) -> str:
+                    """Answer it."""
+                    ...
+            "#),
+    );
+    let class = format!("{PRIMARY_MODULE}:Thing");
+    let construct = |agent: &str, id: u64, args: Value, aliases: Value| {
+        json!({"t": "construct", "agent": agent, "id": id, "class": class, "args": args,
+               "aliases": aliases})
+    };
+    let open = |agent: &str| {
+        json!({"t": "open", "agent": agent, "main": false,
+               "child": {"kind": "request", "construct": "Thing", "model": "m",
+                         "requests_max": 2}})
+    };
+
+    k.opened(open("c1"));
+    k.send(construct(
+        "c1",
+        2,
+        json!([{"name": "note", "mystery": 1}]),
+        json!([]),
+    ));
+    let refused = k.recv();
+    assert_eq!(refused["t"], "constructed", "{refused}");
+    assert_eq!(refused["id"], 2);
+    assert_eq!(
+        refused["error"],
+        json!({"code": "invalid-argument", "traceback": "",
+               "message": "argument 'note' is neither data nor a facility"})
+    );
+
+    k.opened(open("c2"));
+    k.send(construct(
+        "c2",
+        3,
+        json!([{"name": "note", "data": "\"hi\"", "type": null},
+               {"name": "model", "data": "\"other\"", "type": null}]),
+        json!([]),
+    ));
+    let refused = k.recv();
+    assert_eq!(refused["error"]["code"], "raised", "{refused}");
+    assert!(
+        text(&refused["error"]["message"]).contains("cannot run on model='other'"),
+        "{refused}"
+    );
+
+    k.opened(open("c3"));
+    k.send(construct(
+        "c3",
+        4,
+        json!([{"name": "note", "data": "\"hi\"", "type": null}]),
+        json!(["note"]),
+    ));
+    let answer = k.recv();
+    assert_eq!(answer["t"], "constructed", "{answer}");
+    let declared = &answer["declaration"];
+    assert_eq!(declared["prompt"], "ROLE thing.");
+    assert_eq!(declared["channels"][0]["name"], "ask");
+    assert_eq!(declared["instance"]["qualname"], "Thing");
+    assert_eq!(declared["instance"]["self"], true);
+    assert_eq!(declared["instance"]["aliases"], json!(["note"]));
+    assert_eq!(
+        k.output_in(
+            "c3",
+            5,
+            "print(self.note, note is self.note, type(self).__name__)"
+        ),
+        "hi True Thing\n"
+    );
+    let inventory = k.ask(json!({"t": "inv", "agent": "c3", "id": 6}));
+    let names: Vec<String> = inventory["globals"]
+        .as_array()
+        .expect("globals")
+        .iter()
+        .map(|row| text(&row[0]))
+        .collect();
+    assert!(
+        !names.iter().any(|name| name == "self" || name == "note"),
+        "hidden as bound at boot: {names:?}"
+    );
+}
+
 /// The host's word that an instance cannot be ready raises at `ready()`, as the error it names;
 /// and the session's close ends an instance still launching -- its `ready()` and what it holds
 /// raise the closing error -- and says it was released by the close once its child is known.
@@ -7441,6 +7543,7 @@ fn help_on_an_agent_class_says_what_self_is() {
         "one attribute read or write is atomic",
         "keep per-agent state on `self`",
         "nothing collects an instance while its child lives",
+        "where it is `self` and needs no marked method",
     ] {
         assert!(told.contains(said), "{said:?} in {told}");
     }

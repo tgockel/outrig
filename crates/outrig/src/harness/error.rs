@@ -4,6 +4,7 @@ use std::fmt;
 
 use serde::Serialize;
 
+use super::root::RootError;
 use crate::agent::AgentError;
 
 /// Why a session failed to start, or a round failed to run. Its text says
@@ -30,6 +31,24 @@ pub enum SessionError {
     /// [`SessionBuilder::no_primary`](super::SessionBuilder::no_primary).
     #[error("the session has no primary agent, so it runs no rounds")]
     NoPrimary,
+    /// The session has a primary agent, whose owner is the user at its `user`
+    /// channel, so its owner constructs no root: a root is constructed in a
+    /// session started with
+    /// [`SessionBuilder::no_primary`](super::SessionBuilder::no_primary).
+    #[error("the session has a primary agent, so its owner constructs no root")]
+    Primary,
+    /// The root [`SessionBuilder::construct`](super::SessionBuilder::construct)
+    /// asked for, `class`, was not launched as the session started: `error`
+    /// says why, as its [`RootHandle::ready`](super::RootHandle::ready) would.
+    /// Nothing the start launched is left running.
+    #[error("the root `{class}` could not start: {error}")]
+    Construct {
+        /// The class, as the builder named it.
+        class: String,
+        /// Why: boxed, as the largest of these, since every `Err` this
+        /// crate hands back is the size of its largest variant.
+        error: Box<RootError>,
+    },
 }
 
 /// What went wrong, rendered as text: what OutRig's own types and the model

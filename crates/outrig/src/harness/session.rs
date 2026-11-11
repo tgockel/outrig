@@ -2,17 +2,18 @@
 //! and how it stops.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use super::application::{ApplicationIdentity, Prepared};
 use super::bindings::{Bindings, Brief};
 use super::builder::{self, SessionBuilder};
-use super::event::{Payload, SessionState};
+use super::event::{AgentInstanceId, Payload, SessionState};
 use super::lifecycle::Lifecycle;
 use super::report::{
     self, EventDelivery, ExecutionOutcome, ExecutionStatus, ShutdownReport, Stopped,
 };
+use super::root::{ConstructSpec, Owner, RootError, RootHandle};
 use super::services::Services;
 use super::skills::Catalog;
 use super::{Closed, ClosedBy, Failure, SessionError, UserChannel};
@@ -69,6 +70,11 @@ pub struct Session {
     ledger: Ledger,
     /// The child agents its agents launch.
     children: Children,
+    /// Its owner, as the parent of the roots it constructs, once it has
+    /// constructed one.
+    owner: OnceLock<Arc<Owner>>,
+    /// The root its builder constructed as it started, if it asked for one.
+    constructed: Option<RootHandle>,
     /// Why its shutdown is to say it is not proven stopped, for a test.
     #[cfg(test)]
     fail_stop: Option<String>,
@@ -146,6 +152,8 @@ impl Session {
             application: None,
             ledger,
             children,
+            owner: OnceLock::new(),
+            constructed: None,
             #[cfg(test)]
             fail_stop: None,
         }
@@ -384,6 +392,72 @@ impl Session {
         self.bindings.live().cloned()
     }
 
+    /// Construct, in a kernel of its own, the root `spec` describes: an
+    /// instance of a class the session's application code holds
+    /// ([`SessionBuilder::application`]), constructed with `spec`'s arguments
+    /// -- data, and the session's facilities by their bound names -- whose
+    /// `__init__`, `__outrig_attach__` and attachment run in that kernel, where
+    /// the instance is `self`. Returns once the kernel has answered, before the
+    /// root's orienting round: [`RootHandle::ready`] says how the launch went,
+    /// a failure included -- a class that does not import, an argument that
+    /// does not decode, a constructor that raises, an unknown model,
+    /// `children-max`, the session's close. A root whose construction failed
+    /// called no model, and its kernel has ended.
+    ///
+    /// The root is a child of the session's owner, at depth 1, counted by
+    /// `children-max` and `requests-max` as any child. Its rounds open through
+    /// its own runner, on its orienting round and on each request; the owner
+    /// never drives one, and [`Session::round`] stays
+    /// [`SessionError::NoPrimary`]. A class with no request channel is
+    /// constructed too: its work reaches it some other way, such as a
+    /// facility it was given.
+    ///
+    /// [`SessionError::Primary`] for a session with a primary agent, whose
+    /// owner is the user at its `user` channel.
+    pub async fn construct(&self, spec: ConstructSpec) -> Result<RootHandle, SessionError> {
+        if self.agent.is_some() {
+            return Err(SessionError::Primary);
+        }
+        let owner = self
+            .owner
+            .get_or_init(|| Owner::attach(self.children.clone()));
+        Ok(owner.construct(&spec).await)
+    }
+
+    /// The root this session's owner constructed whose instance is `id`, while
+    /// it is launched and not released.
+    pub fn root(&self, id: AgentInstanceId) -> Option<RootHandle> {
+        self.owner.get()?.root(id)
+    }
+
+    /// The root [`SessionBuilder::construct`] constructed as the session
+    /// started, or `None` when it asked for none.
+    pub fn constructed(&self) -> Option<RootHandle> {
+        self.constructed.clone()
+    }
+
+    /// Construct the root the builder asked for, as the session starts: a
+    /// root that was not launched fails the start, saying why.
+    pub(crate) async fn construct_at_start(
+        &mut self,
+        spec: ConstructSpec,
+    ) -> Result<(), SessionError> {
+        let class = spec.class().to_string();
+        let root = self.construct(spec).await?;
+        if root.agent().is_none() {
+            let error = match root.ready().await {
+                Err(error) => error,
+                Ok(()) => RootError::Other("it was not launched".into()),
+            };
+            return Err(SessionError::Construct {
+                class,
+                error: Box::new(error),
+            });
+        }
+        self.constructed = Some(root);
+        Ok(())
+    }
+
     /// The session's child agents, for a program on the host that owns it,
     /// whose agent class instances are root children: held through its
     /// shutdown, which a request may meet.
@@ -491,6 +565,8 @@ impl Session {
             application: _,
             ledger: _,
             children,
+            owner: _,
+            constructed: _,
             #[cfg(test)]
             fail_stop,
         } = self;

@@ -57,7 +57,9 @@ use crate::harness::event::{
 use crate::harness::lifecycle::Lifecycle;
 use crate::harness::services::ServiceBrief;
 use crate::harness::{ClosedBy, RequestOutcome};
-use crate::python::host::{Channels, ChildLines, Counts, Interpreter, OWNER};
+use crate::python::host::{
+    Channels, ChildLines, Counts, ImportFailure, Interpreter, InterpreterError, OWNER,
+};
 
 /// How long a released child's kernel has to stop before it is taken for
 /// wedged: its code never yields, and its thread runs on.
@@ -118,6 +120,10 @@ pub(crate) struct Inner {
     /// made later is oriented with, and one made earlier is told of.
     injected: Injected,
 }
+
+/// What a release marked ([`State::mark_released`]): each child, whether it was still launching,
+/// and its runner.
+type Marked = Vec<(String, bool, Option<JoinHandle<()>>)>;
 
 #[derive(Default)]
 struct State {
@@ -250,10 +256,12 @@ impl Summary {
     }
 }
 
-/// Why a launch was refused, as the spawn's answer names it.
+/// Why a launch was refused, as the spawn's answer names it: for a root
+/// whose construction failed, with the failure.
 struct Refused {
     kind: &'static str,
     message: String,
+    failure: Option<ImportFailure>,
 }
 
 impl Refused {
@@ -261,6 +269,7 @@ impl Refused {
         Self {
             kind,
             message: message.into(),
+            failure: None,
         }
     }
 }
@@ -270,6 +279,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Children {
+    /// The session's `requests-max`: how many requests may be open on one
+    /// child at once.
+    pub(crate) fn requests_max(&self) -> u32 {
+        self.0.settings.limits.requests_max
+    }
+
     /// What the session has learned of its models' windows.
     pub(crate) fn windows(&self) -> &Windows {
         &self.0.settings.windows
@@ -485,6 +500,34 @@ impl State {
             .is_some_and(|node| matches!(node.life, Life::Released | Life::Wedged))
     }
 
+    /// Mark each of `ids` released, and everything below each: every child after its parent,
+    /// with whether it was still launching and its runner. One released already is passed over,
+    /// and what is below it was marked with it.
+    fn mark_released(&mut self, ids: &[String]) -> Marked {
+        let mut subtree = Vec::new();
+        let mut next: Vec<String> = ids.to_vec();
+        while let Some(id) = next.pop() {
+            let Some(node) = self.agents.get_mut(&id) else {
+                continue;
+            };
+            let Some(child) = node.child.as_mut() else {
+                continue;
+            };
+            if matches!(child.life, Life::Released | Life::Wedged) {
+                continue;
+            }
+            let launching = child.life == Life::Launching;
+            child.life = Life::Released;
+            // Woken to see it, and not stopped: a round in flight is given until its next model
+            // call to end (`Inner::end_released`).
+            child.wake.notify_one();
+            let runner = child.runner.take();
+            next.extend(node.children.iter().cloned());
+            subtree.push((id, launching, runner));
+        }
+        subtree
+    }
+
     /// What `child` holds open: see [`Inner::summary`].
     fn summary(&self, child: &str, kind: ChildKind) -> Summary {
         let mut summary = Summary::default();
@@ -598,28 +641,31 @@ impl Inner {
     async fn spawn(self: Arc<Self>, parent: String, line: Value) {
         let ask = line["id"].clone();
         let answer = match self.launch(&parent, &line).await {
-            Ok((child, instance)) => json!({
+            // A root constructed in its kernel says its channels, which only the kernel knew.
+            Ok((child, instance, channels)) => json!({
                 "t": "spawned", "agent": parent, "id": ask, "child": child, "instance": instance,
-                "requests_max": self.settings.limits.requests_max,
+                "requests_max": self.settings.limits.requests_max, "channels": channels,
             }),
             Err(refused) => json!({
                 "t": "spawned", "agent": parent, "id": ask,
-                "error": {"kind": refused.kind, "message": refused.message},
+                "error": {"kind": refused.kind, "message": refused.message,
+                          "failure": refused.failure},
             }),
         };
         self.answer(&parent, answer);
     }
 
-    /// Launch the child `line` asks for under `parent`, and return its id, and
-    /// a root child's instance id, which its kernel gave it. The
-    /// session's admission, the depth and `children-max` decide before
-    /// anything is made, and the place it takes is its own from then on;
-    /// anything that fails after gives it back, and leaves no child.
+    /// Launch the child `line` asks for under `parent`, and return its id, a
+    /// root child's instance id, which its kernel gave it, and the channels of
+    /// a root constructed in its kernel. The session's admission, the depth
+    /// and `children-max` decide before anything is made, and the place it
+    /// takes is its own from then on; anything that fails after gives it back,
+    /// and leaves no child.
     async fn launch(
         self: &Arc<Self>,
         parent: &str,
         line: &Value,
-    ) -> Result<(String, Option<u64>), Refused> {
+    ) -> Result<(String, Option<u64>, Option<Value>), Refused> {
         let limits = self.settings.limits;
         let kind = match line["kind"].as_str() {
             Some("request") => ChildKind::Request,
@@ -724,8 +770,32 @@ impl Inner {
             .make(&id, &name, kind, &model, depth, lineage, parent, line)
             .await
         {
-            Ok(instance) => Ok((id, instance)),
+            Ok((instance, channels)) => Ok((id, instance, channels)),
             Err(refused) => {
+                // What it launched before it failed -- a root's constructor runs in its kernel
+                // and may launch agents -- is released with it, under the one lock: it is marked,
+                // so a launch it asked for and that has not begun never does, and so is each it
+                // launched and still holds, with everything below. One its code released already
+                // is passed over.
+                let (launched, subtree) = {
+                    let mut state = self.state();
+                    if let Some(child) = state.child_mut(&id) {
+                        child.life = Life::Released;
+                    }
+                    let launched: Vec<String> = state
+                        .agents
+                        .get(&id)
+                        .into_iter()
+                        .flat_map(|node| &node.children)
+                        .filter(|child| !state.released(child))
+                        .cloned()
+                        .collect();
+                    let subtree = state.mark_released(&launched);
+                    (launched, subtree)
+                };
+                if !subtree.is_empty() {
+                    self.end_released(&id, &launched, subtree).await;
+                }
                 let mut state = self.state();
                 state.agents.remove(&id);
                 if let Some(node) = state.agents.get_mut(parent) {
@@ -737,7 +807,8 @@ impl Inner {
     }
 
     /// Make child `id`: resolve its model, open its kernel, build it, and
-    /// start its runner.
+    /// start its runner. A root the owner asked to have constructed in its
+    /// kernel is constructed there first, and made of what the kernel answers.
     #[allow(clippy::too_many_arguments)]
     async fn make(
         self: &Arc<Self>,
@@ -749,13 +820,18 @@ impl Inner {
         lineage: (CallSlot, Option<u32>),
         parent: &str,
         line: &Value,
-    ) -> Result<Option<u64>, Refused> {
+    ) -> Result<(Option<u64>, Option<Value>), Refused> {
         let settings = &self.settings;
+        let construct = line
+            .get("construct")
+            .filter(|construct| construct.is_object());
         // A root child with no model named, in a configuration with no
-        // `default-model`, has none, which resolving says.
+        // `default-model`, has none, which resolving says. A root the owner
+        // constructs runs on the model it named, which no `[agents.<name>]`
+        // profile changes.
         let mut resolved = resolve::resolve_agent(
             &settings.config,
-            settings.agent.as_deref(),
+            settings.agent.as_deref().filter(|_| construct.is_none()),
             Some(model).filter(|model| !model.is_empty()),
             &*settings.secrets,
         )
@@ -774,6 +850,24 @@ impl Inner {
         // The tool limits come with the session's agent; its preamble does not
         // (0003-30's fork 1): what a child needs, its parent's prompt says.
         resolved.preamble = None;
+        let handle = self.interpreter.for_agent(id);
+        // A root constructed in its kernel is made of what the kernel says of it, as a spawn's
+        // line says it of any other instance.
+        let constructed = match construct {
+            Some(construct) => {
+                let mut line = line.clone();
+                if let Value::Object(declared) =
+                    self.construct(id, name, model, &handle, construct).await?
+                {
+                    for (key, value) in declared {
+                        line[key] = value;
+                    }
+                }
+                Some(line)
+            }
+            None => None,
+        };
+        let line = constructed.as_ref().unwrap_or(line);
         let inputs = briefs(&line["manifest"]);
         // The facilities it was given, and of each what its instructions say; none for a child
         // whose view is the session's.
@@ -781,39 +875,24 @@ impl Inner {
         let facilities: Option<Vec<FacilityBrief>> = given
             .as_ref()
             .map(|given| given.iter().map(|given| given.brief.clone()).collect());
-        let channels: Vec<ChannelText> = line["channels"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|channel| ChannelText {
-                name: text(&channel["name"]),
-                doc: channel["doc"].as_str().map(str::to_string),
-                request_type: text(&channel["request_type"]),
-                reply_type: text(&channel["reply_type"]),
-                request: text(&channel["request"]),
-                reply: text(&channel["reply"]),
-            })
-            .collect();
-        let handle = self.interpreter.for_agent(id);
-        let minted = handle
-            .open_child(
-                id,
-                json!({
-                    "kind": if kind == ChildKind::Request { "request" } else { "work" },
-                    "spawn": line["id"],
-                    "requests_max": settings.limits.requests_max,
-                    // A root child's, which the program described.
-                    "root": line["root"],
-                }),
-            )
-            .await
-            // A root child's kernel opens only while the session does.
-            .map_err(|e| {
-                Refused::new(
-                    if self.closed() { "closed" } else { "other" },
-                    e.to_string(),
+        let channels = channel_texts(&line["channels"]);
+        let minted = match constructed {
+            // Opened already, and its instance's id said with the rest.
+            Some(_) => line["instance"]["id"].as_u64(),
+            None => handle
+                .open_child(
+                    id,
+                    json!({
+                        "kind": if kind == ChildKind::Request { "request" } else { "work" },
+                        "spawn": line["id"],
+                        "requests_max": settings.limits.requests_max,
+                        // A root child's, which the program described.
+                        "root": line["root"],
+                    }),
                 )
-            })?;
+                .await
+                .map_err(|e| self.not_opened(e))?,
+        };
         let events = handle.events().clone();
         let briefed: Vec<ChannelBrief> = channels
             .iter()
@@ -933,7 +1012,8 @@ impl Inner {
             let Some(child) = node.child.as_mut() else {
                 return Err(Refused::new("other", "the child was ended as it launched"));
             };
-            // A root child's instance the close has said is released never starts.
+            // A root child's instance the close has said is released never starts, nor one the
+            // close came to first.
             let owned = (parent == OWNER).then(|| state.owned.entry(id.to_string()).or_default());
             // Its parent may have been released while this launched it,
             // leaving it to this to end.
@@ -942,7 +1022,10 @@ impl Inner {
                     "released",
                     "the agent launching it was released",
                 ))
-            } else if owned.as_ref().is_some_and(|owned| owned.released) {
+            } else if owned
+                .as_ref()
+                .is_some_and(|owned| owned.released || state.closed.is_some())
+            {
                 Some(Refused::new(
                     "closed",
                     "the session closed as the child launched",
@@ -985,7 +1068,76 @@ impl Inner {
             self.interpreter.end(id, WEDGE_WAIT).await;
             return Err(refused);
         }
-        Ok(minted)
+        Ok((
+            minted,
+            constructed.is_some().then(|| line["channels"].clone()),
+        ))
+    }
+
+    /// Why a child's kernel did not open: a root child's opens only while the
+    /// session does.
+    fn not_opened(&self, e: InterpreterError) -> Refused {
+        Refused::new(
+            if self.closed() { "closed" } else { "other" },
+            e.to_string(),
+        )
+    }
+
+    /// Construct, in a kernel opened for root `id`, the instance `construct`
+    /// asks for -- `class`, `module:qualname`; `args`; `aliases` -- on
+    /// `model`, and return what the kernel says the child is made of. One
+    /// that fails, or that the session's close comes to first, ends the
+    /// kernel and is recorded, and no model is called.
+    async fn construct(
+        &self,
+        id: &str,
+        name: &str,
+        model: &str,
+        handle: &Interpreter,
+        construct: &Value,
+    ) -> Result<Value, Refused> {
+        handle
+            .open_child(
+                id,
+                json!({
+                    "kind": "request", "construct": name, "model": model,
+                    "requests_max": self.settings.limits.requests_max,
+                }),
+            )
+            .await
+            .map_err(|e| self.not_opened(e))?;
+        // The interpreter's close answers a construction it comes to, `closing`; one the
+        // interpreter's exit comes to is answered here the same way.
+        let failure = match handle.construct(construct).await {
+            Ok(Ok(declared)) => return Ok(declared),
+            Ok(Err(failure)) => failure,
+            Err(e) => ImportFailure {
+                code: "closing".to_string(),
+                message: format!("the session ended before it was constructed: {e}"),
+                traceback: String::new(),
+            },
+        };
+        self.interpreter.end(id, WEDGE_WAIT).await;
+        let class = text(&construct["class"]);
+        let (module, qualname) = class.split_once(':').unwrap_or((&class, ""));
+        self.interpreter
+            .events()
+            .emit(Payload::AgentConstructFailed {
+                class: class.clone(),
+                module: module.to_string(),
+                qualname: qualname.to_string(),
+                code: failure.code.clone(),
+                reason: failure.reason(),
+            });
+        Err(Refused {
+            kind: if failure.code == "closing" {
+                "closed"
+            } else {
+                "construct"
+            },
+            message: failure.message.clone(),
+            failure: Some(failure),
+        })
     }
 
     // -------------------------------------------------------------- requests
@@ -1712,31 +1864,15 @@ impl Inner {
                     ));
                 }
             }
-            // Each named child and everything below it, every child after its
-            // parent, and whether it is still launching.
-            let mut subtree = Vec::new();
-            let mut next: Vec<String> = ids.to_vec();
-            while let Some(id) = next.pop() {
-                let Some(node) = state.agents.get_mut(&id) else {
-                    continue;
-                };
-                let Some(child) = node.child.as_mut() else {
-                    continue;
-                };
-                if matches!(child.life, Life::Released | Life::Wedged) {
-                    continue;
-                }
-                let launching = child.life == Life::Launching;
-                child.life = Life::Released;
-                // Woken to see it, and not stopped: a round in flight is
-                // given until its next model call to end (see below).
-                child.wake.notify_one();
-                let runner = child.runner.take();
-                next.extend(node.children.iter().cloned());
-                subtree.push((id, launching, runner));
-            }
-            subtree
+            state.mark_released(ids)
         };
+        self.end_released(releaser, ids, subtree).await;
+        Ok(())
+    }
+
+    /// End what `releaser`'s release of `ids` marked ([`State::mark_released`]): each kernel,
+    /// the deepest first, and what each child held, and say so.
+    async fn end_released(self: &Arc<Self>, releaser: &str, ids: &[String], subtree: Marked) {
         // The deepest first, so each child's kernel ends after those below it.
         // One still launching may have no kernel yet: its launch ends it.
         let ended: Vec<String> = subtree.iter().map(|(id, ..)| id.clone()).collect();
@@ -1779,7 +1915,6 @@ impl Inner {
             ended,
             requests,
         });
-        Ok(())
     }
 
     /// `child`'s kernel is gone: it no longer counts against `children-max`.
@@ -1843,6 +1978,24 @@ async fn wind_down(runner: Option<JoinHandle<()>>) {
         runner.abort();
         let _ = runner.await;
     }
+}
+
+/// The request channels a spawn line, or a root's kernel, declares: each one as a child's
+/// instructions describe it.
+pub(crate) fn channel_texts(channels: &Value) -> Vec<ChannelText> {
+    channels
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|channel| ChannelText {
+            name: text(&channel["name"]),
+            doc: channel["doc"].as_str().map(str::to_string),
+            request_type: text(&channel["request_type"]),
+            reply_type: text(&channel["reply_type"]),
+            request: text(&channel["request"]),
+            reply: text(&channel["reply"]),
+        })
+        .collect()
 }
 
 /// How a request ended, as the interpreter names it.

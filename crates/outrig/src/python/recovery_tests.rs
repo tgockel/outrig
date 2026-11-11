@@ -933,7 +933,7 @@ async fn a_background_wedge_is_ended_and_the_execution_it_stalled_finishes() {
     let billed: Vec<_> = report.background.iter().map(|entry| entry.id).collect();
     assert_eq!(
         billed,
-        [started_it],
+        [Some(started_it)],
         "the task's death, billed to its starter: {report:?}"
     );
     assert!(

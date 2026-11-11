@@ -10,6 +10,7 @@ use super::approval::Approver;
 use super::bindings::{self, BindingSpec, Bindings, Declared, Places, Setup};
 use super::event::{DEFAULT_CAPACITY, Subscription};
 use super::lifecycle::Lifecycle;
+use super::root::ConstructSpec;
 use super::services::{self, Service, ServicePolicy, Services};
 use super::skills::{self, Catalog, SkillSource};
 use super::{Failure, Session, SessionError};
@@ -103,6 +104,8 @@ pub struct SessionBuilder {
     skill_sources: Vec<(String, Arc<dyn SkillSource>)>,
     /// The application code given through [`SessionBuilder::application`].
     application: Option<ApplicationSpec>,
+    /// The root given through [`SessionBuilder::construct`].
+    construct: Option<ConstructSpec>,
     /// How long each module the application imports at start may take, in
     /// place of [`READY_TIMEOUT`].
     #[cfg(test)]
@@ -164,6 +167,7 @@ impl SessionBuilder {
             repo_root: None,
             skill_sources: Vec::new(),
             application: None,
+            construct: None,
             #[cfg(test)]
             import_bound: None,
             #[cfg(test)]
@@ -362,6 +366,22 @@ impl SessionBuilder {
         self
     }
 
+    /// Construct the root `spec` describes as the session starts, once its application code
+    /// is provisioned, and before the start returns: [`Session::constructed`] is its handle.
+    /// [`SessionBuilder::check`], and the start before anything is launched, resolve its model
+    /// and each `${VAR}` its keys name. A root that is not constructed fails the start, naming
+    /// why; one whose orienting round fails says so at [`RootHandle::ready`]. See
+    /// [`Session::construct`] for what construction is; a session with a primary agent
+    /// constructs none.
+    ///
+    /// A later call replaces an earlier one; [`Session::construct`] constructs more.
+    ///
+    /// [`RootHandle::ready`]: super::RootHandle::ready
+    pub fn construct(mut self, spec: ConstructSpec) -> Self {
+        self.construct = Some(spec);
+        self
+    }
+
     /// A subscription to the session's events, from its first, holding up to
     /// [`DEFAULT_CAPACITY`] of them for its reader.
     pub fn subscribe(&mut self) -> Subscription {
@@ -398,7 +418,21 @@ impl SessionBuilder {
         skills::check_sources(&self.skill_sources)
             .map_err(|e| start_error(OutrigError::Configuration(e)))?;
         application::check(self.application.as_ref()).map_err(start_error)?;
-        Ok(())
+        self.check_root()
+    }
+
+    /// The root [`SessionBuilder::construct`] asked for: its model, and the keys it names,
+    /// resolved as a root's are; and a session that may construct one.
+    fn check_root(&self) -> Result<(), SessionError> {
+        let Some(spec) = &self.construct else {
+            return Ok(());
+        };
+        if self.primary {
+            return Err(SessionError::Primary);
+        }
+        agent::resolve(&self.config, None, Some(&spec.model), &*self.secrets)
+            .map(|_| ())
+            .map_err(|e| SessionError::Resolve(Failure(e)))
     }
 
     /// The model and its keys, resolved once: a resolver backed by a secret
@@ -505,6 +539,7 @@ impl SessionBuilder {
         skills::check_sources(&self.skill_sources)
             .map_err(|e| start_error(OutrigError::Configuration(e)))?;
         application::check(self.application.as_ref()).map_err(start_error)?;
+        self.check_root()?;
         let repo_root = chosen_repo_root(self.repo_root.as_deref()).map_err(start_error)?;
         let mut spec = match self.container.take() {
             Some(spec) => spec,
@@ -597,6 +632,7 @@ impl SessionBuilder {
             session,
             application,
             resolved.as_mut(),
+            self.construct.take(),
             workspace.as_deref(),
             &catalog,
         )
@@ -745,6 +781,7 @@ impl SessionBuilder {
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         services::check_names(&declared, &self.served).map_err(start_error)?;
         application::check(self.application.as_ref()).map_err(start_error)?;
+        self.check_root()?;
         let repo_root = chosen_repo_root(self.repo_root.as_deref()).map_err(start_error)?;
         let id = self.host_id.take().unwrap_or_else(|| "test".to_string());
         let log_dir = self.host_log.clone().unwrap_or_default();
@@ -794,6 +831,7 @@ impl SessionBuilder {
             session,
             application,
             resolved.as_mut(),
+            self.construct.take(),
             workspace.as_deref(),
             &catalog,
         )
@@ -845,15 +883,17 @@ async fn default_container(
 }
 
 /// `session`, with its application code provisioned -- each module imported
-/// at start within the bound beside it -- and the primary agent `resolved`
-/// names -- none, for a session with no primary agent -- in a container whose
-/// workspace is `workspace`, holding the session's skills, `catalog`, and
-/// idle. Application code that does not import, or a primary that cannot be
-/// built, stops what the start launched.
+/// at start within the bound beside it -- the primary agent `resolved` names
+/// -- none, for a session with no primary agent -- or the root `construct`
+/// describes, in a container whose workspace is `workspace`, holding the
+/// session's skills, `catalog`, and idle. Application code that does not
+/// import, a primary that cannot be built, or a root not constructed, stops
+/// what the start launched.
 async fn assemble(
     mut session: Session,
     application: Option<(Prepared, std::time::Duration)>,
     resolved: Option<&mut ResolvedAgent>,
+    construct: Option<ConstructSpec>,
     workspace: Option<&Path>,
     catalog: &Arc<Catalog>,
 ) -> Result<Session, SessionError> {
@@ -868,6 +908,12 @@ async fn assemble(
     {
         session.abandon().await;
         return Err(SessionError::Start(Failure(e)));
+    }
+    if let Some(spec) = construct
+        && let Err(e) = session.construct_at_start(spec).await
+    {
+        session.abandon().await;
+        return Err(e);
     }
     session.idle();
     Ok(session)

@@ -442,6 +442,17 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             None,
         ),
         (
+            "agent.construct.failed",
+            {
+                "class": "review.agents:Reviewer",
+                "module": "review.agents",
+                "qualname": "Reviewer",
+                "code": "raised",
+                "reason": "ValueError: no",
+            },
+            None,
+        ),
+        (
             "skill.discovered",
             {
                 "skills": [
@@ -607,7 +618,10 @@ def every_event() -> list[tuple[str, dict, str | None]]:
                 "output": "o",
                 "dropped": 1,
                 "error": "e",
-                "background": [{"id": 2, "output": "o", "dropped": 1}],
+                "background": [
+                    {"id": 2, "output": "o", "dropped": 1},
+                    {"id": None, "output": "c", "dropped": 0},
+                ],
             },
             a,
         ),

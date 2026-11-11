@@ -206,7 +206,7 @@ impl Background {
     /// As an event carries it.
     pub(crate) fn public(&self) -> event::Background {
         event::Background {
-            id: self.id.public(),
+            id: self.id.map(ExecId::public),
             output: self.output.clone(),
             dropped: self.dropped,
         }
@@ -228,7 +228,9 @@ pub(crate) struct Report {
 /// Output from an earlier execution, delivered with a later result.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct Background {
-    pub(crate) id: ExecId,
+    /// The execution that wrote it, or `None` for the construction of a root
+    /// its session's owner constructed in the agent's kernel, which is none.
+    pub(crate) id: Option<ExecId>,
     pub(crate) output: String,
     pub(crate) dropped: u64,
 }
@@ -564,6 +566,8 @@ enum Query {
     Bound(oneshot::Sender<()>),
     /// The application declared: the answer for each module imported at start, as it comes.
     Imported(mpsc::UnboundedSender<Imported>),
+    /// A root constructed in its kernel: what its child is made of, or why it was not.
+    Constructed(oneshot::Sender<Result<Value, ImportFailure>>),
 }
 
 /// One protocol line from the interpreter, which names the agent it concerns.
@@ -664,6 +668,13 @@ enum Reply {
         module: String,
         error: Option<ImportFailure>,
     },
+    /// The answer to a construction asked under `id`: what the root's child is
+    /// made of, as a spawn line says it of an instance, or why it was not.
+    Constructed {
+        id: ExecId,
+        declaration: Option<Value>,
+        error: Option<ImportFailure>,
+    },
     /// A `runtime.wait` the agent's code has been suspended in for a while:
     /// what it waits on, and for how long so far.
     Wait {
@@ -737,14 +748,32 @@ pub(crate) struct Imported {
     pub(crate) error: Option<ImportFailure>,
 }
 
-/// Why a module of the application's did not import at start.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// Why a module of the application's did not import at start, or why a root
+/// its session's owner asked for was not constructed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct ImportFailure {
-    /// `import-failed`, `native-extension-unavailable` or `module-missing`.
+    /// `import-failed`, `native-extension-unavailable` or `module-missing`;
+    /// for a construction also `class-missing`, `not-an-agent-class`,
+    /// `invalid-argument`, `raised`, or `closing` when the session closed
+    /// first.
     pub(crate) code: String,
     pub(crate) message: String,
-    /// The last 16 KiB of the traceback.
+    /// The last 16 KiB of the traceback, or empty when there is none.
     pub(crate) traceback: String,
+}
+
+impl ImportFailure {
+    /// What an event says of it: the message, then the traceback when there
+    /// is one, its control characters but line breaks and tabs escaped.
+    pub(crate) fn reason(&self) -> String {
+        let Self {
+            message, traceback, ..
+        } = self;
+        crate::harness::skills::printable(&match traceback.is_empty() {
+            true => message.clone(),
+            false => format!("{message}\n{traceback}"),
+        })
+    }
 }
 
 impl Interpreter {
@@ -960,6 +989,24 @@ impl Interpreter {
             )));
         };
         answered?.map_err(not_opened)
+    }
+
+    /// Construct, in this handle's kernel -- a root's, opened with a construct
+    /// record -- the agent class instance `construct` describes (its `class`,
+    /// `args` and `aliases`), and wait for the answer: what the root's child is
+    /// made of, or why it was not constructed. No bound: a construction runs
+    /// the application's own code, which ends when it does, and the session's
+    /// close answers one it comes to.
+    pub(crate) async fn construct(
+        &self,
+        construct: &Value,
+    ) -> Result<Result<Value, ImportFailure>, InterpreterError> {
+        let line = json!({
+            "t": "construct", "class": construct["class"], "args": construct["args"],
+            "aliases": construct["aliases"],
+        });
+        let receiver = self.request(line, Query::Constructed, |_, _| {})?;
+        answer(&self.table, receiver).await
     }
 
     /// Tell `agent`'s kernel to end -- its requests, its tasks, its loop, its
@@ -2519,6 +2566,25 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
             _ => {
                 tracing::warn!("ignored the import of {module} under {id}, which nothing asked for")
             }
+        },
+        Reply::Constructed {
+            id,
+            declaration,
+            error,
+        } => match lock(table).queries.remove(&id) {
+            Some(Query::Constructed(waiter)) => {
+                let answer = match (declaration, error) {
+                    (_, Some(error)) => Err(error),
+                    (Some(declaration), None) => Ok(declaration),
+                    (None, None) => Err(ImportFailure {
+                        code: "raised".to_string(),
+                        message: "the interpreter answered without saying".to_string(),
+                        traceback: String::new(),
+                    }),
+                };
+                let _ = waiter.send(answer);
+            }
+            _ => tracing::warn!("ignored construction {id}, which nothing asked for"),
         },
         Reply::File { id, file, error } => match lock(table).queries.remove(&id) {
             Some(Query::File(waiter)) => {

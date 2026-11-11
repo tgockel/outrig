@@ -29,7 +29,9 @@ an alias. A field without a default must be present, even when its type allows n
 accepted only where the type includes `None`. A field left out takes its dataclass default and
 nothing else. A `Literal` matches by value and type, so `true` is not `1`, while an integer passes
 as a float. A union takes a value exactly one member accepts, or that every member accepting it
-builds alike. Every problem is reported with the JSON path where it is, up to `PROBLEMS_MAX`.
+builds alike. Every problem is reported with the JSON path where it is, up to `PROBLEMS_MAX`;
+a path or a message past 1,024 characters -- one quoting a long key, say -- is shortened in its
+middle, saying how much was left out.
 """
 
 import dataclasses
@@ -44,6 +46,7 @@ import typing
 __all__ = ["PROBLEMS_MAX", "DecodeError", "Problem", "Schema", "alias", "declare", "doc"]
 
 PROBLEMS_MAX = 20  # problems one error lists; the rest are counted
+_PROBLEM_TEXT_MAX = 1024  # characters of a problem's path, or its message, kept whole
 
 _SUBSET = (
     "str, bool, int, float, None, Literal of str, int and bool values, list[T], dict[str, T], "
@@ -155,7 +158,7 @@ class _Problems:
 
     def add(self, path, message):
         if len(self.found) < PROBLEMS_MAX:
-            self.found.append(Problem(path, message))
+            self.found.append(Problem(_shortened(path), _shortened(message)))
         else:
             self.more += 1
 
@@ -174,6 +177,16 @@ class _Problems:
     def count(self):
         n = len(self.found) + self.more
         return f"{n} problem" if n == 1 else f"{n} problems"
+
+
+def _shortened(text):
+    """`text`, a problem's path or message, whole up to `_PROBLEM_TEXT_MAX` characters; past that,
+    its middle is left out, saying how much, so a path still ends where the problem is. Bounded,
+    since problems are sent on lines the host reads, and a key a path quotes is not."""
+    if len(text) <= _PROBLEM_TEXT_MAX:
+        return text
+    half = _PROBLEM_TEXT_MAX // 2
+    return f"{text[:half]}...[{len(text) - 2 * half} characters]...{text[-half:]}"
 
 
 def _field_path(path, key):

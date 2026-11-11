@@ -12,9 +12,10 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use super::agent_tests::{messages, round};
+use super::agent_tests::round;
 use super::children_tests::{
-    Tree, data, exec_outputs, kind, of_agent, primary_runs, printed, raised, serving, tree_built,
+    Tree, after_result, data, exec_outputs, kind, of_agent, primary_runs, printed, raised, serving,
+    tree_built,
 };
 use super::instance_tests::{launching, subject};
 use super::mock_http::{RecordedRequest, Responder, submit, system_text, text_reply};
@@ -64,11 +65,7 @@ async fn session(var: &str, routes: Vec<(&'static str, Responder)>) -> (Tree, te
 fn rounds(launch: &str, later: &str) -> Responder {
     let (launch, later) = (py(launch), py(later));
     Arc::new(move |request: &RecordedRequest| {
-        let after_result = messages(request)
-            .last()
-            .and_then(|message| message["content"].as_array())
-            .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"));
-        let canned = if after_result {
+        let canned = if after_result(request) {
             text_reply("ended")
         } else if launching(request) {
             submit("launch", &launch)

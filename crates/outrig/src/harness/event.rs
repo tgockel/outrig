@@ -553,6 +553,25 @@ pub enum Payload {
         /// imported.
         reason: Option<String>,
     },
+    /// A root its session's owner asked for was not constructed in its
+    /// kernel, which was ended: no child started, and no model was called.
+    #[non_exhaustive]
+    AgentConstructFailed {
+        /// The class as the owner named it, `module:qualname`.
+        class: String,
+        /// The part of `class` before its colon.
+        module: String,
+        /// The part of `class` after its colon.
+        qualname: String,
+        /// Why: `module-missing`, `import-failed`, `native-extension-unavailable`,
+        /// `class-missing`, `not-an-agent-class`, `invalid-argument`, `raised`
+        /// for a constructor or hook that raised, or `closing` when the
+        /// session closed first.
+        code: String,
+        /// What was wrong and the last 16 KiB of the traceback, when there is
+        /// one, its control characters but line breaks and tabs escaped.
+        reason: String,
+    },
     /// What the session's skill sources hold, as the session started: each
     /// skill served, and why any other was left out, shadowed by an earlier
     /// source's, or served with a warning. Read from each skill's metadata
@@ -1392,6 +1411,7 @@ impl Payload {
             Payload::BindingExited { .. } => "binding.exited",
             Payload::ApplicationProvisioned { .. } => "application.provisioned",
             Payload::ApplicationImported { .. } => "application.imported",
+            Payload::AgentConstructFailed { .. } => "agent.construct.failed",
             Payload::SkillDiscovered { .. } => "skill.discovered",
             Payload::SkillImported { .. } => "skill.imported",
             Payload::SkillDirectiveReceived { .. } => "skill.directive.received",
@@ -1445,6 +1465,7 @@ impl Payload {
             | Self::BindingExited { .. }
             | Self::ApplicationProvisioned { .. }
             | Self::ApplicationImported { .. }
+            | Self::AgentConstructFailed { .. }
             | Self::SkillDiscovered { .. }
             | Self::ServiceBound { .. }
             | Self::ServiceDescribed { .. } => None,
@@ -2057,8 +2078,10 @@ pub enum WaitEnd {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct Background {
-    /// The execution that wrote it.
-    pub id: ExecId,
+    /// The execution that wrote it, or `None` for the construction of a root
+    /// its session's owner constructed, which ran in the agent's kernel and
+    /// is no execution.
+    pub id: Option<ExecId>,
     /// What it wrote, bounded.
     pub output: String,
     /// The bytes past the bound.

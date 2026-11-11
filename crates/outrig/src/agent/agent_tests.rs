@@ -3196,7 +3196,7 @@ fn a_result_says_what_it_dropped_and_whose_output_came_with_it() {
         output: "mine".to_string(),
         dropped: 7,
         background: vec![Background {
-            id: exec_id(2),
+            id: Some(exec_id(2)),
             output: "theirs\n".to_string(),
             dropped: 3,
         }],

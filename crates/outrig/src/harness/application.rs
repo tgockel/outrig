@@ -25,7 +25,7 @@ use super::skills;
 use crate::container::ContainerMount;
 use crate::error::{IoPathExt, OutrigError, Result};
 use crate::events::Events;
-use crate::python::host::{Interpreter, InterpreterError};
+use crate::python::host::{ImportFailure, Interpreter, InterpreterError};
 use crate::python::install::{self, Install};
 use crate::python::payload::{self, APPLICATION_MOUNT};
 use crate::supervise;
@@ -333,8 +333,7 @@ impl Prepared {
                 events.emit(Payload::ApplicationImported {
                     module: imported.module.clone(),
                     code: error.map(|e| e.code.clone()),
-                    reason: error
-                        .map(|e| skills::printable(&format!("{}\n{}", e.message, e.traceback))),
+                    reason: error.map(ImportFailure::reason),
                 });
             })
             .await?;

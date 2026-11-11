@@ -89,8 +89,9 @@ pub(super) enum Fact {
         dropped: u64,
         error: Option<String>,
         /// Output earlier submissions wrote after they reported: each one's
-        /// id, the output, and how much of it was dropped.
-        background: Vec<(u64, String, u64)>,
+        /// id -- `None` for the agent's construction, which is none -- the
+        /// output, and how much of it was dropped.
+        background: Vec<(Option<u64>, String, u64)>,
     },
     /// Something that happened to a submission, said in a line.
     Exec {
@@ -266,7 +267,10 @@ fn from_payload(payload: &Payload) -> Option<Fact> {
             error: error.clone(),
             background: background
                 .iter()
-                .map(|earlier| (earlier.id.get(), earlier.output.clone(), earlier.dropped))
+                .map(|earlier| {
+                    let id = earlier.id.map(|id| id.get());
+                    (id, earlier.output.clone(), earlier.dropped)
+                })
                 .collect(),
         },
         Payload::ExecWaitStarted {

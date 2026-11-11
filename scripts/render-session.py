@@ -873,6 +873,13 @@ class Builder:
             parts=[Part("result", text(value))] if value is not None else [],
         )
 
+    def on_agent_construct_failed(self, d: dict) -> None:
+        self.add(
+            f"root {text(d.get('class'))} ({text(d.get('module'))}, {text(d.get('qualname'))}) "
+            f"was not constructed: {text(d.get('code'))}",
+            parts=[Part("reason", text(d.get("reason")), True)],
+        )
+
     def on_agent_instance_started(self, d: dict) -> None:
         self.add(
             f"instance launched by {text(d.get('parent'))}: "
@@ -1192,13 +1199,16 @@ class Builder:
         x.error = text(d.get("error"))
         x.ended = self.here().title
         for b in objs(d.get("background")):
-            earlier = self.exec(b.get("id"))
-            label = f"output exec {earlier.id} wrote after it ended"
+            # No id: what an agent's construction wrote, which no execution ran.
+            earlier = None if b.get("id") is None else self.exec(b.get("id"))
+            label = ("output the agent's construction wrote" if earlier is None
+                     else f"output exec {earlier.id} wrote after it ended")
             if num(b.get("dropped")):
                 label += f" ({tokens(b.get('dropped'))} bytes past the bound not recorded)"
             x.background.append(Part(label, text(b.get("output")), True))
-            summary = f"wrote more output, recorded with exec {x.id}"
-            earlier.notes.append(Item(self.time, "background", summary, href=link(x.anchor)))
+            if earlier is not None:
+                summary = f"wrote more output, recorded with exec {x.id}"
+                earlier.notes.append(Item(self.time, "background", summary, href=link(x.anchor)))
         summary = f"exec {x.id}: {x.status} in {x.duration}"
         if x.submitted and x.submitted != x.ended:
             summary += f", submitted in {x.submitted}"

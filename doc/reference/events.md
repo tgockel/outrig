@@ -298,6 +298,15 @@ three times for one call before the rejection ends it.
   nowhere to import from, and `native-extension-unavailable` for one whose import reached
   compiled code, and `reason` is what was raised followed by the last 16 KiB of its traceback.
   A module whose import did not end within 30 seconds has no event; the start's error names it.
+- `agent.construct.failed` -- a root the session's owner asked for was not constructed in its
+  kernel, which was ended: no child started and no model was called. `class`, as the owner named
+  it, and its `module` and `qualname`; `code`, which is `module-missing`, `import-failed` or
+  `native-extension-unavailable` for a module that did not import, `class-missing` for a name
+  the module lacks, `not-an-agent-class`, `invalid-argument` for an argument that could not be
+  made -- a facility the session does not give, data its class refuses, an alias naming no
+  argument -- `raised` for a constructor or `__outrig_attach__` that raised, or `closing` when
+  the session closed first; and `reason`, what was wrong followed by the last 16 KiB of its
+  traceback when there is one.
 - `skill.discovered` -- what the session's skill sources hold, published once as it starts when it
   was given any source, read from each skill's metadata with no Python run:
   - `skills`: each skill served, as `{name, source, description, digest, executable}`; `digest`
@@ -357,7 +366,8 @@ three times for one call before the rejection ends it.
   - `duration`: seconds from submission.
   - `output` and `dropped`: what it printed, bounded, and the bytes past the bound.
   - `error`: the traceback, or `null`.
-  - `background`: output earlier executions wrote since, each as `{id, output, dropped}`.
+  - `background`: output earlier executions wrote since, each as `{id, output, dropped}`; `id`
+    is `null` for what a root's construction wrote, which ran in its kernel and is no execution.
 - `exec.refused` -- a submission not run: `execid`, `holder`, and `reason`. With `reason`
   `held`, the execution `holder` held the interpreter; with `closed`, the session had been closed
   to new work, and `holder` is `null`. It has no `exec.submitted` and no `exec.completed`; its
@@ -552,18 +562,20 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
 - `agent.instance.started` -- an instance of an agent class, a subclass of `outrig.Agent`, launched
   the subject, a child, to answer its requests: `instance`, the instance's id, which its other
   events carry; `parent`, the subject of the agent whose code constructed it, or `owner` for one the
-  program constructed; `module` and `qualname`, the class's `__module__` and `__qualname__`;
-  `digest`, a SHA-256 of the source that declared the class -- its module's file, or the
-  submission's source for a class declared in one, read through a function its body defines -- or
-  `null` when none could be read, as for a class a submission declared with no function in its body;
-  `inputs`, each `{name, type, preview}`; `facilities`, as `agent.spawned` carries them;
-  `channels`, one per request method, each `{name, request, reply}`; and `self`, `true` when the
-  child has the instance as its `self`, as every instance an agent's code constructs is, and
+  program or the session's owner constructed; `module` and `qualname`, the class's `__module__`
+  and `__qualname__`; `digest`, a SHA-256 of the source that declared the class -- its module's
+  file, or the submission's source for a class declared in one, read through a function its body
+  defines -- or `null` when none could be read, as for a class a submission declared with no
+  function in its body; `inputs`, each `{name, type, preview}`; `facilities`, as `agent.spawned`
+  carries them;
+  `channels`, one per request method, each `{name, request, reply}`, empty for a root whose class
+  has none; and `self`, `true` when the child has the instance as its `self`, as every instance an
+  agent's code constructs is and every root the session's owner constructs in its own kernel, and
   `false` for one a program constructed, which stays in the program. An instance whose launch was
   refused, by a limit say, has no child and records none of these events; its `ready()` and its
   requests raise the refusal. Nor does one whose construction raised -- its class's `__init__` or
   `__outrig_attach__`, which run before the launch -- whose exception is the constructor call's,
-  in its execution's traceback.
+  in its execution's traceback; or, for a root its owner asked for, in `agent.construct.failed`.
 - `agent.instance.ready` -- the child has had the round it gets as it launches, in which it reads
   its instructions and prepares: `instance`, and `error`, `null`, or why it cannot have that round
   -- the token budget spent, or a model that cannot answer. A request sent before this may already

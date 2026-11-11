@@ -19,6 +19,33 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **An owner constructs the root in its kernel.** `Session::construct(ConstructSpec)`, on a session
+  started with `no_primary`, constructs an `outrig.Agent` subclass the session's application code
+  holds -- named `module:qualname`, called with keyword `Argument`s, each data as JSON (decoded
+  strictly into a dataclass the spec names, or not) or the session's facilities by their bound names
+  (`Facility::service`, `Facility::binding`, singly or as a dict) -- in a kernel of its own, on its
+  own loop, where `__init__`, `__outrig_attach__` and the attachment run and the instance is `self`,
+  beside the arguments `ConstructSpec::alias` names. It runs on the spec's model, which no
+  `[agents.<name>]` profile, `default-agent` or profile preamble changes. The owner holds a
+  `RootHandle`: `ready()`, settled as the root's orienting round ends or with a `RootError` -- the
+  construction's, with its code and traceback, an unknown model, `children-max`, the close, a
+  release --; `release()`; `channels()`, each a `RequestChannel` with its schema text; and
+  `request(channel, json)`, a `RequestHandle` whose `outcome()` is the reply as JSON text the root's
+  kernel checked against the declared type -- text, so an integer keeps its size -- a reply that
+  does not fit sent back and one past its attempts ending `RootError::Rejected`, and one past the
+  1 MiB a reply's line may hold, fitting or not, sent back counting no attempt -- and whose
+  `cancel()` withdraws it. A release runs to its end whether or not its caller waits, and a root
+  whose construction nobody waits for any more is released. A class with no request channel is
+  constructed as a root, and still refused as a kernel's child. A construction that fails ends its
+  kernel, releases what its constructor launched, frees its place, calls no model and records
+  `agent.construct.failed`; one the close comes to is given up, `closing`. `Session::root(id)` finds
+  a root by its instance id.
+  `SessionBuilder::construct` constructs one as the session starts, failing the start with
+  `SessionError::Construct` when it cannot, and `check()` resolves its model and keys first;
+  `Session::constructed` is its handle. A session with a primary agent constructs none:
+  `SessionError::Primary`. The root's rounds open through its own runner, and `Session::round` stays
+  `NoPrimary`. What a construction prints reaches the root with its first result:
+  `event::Background::id` is `None` for it.
 - **A Rust service is a Python object.** `SessionBuilder::serve(name, Arc<dyn Service>)` binds a
   `Service` -- `describe()`, giving a `ServiceDescription` whose `MethodDescription`s each name a
   method exactly with a JSON Schema for its arguments, and `call(method, args, cx)`, answering by
@@ -463,9 +490,10 @@ without touching each other, from one ensured image. [The container facade besid
   `Literal` of str, int and bool values, and `Annotated` around any type -- naming the field. The
   `Schema` it returns decodes a JSON value strictly into `T`: an unknown key, a missing required
   key -- one whose type allows null included -- and `null` where the type has no `None` are each
-  a problem, reported with its JSON path in a `DecodeError`; a field left out takes only its
-  dataclass default. `doc(text)` and `alias(name)` in a field's `Annotated` are its description
-  and its JSON key, and `text()` renders the JSON Schema with every `doc()` text verbatim.
+  a problem, reported with its JSON path in a `DecodeError`, a path or message past 1,024
+  characters shortened in its middle; a field left out takes only its dataclass default.
+  `doc(text)` and `alias(name)` in a field's `Annotated` are its description and its JSON key, and
+  `text()` renders the JSON Schema with every `doc()` text verbatim.
   Channel contracts take the same types, and a dataclass sent on a channel now crosses as its
   fields' values under their keys, where before the send raised.
 - **`harness::HostProgram`: a trusted Python program on the host, as `outrig run-new <script.py>`

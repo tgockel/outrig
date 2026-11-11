@@ -1328,6 +1328,12 @@ pub outrig::harness::event::Payload::AgentCallStarted::module: alloc::string::St
 pub outrig::harness::event::Payload::AgentCallStarted::parent: alloc::string::String
 pub outrig::harness::event::Payload::AgentCallStarted::qualname: alloc::string::String
 pub outrig::harness::event::Payload::AgentCallStarted::request: outrig::harness::event::AgentRequestId
+#[non_exhaustive] pub outrig::harness::event::Payload::AgentConstructFailed
+pub outrig::harness::event::Payload::AgentConstructFailed::class: alloc::string::String
+pub outrig::harness::event::Payload::AgentConstructFailed::code: alloc::string::String
+pub outrig::harness::event::Payload::AgentConstructFailed::module: alloc::string::String
+pub outrig::harness::event::Payload::AgentConstructFailed::qualname: alloc::string::String
+pub outrig::harness::event::Payload::AgentConstructFailed::reason: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentInstanceCollected
 pub outrig::harness::event::Payload::AgentInstanceCollected::instance: outrig::harness::event::AgentInstanceId
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentInstanceHandleCollected
@@ -1798,7 +1804,7 @@ impl core::fmt::Display for outrig::harness::event::AttemptId
 pub fn outrig::harness::event::AttemptId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::harness::event::Background
 pub outrig::harness::event::Background::dropped: u64
-pub outrig::harness::event::Background::id: outrig::harness::event::ExecId
+pub outrig::harness::event::Background::id: core::option::Option<outrig::harness::event::ExecId>
 pub outrig::harness::event::Background::output: alloc::string::String
 #[non_exhaustive] pub struct outrig::harness::event::CallBudget
 pub outrig::harness::event::CallBudget::estimate_scale: f64
@@ -1950,6 +1956,15 @@ pub const outrig::harness::event::DEFAULT_CAPACITY: usize
 pub outrig::harness::Approval::Approve
 pub outrig::harness::Approval::CannotAsk
 pub outrig::harness::Approval::Refuse
+#[non_exhaustive] pub enum outrig::harness::Argument
+pub outrig::harness::Argument::Data
+pub outrig::harness::Argument::Data::class: core::option::Option<alloc::string::String>
+pub outrig::harness::Argument::Data::json: serde_json::value::Value
+pub outrig::harness::Argument::Facilities(alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::harness::Facility>)
+pub outrig::harness::Argument::Facility(outrig::harness::Facility)
+impl outrig::harness::Argument
+pub fn outrig::harness::Argument::data(serde_json::value::Value) -> Self
+pub fn outrig::harness::Argument::data_as(serde_json::value::Value, impl core::convert::Into<alloc::string::String>) -> Self
 #[non_exhaustive] pub enum outrig::harness::ClosedBy
 #[non_exhaustive] pub outrig::harness::ClosedBy::InterpreterExited
 pub outrig::harness::ClosedBy::InterpreterExited::cause: alloc::string::String
@@ -1962,9 +1977,33 @@ pub fn outrig::harness::ClosedBy::fmt(&self, &mut core::fmt::Formatter<'_>) -> c
 pub outrig::harness::ExecutionStatus::Error
 pub outrig::harness::ExecutionStatus::Ok
 pub outrig::harness::ExecutionStatus::Unknown
+#[non_exhaustive] pub enum outrig::harness::Facility
+pub outrig::harness::Facility::Binding(alloc::string::String)
+pub outrig::harness::Facility::Service(alloc::string::String)
+impl outrig::harness::Facility
+pub fn outrig::harness::Facility::binding(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::harness::Facility::service(impl core::convert::Into<alloc::string::String>) -> Self
 #[non_exhaustive] pub enum outrig::harness::Progress
 pub outrig::harness::Progress::Finished(outrig::harness::Step)
 pub outrig::harness::Progress::Started(outrig::harness::Step)
+#[non_exhaustive] pub enum outrig::harness::RootError
+pub outrig::harness::RootError::Budget(alloc::string::String)
+pub outrig::harness::RootError::Cancelled(alloc::string::String)
+pub outrig::harness::RootError::Closed(alloc::string::String)
+pub outrig::harness::RootError::Construct
+pub outrig::harness::RootError::Construct::code: alloc::string::String
+pub outrig::harness::RootError::Construct::message: alloc::string::String
+pub outrig::harness::RootError::Construct::traceback: alloc::string::String
+pub outrig::harness::RootError::Failed(alloc::string::String)
+pub outrig::harness::RootError::Limit(alloc::string::String)
+pub outrig::harness::RootError::Model(alloc::string::String)
+pub outrig::harness::RootError::Other(alloc::string::String)
+pub outrig::harness::RootError::Rejected
+pub outrig::harness::RootError::Rejected::last: alloc::string::String
+pub outrig::harness::RootError::Rejected::message: alloc::string::String
+pub outrig::harness::RootError::Rejected::problems: alloc::vec::Vec<outrig::harness::Problem>
+pub outrig::harness::RootError::Released(alloc::string::String)
+pub outrig::harness::RootError::Terminated(alloc::string::String)
 #[non_exhaustive] pub enum outrig::harness::RoundOutcome
 pub outrig::harness::RoundOutcome::Ended(outrig::harness::RoundEnd)
 pub outrig::harness::RoundOutcome::NothingNew
@@ -1983,7 +2022,11 @@ pub outrig::harness::SessionEnd::NotStarted(outrig::harness::Stopped)
 pub outrig::harness::SessionEnd::ShutDown(outrig::harness::ShutdownReport)
 #[non_exhaustive] pub enum outrig::harness::SessionError
 pub outrig::harness::SessionError::Closed(outrig::harness::Closed)
+pub outrig::harness::SessionError::Construct
+pub outrig::harness::SessionError::Construct::class: alloc::string::String
+pub outrig::harness::SessionError::Construct::error: alloc::boxed::Box<outrig::harness::RootError>
 pub outrig::harness::SessionError::NoPrimary
+pub outrig::harness::SessionError::Primary
 pub outrig::harness::SessionError::Resolve(outrig::harness::Failure)
 pub outrig::harness::SessionError::Round(outrig::harness::Failure)
 pub outrig::harness::SessionError::Start(outrig::harness::Failure)
@@ -2052,6 +2095,12 @@ pub fn outrig::harness::Closed::from(outrig::harness::ClosedBy) -> Self
 pub struct outrig::harness::Closer(_)
 impl outrig::harness::Closer
 pub fn outrig::harness::Closer::close_admission(&self)
+pub struct outrig::harness::ConstructSpec
+impl outrig::harness::ConstructSpec
+pub fn outrig::harness::ConstructSpec::alias(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::harness::ConstructSpec::arg(self, impl core::convert::Into<alloc::string::String>, outrig::harness::Argument) -> Self
+pub fn outrig::harness::ConstructSpec::class(&self) -> &str
+pub fn outrig::harness::ConstructSpec::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 #[non_exhaustive] pub struct outrig::harness::ContainerSpec
 pub outrig::harness::ContainerSpec::left_out: alloc::vec::Vec<alloc::string::String>
 pub outrig::harness::ContainerSpec::spec: outrig::LaunchSpec
@@ -2117,16 +2166,43 @@ pub outrig::harness::OpenWait::return_when: outrig::harness::event::ReturnWhen
 pub outrig::harness::OpenWait::since: std::time::Instant
 pub outrig::harness::OpenWait::timeout: core::option::Option<core::time::Duration>
 pub outrig::harness::OpenWait::wait: u64
+#[non_exhaustive] pub struct outrig::harness::Problem
+pub outrig::harness::Problem::message: alloc::string::String
+pub outrig::harness::Problem::path: alloc::string::String
 #[non_exhaustive] pub struct outrig::harness::ProgramExit
 impl outrig::harness::ProgramExit
 pub fn outrig::harness::ProgramExit::code(&self) -> i32
 pub fn outrig::harness::ProgramExit::left_open(&self) -> &[outrig::harness::LeftOpen]
 pub fn outrig::harness::ProgramExit::status(&self) -> std::process::ExitStatus
+#[non_exhaustive] pub struct outrig::harness::RequestChannel
+pub outrig::harness::RequestChannel::doc: core::option::Option<alloc::string::String>
+pub outrig::harness::RequestChannel::name: alloc::string::String
+pub outrig::harness::RequestChannel::reply: alloc::string::String
+pub outrig::harness::RequestChannel::reply_type: alloc::string::String
+pub outrig::harness::RequestChannel::request: alloc::string::String
+pub outrig::harness::RequestChannel::request_type: alloc::string::String
+pub struct outrig::harness::RequestHandle
+impl outrig::harness::RequestHandle
+pub async fn outrig::harness::RequestHandle::cancel(&self) -> bool
+pub fn outrig::harness::RequestHandle::id(&self) -> core::option::Option<outrig::harness::event::AgentRequestId>
+pub async fn outrig::harness::RequestHandle::outcome(&self) -> core::result::Result<alloc::string::String, outrig::harness::RootError>
+impl core::fmt::Debug for outrig::harness::RequestHandle
+pub fn outrig::harness::RequestHandle::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::harness::RequestOutcome
 pub outrig::harness::RequestOutcome::channel: core::option::Option<alloc::string::String>
 pub outrig::harness::RequestOutcome::child: alloc::string::String
 pub outrig::harness::RequestOutcome::outcome: outrig::harness::event::RequestEnd
 pub outrig::harness::RequestOutcome::request: outrig::harness::event::AgentRequestId
+pub struct outrig::harness::RootHandle(_)
+impl outrig::harness::RootHandle
+pub fn outrig::harness::RootHandle::agent(&self) -> core::option::Option<&str>
+pub fn outrig::harness::RootHandle::channels(&self) -> &[outrig::harness::RequestChannel]
+pub fn outrig::harness::RootHandle::id(&self) -> core::option::Option<outrig::harness::event::AgentInstanceId>
+pub async fn outrig::harness::RootHandle::ready(&self) -> core::result::Result<(), outrig::harness::RootError>
+pub async fn outrig::harness::RootHandle::release(&self)
+pub fn outrig::harness::RootHandle::request(&self, &str, serde_json::value::Value) -> core::result::Result<outrig::harness::RequestHandle, outrig::harness::RootError>
+impl core::fmt::Debug for outrig::harness::RootHandle
+pub fn outrig::harness::RootHandle::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::harness::RoundEnd
 pub outrig::harness::RoundEnd::reasoning: core::option::Option<alloc::string::String>
 pub outrig::harness::RoundEnd::reply: alloc::string::String
@@ -2173,11 +2249,14 @@ impl outrig::harness::Session
 pub fn outrig::harness::Session::application(&self) -> core::option::Option<&outrig::harness::ApplicationIdentity>
 pub fn outrig::harness::Session::close_admission(&self)
 pub fn outrig::harness::Session::closer(&self) -> outrig::harness::Closer
+pub async fn outrig::harness::Session::construct(&self, outrig::harness::ConstructSpec) -> core::result::Result<outrig::harness::RootHandle, outrig::harness::SessionError>
+pub fn outrig::harness::Session::constructed(&self) -> core::option::Option<outrig::harness::RootHandle>
 pub fn outrig::harness::Session::container_name(&self) -> &str
 pub fn outrig::harness::Session::id(&self) -> &str
 pub fn outrig::harness::Session::interrupter(&self) -> core::option::Option<impl core::ops::function::Fn() -> core::option::Option<alloc::string::String> + core::marker::Send + core::marker::Sync + 'static>
 pub fn outrig::harness::Session::model(&self) -> core::option::Option<&str>
 pub fn outrig::harness::Session::python_version(&self) -> &str
+pub fn outrig::harness::Session::root(&self, outrig::harness::event::AgentInstanceId) -> core::option::Option<outrig::harness::RootHandle>
 pub async fn outrig::harness::Session::round(&mut self) -> core::result::Result<outrig::harness::RoundOutcome, outrig::harness::SessionError>
 pub async fn outrig::harness::Session::shutdown(self, core::time::Duration) -> outrig::harness::ShutdownReport
 pub async fn outrig::harness::Session::start(outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<outrig::harness::Session, outrig::harness::SessionError>
@@ -2191,6 +2270,7 @@ pub fn outrig::harness::SessionBuilder::approver(self, impl outrig::harness::App
 pub fn outrig::harness::SessionBuilder::bind(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<outrig::harness::BindingSpec>) -> Self
 pub fn outrig::harness::SessionBuilder::bindings_env<K, V>(self, impl core::iter::traits::collect::IntoIterator<Item = (K, V)>) -> Self where K: core::convert::Into<std::ffi::os_str::OsString>, V: core::convert::Into<std::ffi::os_str::OsString>
 pub fn outrig::harness::SessionBuilder::check(&self) -> core::result::Result<(), outrig::harness::SessionError>
+pub fn outrig::harness::SessionBuilder::construct(self, outrig::harness::ConstructSpec) -> Self
 pub fn outrig::harness::SessionBuilder::container(self, outrig::LaunchSpec) -> Self
 pub fn outrig::harness::SessionBuilder::new(outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> Self
 pub fn outrig::harness::SessionBuilder::no_primary(self) -> Self

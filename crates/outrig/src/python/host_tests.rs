@@ -124,7 +124,7 @@ async fn a_result_counts_what_it_dropped_and_carries_earlier_output() {
         run(&interpreter, "go.set()\nawait task").await,
         Outcome::Ok(Report {
             background: vec![Background {
-                id: starter_id,
+                id: Some(starter_id),
                 output: "from the starter\n".to_string(),
                 dropped: 0,
             }],
@@ -342,7 +342,7 @@ async fn the_interpreters_results_decode_into_outcomes() {
             output: "x\n".to_string(),
             dropped: 5,
             background: vec![Background {
-                id,
+                id: Some(id),
                 output: "bg".to_string(),
                 dropped: 2
             }],

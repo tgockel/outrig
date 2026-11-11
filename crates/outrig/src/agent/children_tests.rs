@@ -2496,11 +2496,7 @@ pub(super) fn serving(source: &str) -> Responder {
     let source = source.to_string();
     let next = Arc::new(AtomicUsize::new(0));
     Arc::new(move |request: &RecordedRequest| {
-        let after_result = messages(request)
-            .last()
-            .and_then(|message| message["content"].as_array())
-            .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"));
-        let canned = if after_result {
+        let canned = if after_result(request) {
             text_reply("ended")
         } else {
             submit(
@@ -2510,6 +2506,15 @@ pub(super) fn serving(source: &str) -> Responder {
         };
         Box::pin(async move { canned })
     })
+}
+
+/// Whether `request` is the call after one of the agent's executions: it
+/// carries that execution's result.
+pub(super) fn after_result(request: &RecordedRequest) -> bool {
+    messages(request)
+        .last()
+        .and_then(|message| message["content"].as_array())
+        .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"))
 }
 
 /// A request held at the provider: `arrived` is told as it comes in, and it

@@ -248,3 +248,164 @@ Each is a Rust test with a mock model unless it says otherwise; no Python host p
 - `crates/outrig/src/harness/builder.rs`, `session.rs`, `crates/outrig/src/agent/children.rs`,
   `crates/outrig/src/python/outrig/_interpreter.py` (`_open`, `_Instance`),
   `crates/outrig/src/python/outrig/_agents.py`.
+
+## Decisions
+
+Forks 1 through 4 and 7 through 9 were taken as recommended; fork 5 is not built and fork 6 is
+recorded and not built. Both forms of fork 1 landed on one branch: the maintainer chose that over
+the split `plan/todo/README.md` allowed, since the builder form is a thin layer over the
+Session form.
+
+- **"No code of the program's ever crosses" stands.** `agent-classes.md`'s sentence and
+  `0003-35`'s "never code, pickle or a reference" hold for a class a program declares and does not
+  provision: that path is unchanged, its instance stays in the program, and its
+  `agent.instance.started.self` is `false`. For a class the application code holds, the code is
+  provisioned by OutRig (`0003-43`) and named, never sent: what the owner sends is
+  `module:qualname`, JSON, facilities' bound names, alias names and a model's name.
+- **The construction site is the root's own kernel**, beside `0003-35`'s declaration-as-data path.
+  The host opens the kernel with a construct record (`{"construct": <name>, "model": ...}` in
+  `open`'s `child`), then sends `construct`; the kernel answers `constructed` with the fields a
+  spawn line carries of any instance -- `prompt`, `manifest`, `facilities`, `channels`,
+  `instance` -- or `{code, message, traceback}`. `make` merges the answer into the spawn line, so
+  everything after it is the code every instance's launch runs.
+- **The Rust owner speaks `0003-35`'s owner lines in-process.** `harness::root::Owner` attaches
+  through `Children::attach_owner` on a session's first construction and sends `agent.spawn`
+  (with the construct record), `agent.release`, `ask` and `withdraw` through
+  `Children::owner_line`, hearing `spawned`, `released`, `oriented`, `agent.closed` and each
+  request's steps, as `_host.py`'s `_Root` and `_Request` do. Reused whole: admission,
+  `children-max`, the `owner` node at depth 0, the start-and-release-once bookkeeping, the
+  close's release of each root, the report's requests and the request routes. Built here: the
+  construct record and route, the kernel's judging of a constructed root's replies, the
+  `channels` and `failure` the `spawned` answer now carries, and `requests-max` counted per root in
+  Rust, as the program counts it.
+- **The owner holds a handle, never the object.** `RootHandle` (`id`, `agent`, `ready`,
+  `release`, `channels`, `request`) and `RequestHandle` (`id`, `outcome`, `cancel`).
+  Every launch failure is `ready()`'s, as `rust-owner.md` lists them; `Session::construct`
+  returns `Err` only for a session with a primary agent, `SessionError::Primary`, whose owner is
+  the user at its `user` channel. A handle's outcomes are `RootError`'s variants, one per way the
+  engine ends a request or a launch.
+- **The reply is judged in the root's kernel** (fork 5's "the kernel's check is the one check"):
+  a constructed root's owner request takes `_answered`, as a parent kernel's does, so repair,
+  `agent.request.invalid` and `CompletionRejected` after three attempts are the existing ones, and
+  `agent.ended` carries the accepted reply as JSON text under `json` (not `value`, which
+  `_Work.end` takes itself). A rejected request's `last` is the reply's JSON form where it has one.
+  The flag that decides it is named for what it governs, `_Child.owner_judges`, which `_rooted`
+  sets for a program's root; a Rust owner's verdict (fork 5) would set it too.
+- **OR-A1-1, by a construction-site flag** (fork 2). `0003-41` set no context variable ("Fork 2:
+  allowed ... there is no guard and no context variable"), so this task adds one,
+  `_agents._SITE`: the construct route sets it to `"owner"` around its one class call, and
+  `_Attaching.__call__` steps it to `"root"` for that call's extent and to `None` for any call made
+  inside it, so an `Agent()` constructed in the root's `__init__` or hook is a child and keeps the
+  refusal. `Agent.__init__` skips the refusal only for `"root"`; `_attach` reads the same site to
+  attach the instance as `_Adopted` rather than `_Instance`.
+- **`_Adopted`, beside `_Instance`.** Both derive from `_Attached`, which holds what attaching
+  checks and keeps -- the inputs, classes and facilities, the aliases and the boot names --
+  while the launch is `_Instance`'s alone. `_Adopted` takes the root kernel's own record.
+  `ready()`, `release()` and its request methods raise `TypeError` in the kernel, since each is the
+  owner's. It is not in `_instances`: the close releases the root through `_children`, as a
+  program's root, so it is said once.
+- **The kernel adopts the instance.** `Kernel.__init__`'s channel and runtime setup moved into
+  `_equip`, which `adopt` runs again once the class has given the record its channels; the view is
+  offered (`_offer_view`) only then, since the instance's mapping is the view and exists only once
+  `__init__` has run; inputs, classes, `self` and the aliases are bound by `Kernel.bind`, which
+  `_open` uses for a spawned child too, and the channels are described by `_Channel.said`, which
+  the spawn line uses too. During construction the kernel's view is the session's, the owner's.
+- **Fork 8: construction runs on the kernel's loop in a context of its own**, an `_Execution` made
+  `reported`, with no pipe and no id: hosted and service calls from `__init__` are
+  the root's (they already took `exec: null`), and what it prints goes to the kernel's backlog,
+  which the root's first result carries. `Background.id` -- crate-private and the public event's --
+  is therefore `Option<ExecId>`, `None` for the construction; the model reads it as "output from
+  your construction, before your first round", and the CLI and `render-session.py` say so too.
+- **No bound on a construction.** It runs the application's code, which ends when it does; the
+  session's close is the bound. The interpreter's close answers each construction still in flight
+  `closing`, as it ends each launch and each instance not yet ready, and a construction's own
+  answer after that is not sent: its kernel is ended, `ready()` fails `Closed`, and
+  `agent.construct.failed` says `closing`. The interpreter's exit, which answers nothing, ends the
+  wait the same way. `lifecycle.md`'s *Constructing* row says "at the
+  close" rather than "at terminating", since a construction that ended after the close could
+  never start its root -- `make` now also refuses a root's start once `state.closed` is set, which
+  covers a construction whose answer and the close cross.
+- **The model is the owner's.** A root resolves with no `[agents.<name>]` profile, so neither a
+  profile nor `default-agent` applies, and the preamble was dropped already. A `model=` that
+  `__init__` gives `outrig.Agent` other than `None` or the spec's own raises `TypeError` naming
+  both, rather than being dropped silently, as `0003-41`'s fork 1 refused to drop one.
+- **Fork 3: no default alias.** `ConstructSpec::alias` names each; `_Instance.alias` (`0003-45`'s
+  mechanism) is its first caller, and an alias naming no argument is refused.
+- **Fork 7: each argument tagged** `data` (JSON text, with an optional `type`), `facility`
+  (`{kind, name}`) or `facilities` (a dict of those). The Rust `Argument` enum cannot make an
+  untagged one; the kernel refuses one anyway, naming it, which an interpreter test drives.
+  `Facility` is `Service(name)` or `Binding(name)`, `#[non_exhaustive]` for `0003-51`'s channels.
+- **`agent.construct.failed`** is session-level, as `application.imported` is: no child started,
+  so no agent's section holds it. Its `code`s are the import's three, `class-missing`,
+  `not-an-agent-class`, `invalid-argument`, `raised` and `closing`.
+- **The builder form** (`SessionBuilder::construct`) constructs in `assemble` after provisioning,
+  where the primary would be built; a root not launched fails the start through
+  `Session::abandon`, as an application module that does not import does, with
+  `SessionError::Construct { class, error }`, `error` the `RootError` its `ready()` would give,
+  boxed as the largest variant. `check()` and both start paths resolve the
+  spec's model and keys first and refuse a session with a primary. `Session::constructed` is its
+  handle; `Session::root(id)` finds any live root by instance id (fork 4).
+- **Until `0003-47`** the root's instructions are an instance child's, with its `self`
+  sentence, and carry no skill catalog; `0003-47` gives the root its own lead and the catalog.
+- **Fork 6, Python-host parity**: `session.construct` over the owner protocol, a handle whose
+  replies decode into classes rebuilt from the kernel's declaration, and the reads as protocol
+  requests. Nothing here forecloses it: the construct record is a line the protocol could carry.
+- **`help(outrig.Agent)`** gained one sentence, that a session's owner can construct an agent as
+  a root where it is `self` and needs no marked method; it still fits `help()`'s bound.
+- **A pre-existing flake** found while running the suite, in `0003-45`'s
+  `a_dropped_instance_lives_until_it_is_released`, also fails on the base commit:
+  `plan/next/a-dropped-handles-notice-races-the-reply.md`.
+- **`/simplify` changed the first build**, from four reviews: the interpreter's close answers a
+  construction in place of a registry watch and a cancellation parameter only this query had; the
+  base class split, `Kernel.bind`, `_Channel.said` and `_Execution`'s `reported` path replace
+  copies; the failure's typed `SessionError` replaces an `InterpreterError` variant nothing in the
+  interpreter raised; one map of open requests, keyed roots, and `RequestHandle::is_done` and
+  `ConstructSpec::model` dropped; a spawn's answer carries `channels` and `failure` only for a
+  constructed root. Not adopted: sending a data argument and a reply as JSON values rather than
+  text, which keeps the line format the program's path uses.
+- **A review of the branch found five lifecycle and data faults, each fixed where it arose:**
+  - *A failed launch orphaned what it launched.* Only a root's constructor runs code before its
+    launch is decided, so only it can launch an agent of its own first. A launch that fails now
+    marks its node released -- so a launch it asked for and that has not begun never does -- and
+    releases each child it began, before the node goes; this holds for any launch.
+  - *A dropped `construct()` stranded its root.* The registry's spawn runs on whatever the caller
+    does, so a root could launch with nothing holding it. The owner now releases a root whose
+    spawn nobody waits for, as `_release_unheld` releases a spawn a kernel's code gave up on.
+  - *A dropped `release()` skipped its bookkeeping.* The release is now a task of its own;
+    `release()` begins it once and waits for it, so a later call waits for the first to finish.
+  - *An accepted reply could outgrow its line.* The host drops a line past its bound, and the
+    kernel had already accepted the reply. A constructed root's reply notice is now measured
+    against `MESSAGE_MAX`, as a program's root's reply line is, before it is accepted, and one
+    past it raises `ValueError` from `d.reply()`, saying to reply with less.
+  - *An integer past 64 bits was rounded*, and one past `f64`'s range read as `null`, since the
+    workspace's `serde_json` has no `arbitrary_precision`. `outcome()` now gives the reply as
+    the JSON text the kernel wrote, which the embedder deserializes into a type of its own, as
+    `rust-owner.md` has it; `RootError::Rejected::last` is text too. Turning on
+    `arbitrary_precision` would change every `serde_json::Value` in the workspace.
+- **A second review found three more, each fixed:**
+  - *A `construct()` dropped after its answer arrived, unread, stranded its root.* The answer
+    sat in the dropped channel, and the first fix caught only an answer that arrived after the
+    drop. The waiter's end of the channel is now a guard (`Awaited`): dropped unread, it closes
+    the channel, takes an answer already there, and releases the root it launched, through the
+    same `Owner::unheld`.
+  - *A rejected reply could outgrow its line.* The bound covered only an accepted reply, and a
+    rejection carries the last reply. It now covers every reply to the owner before it counts:
+    one past it raises the same `ValueError` whether or not it would be accepted, and counts no
+    attempt, so `Rejected::last` is always a reply that fit.
+  - *A failed launch's cleanup could leave a child running.* It handed every child the node had
+    ever launched to the strict release, which refuses the whole list if one is released
+    already. Now one lock marks the node and every child it still holds, with everything below
+    each, using the same walk a release uses (`State::mark_released`), which passes over those
+    released already. This one has no test. A nested launch begins only after the construction
+    answers, the kernel's end follows that answer at once and cancels the constructor's
+    background work, and an instance's `release()` from an ended kernel does nothing, so no
+    test can release one child before the cleanup runs.
+- **A third review found the rejection could still outgrow its line** through what was wrong
+  rather than the reply: a problem's path quotes each key whole, so twenty problems under one
+  key of 850,000 characters made a 17 MB notice from a reply that fit. `outrig.schema` bounded
+  how many problems it lists but not their text. It now shortens a path or a message past 1,024
+  characters in its middle, keeping where the path ends, so every line problems ride on -- the
+  rejection, `agent.answered`, a `DecodeError`'s listing -- stays bounded: at most 20 of about
+  2 KiB each, beside a reply of at most 1 MiB. Measuring the whole rejection before it counts,
+  the review's other suggestion, would refuse a reply for the decoder's wording, which the agent
+  cannot shorten.

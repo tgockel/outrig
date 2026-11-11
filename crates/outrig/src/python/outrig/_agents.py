@@ -18,6 +18,7 @@ import abc
 import asyncio
 import builtins
 import contextlib
+import contextvars
 import copy
 import dataclasses
 import functools
@@ -67,6 +68,11 @@ _call = None
 _launch = None
 _resolve = None
 _submitted_source = None
+# Where the agent class instance being constructed is constructed: `"owner"` while the session's
+# owner asks the interpreter for a root, `"root"` inside that root's own class call -- its
+# `__init__`, its hook, its attachment -- and `None` anywhere else, inside an agent constructed
+# within it too. The interpreter sets `"owner"` around the one call it makes for the owner.
+_SITE = contextvars.ContextVar("outrig_construction_site", default=None)
 
 
 def _kind_of(name):
@@ -900,14 +906,19 @@ class _Attaching(abc.ABCMeta):
     `help(outrig.Agent)`."""
 
     def __call__(cls, *args, **kwargs):
-        agent = super().__call__(*args, **kwargs)
-        given = vars(agent).pop("_outrig_given", None)
-        if given is None:
-            raise TypeError(f"{cls.__module__}.{cls.__qualname__}.__init__ did not call "
-                            "super().__init__(**inputs, model=...), which gives outrig.Agent "
-                            "what to launch the child with; nothing was launched")
-        cls.__outrig_attach__(agent)
-        agent._outrig = _launch(agent, *given)
+        # Only the call the owner asked for is the root's: one made inside it is a child's.
+        site = _SITE.set("root" if _SITE.get() == "owner" else None)
+        try:
+            agent = super().__call__(*args, **kwargs)
+            given = vars(agent).pop("_outrig_given", None)
+            if given is None:
+                raise TypeError(f"{cls.__module__}.{cls.__qualname__}.__init__ did not call "
+                                "super().__init__(**inputs, model=...), which gives outrig.Agent "
+                                "what to launch the child with; nothing was launched")
+            cls.__outrig_attach__(agent)
+            agent._outrig = _launch(agent, *given)
+        finally:
+            _SITE.reset(site)
         return agent
 
 
@@ -950,7 +961,8 @@ class Agent(metaclass=_Attaching):
     update is not, and a request is how to ask the child for something. A module's globals are
     shared by every agent that imports it; keep per-agent state on `self`. The child holds
     `self`, so nothing collects an instance while its child lives: it ends as it is released, as
-    the agent that made it is, or as the session ends.
+    the agent that made it is, or as the session ends. A session's owner can construct one as a
+    root, in a kernel of its own, where it is `self` and needs no marked method.
 
     `Reviewer(**inputs, facilities={"files": files})` gives the child, beside its data, the
     objects it acts through, by name, kept as `reviewer.facilities`; a name follows an input's
@@ -999,7 +1011,9 @@ class Agent(metaclass=_Attaching):
 
     def __init__(self, *, model=None, session=None, facilities=None, **inputs):
         name = f"{type(self).__module__}.{type(self).__qualname__}"
-        if not type(self)._outrig_channels:
+        # A root its session's owner constructs is given work by its channels and its task; a
+        # child's one way to be given work is a request.
+        if not type(self)._outrig_channels and _SITE.get() != "root":
             raise TypeError(f"{name} declares no request channel -- no method marked "
                             "@outrig.agent -- so an instance of it would answer nothing")
         if model is not None and type(model) is not str:

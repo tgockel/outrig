@@ -59,6 +59,7 @@ mod error;
 pub mod event;
 pub(crate) mod lifecycle;
 mod report;
+mod root;
 pub(crate) mod services;
 mod session;
 pub(crate) mod skills;
@@ -74,6 +75,10 @@ pub use self::error::{Closed, ClosedBy, Failure, SessionError};
 pub use self::report::{
     BindingStop, EventDelivery, ExecutionOutcome, ExecutionStatus, HostedCall, LogLoss,
     RequestOutcome, ServiceCall, ShutdownReport, Stopped, Verdict,
+};
+pub use self::root::{
+    Argument, ConstructSpec, Facility, Problem, RequestChannel, RequestHandle, RootError,
+    RootHandle,
 };
 pub use self::services::{
     CallContext, MethodDescription, Service, ServiceDescription, ServiceError,

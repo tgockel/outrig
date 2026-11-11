@@ -123,7 +123,10 @@ impl Entry {
                     add(error.trim_end());
                 }
                 for (earlier, output, dropped) in background {
-                    let mut part = format!("execution {earlier}, still running, wrote:\n");
+                    let mut part = match earlier {
+                        Some(earlier) => format!("execution {earlier}, still running, wrote:\n"),
+                        None => "the agent's construction wrote:\n".to_string(),
+                    };
                     part.push_str(output.trim_end());
                     if *dropped > 0 {
                         let _ = write!(part, "\n({dropped} bytes of output not kept)");
@@ -312,7 +315,7 @@ mod tests {
             output: "partial\n".into(),
             dropped: 10,
             error: Some("Traceback ...\nValueError: x\n".into()),
-            background: vec![(2, "late\n".into(), 0)],
+            background: vec![(Some(2), "late\n".into(), 0)],
         })
         .expect("shown");
         assert_eq!(entry.kind, Kind::Detail);

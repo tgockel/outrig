@@ -299,10 +299,19 @@ the session.
 A service has no process of its own to stop: it is the embedder's object, dropped with the
 session.
 
-**Root agents** (`0003-35`)
+**Root agents** (`0003-35`, `0003-46`)
 
+- *Constructing* (`0003-46`): the owner asked, and the root's kernel has not answered. Outcome: the
+  interpreter's close answers the construction `closing`, as it ends each launch -- one that ended
+  after it could never start its root, since a launch the close meets is refused -- and the host
+  ends its kernel, which cancels what of it awaits; a constructor blocked in a call of its own runs
+  on until that call is refused by the close or ends with the container. `ready()` fails with the
+  closing error, and `agent.construct.failed` is recorded with `code` `closing`. Invoked: not a
+  boundary request; its hosted and service calls are, under their own rows. Effects: what `__init__`
+  did in the container stands.
 - *Launching, idle, working, or collected.* As the agent-instance rows above; the owner is the
-  parent, and the program's handles settle with the closing error.
+  parent, and the program's handles settle with the closing error, as a Rust owner's
+  `RootHandle` and `RequestHandle` do.
 
 **The host program** (`0003-29`)
 

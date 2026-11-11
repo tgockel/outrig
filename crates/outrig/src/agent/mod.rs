@@ -469,3 +469,7 @@ mod facilities_tests;
 #[cfg(test)]
 #[path = "self_tests.rs"]
 mod self_tests;
+
+#[cfg(test)]
+#[path = "root_tests.rs"]
+mod root_tests;

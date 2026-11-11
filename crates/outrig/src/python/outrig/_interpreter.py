@@ -277,9 +277,13 @@ _STREAMS = (sys.stdout, sys.stderr, sys.stdout.buffer, sys.stderr.buffer)
 
 
 class _Execution:
-    """One submission, and every byte it causes to be written, wherever and whenever."""
+    """One submission, and every byte it causes to be written, wherever and whenever.
 
-    def __init__(self, kernel, exec_id):
+    One made `reported` has no body: everything it writes goes to the kernel's backlog from the
+    start, as a background task's does once its execution has reported. A root's construction
+    runs in one (`_construct`), with no id, since it is no submission."""
+
+    def __init__(self, kernel, exec_id, reported=False):
         self.kernel = kernel
         self.id = exec_id
         self.task = None
@@ -297,6 +301,10 @@ class _Execution:
         self._captured = bytearray()
         self._dropped = 0
         self._drained = threading.Event()
+        if reported:
+            self._drained.set()
+            self._sentinel = self._wfd = None
+            return
         # Random, so no output -- printed or binary, from Python or a child -- ends the body's
         # output early.
         self._sentinel = os.urandom(16)
@@ -2478,7 +2486,7 @@ def _load_outrig(directory):
 
     outrig._kernel.install(_calling)
     outrig._agents._call = _call
-    outrig._agents._launch = _Instance
+    outrig._agents._launch = _attach
     outrig._agents._submitted_source = _submitted_source
     outrig._agents._kind_of = lambda name: getattr(_SESSION.get(name), "kind", "binding")
     outrig._services._call = _service_call
@@ -4078,10 +4086,7 @@ class Runtime:
                 bound += used + also
                 channels[channel] = _Channel(declared.request_type, declared.reply_type, request,
                                              reply, declared.doc)
-                said.append({"name": channel, "doc": declared.doc,
-                             "request_type": _schema._describe(declared.request_type),
-                             "reply_type": _schema._describe(declared.reply_type),
-                             "request": request.text(), "reply": reply.text()})
+                said.append(channels[channel].said(channel))
         bound = list(dict.fromkeys(bound))
         _agents.one_name_each(bound, copies)
         _agents.one_name_each(bound + sorted(classes, key=_type_qualname))
@@ -4107,8 +4112,7 @@ class Runtime:
                             "record": None if instance is None else instance.record,
                             # What the child binds at boot: an agent class instance, as `self`,
                             # and each of its aliases beside it.
-                            "boot": {} if instance is None else {"self": instance.instance,
-                                                                 **instance.aliases}}
+                            "boot": {} if instance is None else instance.boot()}
         try:
             # Inside the `try`, so a line that could not be written leaves no entry behind.
             ask = kernel.ask(line)
@@ -4565,6 +4569,15 @@ def _answered(declared, value):
     return None, tuple(problems.found)
 
 
+def _json_form(value):
+    """`value`'s JSON form, where it has one as data, or `None`: what a rejected reply is said as
+    to an owner, beside what was wrong with it."""
+    try:
+        return _agents.walk(value, "$")[0]
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
 def _holds_instances(value, depth=0):
     """Whether `value` holds a dataclass instance anywhere: it is then an instance, not a JSON
     form, and is checked as one."""
@@ -4662,6 +4675,13 @@ class _Channel:
     reply: object  # the reply type's Schema
     doc: object
 
+    def said(self, name):
+        """The channel `name`, as the host is told of it: what its child's instructions say."""
+        return {"name": name, "doc": self.doc,
+                "request_type": _schema._describe(self.request_type),
+                "reply_type": _schema._describe(self.reply_type),
+                "request": self.request.text(), "reply": self.reply.text()}
+
 
 class _Child:
     """What a child agent's parent and its kernel share: its queue of submissions, its limit on
@@ -4684,6 +4704,13 @@ class _Child:
         self.last = None  # the submission given to it last
         self.kernel = None
         self.released = False
+        # A root child's instance id, once it has one; whether its owner -- a program on the host,
+        # whose classes it rebuilt (`_rooted`) -- judges each reply to it, which is otherwise
+        # judged here. A root its session's owner constructs in its own kernel (`_construct`) is
+        # `constructing` until the kernel has adopted the instance, on `model`, the owner's.
+        self.instance = None
+        self.owner_judges = self.constructing = False
+        self.model = None
 
     def __str__(self):
         return f"child {self.name!r}" + ("" if self.id is None else f" ({self.id})")
@@ -4874,7 +4901,10 @@ class _Work:
         if ended:
             raise self.refused()
         reply = None
-        if self.sender is _OWNER:
+        # A program on the host judges a reply to its root child; a parent kernel, and the owner
+        # of a root constructed here, which hears the accepted reply's JSON, have it judged here.
+        judged = self.sender is _OWNER and self.child.owner_judges
+        if judged:
             accepted, problems, reply = await self._judged(value, attempt)
             with self.lock:
                 attempt = self.attempts + 1  # another reply may have been counted meanwhile
@@ -4889,11 +4919,7 @@ class _Work:
                 if type(found) not in (list, tuple) or any(type(p) is not str for p in found):
                     raise TypeError(f"it returned {found!r}, not a list of str")
             except BaseException as e:
-                try:
-                    message = str(e)
-                except BaseException:
-                    message = "<a message that could not be read>"
-                text = _agents.cut(f"the validator raised {_type_qualname(type(e))}: {message}")
+                text = _agents.cut(f"the validator raised {_said_of(e)}")
                 if not self.end("failed", error=e, message=text):
                     raise self.refused()
                 raise RuntimeError(text)
@@ -4903,10 +4929,21 @@ class _Work:
             problems = tuple(_schema.Problem("$", _agents.cut(text)) for text in kept)
             if len(found) > len(kept):
                 problems += (_schema.Problem("$", f"... and {len(found) - len(kept)} more"),)
+        # What the owner of a root constructed here is told of the reply, accepted or rejected:
+        # JSON text, which keeps a dict's order and an integer's size, on a line the host reads --
+        # bounded as a program's root's reply is, before it counts, so one past the bound,
+        # whatever it is, counts no attempt and ends nothing.
+        told = {}
+        if self.sender is _OWNER and not judged:
+            told = {"json": json.dumps(_json_form(value) if problems
+                                       else self.declared.encode(accepted))}
+            _refuse_long({"t": "agent.ended", "agent": self.child.id, "request": self.id,
+                          "outcome": "accepted", "ask": self.ask, "error": None, "reply": None,
+                          **told}, "reply", "reply with less")
         said = None
         if _observing:
             said = (_loose_preview(value) if problems else _agents.preview(
-                accepted if self.sender is _OWNER else self.declared.encode(accepted)))
+                accepted if judged else self.declared.encode(accepted)))
         _notify({"t": "agent.answered", "agent": self.child.id, "request": self.id,
                  "attempt": attempt, "problems": [str(p) for p in problems], "value": said})
         with self.lock:
@@ -4922,9 +4959,9 @@ class _Work:
                         f"{self.attempts_max}: it has ended rejected, and takes no answer now:\n"
                         f"{listing}")
                 rejected = _agents.CompletionRejected(text, _copy_or_none(value), problems)
-                # The program's handle carries the last reply's JSON form and what was wrong.
+                # The owner's handle carries the last reply's JSON form and what was wrong.
                 said = {} if self.sender is not _OWNER else {"last": {
-                    "value": json.dumps(accepted),
+                    "value": told["json"] if told else json.dumps(accepted),
                     "problems": [[p.path, p.message] for p in problems]}}
                 if not self.end("rejected", error=rejected, **said):
                     raise self.refused()
@@ -4934,7 +4971,7 @@ class _Work:
                 f"{self.attempts_max}); correct what is listed and answer again:\n{listing}",
                 problems,
             )
-        if not self.end(None, value=accepted, reply=reply):
+        if not self.end(None, value=accepted, reply=reply, **told):
             raise self.refused()
 
     async def _judged(self, value, attempt):
@@ -5323,27 +5360,20 @@ def _call(declaration, arguments):
     return _agents.Handle(call)
 
 
-class _Instance:
-    """What the runtime keeps of an agent class instance (`outrig.Agent`), the instance among it:
-    the launch gives it to the child's kernel, which binds it as `self` (`_open`), so nothing
-    collects it while the child lives, and it ends only as it is released -- by
-    `release()` or `async with`, by the end of the kernel that made it, whose children end with
-    it, or by the session's close.
+class _Attached:
+    """What attaching an agent class instance (`outrig.Agent`) checks and keeps, wherever its
+    child is: the instance among it, and what the child is made of and binds. `_Instance` launches
+    that child from the constructing kernel; `_Adopted` is a root's own kernel."""
 
-    The child's record is made with it, and holds the requests made before the child exists,
-    which the launch -- a spawn, as a task of the constructing kernel's loop -- sends, in order,
-    once it does. The host settles `ready()` as the child's orienting round ends, unless what ends
-    the instance first does: its launch failing, its release, the session's close, or the end of
-    the kernel that made it. The release runs on that loop too, once, however it began.
-    """
-
-    def __init__(self, agent, inputs, model, session, facilities):
+    def attaching(self, agent, inputs, model, session, facilities):
+        """Check and keep what attaching `agent` takes, constructed in the calling kernel with
+        `inputs`, `model` and `facilities`: what its child is made of, wherever that child is."""
         cls = type(agent)
         if session is not None:
             raise TypeError(f"{cls.__qualname__}(session=...) names a session a program on the "
                             "host owns; an agent's instance runs in the agent's own")
         kernel = _sending_kernel(f"{cls.__qualname__}()")
-        _, copies, classes, _ = _inputs(inputs, f"{cls.__qualname__}()")
+        manifest, copies, classes, _ = _inputs(inputs, f"{cls.__qualname__}()")
         methods = {name: send.__outrig_channel__ for name, send in cls._outrig_channels.items()}
         bound = list(dict.fromkeys(c for method in methods.values() for c in method.classes))
         _agents.one_name_each(bound, copies)
@@ -5362,26 +5392,16 @@ class _Instance:
         # it, each a name and the object of the constructor argument it names (`alias`).
         self.instance, self.aliases = agent, {}
         self.kernel, self.loop, self.inputs, self.model = kernel, kernel.loop, copies, model
-        self.classes = named
+        self.manifest, self.classes = manifest, named
         self.prompt = inspect.cleandoc(cls.__doc__)
         self.requests = {name: _agents.Request(m.request_type, m.reply_type, doc=m.doc)
                          for name, m in methods.items()}
         self.said = {"id": self.id, "module": cls.__module__, "qualname": cls.__qualname__,
                      "digest": cls._outrig_digest, "self": True}
-        self.record = _Child(None, f"{cls.__name__[:48]}-{self.id}", "request", kernel,
-                             {name: _Channel(m.request_type, m.reply_type, m.request, m.reply,
-                                             m.doc) for name, m in methods.items()},
-                             _requests_max)
-        self.record.holding = True
+        self.channels = {name: _Channel(m.request_type, m.reply_type, m.request, m.reply, m.doc)
+                         for name, m in methods.items()}
         self.lock = threading.Lock()
         self.how = self.child = self.error = self.task = self.ending = None
-        # Each settled once, from any thread, and awaited from any loop: running, so that a
-        # waiter that is cancelled cancels neither.
-        self.oriented, self.released = concurrent.futures.Future(), concurrent.futures.Future()
-        self.oriented.set_running_or_notify_cancel()
-        self.released.set_running_or_notify_cancel()
-        _instances[self.id] = self
-        kernel.loop.call_soon_threadsafe(self.start, contextvars.copy_context())
 
     def alias(self, aliases):
         """Bind each of `aliases` -- a name, and the object the constructor argument of that name
@@ -5400,6 +5420,39 @@ class _Instance:
                 raise ValueError(f"alias {name!r} is also a facility's name")
         _agents.one_name_each(self.classes, list(aliases), "an alias")
         self.aliases = dict(aliases)
+
+    def boot(self):
+        """What the child binds at boot: the instance, as `self`, and each alias beside it."""
+        return {"self": self.instance, **self.aliases}
+
+
+class _Instance(_Attached):
+    """What the runtime keeps of an agent class instance (`outrig.Agent`), the instance among it:
+    the launch gives it to the child's kernel, which binds it as `self` (`_open`), so nothing
+    collects it while the child lives, and it ends only as it is released -- by
+    `release()` or `async with`, by the end of the kernel that made it, whose children end with
+    it, or by the session's close.
+
+    The child's record is made with it, and holds the requests made before the child exists,
+    which the launch -- a spawn, as a task of the constructing kernel's loop -- sends, in order,
+    once it does. The host settles `ready()` as the child's orienting round ends, unless what ends
+    the instance first does: its launch failing, its release, the session's close, or the end of
+    the kernel that made it. The release runs on that loop too, once, however it began.
+    """
+
+    def __init__(self, agent, inputs, model, session, facilities):
+        cls = type(agent)
+        self.attaching(agent, inputs, model, session, facilities)
+        self.record = _Child(None, f"{cls.__name__[:48]}-{self.id}", "request", self.kernel,
+                             self.channels, _requests_max)
+        self.record.holding = True
+        # Each settled once, from any thread, and awaited from any loop: running, so that a
+        # waiter that is cancelled cancels neither.
+        self.oriented, self.released = concurrent.futures.Future(), concurrent.futures.Future()
+        self.oriented.set_running_or_notify_cancel()
+        self.released.set_running_or_notify_cancel()
+        _instances[self.id] = self
+        self.kernel.loop.call_soon_threadsafe(self.start, contextvars.copy_context())
 
     def start(self, context):
         self.task = asyncio.Task(self.launch(), loop=self.loop, context=context,
@@ -5563,6 +5616,61 @@ class _Instance:
             self.released.set_result(None)
 
 
+class _Adopted(_Attached):
+    """What the runtime keeps of an agent class instance its session's owner constructed as a
+    root (`_construct`): constructed in the root's own kernel, which adopts it rather than
+    launching a child, so the record is that kernel's and the owner is its parent. It has no
+    launch; its readiness, its requests and its release are the owner's, through the host, and
+    each raises `TypeError` here, as a request method called on `self` does in any child."""
+
+    def __init__(self, agent, inputs, model, session, facilities):
+        self.attaching(agent, inputs, model, session, facilities)
+        self.record = self.kernel.child
+        if self.record is None or not self.record.constructing:
+            raise RuntimeError(f"{type(agent).__qualname__} is attached as a root only in the "
+                               "kernel its session's owner opened to construct it")
+        if model is not None and model != self.record.model:
+            raise TypeError(
+                f"{type(agent).__qualname__} is constructed as a root on {self.record.model!r}, "
+                f"the model its session's owner named, and cannot run on model={model!r}"
+            )
+
+    def owners(self, what):
+        return TypeError(f"{self.record} is a root its session's owner constructed, so {what} "
+                         "is the owner's")
+
+    def request(self, agent, name, message):
+        raise TypeError(
+            f"{type(agent).__qualname__}.{name}() would send a request on channel {name!r} of a "
+            f"root, whose requests are its session's owner's, so nothing was sent. Take what "
+            f"arrives on it with `await runtime.channels[{name!r}].receive()`"
+        )
+
+    async def ready(self):
+        raise self.owners("its readiness")
+
+    async def release(self, how):
+        raise self.owners("its release")
+
+    def declaration(self):
+        """What the host makes the root's child of, as a spawn's line says it of any instance's:
+        its prompt, inputs, facilities, channels and instance."""
+        return {
+            "prompt": self.prompt, "manifest": self.manifest,
+            "facilities": None if self.facilities is None else _manifest(self.facilities),
+            "channels": [channel.said(name) for name, channel in self.channels.items()],
+            "instance": {**self.said, "aliases": list(self.aliases)},
+        }
+
+
+def _attach(agent, inputs, model, session, facilities):
+    """Attach `agent`, an agent class instance whose construction has finished: adopted by its
+    own kernel when it is the root its session's owner asked for, and launched as the calling
+    kernel's child otherwise. What `outrig.Agent`'s metaclass calls."""
+    attached = _Adopted if _agents._SITE.get() == "root" else _Instance
+    return attached(agent, inputs, model, session, facilities)
+
+
 class _ProgressOut(Endpoint):
     """A work child's `progress` channel: text sent on it goes to the handle of the submission it
     is working on, which its parent reads as `handle.progress`. It ends nothing, and nothing comes
@@ -5665,30 +5773,8 @@ class Kernel:
         self.globals = self.module.__dict__
         self.globals["__builtins__"] = builtins
         self.globals["asyncio"] = asyncio
-        # The channels this agent has, and the runtime class that describes them: each kind of
-        # agent is told of its own, so the three are told apart here and nowhere else.
-        if child is None:
-            # The user's channel carries text both ways, and the host is at the other end of it.
-            # A child has none: what it is given comes from its parent.
-            self.channels = {"user": Endpoint(agent, "user", receives=str, sends=str)}
-            runtime = Runtime
-        elif child.kind == "request":
-            self.channels = {
-                name: RequestEndpoint(agent, name, channel)
-                for name, channel in child.channels.items()
-            }
-            runtime = RequestRuntime
-        else:
-            self.channels = {"progress": _ProgressOut(agent, child)}
-            runtime = WorkRuntime
-        if facilities is not None:
-            runtime = _GIVEN_RUNTIMES[runtime]
         self.history = History()
-        # Also `outrig.runtime`, from any code an execution of this kernel runs, whatever the
-        # global comes to hold.
-        self.runtime = self.globals["runtime"] = runtime._made(
-            self.channels, self.held, self.history, Context(agent, self.history), self
-        )
+        self._equip()
         sys.modules[self.module.__name__] = self.module
         # Names bound at boot are infrastructure, not the model's work. Hidden by identity, so a
         # name the model rebinds is listed again.
@@ -5723,10 +5809,72 @@ class Kernel:
         self._offered = set()
         # This kernel's object of each service it has reached, by the service's name.
         self.services = {}
-        if facilities is None:
+        # A root's kernel opened to construct its instance offers its view once it has adopted
+        # the instance, whose view it is.
+        if child is None or not child.constructing:
+            self._offer_view()
+
+    def _equip(self):
+        """Give this kernel the channels its kind of agent has, and the runtime class that
+        describes them, as `runtime` and `outrig.runtime`: each kind of agent is told of its own,
+        so the three are told apart here and nowhere else. As it is built, and again as a root's
+        kernel adopts the instance constructed in it (`adopt`)."""
+        agent, child = self.agent, self.child
+        if child is None:
+            # The user's channel carries text both ways, and the host is at the other end of it.
+            # A child has none: what it is given comes from its parent.
+            self.channels = {"user": Endpoint(agent, "user", receives=str, sends=str)}
+            runtime = Runtime
+        elif child.kind == "request":
+            self.channels = {
+                name: RequestEndpoint(agent, name, channel)
+                for name, channel in child.channels.items()
+            }
+            runtime = RequestRuntime
+        else:
+            self.channels = {"progress": _ProgressOut(agent, child)}
+            runtime = WorkRuntime
+        if self.facilities is not None:
+            runtime = _GIVEN_RUNTIMES[runtime]
+        # Also `outrig.runtime`, from any code an execution of this kernel runs, whatever the
+        # global comes to hold.
+        self.runtime = self.globals["runtime"] = runtime._made(
+            self.channels, self.held, self.history, Context(agent, self.history), self
+        )
+
+    def _offer_view(self):
+        """Bind what this kernel's view holds as globals: the session's bindings and services, or
+        the entries of its mapping."""
+        if self.facilities is None:
             self.offer_session()
         else:
             self._bind_facilities()
+
+    def adopt(self, instance):
+        """Make this kernel, a root's opened to construct its instance, that instance's child, as
+        `_open` makes a spawned child's: its record takes the instance's channels and id, its view
+        the instance's facilities, and its namespace the inputs and classes, `self` and the
+        aliases. On the kernel's own thread, before anything else runs in it."""
+        record = self.child
+        record.channels, record.instance = instance.channels, instance.id
+        self.facilities = instance.facilities
+        self._equip()
+        self._boot["runtime"] = self.runtime
+        self._offer_view()
+        self.bind(instance.inputs, instance.classes, instance.boot())
+        record.constructing = False
+
+    def bind(self, inputs, classes, boot):
+        """Bind what a child is given in this kernel's namespace: each input, each class under its
+        name, and what it binds at boot -- an agent class instance, as `self`, and its aliases --
+        each the object itself, never a copy, and among the names bound at boot, which the
+        inventory leaves out until agent code rebinds one."""
+        for name, value in inputs.items():
+            self.globals[name] = value
+        for cls in classes:
+            self.globals[cls.__name__] = cls
+        for name, value in boot.items():
+            self.globals[name] = self._boot[name] = value
 
     def announce(self, instance=None):
         """Say the kernel is ready: a root child's, with its instance's id."""
@@ -6792,11 +6940,7 @@ def _import_failure(module, e):
             "code": "module-missing",
             "message": f"no module named {name!r} is in the application or elsewhere on `sys.path`",
         }
-    try:
-        text = "".join(traceback.format_exception(e))
-    except BaseException as failed:
-        text = _unformatted(e, failed)
-    return {**said, "traceback": text[-_serve.TEXT_MAX:]}
+    return {**said, "traceback": _traceback_text(e)[-_serve.TEXT_MAX:]}
 
 
 # ---------------------------------------------------------------------------- facilities
@@ -6934,7 +7078,8 @@ def _close(message):
     sent is the binding's to finish. Every request made of a child and not yet answered ends with
     the closing error -- one that had ended, the host not yet told so, is told again -- and no
     request or submission is sent from now on. Each agent class instance not yet ready never is,
-    and each is released, as `closing`."""
+    and each is released, as `closing`; and each construction a root's kernel has not answered is
+    answered, `closing`."""
     global _closing
     if _closing is not None:
         return  # each endpoint's relay says so
@@ -6963,6 +7108,8 @@ def _close(message):
         instance.settle(_agents.SessionClosing(
             f"the session closed before {instance.record} was ready: {text}"))
         instance.close()
+    for agent in list(_constructions):
+        _not_constructed(agent, text)
     for record in list(_children.values()):
         if record.parent is _OWNER and not record.released:
             _notify({"t": "agent.instance.released", "agent": _OWNER.agent, "how": "closing",
@@ -6990,7 +7137,9 @@ def _open(agent, main, child=None):
     `child`, for a child agent's kernel, names the spawn waiting for it -- whose parent's inputs
     are bound in its namespace, its classes under their names, and an agent class instance's
     instance as `self`, with its aliases -- and its `requests_max`. A root child's spawn waits on
-    the host, and `child` brings its `root` instead (`_rooted`).
+    the host, and `child` brings its `root` instead (`_rooted`); or, for a root its session's
+    owner constructs here, `construct`, the class's name, and the `model` the owner named, and
+    the kernel is made ready to be told to construct it (`_construct`).
     """
     global _primary
     if not _valid_agent(agent):
@@ -7002,11 +7151,15 @@ def _open(agent, main, child=None):
     record = spec = None
     if child is not None:
         if isinstance(child, dict):
-            if child.get("root") and _closing is not None:
+            if (child.get("root") or child.get("construct")) and _closing is not None:
                 # Its instance would start after the close said what it released.
                 raise ValueError("the session is closing")
-            spec = _rooted(agent, child["root"]) if child.get("root") else _spawning.get(
-                child.get("spawn"))
+            if child.get("root"):
+                spec = _rooted(agent, child["root"])
+            elif child.get("construct"):
+                spec = _to_construct(agent, child["construct"], child.get("model"))
+            else:
+                spec = _spawning.get(child.get("spawn"))
         requests_max = child.get("requests_max") if isinstance(child, dict) else None
         if main or spec is None or type(requests_max) is not int or requests_max < 1:
             raise ValueError(f"no spawn is waiting for agent {agent!r} as {child!r} names it")
@@ -7017,15 +7170,7 @@ def _open(agent, main, child=None):
     kernel = Kernel(agent, child=record, facilities=None if spec is None else spec.get("facilities"))
     if record is not None:
         record.kernel = kernel
-        for name, value in spec["inputs"].items():
-            kernel.globals[name] = value
-        for cls in spec["classes"]:
-            kernel.globals[cls.__name__] = cls
-        # An agent class instance, as `self`, and its aliases: each the object itself, never a
-        # copy, and among the names bound at boot, which the inventory leaves out until agent
-        # code rebinds one.
-        for name, value in spec.get("boot", {}).items():
-            kernel.globals[name] = kernel._boot[name] = value
+        kernel.bind(spec["inputs"], spec["classes"], spec.get("boot", {}))
     if main:
         kernel.thread = threading.main_thread()
     else:
@@ -7055,7 +7200,206 @@ def _rooted(agent, root):
                 for name, (rq, rp, doc) in channels.items()}
     record = _Child(agent, root["name"], "request", _OWNER, channels, 1)
     record.instance = next(_ids)  # among the ids every instance here takes, so none shares it
+    record.owner_judges = True
     return {"inputs": inputs, "classes": classes, "record": record}
+
+
+def _to_construct(agent, name, model):
+    """What root `agent`'s kernel is made from when its session's owner constructs its instance
+    in it: nothing bound yet, and a record whose parent is the owner, with no channels until the
+    instance's class gives them (`Kernel.adopt`)."""
+    if type(name) is not str or type(model) is not str:
+        raise ValueError(f"agent {agent!r} is constructed from a class's name and a model's")
+    record = _Child(agent, name, "request", _OWNER, {}, 1)
+    record.constructing, record.model = True, model
+    return {"inputs": {}, "classes": [], "record": record}
+
+
+# ---------------------------------------------------------------------------- construction
+#
+# A root its session's owner constructs is constructed in its own kernel, which the host opened
+# for it (`_to_construct`): the class is imported from the session's application code, the
+# arguments are made from what the owner described -- data, or references to the session's
+# facilities by name -- and the class is called, so its `__init__`, its `__outrig_attach__` and
+# its attachment run there, on the kernel's own loop, in a context of their own: an `_Execution`
+# that has reported. The kernel then adopts the instance as its `self` and answers with what the
+# host makes the root's child of: what a spawn's line carries of any instance. Nothing of the
+# owner's process crosses but names and JSON.
+
+# Each construction not yet answered, by its root's agent: the id the host asked under.
+_constructions = {}
+
+
+class _NotConstructed(Exception):
+    """Why a construction failed, as the host is told it: `code`, `message`, `traceback`."""
+
+    def __init__(self, code, message, traceback_text=""):
+        super().__init__(message)
+        self.said = {"code": code, "message": message[:OWNER_TEXT_MAX],
+                     "traceback": traceback_text[-_serve.TEXT_MAX:]}
+
+
+def _construct(kernel, request_id, message):
+    """Construct, in `kernel` -- a root's, opened to construct it -- the instance `message`
+    describes: `class`, its `module:qualname`; `args`, each a `name` and its `data` (JSON text,
+    with the `type` it decodes into strictly, or none), its `facility` (`{kind, name}`), or its
+    `facilities` (a dict of those); and `aliases`, the arguments bound beside `self`. On the
+    kernel's loop, which nothing else runs on yet; answered with `constructed`. Reader thread."""
+    record = kernel.child
+    if record is None or not record.constructing or kernel.ended:
+        raise ValueError(f"agent {kernel.agent!r} has no construction waiting")
+    _constructions[kernel.agent] = request_id
+    if _closing is not None:
+        _not_constructed(kernel.agent, _closing)
+        return
+    context = contextvars.Context()
+    context.run(_CURRENT.set, _Execution(kernel, None, reported=True))
+    kernel.loop.call_soon_threadsafe(_constructing, kernel, request_id, message, context=context)
+
+
+def _not_constructed(agent, closing):
+    """Answer the construction in root `agent`'s kernel, if it has not been answered: the session
+    closed, `closing`, first. What of it is still running runs on, into a kernel the host ends."""
+    request_id = _constructions.pop(agent, None)
+    if request_id is not None:
+        _notify({"t": "constructed", "agent": agent, "id": request_id,
+                 "error": {"code": "closing", "traceback": "",
+                           "message": f"the session closed before it was constructed: {closing}"}})
+
+
+def _constructing(kernel, request_id, message):
+    """`_construct`'s work, on `kernel`'s loop: the instance constructed and adopted, and the host
+    told what to make its child of, or why it could not be."""
+    answer = {"t": "constructed", "agent": kernel.agent, "id": request_id}
+    try:
+        answer["declaration"] = _constructed(kernel, message)
+        line = _refuse_long(answer, "construction's answer",
+                            "give the class shorter docstrings, or fewer inputs or channels")
+    except BaseException as e:
+        failed = e if type(e) is _NotConstructed else _NotConstructed(
+            "raised", _said_of(e), _traceback_text(e))
+        answer.pop("declaration", None)
+        answer["error"] = failed.said
+        line = _with_room(_encode, answer)
+    # Answered once: the session's close may have answered it already.
+    if _constructions.pop(kernel.agent, None) is not None:
+        _write_line(line)
+
+
+def _constructed(kernel, message):
+    """Import the class, make the arguments, call the class as its owner's root, and adopt it."""
+    reference = message.get("class")
+    cls = _class_named(reference)
+    if not (isinstance(cls, type) and issubclass(cls, _agents.Agent)):
+        raise _NotConstructed("not-an-agent-class",
+                              f"{reference} is not a subclass of outrig.Agent")
+    arguments = {}
+    for argument in message.get("args") or ():
+        name = argument.get("name")
+        if type(name) is not str or name in arguments:
+            raise _NotConstructed("invalid-argument", f"argument {name!r} is named twice, or not "
+                                  "by a str")
+        arguments[name] = _argument(name, argument)
+    aliases = message.get("aliases") or []
+    for name in aliases:
+        if name not in arguments:
+            raise _NotConstructed("invalid-argument", f"alias {name!r} names no argument")
+    site = _agents._SITE.set("owner")
+    try:
+        agent = cls(**arguments)
+    finally:
+        _agents._SITE.reset(site)
+    adopted = agent._outrig
+    adopted.alias({name: arguments[name] for name in aliases})
+    declaration = adopted.declaration()
+    kernel.adopt(adopted)
+    return declaration
+
+
+def _class_named(reference):
+    """The object `reference`, `module:qualname`, names: its module imported, if it had not
+    been, then each part of its qualified name read in turn."""
+    if type(reference) is not str:
+        raise _NotConstructed("class-missing", f"{reference!r} names no class")
+    module, colon, qualname = reference.partition(":")
+    if not colon or not module or not qualname:
+        raise _NotConstructed("class-missing",
+                              f"{reference!r} names no class: give it as module:qualname")
+    try:
+        found = importlib.import_module(module)
+    except BaseException as e:
+        said = _import_failure(module, e)
+        raise _NotConstructed(said["code"], f"module {module!r} did not import: "
+                              f"{said['message']}", said["traceback"]) from None
+    for part in qualname.split("."):
+        try:
+            found = getattr(found, part)
+        except AttributeError:
+            raise _NotConstructed("class-missing", f"{reference}: module {module!r} has no "
+                                  f"{qualname!r}") from None
+    return found
+
+
+def _argument(name, argument):
+    """Argument `name` of a construction, made from what the owner described of it."""
+    if "data" in argument:
+        try:
+            value = json.loads(argument["data"])
+        except (TypeError, ValueError) as e:
+            raise _NotConstructed("invalid-argument", f"argument {name!r} is not JSON: {e}") \
+                from None
+        declared = argument.get("type")
+        if declared is None:
+            return value
+        cls = _class_named(declared)
+        try:
+            return _schema.declare(cls).decode(value)
+        except _schema.DecodeError as e:
+            listing = "\n".join(f"  {problem}" for problem in e.problems)
+            raise _NotConstructed("invalid-argument", f"argument {name!r} does not decode into "
+                                  f"{declared}:\n{listing}") from None
+        except TypeError as e:
+            raise _NotConstructed("invalid-argument", f"argument {name!r} names {declared}, "
+                                  f"which no data decodes into: {e}") from None
+    if "facility" in argument:
+        return _referenced(name, argument["facility"])
+    if "facilities" in argument and type(argument["facilities"]) is dict:
+        return {key: _referenced(f"{name}[{key!r}]", ref)
+                for key, ref in argument["facilities"].items()}
+    raise _NotConstructed("invalid-argument",
+                          f"argument {name!r} is neither data nor a facility")
+
+
+def _referenced(key, ref):
+    """A reference to the session's facility `ref`, `{kind, name}`, given as `key`; refused,
+    naming it, when the session has no such facility."""
+    kind, target = (ref.get("kind"), ref.get("name")) if type(ref) is dict else (None, None)
+    if kind not in _KINDS or type(target) is not str:
+        raise _NotConstructed("invalid-argument", f"argument {key} names no facility the session "
+                              f"could have: {ref!r}")
+    try:
+        _KINDS[kind].brief(key, target)
+    except LookupError as e:
+        raise _NotConstructed("invalid-argument", f"argument {e}") from None
+    return _agents._reference(kind, target)
+
+
+def _said_of(e):
+    """`e`, raised by agent code, as its type and message."""
+    try:
+        text = str(e)
+    except BaseException:
+        text = "<a message that could not be read>"
+    return f"{_type_qualname(type(e))}: {text}" if text else _type_qualname(type(e))
+
+
+def _traceback_text(e):
+    """`e`'s traceback, as Python formats it; or, when formatting it raises, what
+    `_unformatted` says."""
+    try:
+        return "".join(traceback.format_exception(e))
+    except BaseException as failed:
+        return _unformatted(e, failed)
 
 
 def _exec(kernel, request_id, message):
@@ -7462,6 +7806,7 @@ _ROUTES = {
     "settle": _settle_work,
     "oriented": _oriented,
     "child": _child_state,
+    "construct": _construct,
     "end": lambda kernel, _, __: kernel.end(),
 }
 

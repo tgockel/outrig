@@ -618,7 +618,8 @@ agents share `self` from two threads: one attribute read or write is atomic, a c
 update is not, and a request is how to ask the child for something. A module's globals are
 shared by every agent that imports it; keep per-agent state on `self`. The child holds
 `self`, so nothing collects an instance while its child lives: it ends as it is released, as
-the agent that made it is, or as the session ends.
+the agent that made it is, or as the session ends. A session's owner can construct one as a
+root, in a kernel of its own, where it is `self` and needs no marked method.
 
 `Reviewer(**inputs, facilities={"files": files})` gives the child, beside its data, the
 objects it acts through, by name, kept as `reviewer.facilities`; a name follows an input's
@@ -964,7 +965,9 @@ an alias. A field without a default must be present, even when its type allows n
 accepted only where the type includes `None`. A field left out takes its dataclass default and
 nothing else. A `Literal` matches by value and type, so `true` is not `1`, while an integer passes
 as a float. A union takes a value exactly one member accepts, or that every member accepting it
-builds alike. Every problem is reported with the JSON path where it is, up to `PROBLEMS_MAX`.
+builds alike. Every problem is reported with the JSON path where it is, up to `PROBLEMS_MAX`;
+a path or a message past 1,024 characters -- one quoting a long key, say -- is shortened in its
+middle, saying how much was left out.
 
 ### `outrig.schema.declare`
 

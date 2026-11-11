@@ -660,10 +660,16 @@ fn render_report(report: &Report) -> String {
         );
     }
     for background in &report.background {
-        let mut section = format!(
-            "[output from execution {}, written after it reported]\n{}",
-            background.id, background.output
-        );
+        let mut section = match background.id {
+            Some(id) => format!(
+                "[output from execution {id}, written after it reported]\n{}",
+                background.output
+            ),
+            None => format!(
+                "[output from your construction, before your first round]\n{}",
+                background.output
+            ),
+        };
         if background.dropped > 0 {
             push_block(
                 &mut section,
