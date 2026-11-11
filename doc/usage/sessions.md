@@ -99,6 +99,14 @@ the directory is the session's. Running again with the same path is refused for 
 reason, since the first run's `session.json` is still there: discard that session first, or
 give each run its own path.
 
+If `<path>` -- or, for an auto-allocated session, the directory `--session-root` would create it
+under -- lies inside an `[images.<name>]` build's context and nothing excludes it there, outrig
+refuses the run before anything is hashed or built, naming the directory. Left unchecked, the
+session's own writes (`session.json`, `logs/`, and under `-v` a live transcript) would land in
+what the image's cache key hashes, so every build of it would finish only to be discarded and
+retried. Point `--session-dir` or `--session-root` outside the build context, or exclude it with
+a `.gitignore` rule, to fix it.
+
 ## `outrig ls`
 
 List sessions newest-first:

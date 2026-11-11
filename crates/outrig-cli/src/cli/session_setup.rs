@@ -351,7 +351,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
 
     let session_root =
         session::resolve_session_root(args.session_root_flag, &cfg, &default_session_root());
-    let store = SessionStore::new(session_root);
+    let store = SessionStore::new(session_root.clone());
     let attach = match args.attach_target {
         Some(target) if args.llm_session => {
             return Err(OutrigError::Configuration(format!(
@@ -614,8 +614,43 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     // the image is built and started below -- minutes, for a cold build
     // (#366). An id already taken under the root is drawn again, and the
     // record rebuilt for the new one (#382).
-    let (mut session, session_dir, session_lock) =
-        store.create_fresh(SessionId::new, args.explicit_session_dir, |sid| Session {
+    //
+    // This inlines `SessionStore::create_fresh`'s own draw-and-retry loop
+    // rather than calling it, so each draw's exact directory -- not the
+    // session root above it -- can be checked before `store.create` claims
+    // it: a fresh session writes `session.json`, `logs/`, and (with `-v`) a
+    // live transcript into its directory, and a build whose context holds
+    // that directory unignored is refused only after it finishes, every
+    // time, once those writes land in what gets hashed (#909). The root
+    // itself is not necessarily that directory -- an ignore rule can exclude
+    // every `<sid>` under it without excluding the root, e.g. `sessions/*`
+    // -- so only the draw's own directory answers the question. Attaching
+    // builds nothing, so it is not asked. The check itself shells out to
+    // `git`, so it is raced against `signals` like every other step below
+    // that can stall: unraced, a `git` that hung would leave a `SIGTERM` or
+    // `SIGHUP` queued (`Signals::install` has already turned the default
+    // disposition off) rather than ending the wait.
+    let mut draws = 1;
+    let (mut session, session_dir, session_lock) = loop {
+        let sid = SessionId::new();
+        if attach.is_none() {
+            let candidate = args
+                .explicit_session_dir
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| session_root.join(&sid.0));
+            let (candidate_logical, _) = session::canonicalize_prefix(&candidate)
+                .path_ctx("resolve", &candidate)?;
+            signals
+                .race(image::refuse_session_dir_in_build_context(
+                    &image_cfg_name,
+                    &image_cfg,
+                    &repo_root,
+                    &candidate,
+                    &candidate_logical,
+                ))
+                .await?;
+        }
+        let mut session = Session {
             id: sid.clone(),
             started_at: SystemTime::now(),
             ended_at: None,
@@ -631,7 +666,14 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             session_dir: PathBuf::new(), // set by `create`
             exit_code: None,
             link_target: None,
-        })?;
+        };
+        match store.create(&sid, args.explicit_session_dir, &mut session) {
+            Err(CliError::SessionIdTaken(_)) if draws < session::SESSION_ID_DRAWS => {
+                draws += 1;
+            }
+            created => break created.map(|(dir, lock)| (session, dir, lock))?,
+        }
+    };
     // Set after the claim, so the label carries the id the record has.
     let sid = session.id.clone();
     let container_name = session.container_name.clone();

@@ -429,6 +429,223 @@ async fn ensure_key_still_holds(
     })
 }
 
+/// Refuse before any build work starts if `session_dir` -- the directory a
+/// fresh session is about to write `session.json`, `logs/`, and (with `-v`) a
+/// live transcript into -- lies inside `cfg`'s build context and nothing
+/// excludes it there. Keying the build and writing the session before the
+/// build runs (`ensure_key_still_holds`) catches an edit the hash missed
+/// only after the whole build is thrown away; this runs earlier, before
+/// [`compute_tag_for`] hashes anything, so the directory's own future writes
+/// never reach a hash or a `buildah build` invocation at all (#909).
+///
+/// `session_dir` is passed already resolved to its *logical* path -- existing
+/// components canonicalized, a not-yet-created tail appended as written --
+/// because the caller checks this before the directory (or, for an
+/// auto-allocated session, its final `<sid>` component) necessarily exists.
+/// It is the caller's job to pass the directory that will actually be
+/// created: an auto-allocated session's own `<root>/<sid>`, not the session
+/// root above it, whose own ignore status can differ from a child's (a
+/// `sessions/*` rule excludes every child without excluding `sessions`
+/// itself).
+///
+/// `Ok(())` for an `image-name` source, which builds nothing and so has no
+/// context to collide with; for a context that does not resolve (the build
+/// that follows reports that with a clearer error); and for a directory
+/// outside the context, or inside it but excluded by an ignore rule a git
+/// context honors -- including a nested repository's own rule over a
+/// directory under it, as `hash_git_tree` honors. A non-git context has no
+/// ignore mechanism at all, so there every directory inside it conflicts.
+pub async fn refuse_session_dir_in_build_context(
+    image: &str,
+    cfg: &ImageConfig,
+    repo_root: &Path,
+    session_dir: &Path,
+    session_dir_logical: &Path,
+) -> Result<()> {
+    let ImageSourceRef::Build { .. } = cfg.source() else {
+        return Ok(());
+    };
+    let (_, context) = cfg.resolved_build_paths(repo_root);
+    let Ok(context_canon) = tokio::fs::canonicalize(&context).await else {
+        return Ok(());
+    };
+    if session_dir_logical != context_canon && !session_dir_logical.starts_with(&context_canon) {
+        return Ok(());
+    }
+    // The context root itself: nothing excludes a context from its own
+    // build, so there is no rule to even ask about.
+    if session_dir_logical != context_canon && directory_is_ignored(session_dir_logical).await? {
+        return Ok(());
+    }
+    Err(OutrigError::SessionDirInBuildContext {
+        image: image.to_string(),
+        dir: session_dir.to_path_buf(),
+        context,
+    })
+}
+
+/// Whether `dir` -- a path inside a build context, possibly not created yet
+/// -- is excluded by a `.gitignore`, `core.excludesFile`, or
+/// `.git/info/exclude` rule, in whichever repository actually owns it: the
+/// build context's own, or a nested one under it, exactly as
+/// [`hash_git_tree`]'s own boundary-crossing honors a nested repository's
+/// rules over its own tree. `false` for a `dir` no repository at all owns,
+/// which [`hash_non_git_context`] hashes whole with no ignore mechanism to
+/// ask about.
+///
+/// `git check-ignore` needs `dir` to exist to answer a directory-only rule
+/// (`/sessions/`) correctly -- asked about a path that is not there yet, it
+/// cannot tell that path would have been a directory -- and needs to be run
+/// from inside whichever repository actually owns `dir` for a nested one
+/// under the build context to be asked about its own rules rather than the
+/// outer repository's, which refuses a path across that boundary. So `dir`
+/// (and any missing parent) is created first, asked about by
+/// [`check_ignore_at`], and removed back down to whatever already existed,
+/// win or lose: this is a read of the context, not a write to it.
+async fn directory_is_ignored(dir: &Path) -> Result<bool> {
+    let boundary = deepest_existing_ancestor(dir);
+    // Holds the directories this creates for the rest of the function, and
+    // removes them on the way out whichever way that happens -- including a
+    // caller that races this against a signal and drops the future mid-`await`
+    // in `check_ignore_at`, which runs no code of its own after that point for
+    // an ordinary return to reach.
+    let _guard = if boundary != dir {
+        std::fs::create_dir_all(dir).path_ctx("create directory", dir)?;
+        Some(CreatedDirGuard {
+            dir: dir.to_path_buf(),
+            boundary,
+        })
+    } else {
+        None
+    };
+    check_ignore_at(dir).await
+}
+
+/// `dir` itself, or the nearest ancestor already on disk. Always returns
+/// something: the walk ends at a root component, which exists whenever `dir`
+/// does, and `dir` is always absolute here -- it is `session_dir_logical`,
+/// already anchored against the current directory by its caller.
+fn deepest_existing_ancestor(dir: &Path) -> PathBuf {
+    let mut cur = dir;
+    loop {
+        if cur.exists() {
+            return cur.to_path_buf();
+        }
+        match cur.parent() {
+            Some(parent) => cur = parent,
+            None => return cur.to_path_buf(),
+        }
+    }
+}
+
+/// Undoes what [`directory_is_ignored`] created -- `dir` and each empty
+/// parent above it, stopping the moment `boundary` (what was already there)
+/// is reached -- whenever it drops, ordinary return or an `await` abandoned
+/// mid-probe alike. Best-effort: a directory this cannot remove (another
+/// process raced in under it, say) is left rather than failing or panicking
+/// out of a `Drop`.
+struct CreatedDirGuard {
+    dir: PathBuf,
+    boundary: PathBuf,
+}
+
+impl Drop for CreatedDirGuard {
+    fn drop(&mut self) {
+        let mut cur = self.dir.as_path();
+        while cur != self.boundary {
+            if std::fs::remove_dir(cur).is_err() {
+                break;
+            }
+            match cur.parent() {
+                Some(parent) => cur = parent,
+                None => break,
+            }
+        }
+    }
+}
+
+/// `git check-ignore --quiet --no-index -- ./<name>` for `dir`'s own
+/// basename, run with `dir`'s *parent* as the working directory. Four things
+/// ride on asking it exactly that way:
+///
+/// - Asked about `.` from inside `dir` itself, `check-ignore` answers against
+///   the literal string `.` rather than `dir`'s repository-relative path, and
+///   a pattern ending in a wildcard (`/sessions/*`) matches that literal --
+///   wrongly reporting `dir` itself excluded by a rule that excludes only its
+///   children. Asking the parent about the plain basename does not have this
+///   failure mode.
+/// - Run from `dir`'s parent, git's own repository discovery still resolves
+///   to whichever repository actually owns `dir` -- a nested one under the
+///   build context included, the same boundary [`hash_git_tree`] honors --
+///   because `dir` and its parent are (barring the parent being a repository
+///   root itself, which a session directory never is) inside the same one.
+///   Asking the *build context's* root about a path across that boundary is
+///   refused by git itself, which is why this cannot run from there instead.
+/// - `--` alone does not make `name` literal: a pathspec beginning with `:`
+///   is "magic" syntax (`:(glob)...`, `:!...`) rather than a path, which `--`
+///   stops git from reading as an *option* but not from reading as *pathspec
+///   magic*. Prefixing it with `./` forces the plain-path reading either way.
+/// - `--no-index` keeps the question off the index entirely: without it, a
+///   basename whose glob pathspec happens to match some unrelated *tracked*
+///   file resolves against that file instead of the untracked directory this
+///   is actually asking about, and a tracked file is answered "not excluded"
+///   unconditionally (tracked content is never subject to exclude rules).
+/// - The four `GIT_*_PATHSPECS` environment variables, inherited from
+///   whatever started outrig, each select a pathspec-magic mode
+///   `check-ignore` does not support at all -- it fails outright (exit 128)
+///   if any is on, this call's own `./` included. Pinned off here so this
+///   probe's own answer does not depend on what the caller's shell exported.
+///
+/// `dir` must already exist for any of this to work: unlike its parent, a
+/// directory-only rule (`/sessions/`) cannot be told a path that is not
+/// there would have been one. See [`directory_is_ignored`].
+async fn check_ignore_at(dir: &Path) -> Result<bool> {
+    let Some(cmd) = check_ignore_cmd(dir) else {
+        return Ok(false);
+    };
+    let output = process::try_capture(cmd).await?;
+    match output.status.code() {
+        // 0: matched, excluded. 1: no rule matched it. Anything else -- no
+        // repository owns `dir` at all (no ignore mechanism, so nothing is
+        // excluded), or a real git failure -- reads as "not excluded" too: a
+        // failure to answer is not itself an answer of "yes", so the probe
+        // falls through to the conflict this guards, the safe side for a
+        // check that runs before a build rather than blocking one on a `git`
+        // that cannot currently say.
+        Some(0) => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+/// The command [`check_ignore_at`] runs, split out so its shape -- argv and
+/// the pathspec-magic overrides -- is checkable without a `git` to run it
+/// against. `None` for a `dir` with no parent or no basename (`/`, or an
+/// empty path), which [`check_ignore_at`] reads as "not excluded" the same
+/// as any other answer this cannot get.
+fn check_ignore_cmd(dir: &Path) -> Option<Cmd> {
+    let parent = dir.parent()?;
+    let name = dir.file_name()?;
+    let mut literal_name = OsString::from("./");
+    literal_name.push(name);
+    Some(
+        Cmd::new("git")
+            // `check-ignore` supports none of the four pathspec-magic modes
+            // these select and fails outright (exit 128) if the environment
+            // it inherits has turned one on, which this read's own `./`
+            // prefix as much as a caller's pathspec could -- so every one is
+            // pinned off for this call alone, regardless of what outrig's own
+            // process was started with.
+            .env_hidden("GIT_LITERAL_PATHSPECS", "0")
+            .env_hidden("GIT_GLOB_PATHSPECS", "0")
+            .env_hidden("GIT_NOGLOB_PATHSPECS", "0")
+            .env_hidden("GIT_ICASE_PATHSPECS", "0")
+            .arg("-C")
+            .arg(parent)
+            .args(["check-ignore", "--quiet", "--no-index", "--"])
+            .arg(literal_name),
+    )
+}
+
 /// Returns `true` iff `tag` already exists in buildah's local image store.
 /// `buildah images --quiet <tag>` prints the image id on a hit, and exits 125
 /// with `image not known` on a miss; any failure reads as a miss, and so does

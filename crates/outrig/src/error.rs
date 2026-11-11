@@ -204,6 +204,29 @@ pub enum OutrigError {
     #[non_exhaustive]
     BuildContextChanged { image: String, tag: String },
 
+    /// A fresh session's directory -- explicit (`--session-dir`), or an
+    /// auto-allocated one under `--session-root` -- lies inside the build
+    /// context an image-config's `[images.<name>]` build would hash and send
+    /// to buildah, and no ignore rule takes it out. Refused before anything is
+    /// hashed: the directory is about to receive `session.json`, `logs/`, and
+    /// (with `-v`) a transcript buildah can still read mid-build, each of
+    /// which [`OutrigError::BuildContextChanged`] would catch only after a
+    /// full build was thrown away (#909).
+    #[error(
+        "session directory {} is inside the build context {} for image-config {image:?}, and \
+         nothing excludes it there\n\
+         help: pass --session-dir or --session-root outside the build context, or add it to \
+         .gitignore",
+        dir.display(),
+        context.display()
+    )]
+    #[non_exhaustive]
+    SessionDirInBuildContext {
+        image: String,
+        dir: PathBuf,
+        context: PathBuf,
+    },
+
     // Raised by the build merge, a runtime read of a raw or sidecar image, and
     // `image inspect`, so the `help:` cannot assume the reader owns the
     // image's Dockerfile.

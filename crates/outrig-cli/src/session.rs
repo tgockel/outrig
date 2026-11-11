@@ -424,6 +424,12 @@ impl SessionStore {
     /// instead of reporting a taken id -- `create` undoes the write first, so
     /// the failure leaves the directory as it found it (#431). A launch draws
     /// with [`SessionId::new`]; a test can draw ids it has already taken.
+    ///
+    /// `setup` inlines this loop rather than calling it, so it can check each
+    /// draw's own directory against its image's build context before
+    /// `create` claims it (#909); only the integration tests under
+    /// `internal-test-api` still call this directly.
+    #[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
     pub fn create_fresh(
         &self,
         mut draw: impl FnMut() -> SessionId,
@@ -743,7 +749,7 @@ fn dir_names(dir: &Path) -> Result<Vec<String>> {
 /// growing `resolved` forward -- misjudged as inside it). `resolved` at the
 /// end of the walk, before `missing` -- empty or not -- is appended onto it
 /// for `logical`, is `existing_prefix`.
-fn canonicalize_prefix(path: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
+pub(crate) fn canonicalize_prefix(path: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     let anchored;
     let start: &Path = if path.is_absolute() {
         path

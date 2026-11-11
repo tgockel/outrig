@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`image::refuse_session_dir_in_build_context` catches a session directory inside its own
+  build context before anything is hashed.** A build whose context held the session's directory
+  unignored was keyed, then re-hashed after `buildah build` finished and refused as
+  `BuildContextChanged` once the session's own writes -- `session.json`, `logs/`, and under `-v`
+  a live transcript -- reached what got hashed, discarding a finished build every time. The new
+  check runs before `compute_tag_for` hashes anything and names the directory; an `image-name`
+  source, a directory outside the context, and one an ignore rule excludes are all left alone.
+  (#909)
+
 - **A canceled build no longer strands its temporary tag behind a slow working-container
   removal.** The label commit's working container and the build's `outrig-tmp-*` tag were owed by
   two guards that, dropped by a canceled future, reissued their removals side by side. buildah

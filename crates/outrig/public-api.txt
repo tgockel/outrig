@@ -1090,6 +1090,10 @@ pub outrig::error::OutrigError::Process::argv: alloc::vec::Vec<std::ffi::os_str:
 pub outrig::error::OutrigError::Process::exit_code: core::option::Option<i32>
 pub outrig::error::OutrigError::Process::program: &'static str
 pub outrig::error::OutrigError::Process::stderr_tail: alloc::string::String
+#[non_exhaustive] pub outrig::error::OutrigError::SessionDirInBuildContext
+pub outrig::error::OutrigError::SessionDirInBuildContext::context: std::path::PathBuf
+pub outrig::error::OutrigError::SessionDirInBuildContext::dir: std::path::PathBuf
+pub outrig::error::OutrigError::SessionDirInBuildContext::image: alloc::string::String
 pub outrig::error::OutrigError::SidecarNotUnwound(alloc::boxed::Box<outrig::error::SidecarUnwindFailure>)
 #[non_exhaustive] pub outrig::error::OutrigError::Spawn
 pub outrig::error::OutrigError::Spawn::command: alloc::string::String
@@ -1161,6 +1165,7 @@ pub async fn outrig::image::read_image_entrypoint_cmd(&outrig::image::ImageTag, 
 pub async fn outrig::image::read_image_env(&outrig::image::ImageTag, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
 pub async fn outrig::image::read_image_labels(&outrig::image::ImageTag, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
 pub async fn outrig::image::read_remote_image_labels(&str) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
+pub async fn outrig::image::refuse_session_dir_in_build_context(&str, &outrig::config::ImageConfig, &std::path::Path, &std::path::Path, &std::path::Path) -> outrig::error::Result<()>
 pub mod outrig::mcp_proxy
 pub struct outrig::mcp_proxy::ProxyServer<C>
 impl<C: outrig::mcp_proxy::BackingClient> outrig::mcp_proxy::ProxyServer<C>

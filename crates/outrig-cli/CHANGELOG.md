@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A cold `outrig run` no longer builds, discards, and refuses a session whose directory lies
+  in its own build context.** An explicit `--session-dir`, or an auto-allocated one under
+  `--session-root`, left unignored inside an `[images.<name>]` build's context meant the session's
+  own writes (`session.json`, `logs/`, and under `-v` a live transcript) landed in what the image's
+  cache key hashes, so the build was discarded as changed every time and the retry failed the same
+  way. `setup` now refuses the run before anything is hashed or built, naming the directory. (#909)
+
 - **A global config with a hard link now gets a warning.** The global-config guards compare
   pathnames, so a second name for the file inside a read-write workspace or mount is invisible to
   them, and a write through it (`>>`) rewrites the global config. Finding the aliases would take a

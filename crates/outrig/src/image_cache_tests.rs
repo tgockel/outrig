@@ -10,7 +10,8 @@ use std::process::Command;
 
 use super::{
     CacheKey, ImageConfig, ImageTag, KEY_HEX_LEN, McpServerSpec, OutrigError, TreeHasher,
-    UNNAMED_IMAGE, compute_tag, compute_tag_for, ensure_key_still_holds, hash_context, pairs_block,
+    UNNAMED_IMAGE, check_ignore_cmd, compute_tag, compute_tag_for, ensure_key_still_holds,
+    hash_context, pairs_block, refuse_session_dir_in_build_context,
 };
 
 fn make_ctx(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -50,7 +51,7 @@ fn git_init(p: &Path) {
 fn check_ignore(repo: &Path, rel: &str) -> Option<i32> {
     Command::new("git")
         .current_dir(repo)
-        .args(["check-ignore", "-q", rel])
+        .args(["check-ignore", "-q", "--", rel])
         .status()
         .expect("spawn git")
         .code()
@@ -1379,5 +1380,384 @@ fn a_temporary_tag_splits_a_ref_where_the_engine_would() {
         let (repo, tag) = temp.as_str().rsplit_once(':').expect("tagged");
         assert_eq!(repo, expected_repo, "for {input}");
         assert!(!tag.contains('/'), "a tag may not contain a slash: {tag}");
+    }
+}
+
+/// Build-source config whose context is `ctx`, repo_root irrelevant because
+/// an absolute context resolves as itself ([`super::resolve_against`]).
+fn session_dir_test_cfg(ctx: &Path) -> ImageConfig {
+    ImageConfig::from_dockerfile(ctx.join("Dockerfile"), ctx)
+}
+
+/// #909: an `image-name` source builds nothing, so it has no context a
+/// session directory could collide with.
+#[tokio::test]
+async fn refuse_session_dir_skips_an_image_name_source() {
+    let ctx = make_ctx(&[]);
+    let cfg = ImageConfig::from_image_name("ghcr.io/example/tool:1");
+    let outside = ctx.path().join("sessions/auto123");
+
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &outside, &outside)
+        .await
+        .expect("an image-name source has no context to collide with");
+}
+
+/// #909: a directory outside the context entirely is never a conflict, git
+/// context or not.
+#[tokio::test]
+async fn refuse_session_dir_allows_a_directory_outside_the_context() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let ctx_canon = std::fs::canonicalize(ctx.path()).expect("canonicalize ctx");
+    let cfg = session_dir_test_cfg(&ctx_canon);
+
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    let dir = elsewhere.path().join("sessions/auto123");
+
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .expect("a directory outside the context is never a conflict");
+}
+
+/// #909's central case: a non-git context has no ignore mechanism at all, so
+/// every directory inside it -- explicit or an auto-allocated one under a
+/// session root -- conflicts. The directory need not exist yet: the whole
+/// point is to refuse before a fresh session has created it.
+#[tokio::test]
+async fn refuse_session_dir_refuses_inside_a_non_git_context() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let ctx_canon = std::fs::canonicalize(ctx.path()).expect("canonicalize ctx");
+    let cfg = session_dir_test_cfg(&ctx_canon);
+
+    let dir = ctx_canon.join("sessions").join("auto123");
+    assert!(!dir.exists(), "the directory must not exist yet");
+
+    let err = refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .expect_err("a session directory inside an un-ignorable context must be refused");
+    assert!(
+        matches!(
+            &err,
+            OutrigError::SessionDirInBuildContext { image, dir: d, context }
+                if image == "tool" && d == &dir && context == &ctx_canon
+        ),
+        "got {err}"
+    );
+}
+
+/// #909: an explicit `--session-dir` landing exactly on the context root is
+/// refused too -- there is no relative path to test a rule against, and
+/// nothing excludes a context from its own build.
+#[tokio::test]
+async fn refuse_session_dir_refuses_the_context_root_itself() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let ctx_canon = std::fs::canonicalize(ctx.path()).expect("canonicalize ctx");
+    let cfg = session_dir_test_cfg(&ctx_canon);
+
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &ctx_canon, &ctx_canon)
+        .await
+        .expect_err("the context root itself cannot be excluded from its own build");
+}
+
+/// #909: in a git context, a `.gitignore` rule that excludes the directory
+/// takes it out of what is hashed -- the same `--exclude-standard` set
+/// [`hash_git_tree`] honors -- and there is nothing to refuse.
+#[tokio::test]
+async fn refuse_session_dir_allows_a_gitignored_directory() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        (".gitignore", "/sessions/\n"),
+    ]);
+    git_init(ctx.path());
+    let ctx_canon = std::fs::canonicalize(ctx.path()).expect("canonicalize ctx");
+    assert_ignored(&ctx_canon, "sessions/auto123");
+    let cfg = session_dir_test_cfg(&ctx_canon);
+
+    let dir = ctx_canon.join("sessions").join("auto123");
+
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .expect("a gitignored directory is excluded from the context, not a conflict");
+}
+
+/// #909: the same git context with no rule excluding the directory still
+/// refuses it -- a `.gitignore` elsewhere in the repo does not reach it.
+#[tokio::test]
+async fn refuse_session_dir_refuses_an_unignored_directory_in_a_git_context() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        (".gitignore", "/target/\n"),
+    ]);
+    git_init(ctx.path());
+    let ctx_canon = std::fs::canonicalize(ctx.path()).expect("canonicalize ctx");
+    assert_not_ignored(&ctx_canon, "sessions/auto123");
+    let cfg = session_dir_test_cfg(&ctx_canon);
+
+    let dir = ctx_canon.join("sessions").join("auto123");
+
+    let err = refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .expect_err("nothing excludes this directory from the context");
+    assert!(
+        matches!(&err, OutrigError::SessionDirInBuildContext { .. }),
+        "got {err}"
+    );
+}
+
+/// #909 review: an explicit `--session-dir` landing exactly on a
+/// directory-only `.gitignore` rule (`/sessions/`, not a wildcard) is
+/// excluded, even though it does not exist yet. `git check-ignore` cannot
+/// tell a nonexistent path would have been a directory unless it is asked
+/// about a real one, which is why `directory_is_ignored` creates it first.
+#[tokio::test]
+async fn refuse_session_dir_allows_a_gitignored_directory_that_does_not_exist_yet() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        (".gitignore", "/sessions/\n"),
+    ]);
+    git_init(ctx.path());
+    let ctx_canon = std::fs::canonicalize(ctx.path()).expect("canonicalize ctx");
+    let cfg = session_dir_test_cfg(&ctx_canon);
+
+    let dir = ctx_canon.join("sessions");
+    assert!(!dir.exists(), "the directory must not exist yet");
+
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .expect("a gitignored directory is excluded even before it is created");
+    assert!(
+        !dir.exists(),
+        "the probe must not leave behind what it created to ask the question"
+    );
+}
+
+/// #909 review: a `sessions/*` rule excludes every child of `sessions/`
+/// without excluding `sessions` itself, so checking the session root (what
+/// an earlier version of this guard did for an auto-allocated session) and
+/// checking the actual `<root>/<sid>` child disagree -- the caller has to
+/// pass the child, not the root, or every auto-allocated session is refused
+/// even though its real directory would have been excluded.
+#[tokio::test]
+async fn refuse_session_dir_root_and_child_disagree_under_a_wildcard_rule() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        (".gitignore", "/sessions/*\n"),
+    ]);
+    git_init(ctx.path());
+    let ctx_canon = std::fs::canonicalize(ctx.path()).expect("canonicalize ctx");
+    let cfg = session_dir_test_cfg(&ctx_canon);
+
+    let root = ctx_canon.join("sessions");
+    let child = root.join("20260501T134412-3f2ad11c");
+    std::fs::create_dir_all(&child).unwrap();
+    assert_not_ignored(&ctx_canon, "sessions");
+    assert_ignored(&ctx_canon, "sessions/20260501T134412-3f2ad11c");
+
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &root, &root)
+        .await
+        .expect_err("the session root itself is not excluded by a children-only rule");
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &child, &child)
+        .await
+        .expect("an auto-allocated session's own directory is excluded");
+}
+
+/// #909 review: a session directory under an *initialized* nested
+/// repository (a submodule, in the shape `nested_repo_in_context_is_hashed`
+/// already pins) is excluded by that nested repository's own `.gitignore`,
+/// the same rule `hash_git_tree` honors when it recurses into one. Asking
+/// the outer repository about a path across that boundary is refused by git
+/// itself; the probe has to run from inside the nested one.
+#[tokio::test]
+async fn refuse_session_dir_allows_a_directory_a_nested_repository_ignores() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    git_init(ctx.path());
+    let sub = ctx.path().join("vendor/lib");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("lib.txt"), "v1").unwrap();
+    std::fs::write(sub.join(".gitignore"), "/sessions/\n").unwrap();
+    git_init(&sub);
+
+    let ctx_canon = std::fs::canonicalize(ctx.path()).expect("canonicalize ctx");
+    let cfg = session_dir_test_cfg(&ctx_canon);
+    let dir = ctx_canon.join("vendor/lib/sessions");
+
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .expect("a directory the nested repository ignores is excluded");
+}
+
+/// #909 review: a session directory whose name begins with `-` is still
+/// read as a path, not parsed as a `git` option, because the probe never
+/// hands git a dash-leading operand positionally without a `--` ahead of
+/// it, and asks the parent directory rather than passing the name as `-C`'s
+/// own argument.
+#[tokio::test]
+async fn refuse_session_dir_handles_a_directory_name_starting_with_a_dash() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        (".gitignore", "/-sessions/\n"),
+    ]);
+    git_init(ctx.path());
+    let ctx_canon = std::fs::canonicalize(ctx.path()).expect("canonicalize ctx");
+    let cfg = session_dir_test_cfg(&ctx_canon);
+
+    let dir = ctx_canon.join("-sessions");
+    assert!(!dir.exists(), "the directory must not exist yet");
+    // A directory-only rule needs a real directory to match against (see
+    // `refuse_session_dir_allows_a_gitignored_directory_that_does_not_exist_yet`),
+    // so the ground truth is pinned only after this call, which creates and
+    // removes it as it asks.
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .expect("a dash-leading directory name must not be misread as a git option");
+    std::fs::create_dir(&dir).unwrap();
+    assert_ignored(&ctx_canon, "-sessions");
+}
+
+/// #909 review: a session directory whose name begins with `:` is still read
+/// as a path, not as pathspec magic (`:(glob)...`, `:!...`) -- `--` stops
+/// git reading it as an *option*, but not as *magic*, which is why the probe
+/// also prefixes the basename with `./` to force the plain-path reading.
+#[tokio::test]
+async fn refuse_session_dir_handles_a_directory_name_starting_with_a_colon() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        (".gitignore", "/:sessions/\n"),
+    ]);
+    git_init(ctx.path());
+    let ctx_canon = std::fs::canonicalize(ctx.path()).expect("canonicalize ctx");
+    let cfg = session_dir_test_cfg(&ctx_canon);
+
+    let dir = ctx_canon.join(":sessions");
+    assert!(!dir.exists(), "the directory must not exist yet");
+
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .expect("a colon-leading directory name must not be read as pathspec magic");
+
+    // `assert_ignored` asks with a bare basename, which a leading `:` reads
+    // as pathspec magic rather than a path and so misjudges the same way the
+    // probe would without its own `./` prefix; ask the way the probe does.
+    std::fs::create_dir(&dir).unwrap();
+    let status = Command::new("git")
+        .current_dir(&ctx_canon)
+        .args(["check-ignore", "-q", "--no-index", "--", "./:sessions"])
+        .status()
+        .expect("spawn git");
+    assert!(
+        status.success(),
+        ":sessions must be gitignored once asked as a literal path"
+    );
+}
+
+/// #909 review: an ignored directory whose name is itself a glob (`cache*`)
+/// must not be answered against some unrelated *tracked* file the glob
+/// happens to match -- `cache.txt` here -- which `check-ignore` would
+/// otherwise read the question against instead of the untracked directory,
+/// and answer "not excluded" because tracked content never is. `--no-index`
+/// keeps the question off the index (and so off `cache.txt`) entirely.
+#[tokio::test]
+async fn refuse_session_dir_is_not_confused_by_a_tracked_file_matching_its_glob() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        (".gitignore", "/cache\\*/\n"),
+        ("cache.txt", "tracked, and not what is being asked about\n"),
+    ]);
+    git_init(ctx.path());
+    let ctx_canon = std::fs::canonicalize(ctx.path()).expect("canonicalize ctx");
+    let cfg = session_dir_test_cfg(&ctx_canon);
+
+    let dir = ctx_canon.join("cache*");
+    assert!(!dir.exists(), "the directory must not exist yet");
+
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .expect("a glob-named directory must be judged on its own ignore rule");
+
+    // The shared `assert_ignored` helper asks the same question the probe
+    // must not: a bare `check-ignore -- cache*`, with no `--no-index`, reads
+    // the glob against the index, matches the tracked `cache.txt` instead of
+    // the untracked directory, and wrongly answers "not ignored" -- which
+    // would make this test's ground truth as confused as the bug it pins.
+    // `--no-index` is what keeps it honest.
+    std::fs::create_dir(&dir).unwrap();
+    let status = Command::new("git")
+        .current_dir(&ctx_canon)
+        .args(["check-ignore", "-q", "--no-index", "--", "./cache*"])
+        .status()
+        .expect("spawn git");
+    assert!(
+        status.success(),
+        "cache* must be gitignored once --no-index asks honestly"
+    );
+}
+
+/// #909 review: `check_ignore_cmd`'s own env overrides are part of the
+/// command it builds, not contingent on anything about the call site --
+/// checked directly, without a `git` to run against.
+#[test]
+fn check_ignore_cmd_pins_off_all_four_pathspec_magic_modes() {
+    let cmd = check_ignore_cmd(Path::new("/some/context/sessions"))
+        .expect("a path with a parent and a basename always has a command");
+    assert_eq!(
+        cmd.hidden_env(),
+        [
+            ("GIT_LITERAL_PATHSPECS".to_string(), "0".to_string()),
+            ("GIT_GLOB_PATHSPECS".to_string(), "0".to_string()),
+            ("GIT_NOGLOB_PATHSPECS".to_string(), "0".to_string()),
+            ("GIT_ICASE_PATHSPECS".to_string(), "0".to_string()),
+        ],
+        "every pathspec-magic mode must be pinned off, not left to the ambient environment"
+    );
+    let argv = cmd.exec_args();
+    assert!(
+        argv.iter().any(|a| a == "--no-index"),
+        "argv must ask off the index: {argv:?}"
+    );
+    assert!(
+        argv.last()
+            .is_some_and(|a| a.to_string_lossy().starts_with("./")),
+        "the basename must be prefixed, not bare: {argv:?}"
+    );
+}
+
+/// #909 review: the four `GIT_*_PATHSPECS` variables are each read by `git`
+/// itself; `check-ignore` refuses outright (exit 128) if any is on, which an
+/// environment outrig's own process did not set itself -- inherited from
+/// whatever started it -- could still carry. Proven by running the exact
+/// command `check_ignore_cmd` builds in a *child* that has one set, rather
+/// than mutating this test binary's own environment, which every other
+/// test's own `git` calls would then share.
+#[tokio::test]
+async fn check_ignore_cmd_still_answers_under_an_inherited_pathspec_mode() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        (".gitignore", "/sessions/\n"),
+    ]);
+    git_init(ctx.path());
+    let ctx_canon = std::fs::canonicalize(ctx.path()).expect("canonicalize ctx");
+    std::fs::create_dir(ctx_canon.join("sessions")).unwrap();
+
+    let cmd = check_ignore_cmd(&ctx_canon.join("sessions")).expect("has a parent and a name");
+
+    for inherited in [
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
+    ] {
+        let status = std::process::Command::new(cmd.program)
+            .args(cmd.exec_args())
+            // Set first, as an inherited setting would already be present
+            // before outrig's own overrides are applied; `cmd.hidden_env()`
+            // after it is what proves those overrides are the ones that
+            // land, whichever order a real spawn applies them in.
+            .env(inherited, "1")
+            .envs(cmd.hidden_env())
+            .status()
+            .expect("spawn git");
+        assert!(
+            status.success(),
+            "{inherited}=1 (as if inherited) must not defeat check-ignore's own overrides"
+        );
     }
 }
