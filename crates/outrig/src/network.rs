@@ -1586,9 +1586,16 @@ where
     // `--echo --handle` makes the commit report the handle it assigned, in the
     // same transaction that created the table. (nft 0.9.0 and later; outrig
     // already requires `create table`, which is no older.)
-    let echo = run(nsenter_nft(target.pid)
-        .args(["--echo", "--handle", "-f"])
-        .arg(rules.path()))
+    //
+    // Into the namespace `rollback` was armed against and no other, checked
+    // from inside the process that runs nft: `nsenter` resolves the pid when it
+    // runs, and the pin's last say was `Rollback::new`. See
+    // `apply_nft_rules_in_namespace`.
+    let echo = run(apply_nft_rules_in_namespace(
+        target.pid,
+        rollback.netns_inode(),
+        rules.path(),
+    ))
     .await?;
     // The table exists from here on, and so does its name in a ruleset anyone
     // in the namespace can list. Narrowing the undo to the handle is what
@@ -4290,6 +4297,44 @@ fn delete_nft_table_by_handle(pid: u32, netns: u64, handle: u64) -> Cmd {
 const NFT_DELETE_IN_NAMESPACE: &str = "[ \"$(readlink /proc/self/ns/net)\" = \"$1\" ] || exit 0; \
      exec nft delete table inet handle \"$2\"";
 
+/// Apply the rules file at `rules` with `nft --echo --handle -f`, but only
+/// while the namespace this lands in is the one numbered `netns`.
+///
+/// The same binding as [`delete_nft_table_by_handle`], for the same reason:
+/// `nsenter -t <pid>` resolves the pid when it execs, and nothing between the
+/// last read through the pin ([`Rollback::new`]) and that exec stops the
+/// number passing to another container's init. Checked from outside, the
+/// apply would put the redirect into that stranger's namespace and report
+/// success, and every undo -- keyed to the namespace that was recorded --
+/// would then decline to remove it (#912). Checked here, in the process that
+/// goes on to exec nft, the namespace read back is the one nft acts in.
+///
+/// A refusal exits non-zero having changed nothing anywhere, so the attach
+/// fails with nothing to undo. As with the undo, the shell, `readlink` and
+/// `nft` are the host's.
+fn apply_nft_rules_in_namespace(pid: u32, netns: u64, rules: &Path) -> Cmd {
+    nsenter_net(pid)
+        .args(["--", "sh", "-c"])
+        .arg(NFT_APPLY_IN_NAMESPACE)
+        .arg("_")
+        .arg(format!("net:[{netns}]"))
+        .arg(rules)
+}
+
+/// Apply the rules file at `$2` with `nft --echo --handle -f`, but only while
+/// the namespace this landed in is the one named by `$1`. Unlike
+/// [`NFT_DELETE_IN_NAMESPACE`], a mismatch is a failure: the attach asked for
+/// a redirect, and none was made.
+///
+/// Run as `sh -c <script> _ <namespace> <rules>`, so `_` is `$0` and the two
+/// arguments are `$1` and `$2`.
+const NFT_APPLY_IN_NAMESPACE: &str = "now=\"$(readlink /proc/self/ns/net)\"; \
+     [ \"$now\" = \"$1\" ] || { \
+     echo \"refusing to apply the redirect in network namespace $now: the attach was \
+     armed against $1, and the pid it entered by no longer names that container\" >&2; \
+     exit 1; }; \
+     exec nft --echo --handle -f \"$2\"";
+
 /// The handle nft reports for `table`, from either the echo of the transaction
 /// that created it (`create table inet <name> # handle 3`) or a later listing
 /// of it (`table inet <name> { # handle 3`).
@@ -6660,6 +6705,102 @@ mod tests {
             undo.contains("readlink /proc/self/ns/net")
                 && undo.contains(&format!("net:[{}]", expected.1)),
             "the undo must check the namespace it lands in: {undo}"
+        );
+    }
+
+    /// The apply takes the namespace it was armed against into the process
+    /// that runs nft, rather than trusting the pid `nsenter` resolves at exec
+    /// time to still name that container (#912).
+    #[tokio::test]
+    async fn the_apply_checks_the_namespace_it_lands_in() {
+        let fake = FakeRunner::default();
+        let run = |cmd: Cmd| fake.run(cmd);
+        let resolver = FakeResolver::new();
+        let mut rollback = this_process_rollback().expect("this process has a namespace");
+        install(&run, &mut rollback, &target(), &resolver)
+            .await
+            .expect("install interception");
+
+        let NamespaceAnswer::Is(expected) = namespace_id(std::process::id()) else {
+            panic!("this process has a namespace");
+        };
+        let ran = fake.ran();
+        let apply = ran
+            .iter()
+            .find(|cmd| cmd.contains("nft --echo --handle -f"))
+            .unwrap_or_else(|| panic!("the rules must be applied: {ran:#?}"));
+        assert!(
+            apply.contains("readlink /proc/self/ns/net")
+                && apply.contains(&format!("net:[{}]", expected.1)),
+            "the apply must check the namespace it lands in: {apply}"
+        );
+    }
+
+    /// The apply's script, run for real outside any `nsenter`: in a namespace
+    /// that is not the one named it exits non-zero, says why, and never
+    /// reaches nft; in the one named it hands the rules file to nft.
+    #[test]
+    fn the_apply_script_runs_nft_only_in_the_namespace_it_names() {
+        let bin = tempfile::tempdir().expect("tempdir");
+        let marker = bin.path().join("ran");
+        let nft = bin.path().join("nft");
+        std::fs::write(
+            &nft,
+            format!("#!/bin/sh\nprintf '%s ' \"$@\" > '{}'\n", marker.display()),
+        )
+        .expect("write fake nft");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&nft, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake nft");
+        }
+        let path = format!(
+            "{}:{}",
+            bin.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let apply = |netns: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", NFT_APPLY_IN_NAMESPACE, "_", netns, "/rules"])
+                .env("PATH", &path)
+                .output()
+                .expect("run sh")
+        };
+
+        let wrong = apply("net:[0]");
+        assert!(!wrong.status.success(), "{wrong:?}");
+        assert!(
+            String::from_utf8_lossy(&wrong.stderr).contains("refusing to apply the redirect"),
+            "{wrong:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "nft must not run in a stranger's namespace"
+        );
+
+        let NamespaceAnswer::Is(here) = namespace_id(std::process::id()) else {
+            panic!("this process has a namespace");
+        };
+        // Retried on a transient `ETXTBSY`, as `read_labels_via_fake` in the
+        // image tests is: a spawn on another test thread can fork while the
+        // fake nft's write descriptor is open and hold it until its child
+        // execs or exits, and the shell then reports the file busy (126).
+        let mut right = apply(&format!("net:[{}]", here.1));
+        for _ in 0..100 {
+            let busy = right.status.code() == Some(126)
+                && String::from_utf8_lossy(&right.stderr)
+                    .to_lowercase()
+                    .contains("text file busy");
+            if !busy {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            right = apply(&format!("net:[{}]", here.1));
+        }
+        assert!(right.status.success(), "{right:?}");
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("nft ran"),
+            "--echo --handle -f /rules "
         );
     }
 

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The network interceptor's redirect table goes into the namespace its attach was armed
+  against, or nowhere.** The nft apply ran as `nsenter -t <pid> ... nft`, and `nsenter` resolves
+  the number when it execs, so an init that exited and had its PID handed to another container in
+  between put the redirect table in that container: the attach reported success, its TCP and DNS
+  went to ports nothing listened on there, and every rollback declined to remove the table because
+  the namespace was not the one recorded. The apply now reads `/proc/self/ns/net` in the process
+  that goes on to exec nft, as the by-handle undo already did, and refuses with nothing changed
+  when it is not the namespace read through the pinned init. (#912)
+
 - **`image::refuse_session_dir_in_build_context` catches a session directory inside its own
   build context before anything is hashed.** A build whose context held the session's directory
   unignored was keyed, then re-hashed after `buildah build` finished and refused as
