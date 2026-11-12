@@ -8,8 +8,9 @@
 //! still helps speed up the build itself when we miss; the project-level tag
 //! cache exists so a *hit* skips buildah entirely.
 //!
-//! A finished build is hashed again, and discarded rather than tagged if the
-//! key moved ([`OutrigError::BuildContextChanged`]).
+//! A build's inputs are hashed again just before buildah starts and once it
+//! finishes, and the build is discarded rather than tagged if the key moved or
+//! anything it read was touched in between ([`OutrigError::BuildContextChanged`]).
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -240,48 +241,166 @@ impl CacheKey {
     /// concrete values. Caller passes absolute paths; `ensure_image` resolves
     /// relative-to-repo-root before calling. Repo-local builds use
     /// [`CacheKey::compute_with_labels`] instead.
+    #[cfg(test)]
     pub(crate) async fn compute(
         dockerfile: &Path,
         build_args: &BTreeMap<String, String>,
         context: &Path,
     ) -> Result<String> {
-        let mut hasher = blake3::Hasher::new();
-
-        hash_dockerfile(dockerfile, &mut hasher).await?;
-
-        hash_pairs(build_args, &mut hasher);
-
-        hash_context(context, &mut hasher).await?;
-
-        let hex = hasher.finalize().to_hex();
-        Ok(hex.as_str()[..KEY_HEX_LEN].to_string())
+        Self::compute_with_labels(dockerfile, build_args, context, &BTreeMap::new()).await
     }
 
     /// Hash the same build inputs as [`CacheKey::compute`], plus the labels
     /// OutRig will stamp onto repo-local build images. Label changes therefore
-    /// produce new tags instead of stale `org.outrig.mcp` metadata.
+    /// produce new tags instead of stale `org.outrig.mcp` metadata. No labels
+    /// key the same as [`CacheKey::compute`]. Builds use [`CacheKey::stamped`].
+    #[cfg(test)]
     pub(crate) async fn compute_with_labels(
         dockerfile: &Path,
         build_args: &BTreeMap<String, String>,
         context: &Path,
         labels: &BTreeMap<String, String>,
     ) -> Result<String> {
-        if labels.is_empty() {
-            return Self::compute(dockerfile, build_args, context).await;
-        }
+        Ok(Self::stamped(dockerfile, build_args, context, labels)
+            .await?
+            .0)
+    }
 
+    /// [`CacheKey::compute_with_labels`], with the [`Stamps`] of every path the
+    /// key read.
+    pub(crate) async fn stamped(
+        dockerfile: &Path,
+        build_args: &BTreeMap<String, String>,
+        context: &Path,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<(String, Stamps)> {
         let mut hasher = blake3::Hasher::new();
+        let mut stamps = Stamps::default();
 
-        hash_dockerfile(dockerfile, &mut hasher).await?;
+        hash_dockerfile(dockerfile, &mut hasher, &mut stamps).await?;
 
         hash_pairs(build_args, &mut hasher);
-        hasher.update(b"\n[outrig-labels]\n");
-        hash_pairs(labels, &mut hasher);
+        if !labels.is_empty() {
+            hasher.update(b"\n[outrig-labels]\n");
+            hash_pairs(labels, &mut hasher);
+        }
 
-        hash_context(context, &mut hasher).await?;
+        hash_context(context, &mut hasher, &mut stamps).await?;
+        // buildah is handed the context's path, and follows any link in it.
+        stamps.record_followed(context)?;
 
         let hex = hasher.finalize().to_hex();
-        Ok(hex.as_str()[..KEY_HEX_LEN].to_string())
+        Ok((hex.as_str()[..KEY_HEX_LEN].to_string(), stamps))
+    }
+}
+
+/// How each path a cache key read looked when it was read: by absolute path,
+/// its device and inode, mode, size, and modification and change times.
+///
+/// A key compares content at the moment it is hashed, and buildah reads the
+/// context at each `COPY`, in between two such moments. An edit made after
+/// one hash and undone before the next is invisible to both, yet a `COPY`
+/// between them may have taken it (#734). Stamps see it: a write, a rename
+/// over a file, or an entry added to or removed from a directory advances
+/// `ctime`, which nothing but the kernel's clock sets, so the undo cannot
+/// put it back. Comparing the stamps taken before a build with those after
+/// refuses any such change -- including one that left the content as it
+/// was, like a `git stash` and `git stash pop`, or an ignored file created
+/// in a keyed directory. Those cost a rebuild; a stale key costs a wrong
+/// image.
+///
+/// Paths reached by following symlinks -- the Dockerfile and the context
+/// directory, which buildah opens through any link -- are kept apart from the
+/// context walk's own, which stats a link rather than what it points to: a
+/// Dockerfile in the context that links elsewhere is stamped both ways.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Stamps {
+    walked: BTreeMap<PathBuf, Stamp>,
+    followed: BTreeMap<PathBuf, Stamp>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            mode: meta.mode(),
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
+impl Stamps {
+    /// `path` as the context walk met it, `meta` from a `stat` that does not
+    /// follow a link.
+    fn record(&mut self, path: &Path, meta: &std::fs::Metadata) {
+        self.walked.insert(path.to_path_buf(), Stamp::of(meta));
+    }
+
+    fn extend(&mut self, other: Stamps) {
+        self.walked.extend(other.walked);
+        self.followed.extend(other.followed);
+    }
+
+    /// Stamp `path` as opening it reaches it: each symlink resolved on the way,
+    /// in any component, and what it ends at. A link re-pointed and put back
+    /// is a new link, so the undo shows here even where the file it ends at
+    /// never changed.
+    fn record_followed(&mut self, path: &Path) -> Result<()> {
+        // The kernel's own limit on links followed in one lookup.
+        const MAX_LINKS: usize = 40;
+        let start = std::path::absolute(path).path_ctx("resolve", path)?;
+        let mut resolved = PathBuf::new();
+        // Still to walk, next component last.
+        let mut pending: Vec<PathBuf> = Vec::new();
+        let push = |pending: &mut Vec<PathBuf>, path: &Path| {
+            pending.extend(path.components().rev().map(|c| c.as_os_str().into()));
+        };
+        push(&mut pending, &start);
+        let mut links = 0;
+        while let Some(component) = pending.pop() {
+            match component.components().next() {
+                Some(Component::CurDir) | None => continue,
+                // `resolved` holds no links, so this is the directory above.
+                Some(Component::ParentDir) => {
+                    resolved.pop();
+                    continue;
+                }
+                _ => {}
+            }
+            // An absolute component (a link's target) replaces `resolved`.
+            let next = resolved.join(&component);
+            let meta = std::fs::symlink_metadata(&next).path_ctx("stat", &next)?;
+            if !meta.file_type().is_symlink() {
+                resolved = next;
+                continue;
+            }
+            links += 1;
+            if links > MAX_LINKS {
+                // A loop: the kernel's own refusal names it.
+                std::fs::metadata(path).path_ctx("stat", path)?;
+                return Ok(());
+            }
+            self.followed.insert(next.clone(), Stamp::of(&meta));
+            let target = std::fs::read_link(&next).path_ctx("read", &next)?;
+            // Relative to the link's directory, which `resolved` still is.
+            push(&mut pending, &target);
+        }
+        let meta = std::fs::metadata(&resolved).path_ctx("stat", &resolved)?;
+        self.followed.insert(resolved, Stamp::of(&meta));
+        Ok(())
     }
 }
 
@@ -316,7 +435,12 @@ fn pairs_block(pairs: &BTreeMap<String, String>) -> String {
 /// raw bytes left no boundary between the two: a Dockerfile ending `# A=1\n`, built with no
 /// build args, fed the hasher the same bytes as one ending `# ` with no trailing newline, built
 /// with `A=1`, and the second build reused the first's image with `ARG A` unset. See #583.
-async fn hash_dockerfile(dockerfile: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
+async fn hash_dockerfile(
+    dockerfile: &Path,
+    hasher: &mut blake3::Hasher,
+    stamps: &mut Stamps,
+) -> Result<()> {
+    stamps.record_followed(dockerfile)?;
     let dockerfile_bytes = tokio::fs::read(dockerfile)
         .await
         .path_ctx("read", dockerfile)?;
@@ -392,6 +516,16 @@ async fn compute_tag_with_build_args(
     repo_root: &Path,
     build_args: &BTreeMap<String, ResolvedEnvValue>,
 ) -> Result<ImageTag> {
+    Ok(stamped_tag(repo, cfg, repo_root, build_args).await?.0)
+}
+
+/// [`compute_tag_with_build_args`], with the [`Stamps`] of what it read.
+async fn stamped_tag(
+    repo: &str,
+    cfg: &ImageConfig,
+    repo_root: &Path,
+    build_args: &BTreeMap<String, ResolvedEnvValue>,
+) -> Result<(ImageTag, Stamps)> {
     let (dockerfile, context) = cfg.resolved_build_paths(repo_root);
     let labels = repo_build_cache_labels(cfg)?;
     // The key covers the values buildah receives, however each is passed.
@@ -399,34 +533,61 @@ async fn compute_tag_with_build_args(
         .iter()
         .map(|(key, value)| (key.clone(), value.value().to_owned()))
         .collect();
-    let key = CacheKey::compute_with_labels(&dockerfile, &values, &context, &labels).await?;
-    Ok(ImageTag::new(format!("{repo}:{key}")))
+    let (key, stamps) = CacheKey::stamped(&dockerfile, &values, &context, &labels).await?;
+    Ok((ImageTag::new(format!("{repo}:{key}")), stamps))
 }
 
-/// Refuse to name a finished build `tag` if its inputs no longer hash to it.
+/// The [`Stamps`] of `cfg`'s inputs as `buildah build` is about to read them, refusing if they
+/// no longer hash to `tag`.
 ///
-/// `tag` was computed before buildah started, and buildah reads the context as each `COPY` runs
-/// rather than when the build starts. A file saved while an earlier `RUN` was still going is
-/// one the image holds and the key does not hash, and under that key the image would be served
-/// the next time the old content came back. Called after `buildah build` and before anything
-/// is named `tag`, so the temporary image [`into_temp_tag`] removes on the error is all that
-/// exists. The same check also trips on an edit after the last `COPY`, which no key can tell
-/// from one before it.
+/// `tag` may have been computed long before -- a caller prints it, probes the cache, and only
+/// then builds -- so it is checked here, against the same walk the stamps come from. Hand the
+/// result to [`ensure_key_still_holds`] once buildah finishes.
+async fn key_before_build(
+    image: &str,
+    cfg: &ImageConfig,
+    repo_root: &Path,
+    build_args: &BTreeMap<String, ResolvedEnvValue>,
+    tag: &ImageTag,
+) -> Result<Stamps> {
+    let (now, stamps) = stamped_tag(tag_repo(image), cfg, repo_root, build_args).await?;
+    if now == *tag {
+        return Ok(stamps);
+    }
+    Err(context_changed(image, tag))
+}
+
+/// Refuse to name a finished build `tag` if its inputs changed while buildah ran.
+///
+/// buildah reads the context as each `COPY` runs rather than when the build starts. A file
+/// saved while an earlier `RUN` was still going is one the image holds and the key does not
+/// hash, and under that key the image would be served the next time the old content came back
+/// (#392). Hashing again catches an edit that lasts to the end of the build; comparing the
+/// [`Stamps`] [`key_before_build`] took with this walk's also catches one undone before the end,
+/// which a `COPY` in between may still have taken (#734). Called after `buildah build` and
+/// before anything is named `tag`, so the temporary image [`into_temp_tag`] removes on the
+/// error is all that exists. The same check also trips on an edit after the last `COPY`, which
+/// no key can tell from one before it.
 async fn ensure_key_still_holds(
     image: &str,
     cfg: &ImageConfig,
     repo_root: &Path,
     build_args: &BTreeMap<String, ResolvedEnvValue>,
     tag: &ImageTag,
+    before: &Stamps,
 ) -> Result<()> {
-    let now = compute_tag_with_build_args(tag_repo(image), cfg, repo_root, build_args).await?;
-    if now == *tag {
+    let after = key_before_build(image, cfg, repo_root, build_args, tag).await?;
+    if after == *before {
         return Ok(());
     }
-    Err(OutrigError::BuildContextChanged {
+    Err(context_changed(image, tag))
+}
+
+fn context_changed(image: &str, tag: &ImageTag) -> OutrigError {
+    OutrigError::BuildContextChanged {
         image: image.to_string(),
         tag: tag.to_string(),
-    })
+    }
 }
 
 /// Refuse before any build work starts if `session_dir` -- the directory a
@@ -864,6 +1025,7 @@ async fn build_image_with_build_args(
     no_cache: bool,
     build_args: &BTreeMap<String, ResolvedEnvValue>,
 ) -> Result<()> {
+    let before = key_before_build(image, cfg, repo_root, build_args, tag).await?;
     into_temp_tag(tag, None, async |temp_tag, owing| {
         process::run_streamed_checked(
             build_image_cmd(cfg, repo_root, temp_tag, no_cache, build_args),
@@ -871,7 +1033,7 @@ async fn build_image_with_build_args(
             build_termination(),
         )
         .await?;
-        ensure_key_still_holds(image, cfg, repo_root, build_args, tag).await?;
+        ensure_key_still_holds(image, cfg, repo_root, build_args, tag, &before).await?;
         stamp_repo_image_labels(image, temp_tag, tag, &cfg.mcp, no_cache, None, owing).await
     })
     .await
@@ -888,6 +1050,7 @@ async fn build_image_logged_with_build_args(
     build_args: &BTreeMap<String, ResolvedEnvValue>,
     output: BuildOutput,
 ) -> Result<()> {
+    let before = key_before_build(image, cfg, repo_root, build_args, tag).await?;
     into_temp_tag(tag, transcript, async |temp_tag, owing| {
         run_shown_or_captured(
             build_image_cmd(cfg, repo_root, temp_tag, no_cache, build_args),
@@ -897,7 +1060,7 @@ async fn build_image_logged_with_build_args(
             output,
         )
         .await?;
-        ensure_key_still_holds(image, cfg, repo_root, build_args, tag).await?;
+        ensure_key_still_holds(image, cfg, repo_root, build_args, tag, &before).await?;
         stamp_repo_image_labels(image, temp_tag, tag, &cfg.mcp, no_cache, transcript, owing).await
     })
     .await
@@ -1784,11 +1947,12 @@ fn buildah_build_cmd(
 
 /// Key the build context `ctx`: by [`hash_git_context`] in a git worktree, or
 /// by [`hash_non_git_context`], the same in-process walk, outside one.
-async fn hash_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
+/// Each path read is recorded in `stamps`.
+async fn hash_context(ctx: &Path, hasher: &mut blake3::Hasher, stamps: &mut Stamps) -> Result<()> {
     if is_git_context(ctx).await? {
-        hash_git_context(ctx, hasher).await
+        hash_git_context(ctx, hasher, stamps).await
     } else {
-        hash_non_git_context(ctx, hasher).await
+        hash_non_git_context(ctx, hasher, stamps).await
     }
 }
 
@@ -1832,15 +1996,24 @@ async fn is_worktree_root(dir: &Path) -> Result<bool> {
 /// in it is ignored -- they say nothing about which are build inputs, and the
 /// whole tree counts. A file tracked although a rule matches it, force-added
 /// or committed before the rule, is excluded all the same.
-async fn hash_git_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
-    hash_git_tree(ctx, Path::new(""), hasher).await
+async fn hash_git_context(
+    ctx: &Path,
+    hasher: &mut blake3::Hasher,
+    stamps: &mut Stamps,
+) -> Result<()> {
+    hash_git_tree(ctx, Path::new(""), hasher, stamps).await
 }
 
 /// [`hash_git_context`] for `ctx/dir`, a directory git lists from its own
 /// repository: the context itself, or a nested repository in it. Paths are
 /// keyed relative to `ctx/dir`, but symlinks resolve against `ctx`, as buildah
 /// resolves every `COPY` source.
-async fn hash_git_tree(ctx: &Path, dir: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
+async fn hash_git_tree(
+    ctx: &Path,
+    dir: &Path,
+    hasher: &mut blake3::Hasher,
+    stamps: &mut Stamps,
+) -> Result<()> {
     let tree = ctx.join(dir);
     // What the rules admit, tracked or not, and what is tracked although a
     // rule matches it.
@@ -1852,7 +2025,7 @@ async fn hash_git_tree(ctx: &Path, dir: &Path, hasher: &mut blake3::Hasher) -> R
     // One blocking pass rather than an async round-trip per stat and read:
     // a context can be a whole checkout.
     let (root, base) = (ctx.to_path_buf(), dir.to_path_buf());
-    let entries = tokio::task::spawn_blocking(move || {
+    let (entries, listed_stamps) = tokio::task::spawn_blocking(move || {
         let mut tree = TreeHasher::new(&root);
         let mut entries = Vec::with_capacity(paths.len());
         for rel in paths {
@@ -1860,10 +2033,11 @@ async fn hash_git_tree(ctx: &Path, dir: &Path, hasher: &mut blake3::Hasher) -> R
                 entries.push((rel, mode, entry));
             }
         }
-        Ok::<_, OutrigError>(entries)
+        Ok::<_, OutrigError>((entries, tree.stamps))
     })
     .await
     .expect("context hashing task panicked")?;
+    stamps.extend(listed_stamps);
 
     // Nothing left, or only what a rule excludes: the whole tree counts, and
     // so does its own mode, which `TreeHasher::dir` leaves to a parent.
@@ -1874,7 +2048,8 @@ async fn hash_git_tree(ctx: &Path, dir: &Path, hasher: &mut blake3::Hasher) -> R
         let root = tokio::fs::symlink_metadata(&tree)
             .await
             .path_ctx("stat", &tree)?;
-        update_record(hasher, b"", root.mode(), &hash_whole_tree(ctx, dir).await?);
+        let digest = hash_whole_tree(ctx, dir, stamps).await?;
+        update_record(hasher, b"", root.mode(), &digest);
         return Ok(());
     }
 
@@ -1897,9 +2072,13 @@ async fn hash_git_tree(ctx: &Path, dir: &Path, hasher: &mut blake3::Hasher) -> R
         )
         .map(<[u8]>::to_vec)
         .collect();
-    let dirs = tokio::task::spawn_blocking(move || context_dirs(&tree, &skip))
-        .await
-        .expect("context hashing task panicked")?;
+    let (dirs, dir_stamps) = tokio::task::spawn_blocking(move || {
+        let mut stamps = Stamps::default();
+        context_dirs(&tree, &skip, &mut stamps).map(|dirs| (dirs, stamps))
+    })
+    .await
+    .expect("context hashing task panicked")?;
+    stamps.extend(dir_stamps);
 
     for (rel, mode, entry) in entries {
         let digest = match entry {
@@ -1914,10 +2093,10 @@ async fn hash_git_tree(ctx: &Path, dir: &Path, hasher: &mut blake3::Hasher) -> R
                 // recursing would never end.
                 if is_worktree_root(&ctx.join(&sub_dir)).await? {
                     let mut sub = blake3::Hasher::new();
-                    Box::pin(hash_git_tree(ctx, &sub_dir, &mut sub)).await?;
+                    Box::pin(hash_git_tree(ctx, &sub_dir, &mut sub, stamps)).await?;
                     sub.finalize()
                 } else {
-                    hash_whole_tree(ctx, &sub_dir).await?
+                    hash_whole_tree(ctx, &sub_dir, stamps).await?
                 }
             }
         };
@@ -1949,8 +2128,13 @@ const NO_CONTENT: blake3::Hash = blake3::Hash::from_bytes([0; 32]);
 ///
 /// `skip` holds the paths, relative to `tree`, that are not walked: directories
 /// the rules exclude, and those a nested repository or submodule owns. `.git`
-/// and symlinks are not walked either.
-fn context_dirs(tree: &Path, skip: &HashSet<Vec<u8>>) -> Result<Vec<(Vec<u8>, u32)>> {
+/// and symlinks are not walked either. Each directory listed is recorded in
+/// `stamps`.
+fn context_dirs(
+    tree: &Path,
+    skip: &HashSet<Vec<u8>>,
+    stamps: &mut Stamps,
+) -> Result<Vec<(Vec<u8>, u32)>> {
     let mut dirs = Vec::new();
     // Next to visit last, so names come out sorted.
     let mut pending = vec![Vec::new()];
@@ -1961,6 +2145,7 @@ fn context_dirs(tree: &Path, skip: &HashSet<Vec<u8>>) -> Result<Vec<(Vec<u8>, u3
         let Some(meta) = unless_denied(std::fs::symlink_metadata(&path), "stat", &path)? else {
             continue;
         };
+        stamps.record(&path, &meta);
         dirs.push((rel.clone(), meta.mode()));
 
         // Keyed but not opened, as `git ls-files` does.
@@ -2039,18 +2224,24 @@ async fn ls_files(tree: &Path, flags: &[&str]) -> Result<Vec<Vec<u8>>> {
 
 /// `ctx/dir` whole, ignored files and all, by [`TreeHasher::dir`]. From the
 /// context's own root (an empty `dir`) the walk is [`TreeHasher::whole`].
-async fn hash_whole_tree(ctx: &Path, dir: &Path) -> Result<blake3::Hash> {
+/// `ctx/dir` and everything the walk meets are recorded in `stamps`.
+async fn hash_whole_tree(ctx: &Path, dir: &Path, stamps: &mut Stamps) -> Result<blake3::Hash> {
     let (root, dir) = (ctx.to_path_buf(), dir.to_path_buf());
-    tokio::task::spawn_blocking(move || {
+    let (digest, walked) = tokio::task::spawn_blocking(move || {
         let mut tree = if dir.as_os_str().is_empty() {
             TreeHasher::whole(&root)
         } else {
             TreeHasher::new(&root)
         };
-        tree.dir(&dir)
+        let top = root.join(&dir);
+        let meta = std::fs::symlink_metadata(&top).path_ctx("stat", &top)?;
+        tree.stamps.record(&top, &meta);
+        Ok::<_, OutrigError>((tree.dir(&dir)?, tree.stamps))
     })
     .await
-    .expect("context hashing task panicked")
+    .expect("context hashing task panicked")?;
+    stamps.extend(walked);
+    Ok(digest)
 }
 
 /// What one listed path contributes to [`hash_git_context`].
@@ -2087,6 +2278,8 @@ struct TreeHasher<'a> {
     /// makes "first" mean something; a referent hashed from the middle of
     /// another walk would not.
     whole: Option<HashMap<(u64, u64), PathBuf>>,
+    /// Every path met, as [`Self::entry`] met it.
+    stamps: Stamps,
 }
 
 impl<'a> TreeHasher<'a> {
@@ -2096,6 +2289,7 @@ impl<'a> TreeHasher<'a> {
             done: HashMap::new(),
             active: HashSet::new(),
             whole: None,
+            stamps: Stamps::default(),
         }
     }
 
@@ -2132,6 +2326,7 @@ impl<'a> TreeHasher<'a> {
     /// device by nothing -- its mode says which, and opening a FIFO would
     /// block.
     fn entry(&mut self, rel: &Path, meta: &std::fs::Metadata) -> Result<blake3::Hash> {
+        self.stamps.record(&self.ctx.join(rel), meta);
         let file_type = meta.file_type();
         if file_type.is_file() {
             match self.earlier_link(rel, meta) {
@@ -2197,7 +2392,7 @@ impl<'a> TreeHasher<'a> {
         hasher.update(target.as_os_str().as_bytes());
         hasher.update(b"\0");
         if self.whole.is_none()
-            && let Some(referent) = resolve_in_context(self.ctx, rel)
+            && let Some(referent) = resolve_in_context(self.ctx, rel, &mut self.stamps)
             && let Some((mode, digest)) = self.referent(referent)?
         {
             hasher.update(&mode.to_le_bytes());
@@ -2249,8 +2444,10 @@ fn hash_file(path: &Path) -> Result<blake3::Hash> {
 /// link's directory first -- is cleaned before any of it is resolved, so
 /// `alias/..` cancels even where `alias` is itself a link, and a component
 /// that is not there is kept as written. `None` past buildah's limit on links
-/// followed -- a loop.
-fn resolve_in_context(ctx: &Path, rel: &Path) -> Option<PathBuf> {
+/// followed -- a loop. Each link followed is recorded in `stamps`, wherever
+/// it is: one under an ignored directory is no part of the key, yet
+/// re-pointing it changes what the `COPY` of a link through it copies.
+fn resolve_in_context(ctx: &Path, rel: &Path, stamps: &mut Stamps) -> Option<PathBuf> {
     // buildah's maxLoopsFollowed.
     const MAX_LINKS: usize = 64;
     // Cleaned paths hold only names, so the walk below never meets `..`.
@@ -2268,10 +2465,14 @@ fn resolve_in_context(ctx: &Path, rel: &Path) -> Option<PathBuf> {
     let mut links = 0;
     while let Some(name) = pending.pop() {
         let next = resolved.join(&name);
-        let Ok(target) = std::fs::read_link(ctx.join(&next)) else {
+        let path = ctx.join(&next);
+        let Ok(target) = std::fs::read_link(&path) else {
             resolved = next;
             continue;
         };
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            stamps.record(&path, &meta);
+        }
         links += 1;
         if links > MAX_LINKS {
             return None;
@@ -2310,16 +2511,16 @@ fn clean_lexically(path: &Path) -> PathBuf {
 /// a minimal distro image's busybox `tar` does not implement -- and a read
 /// failure now comes back as the `OutrigError::Path` that named it, not a bare
 /// `tar` exit code with nothing in its stderr.
-async fn hash_non_git_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
+async fn hash_non_git_context(
+    ctx: &Path,
+    hasher: &mut blake3::Hasher,
+    stamps: &mut Stamps,
+) -> Result<()> {
     let root = tokio::fs::symlink_metadata(ctx)
         .await
         .path_ctx("stat", ctx)?;
-    update_record(
-        hasher,
-        b"",
-        root.mode(),
-        &hash_whole_tree(ctx, Path::new("")).await?,
-    );
+    let digest = hash_whole_tree(ctx, Path::new(""), stamps).await?;
+    update_record(hasher, b"", root.mode(), &digest);
     Ok(())
 }
 

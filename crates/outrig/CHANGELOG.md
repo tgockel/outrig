@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A build whose context was edited and put back while buildah ran is no longer saved under
+  the original key.** buildah reads the context at each `COPY`, and the check after the build
+  compared only the key hashed before it with the one hashed after, so an edit made during an
+  early `RUN`, taken by the `COPY`, and undone before the end -- a `git stash` and `git stash
+  pop`, a branch switched away and back -- left an image holding the edit tagged as the original
+  content. The inputs are now hashed once more just before `buildah build` starts, recording the
+  inode, size, and modification and change times of every file and directory the key reads, and
+  the build is refused as `BuildContextChanged` if any of them differ afterward. Change times
+  cannot be set back, so the undo shows. The Dockerfile and the context directory are also stamped
+  through every symlink buildah follows to open them, and so is each link a context symlink is
+  resolved through, even one under an ignored directory. Touching a keyed file without changing it, or adding
+  and removing a file in a keyed directory, during a build is refused the same way; writes under
+  an ignored directory are not. (#734)
+
 - **The network interceptor's redirect table goes into the namespace its attach was armed
   against, or nowhere.** The nft apply ran as `nsenter -t <pid> ... nft`, and `nsenter` resolves
   the number when it execs, so an init that exited and had its PID handed to another container in

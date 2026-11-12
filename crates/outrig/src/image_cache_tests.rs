@@ -11,7 +11,7 @@ use std::process::Command;
 use super::{
     CacheKey, ImageConfig, ImageTag, KEY_HEX_LEN, McpServerSpec, OutrigError, TreeHasher,
     UNNAMED_IMAGE, check_ignore_cmd, compute_tag, compute_tag_for, ensure_key_still_holds,
-    hash_context, pairs_block, refuse_session_dir_in_build_context,
+    hash_context, key_before_build, pairs_block, refuse_session_dir_in_build_context,
 };
 
 fn make_ctx(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -112,7 +112,9 @@ async fn unescaped_key(
         hasher.update(b"\n[outrig-labels]\n");
         hasher.update(raw(labels).as_bytes());
     }
-    hash_context(ctx, &mut hasher).await.expect("hash_context");
+    hash_context(ctx, &mut hasher, &mut Default::default())
+        .await
+        .expect("hash_context");
     hasher.finalize().to_hex().as_str()[..KEY_HEX_LEN].to_string()
 }
 
@@ -1250,7 +1252,8 @@ async fn named_build_tag_tracks_repo_mcp_labels() {
 }
 
 /// What `ensure_key_still_holds` is asked after a build: does `tag` still name what the inputs
-/// hash to. Both ways the context is keyed, since each reads the files itself.
+/// hash to, and was nothing they were read from touched since `key_before_build`. Both ways
+/// the context is keyed, since each reads the files itself.
 #[tokio::test]
 async fn a_key_holds_until_the_context_changes() {
     for in_git in [false, true] {
@@ -1266,32 +1269,167 @@ async fn a_key_holds_until_the_context_changes() {
             .await
             .expect("compute_tag_for");
         let no_args = BTreeMap::new();
-        let holds = || ensure_key_still_holds("coding", &cfg, Path::new(""), &no_args, &tag);
+        let keyed = || key_before_build("coding", &cfg, Path::new(""), &no_args, &tag);
+        let before = keyed()
+            .await
+            .unwrap_or_else(|e| panic!("an untouched context keeps its key (git: {in_git}): {e}"));
+        let holds =
+            || ensure_key_still_holds("coding", &cfg, Path::new(""), &no_args, &tag, &before);
 
         holds()
             .await
             .unwrap_or_else(|e| panic!("an untouched context keeps its key (git: {in_git}): {e}"));
 
+        let changed = |err: OutrigError| {
+            assert!(
+                matches!(
+                    &err,
+                    OutrigError::BuildContextChanged { image, tag: named }
+                        if image == "coding" && named == tag.as_str()
+                ),
+                "git: {in_git}, got {err}"
+            );
+        };
+        // Past the filesystem's timestamp granularity, so the edit's `ctime` is its own.
+        std::thread::sleep(TIMESTAMP_TICK);
         std::fs::write(ctx.path().join("payload"), "two\n").expect("edit payload");
-        let err = holds()
-            .await
-            .expect_err("an edited context is not the one the key hashed");
-        assert!(
-            matches!(
-                &err,
-                OutrigError::BuildContextChanged { image, tag: named }
-                    if image == "coding" && named == tag.as_str()
-            ),
-            "git: {in_git}, got {err}"
+        changed(
+            holds()
+                .await
+                .expect_err("an edited context is not the one the key hashed"),
+        );
+        changed(
+            keyed()
+                .await
+                .expect_err("an edit before the build starts is refused there"),
         );
 
-        // Reverting is the case the stale tag would have been served for.
+        // Reverting is the case the stale tag would have been served for: the content hashes
+        // to the key again, but a `COPY` between the edit and its undo took the edit (#734).
         std::fs::write(ctx.path().join("payload"), "one\n").expect("revert payload");
-        holds().await.unwrap_or_else(|e| {
-            panic!("a reverted context holds its key again (git: {in_git}): {e}")
-        });
+        changed(
+            holds()
+                .await
+                .expect_err("an edit undone during a build is still refused"),
+        );
+        // A build that starts from the reverted context is keyed by it.
+        let again = keyed()
+            .await
+            .unwrap_or_else(|e| panic!("a reverted context holds its key (git: {in_git}): {e}"));
+        ensure_key_still_holds("coding", &cfg, Path::new(""), &no_args, &tag, &again)
+            .await
+            .unwrap_or_else(|e| panic!("an untouched rebuild holds (git: {in_git}): {e}"));
     }
 }
+
+/// The stamps cover what the key reads, not the whole directory: writes under an ignored
+/// directory, as a concurrent `cargo build` makes in `target/`, do not refuse a build.
+#[tokio::test]
+async fn writes_under_an_ignored_directory_do_not_refuse_a_build() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\nCOPY . /src\n"),
+        (".gitignore", "/target/\n"),
+        ("payload", "one\n"),
+        ("target/out", "a\n"),
+    ]);
+    git_init(ctx.path());
+    let cfg = build_cfg(ctx.path());
+    let no_args = BTreeMap::new();
+    let tag = compute_tag_for("coding", &cfg, Path::new(""))
+        .await
+        .expect("compute_tag_for");
+    let before = key_before_build("coding", &cfg, Path::new(""), &no_args, &tag)
+        .await
+        .expect("key_before_build");
+
+    std::thread::sleep(TIMESTAMP_TICK);
+    std::fs::write(ctx.path().join("target/out"), "b\n").expect("rewrite target/out");
+    std::fs::write(ctx.path().join("target/new"), "c\n").expect("add target/new");
+    ensure_key_still_holds("coding", &cfg, Path::new(""), &no_args, &tag, &before)
+        .await
+        .expect("an ignored directory is not a build input");
+
+    // A file created and removed again in a keyed directory is one a `COPY` may have taken.
+    std::fs::write(ctx.path().join("extra"), "x\n").expect("add extra");
+    std::fs::remove_file(ctx.path().join("extra")).expect("remove extra");
+    let err = ensure_key_still_holds("coding", &cfg, Path::new(""), &no_args, &tag, &before)
+        .await
+        .expect_err("an entry added and removed in a keyed directory is refused");
+    assert!(
+        matches!(err, OutrigError::BuildContextChanged { .. }),
+        "got {err}"
+    );
+}
+
+/// A link the key does not hash, followed on the way to one it does, is still read by a `COPY`
+/// through it: re-pointing it and putting it back is refused like any other undone edit.
+#[tokio::test]
+async fn a_link_re_pointed_and_put_back_under_an_ignored_directory_is_refused() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\nCOPY cfg /cfg\n"),
+        (".gitignore", "/hidden/\n"),
+        ("profiles/prod/f", "prod\n"),
+        ("profiles/dev/f", "dev\n"),
+    ]);
+    std::fs::create_dir(ctx.path().join("hidden")).expect("mkdir hidden");
+    let current = ctx.path().join("hidden/current");
+    std::os::unix::fs::symlink("../profiles/prod", &current).expect("link current");
+    std::os::unix::fs::symlink("hidden/current/f", ctx.path().join("cfg")).expect("link cfg");
+    git_init(ctx.path());
+    let cfg = build_cfg(ctx.path());
+    let no_args = BTreeMap::new();
+    let tag = compute_tag_for("coding", &cfg, Path::new(""))
+        .await
+        .expect("compute_tag_for");
+    let before = key_before_build("coding", &cfg, Path::new(""), &no_args, &tag)
+        .await
+        .expect("key_before_build");
+
+    std::thread::sleep(TIMESTAMP_TICK);
+    for profile in ["../profiles/dev", "../profiles/prod"] {
+        std::fs::remove_file(&current).expect("unlink current");
+        std::os::unix::fs::symlink(profile, &current).expect("re-point current");
+    }
+    let err = ensure_key_still_holds("coding", &cfg, Path::new(""), &no_args, &tag, &before)
+        .await
+        .expect_err("a re-pointed link a `COPY` went through is refused");
+    assert!(
+        matches!(err, OutrigError::BuildContextChanged { .. }),
+        "got {err}"
+    );
+}
+
+/// A Dockerfile in the context that links outside it is stamped as buildah opens it, through
+/// the link, as well as the context walk stamps the link itself.
+#[tokio::test]
+async fn a_linked_dockerfile_edited_and_put_back_is_refused() {
+    let outside = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let ctx = make_ctx(&[("payload", "one\n")]);
+    let target = outside.path().join("Dockerfile");
+    std::os::unix::fs::symlink(&target, ctx.path().join("Dockerfile")).expect("link Dockerfile");
+    let cfg = build_cfg(ctx.path());
+    let no_args = BTreeMap::new();
+    let tag = compute_tag_for("coding", &cfg, Path::new(""))
+        .await
+        .expect("compute_tag_for");
+    let before = key_before_build("coding", &cfg, Path::new(""), &no_args, &tag)
+        .await
+        .expect("key_before_build");
+
+    std::thread::sleep(TIMESTAMP_TICK);
+    std::fs::write(&target, "FROM busybox\n").expect("edit Dockerfile");
+    std::fs::write(&target, "FROM alpine\n").expect("revert Dockerfile");
+    let err = ensure_key_still_holds("coding", &cfg, Path::new(""), &no_args, &tag, &before)
+        .await
+        .expect_err("a Dockerfile edited and put back is refused");
+    assert!(
+        matches!(err, OutrigError::BuildContextChanged { .. }),
+        "got {err}"
+    );
+}
+
+/// Longer than any clock tick a filesystem stamps `ctime` with.
+const TIMESTAMP_TICK: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[tokio::test]
 async fn unnamed_build_tag_falls_back_to_outrig_cache() {

@@ -1018,8 +1018,8 @@ async fn a_canceled_build_removes_its_temporary_tag() {
 
     let token = unique_name("built");
     let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
-    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
-    let build = outrig::image::build_image_for("built", &cfg, context.path(), &final_tag, false);
+    let final_tag = keyed_tag(&token, &cfg, context.path()).await;
+    let build = outrig::image::build_image_for(&token, &cfg, context.path(), &final_tag, false);
     let mut build = Box::pin(build);
 
     let building = [token.as_str()];
@@ -1241,8 +1241,8 @@ async fn a_canceled_build_asks_buildah_to_stop_before_killing_it() {
 
     let token = unique_name("graceful");
     let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
-    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
-    let build = outrig::image::build_image_for("graceful", &cfg, context.path(), &final_tag, false);
+    let final_tag = keyed_tag(&token, &cfg, context.path()).await;
+    let build = outrig::image::build_image_for(&token, &cfg, context.path(), &final_tag, false);
     let mut build = Box::pin(build);
 
     let building = [token.as_str()];
@@ -1264,15 +1264,18 @@ async fn a_canceled_logged_build_asks_buildah_to_stop_before_killing_it() {
     let journal = fake_runtime();
     let context = tempfile::tempdir().expect("tempdir");
     std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
-    let transcript = outrig::Transcript::create(&context.path().join("log"), false)
+    // Outside the context: the build writes to it, and a write in the context is a change to
+    // what the key hashed.
+    let logs = tempfile::tempdir().expect("tempdir");
+    let transcript = outrig::Transcript::create(&logs.path().join("log"), false)
         .await
         .expect("create transcript");
 
     let token = unique_name("logged");
     let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
-    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
+    let final_tag = keyed_tag(&token, &cfg, context.path()).await;
     let build = outrig::image::ensure_tagged_image_for(
-        "logged",
+        &token,
         &cfg,
         context.path(),
         &final_tag,
@@ -1342,8 +1345,8 @@ async fn a_buildah_that_ignores_the_stop_is_killed_anyway() {
     ignore_stop_for(journal, &token);
 
     let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
-    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
-    let build = outrig::image::build_image_for("stubborn", &cfg, context.path(), &final_tag, false);
+    let final_tag = keyed_tag(&token, &cfg, context.path()).await;
+    let build = outrig::image::build_image_for(&token, &cfg, context.path(), &final_tag, false);
     let mut build = Box::pin(build);
 
     let building = [token.as_str()];
@@ -1788,8 +1791,8 @@ async fn a_failed_build_reports_a_referenced_build_arg_by_name() {
         "GH_TOKEN".to_string(),
         outrig::config::EnvValue::EnvRef(var.to_string()),
     )]);
-    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
-    let err = outrig::image::build_image_for("referenced", &cfg, context.path(), &final_tag, false)
+    let final_tag = keyed_tag(&token, &cfg, context.path()).await;
+    let err = outrig::image::build_image_for(&token, &cfg, context.path(), &final_tag, false)
         .await
         .expect_err("the fake refuses the build");
 

@@ -196,6 +196,8 @@ pub enum OutrigError {
     // The image was built, and discarded: buildah reads the context as each
     // `COPY` runs, so a build that read an edit holds content its key does not
     // hash, and naming it `tag` would serve it for the content the key does.
+    // Raised when the inputs no longer hash to `tag`, or when anything the key
+    // read was touched while buildah ran, even if put back before it finished.
     #[error(
         "image {image:?}: its Dockerfile or build context changed while it was building, so \
          the build was discarded rather than saved as {tag}\n\

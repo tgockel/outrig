@@ -234,6 +234,15 @@ fn slow_context(base: &ImageTag) -> tempfile::TempDir {
     dir
 }
 
+/// The tag a build of `cfg` in `ctx` is keyed by, with `marker` as its repository so `sweep`
+/// finds it. A build is refused any other tag (#392).
+async fn keyed_tag(marker: &str, cfg: &outrig::config::ImageConfig, ctx: &Path) -> ImageTag {
+    image::compute_tag_for(marker, cfg, ctx)
+        .await
+        .expect("compute_tag_for")
+}
+
+/// The tag a standalone build is named by, which is the caller's choice.
 fn final_tag(marker: &str) -> ImageTag {
     ImageTag::new(format!("{marker}:built"))
 }
@@ -274,9 +283,10 @@ async fn a_canceled_multi_stage_build_leaves_no_working_container() {
     let ctx = slow_context(&base);
 
     let cfg = common::fixture_build_config();
+    let tag = keyed_tag(&marker, &cfg, ctx.path()).await;
     let took = cancel_mid_stage(
         &marker,
-        image::build_image_for(&marker, &cfg, ctx.path(), &final_tag(&marker), true),
+        image::build_image_for(&marker, &cfg, ctx.path(), &tag, true),
     )
     .await;
 
@@ -301,21 +311,18 @@ async fn a_canceled_logged_build_leaves_no_working_container() {
     let marker = marker("logged");
     let base = build_base(&marker);
     let ctx = slow_context(&base);
-    let transcript = outrig::Transcript::create(&ctx.path().join("transcript.log"), false)
+    // Outside the context: the build writes to it, and a write in the context is a change to
+    // what the key hashed.
+    let logs = tempfile::tempdir().expect("tempdir");
+    let transcript = outrig::Transcript::create(&logs.path().join("transcript.log"), false)
         .await
         .expect("create transcript");
 
     let cfg = common::fixture_build_config();
+    let tag = keyed_tag(&marker, &cfg, ctx.path()).await;
     let took = cancel_mid_stage(
         &marker,
-        image::ensure_tagged_image_for(
-            &marker,
-            &cfg,
-            ctx.path(),
-            &final_tag(&marker),
-            true,
-            Some(&transcript),
-        ),
+        image::ensure_tagged_image_for(&marker, &cfg, ctx.path(), &tag, true, Some(&transcript)),
     )
     .await;
 
@@ -369,10 +376,11 @@ async fn twenty_cancellations_leave_no_growth() {
     let before = images_named(&marker);
 
     let cfg = common::fixture_build_config();
+    let tag = keyed_tag(&marker, &cfg, ctx.path()).await;
     for attempt in 0..20 {
         let took = cancel_mid_stage(
             &marker,
-            image::build_image_for(&marker, &cfg, ctx.path(), &final_tag(&marker), true),
+            image::build_image_for(&marker, &cfg, ctx.path(), &tag, true),
         )
         .await;
         println!("cancellation {attempt}: engine clean in {took:?}");
@@ -410,9 +418,7 @@ async fn a_concurrent_build_from_the_same_base_is_untouched() {
     let cfg = common::fixture_build_config();
     // This one finishes, and a build is refused a tag its inputs do not hash to (#392). The
     // marker is still its repository, which is what `sweep` finds it by.
-    let keep_tag = image::compute_tag_for(&marker, &cfg, keep_ctx.path())
-        .await
-        .expect("compute_tag_for");
+    let keep_tag = keyed_tag(&marker, &cfg, keep_ctx.path()).await;
     let mut keep = Box::pin(image::build_image_for(
         &marker,
         &cfg,
@@ -431,7 +437,7 @@ async fn a_concurrent_build_from_the_same_base_is_untouched() {
         _ = tokio::time::sleep(RUN_SETTLE) => {}
     }
 
-    let cancel_tag = ImageTag::new(format!("{marker}:canceled"));
+    let cancel_tag = keyed_tag(&marker, &cfg, cancel_ctx.path()).await;
     let mut canceled = Box::pin(image::build_image_for(
         &marker,
         &cfg,
@@ -502,7 +508,7 @@ async fn the_graceful_stop_is_what_keeps_the_engine_clean() {
     let ctx = slow_context(&base);
 
     let cfg = common::fixture_build_config();
-    let tag = final_tag(&marker);
+    let tag = keyed_tag(&marker, &cfg, ctx.path()).await;
     // Scoped to this build, so nothing else in the binary can see it and
     // there is nothing to reset if this test panics.
     let mut build = Box::pin(image::ungraceful_build_termination(image::build_image_for(
