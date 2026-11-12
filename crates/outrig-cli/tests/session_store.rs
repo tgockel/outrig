@@ -1242,6 +1242,118 @@ fn claims_are_per_directory() {
     );
 }
 
+#[test]
+/// #655: the record used to be published before the claim was taken, so a
+/// `discard` or `clean` reading the directory in between found a record with
+/// no live owner and no container, and removed a session that was starting.
+/// Stopped where the record is about to be written, the directory is
+/// already claimed.
+fn an_auto_directory_is_claimed_before_its_record_is_published() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261112T220000-6550aaaa".into());
+    let mut paused_in = None;
+    let (dir, _lock) = store
+        .create_pausing_before_publish(&sid, None, &mut sample_session(&sid), |dir| {
+            assert!(
+                !dir.join("session.json").exists(),
+                "the pause is before the record is written"
+            );
+            assert!(
+                session::owner_is_live(dir),
+                "a discard here sees a live owner and keeps the session"
+            );
+            paused_in = Some(dir.to_path_buf());
+        })
+        .expect("create");
+
+    assert_eq!(paused_in.as_deref(), Some(dir.as_path()));
+    assert!(store.get_by_path(&dir).is_ok(), "the record is published");
+    assert!(session::owner_is_live(&dir), "and still claimed");
+}
+
+#[test]
+/// The same for a `--session-dir` session, whose record is the claim on the
+/// directory against other launches: it too is never visible unclaimed.
+fn an_explicit_directory_is_claimed_before_its_record_is_published() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261112T220001-6550bbbb".into());
+    let mut paused_in = None;
+    let (dir, _lock) = store
+        .create_pausing_before_publish(
+            &sid,
+            Some(explicit.path()),
+            &mut sample_session(&sid),
+            |dir| {
+                assert!(!dir.join("session.json").exists());
+                assert!(session::owner_is_live(dir));
+                paused_in = Some(dir.to_path_buf());
+            },
+        )
+        .expect("create");
+
+    assert_eq!(paused_in.as_deref(), Some(dir.as_path()));
+    assert!(store.get_by_path(&dir).is_ok(), "the record is published");
+    assert!(session::owner_is_live(&dir), "and still claimed");
+}
+
+#[test]
+/// Claiming before the write means a write that fails has a claim to give
+/// back: here another launch's record lands in the directory between the
+/// claim and this one's write, which is refused, and the refused launch
+/// leaves no claim that would read as the other session's live owner.
+fn a_refused_publish_drops_the_claim() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261112T220002-6550cccc".into());
+    let err = store
+        .create_pausing_before_publish(
+            &sid,
+            Some(explicit.path()),
+            &mut sample_session(&sid),
+            |dir| {
+                std::fs::write(dir.join("session.json"), b"{}").expect("racing record");
+            },
+        )
+        .expect_err("the directory was claimed by the other launch first");
+
+    assert!(
+        err.to_string().contains("claimed by another session"),
+        "got: {err}"
+    );
+    assert!(
+        !session::owner_is_live(explicit.path()),
+        "the refused launch's claim went with it"
+    );
+}
+
+#[test]
+/// A launch whose record was written but could not be linked under the root
+/// undoes the write (#431), and the claim goes with it.
+fn an_unregistered_explicit_launch_drops_the_claim() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261112T220003-6550dddd".into());
+    std::fs::write(root.path().join(sid.as_str()), b"").expect("hold the link name");
+
+    store
+        .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
+        .expect_err("the link name is taken");
+
+    assert!(
+        !explicit.path().join("session.json").exists(),
+        "the write is undone"
+    );
+    assert!(
+        !session::owner_is_live(explicit.path()),
+        "and the claim dropped"
+    );
+}
+
 /// #429: `--session-dir` naming a path at or under the session root used to
 /// link `<root>/<sid>` to `<root>/x` on top of `<root>/x` itself, so `list`
 /// read the one record twice. `create` now refuses this before writing
