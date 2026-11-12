@@ -25,5 +25,13 @@ RUN rustup component add clippy rustfmt \
 
 RUN cargo install mdbook mdbook-mermaid lychee --locked
 
+# After the `cargo install` above, so those binaries stay in `/usr/local/cargo/bin` on
+# `PATH`. The base image's `/usr/local/cargo` is not writable by the session user and holds
+# none of this repo's dependencies, so a build with it fails either on a permission denied
+# under `registry/` or, offline, on a missing crate. The checkout's gitignored
+# `/workspace/.cargo` is the cargo home that works; rustup still finds its toolchain through
+# `RUSTUP_HOME=/usr/local/rustup`.
+ENV CARGO_HOME=/workspace/.cargo
+
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
