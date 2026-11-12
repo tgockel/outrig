@@ -105,7 +105,8 @@ pub(crate) fn preamble(
         "each time you are told messages are waiting",
     ));
     if !holdings.skills.is_empty() {
-        text.push_str(&skilled(holdings.skills));
+        text.push_str("\n\n");
+        text.push_str(&skilled(holdings.skills, true));
     }
     if let Some(configured) = configured {
         text.push_str("\n\n");
@@ -188,7 +189,7 @@ fn rest(workspace: Option<&Path>, view: View<'_>, window: Window, begins: &str) 
         View::Session { bindings, services } if !bindings.is_empty() || !services.is_empty() => {
             text.push_str(&held(bindings, services));
         }
-        View::Given(given) if !given.is_empty() => text.push_str(&facilities(given)),
+        View::Given(given) if !given.is_empty() => text.push_str(&facility_rules(given)),
         _ => {}
     }
     text
@@ -208,9 +209,22 @@ pub(crate) enum ChildBrief<'a> {
         schema: &'a str,
     },
     Request(&'a [ChannelText]),
-    /// An agent class instance's child; when it has the instance as `self`,
-    /// the class's `__qualname__` and the names of the aliases bound beside it.
-    Instance(&'a [ChannelText], Option<(&'a str, &'a [&'a str])>),
+    /// An agent class instance's child.
+    Instance {
+        channels: &'a [ChannelText],
+        /// When it has the instance as `self`, the class's `__qualname__` and
+        /// the names of the aliases bound beside it.
+        own: Option<(&'a str, &'a [&'a str])>,
+        /// The titled sections its class contributed, each a title and a
+        /// text, which follow its docstring.
+        sections: &'a [(&'a str, &'a str)],
+        /// Whether its parent is the session's owner: it is a root, which no
+        /// agent's code made and no user reaches.
+        root: bool,
+        /// The session's skills, for a root its owner constructed in its own
+        /// kernel; none for any other.
+        skills: &'a [SkillBrief],
+    },
 }
 
 /// One of a request child's channels, as its instructions describe it.
@@ -223,10 +237,21 @@ pub(crate) struct ChannelText {
     pub(crate) reply: String,
 }
 
-/// A child agent's system prompt: how it acts, what it is, `prompt` -- the
-/// first part of its instructions, which its parent wrote -- what it was
-/// given, and how it answers; then what every agent is told. No user reaches
-/// a child, and none of the session's own preamble applies to it.
+/// What a child that is not a root is told of what it is.
+const CHILD: &str = "You are a child agent: another agent's code launched you to do work for it, and \
+                     that code is who you answer.\n\n";
+
+/// What a root is told of what it is: the program that owns the session
+/// constructed it, and no agent's code did.
+const ROOT: &str = "You are a root agent: the program that owns this session constructed you; no \
+                    user reaches you, and that program is who you answer.\n\n";
+
+/// A child agent's system prompt, in this order: how it acts, what it is,
+/// `prompt` -- the first part of its instructions, which its parent wrote, or
+/// its class's docstring -- the sections its class contributed, what it was
+/// given, what it is of its parent's, the facilities it was given, and how it
+/// answers; then what every agent is told. No user reaches a child, and none
+/// of the session's own preamble applies to it.
 pub(crate) fn child_preamble(
     workspace: Option<&Path>,
     view: View<'_>,
@@ -236,6 +261,7 @@ pub(crate) fn child_preamble(
     brief: &ChildBrief<'_>,
 ) -> String {
     let mut text = String::from(ACT);
+    let root = matches!(brief, ChildBrief::Instance { root: true, .. });
     if let ChildBrief::Call { signature, .. } = brief {
         let _ = write!(
             text,
@@ -244,12 +270,14 @@ pub(crate) fn child_preamble(
             indented(prompt.trim())
         );
     } else {
-        text.push_str(
-            "You are a child agent: another agent's code launched you to do work for it, and \
-             that code is who you answer.\n\n",
-        );
+        text.push_str(if root { ROOT } else { CHILD });
         text.push_str(prompt.trim());
         text.push_str("\n\n");
+    }
+    if let ChildBrief::Instance { sections, .. } = brief {
+        for (title, body) in *sections {
+            let _ = write!(text, "## {title}\n\n{body}\n\n");
+        }
     }
     if !inputs.is_empty() {
         text.push_str("These names were bound for you before you began:\n");
@@ -262,13 +290,25 @@ pub(crate) fn child_preamble(
         }
         text.push('\n');
     }
-    if let ChildBrief::Instance(_, Some((qualname, aliases))) = brief {
+    if let ChildBrief::Instance {
+        own: Some((qualname, aliases)),
+        ..
+    } = brief
+    {
+        let (maker, asker) = if root {
+            (
+                "that program constructed in this interpreter for you",
+                "that program",
+            )
+        } else {
+            ("your parent's code constructed", "your parent")
+        };
         let _ = write!(
             text,
-            "`self` is the `{qualname}` instance your parent's code constructed: the same object, \
-             not a copy. Its attributes hold what its constructor stored, and its ordinary methods \
-             run here when you call them; its request methods are how your parent asks you for \
-             something, so calling one on `self` raises `TypeError`."
+            "`self` is the `{qualname}` instance {maker}: the same object, not a copy. Its \
+             attributes hold what its constructor stored, and its ordinary methods run here when \
+             you call them; its request methods are how {asker} asks you for something, so \
+             calling one on `self` raises `TypeError`."
         );
         for alias in *aliases {
             let _ = write!(
@@ -276,12 +316,22 @@ pub(crate) fn child_preamble(
                 " `{alias}` is the `{alias}` its constructor was given, the same object."
             );
         }
-        text.push_str(
-            " Your parent's code holds `self` too, and can change it while yours runs: one attribute \
-             read or write is whole, a read followed by a write is not. Keep your own state on \
-             `self`, not in a module's globals, which every agent that imports the module shares. \
-             You run until you are released -- by your parent, with it, or as the session ends.\n\n",
-        );
+        text.push_str(if root {
+            " Keep your own state on `self`, not in a module's globals, which every agent that \
+             imports the module shares. You run until that program releases you, or as the \
+             session ends.\n\n"
+        } else {
+            " Your parent's code holds `self` too, and can change it while yours runs: one \
+             attribute read or write is whole, a read followed by a write is not. Keep your own \
+             state on `self`, not in a module's globals, which every agent that imports the \
+             module shares. You run until you are released -- by your parent, with it, or as the \
+             session ends.\n\n"
+        });
+    }
+    if let View::Given(given) = view
+        && !given.is_empty()
+    {
+        text.push_str(&facility_entries(given));
     }
     let begins = match brief {
         ChildBrief::Call {
@@ -326,7 +376,20 @@ pub(crate) fn child_preamble(
             text.push_str(WAIT);
             "each time a submission is given to you, or one stays open"
         }
-        ChildBrief::Request(channels) | ChildBrief::Instance(channels, _) => {
+        // A root that declares no request channel has none to answer on, and says so.
+        ChildBrief::Instance {
+            root: true,
+            channels: [],
+            ..
+        } => {
+            let _ = write!(
+                text,
+                "Your class declares no request channel, so no request arrives and you have no \
+                 `runtime.complete`. {WAIT}{NOT_WAITING}\n\n"
+            );
+            "as you are launched"
+        }
+        ChildBrief::Request(channels) | ChildBrief::Instance { channels, .. } => {
             text.push_str("You answer requests, which arrive on these channels:\n");
             for channel in *channels {
                 let _ = write!(text, "\n- `runtime.channels[{:?}]`", channel.name);
@@ -344,7 +407,9 @@ pub(crate) fn child_preamble(
             }
             text.push_str(
                 "\nTake a request with `d = await runtime.channels[name].receive()`: `d.body` is \
-                 the request and `d.id` its id. Answer it with `await d.reply(value)`, `value` an \
+                 the request and `d.id` its id. A round's opening line says what waits, by channel \
+                 and count, and never what it holds: you read each request in code, with \
+                 `receive()`. Answer it with `await d.reply(value)`, `value` an \
                  instance of the reply type -- bound under its name, with every dataclass it \
                  uses -- or its JSON form. It returns once the reply is accepted; one that is not \
                  raises what is wrong, each problem with its path, so correct it and reply again. \
@@ -364,7 +429,7 @@ pub(crate) fn child_preamble(
                  way, and each sender then gets an exception.\n\n"
             );
             match brief {
-                ChildBrief::Instance(..) => {
+                ChildBrief::Instance { .. } => {
                     "as you are launched, to get ready in, then when requests are waiting, or \
                      one you took is unanswered"
                 }
@@ -372,6 +437,13 @@ pub(crate) fn child_preamble(
             }
         }
     };
+    // A root the owner constructed is the application's primary, and is told the session's skills.
+    if let ChildBrief::Instance { skills, .. } = brief
+        && !skills.is_empty()
+    {
+        text.push_str(&skilled(skills, false));
+        text.push_str("\n\n");
+    }
     text.push_str(&rest(workspace, view, window, begins));
     text
 }
@@ -481,11 +553,9 @@ fn rules(binding: Option<&str>, service: Option<&str>) -> String {
 }
 
 /// What a child given facilities is told of them, of which there is at least
-/// one: each by name, kind and description; how a binding among them is
-/// used; and that its mapping is read as it stands while its globals and this
-/// text were made once.
-fn facilities(given: &[Given]) -> String {
-    let mut text = String::from("\n\nYou were given these to act through, by name:\n");
+/// one, before its channels: each by name, kind and description.
+fn facility_entries(given: &[Given]) -> String {
+    let mut text = String::from("You were given these to act through, by name:\n");
     for facility in given {
         let (brief, description) = (&facility.brief, facility.description.trim());
         match brief.kind {
@@ -519,6 +589,16 @@ fn facilities(given: &[Given]) -> String {
         }
     }
     text.push_str("\n\n");
+    text
+}
+
+/// What a child given facilities is told of how to use them, with what every
+/// agent is told last, of which there is at least one: how each kind among
+/// them is used, the rule about a binding or a service among them, and that
+/// the mapping is read as it stands while its globals and these entries were
+/// made once.
+fn facility_rules(given: &[Given]) -> String {
+    let mut text = String::from("\n\n");
     let first = |kind| {
         given
             .iter()
@@ -574,24 +654,29 @@ const SKILLS_LISTED_MAX: usize = 50;
 /// The most bytes of the preamble's list of skills: some 3,000 tokens.
 const SKILLS_TEXT_MAX: usize = 12 * 1024;
 
-/// What the primary agent is told of the session's skills, of which there is
-/// at least one: as many as fit [`SKILLS_LISTED_MAX`] and
-/// [`SKILLS_TEXT_MAX`], each by name and description, then how many more
-/// there are and where they are listed.
-fn skilled(skills: &[SkillBrief]) -> String {
+/// What an agent is told of the session's skills, of which there is at least
+/// one: as many as fit [`SKILLS_LISTED_MAX`] and [`SKILLS_TEXT_MAX`], each by
+/// name and description, then how many more there are and where they are
+/// listed. With `directive`, how the user's `/name` message asks for one,
+/// which only the primary, with a user channel, is told.
+fn skilled(skills: &[SkillBrief], directive: bool) -> String {
     let mut text = String::from(
-        "\n\nThese skills come with the session, each instructions for a kind of work: \
+        "These skills come with the session, each instructions for a kind of work: \
          `outrig.skills.read(name)` returns them, to read when a skill's description fits what \
          you are doing. One that names a package also has Python, its entry module that \
-         package's `skill`, which you import as any module. `help(outrig.skills)` says more.\n\n\
-         A message from the user whose delivery names a skill, as `d.skill`, is the user typing \
-         `/name`: it asks you to run that skill. For a skill with a package, call `await \
-         outrig.skills.invoke(d.skill, (d.body.split(maxsplit=1) + [\"\"])[1])`, the text after \
-         the name and the whitespace that ends it. When that raises `outrig.skills.SkillNeedsClarification`, send its `question` to \
-         the user on `runtime.channels[\"user\"]`, and once they answer, call `invoke` again \
-         with `params=outrig.skills.params(d.skill)(...)`. For a skill without one, the message \
-         is its instructions followed by what the user typed: follow them.\n",
+         package's `skill`, which you import as any module. `help(outrig.skills)` says more.\n",
     );
+    if directive {
+        text.push_str(
+            "\nA message from the user whose delivery names a skill, as `d.skill`, is the user typing \
+             `/name`: it asks you to run that skill. For a skill with a package, call `await \
+             outrig.skills.invoke(d.skill, (d.body.split(maxsplit=1) + [\"\"])[1])`, the text after \
+             the name and the whitespace that ends it. When that raises `outrig.skills.SkillNeedsClarification`, send its `question` to \
+             the user on `runtime.channels[\"user\"]`, and once they answer, call `invoke` again \
+             with `params=outrig.skills.params(d.skill)(...)`. For a skill without one, the message \
+             is its instructions followed by what the user typed: follow them.\n",
+        );
+    }
     let mut listed = 0;
     let mut size = 0;
     for skill in skills {
@@ -631,9 +716,29 @@ pub(crate) fn child_opening(lead: &str, detail: &str, omitted: usize) -> String 
 
 /// What an agent class instance's child is told as its first round opens, as
 /// it launches: the round is for getting ready.
-pub(crate) const ORIENTING: &str = "you have just been launched, and this round is for getting \
-                                    ready: read your instructions, and prepare what answering \
-                                    requests will need";
+const ORIENTING: &str = "you have just been launched, and this round is for getting ready: read \
+                         your instructions, and prepare what answering requests will need";
+
+/// What a root whose class contributed sections is told besides: its task is
+/// in its instructions, and this round is where it begins.
+const ORIENTING_TASK: &str =
+    "Your task is in your instructions, and this round is where you begin it";
+
+/// What an agent class instance's first round opens on, as it launches: that
+/// it is for getting ready, and for a root with a `task` in its instructions
+/// that it is where the task begins; then `waiting`, by channel and count, when
+/// a request already waits. What waits is never told in the instructions, nor
+/// its body here: the round reads it in code.
+pub(crate) fn orienting(task: bool, waiting: &str) -> String {
+    let mut lead = String::from(ORIENTING);
+    if task {
+        let _ = write!(lead, ". {ORIENTING_TASK}");
+    }
+    if !waiting.is_empty() {
+        let _ = write!(lead, ". {waiting}");
+    }
+    lead
+}
 
 /// What a work child is told as a submission is given to it.
 pub(crate) fn submission(
@@ -786,6 +891,20 @@ mod tests {
             inputs,
             brief,
         )
+    }
+
+    /// An agent class instance's child that contributed no section and is no root.
+    fn instance<'a>(
+        channels: &'a [ChannelText],
+        own: Option<(&'a str, &'a [&'a str])>,
+    ) -> ChildBrief<'a> {
+        ChildBrief::Instance {
+            channels,
+            own,
+            sections: &[],
+            root: false,
+            skills: &[],
+        }
     }
 
     fn given(name: &str, kind: FacilityKind, type_name: &str, description: &str) -> Given {
@@ -1089,7 +1208,7 @@ mod tests {
         }];
         let told = |aliases: Option<&[&str]>| {
             let own = aliases.map(|aliases| ("Reviewer", aliases));
-            preamble(&ChildBrief::Instance(&channels, own), &inputs)
+            preamble(&instance(&channels, own), &inputs)
         };
         let plain = told(Some(&[]));
         let at = plain
@@ -1126,6 +1245,226 @@ mod tests {
         assert!(!hosted.contains("`self`"), "{hosted}");
     }
 
+    fn channel(name: &str) -> ChannelText {
+        ChannelText {
+            name: name.into(),
+            doc: Some("Review a path.".into()),
+            request_type: "str".into(),
+            reply_type: "Verdict".into(),
+            request: "{}".into(),
+            reply: "{}".into(),
+        }
+    }
+
+    /// An instance's instructions are composed in the documented order, each part its own and none
+    /// formatted into another: how it acts, what it is, its class's docstring, each section its
+    /// class contributed under its title as returned -- braces and all -- the inputs, `self`, the
+    /// facilities it was given, the channels, and what every agent is told last, which has the
+    /// rule about a binding after them. A class that contributed none has no section.
+    #[test]
+    fn an_instance_is_composed_in_the_documented_order() {
+        let channels = [channel("review")];
+        let inputs = [InputBrief {
+            name: "path".into(),
+            type_name: "str".into(),
+            preview: "\"src\"".into(),
+        }];
+        let sections = [("Task", "Review {x} and {}"), ("Rules", "Be brief.")];
+        let files = [given(
+            "files",
+            FacilityKind::Binding,
+            "git.Repo",
+            "The repository.",
+        )];
+        let told = |sections: &[(&str, &str)]| {
+            child_preamble(
+                None,
+                View::Given(&files),
+                Window::DEFAULT,
+                "Name {the} capital.",
+                &inputs,
+                &ChildBrief::Instance {
+                    channels: &channels,
+                    own: Some(("Reviewer", &[])),
+                    sections,
+                    root: false,
+                    skills: &[],
+                },
+            )
+        };
+        let text = told(&sections);
+        let positions: Vec<usize> = [
+            ACT.trim_end(),
+            "You are a child agent",
+            "Name {the} capital.",
+            "## Task\n\nReview {x} and {}\n\n## Rules\n\nBe brief.",
+            "- `path` (str)",
+            "`self` is the `Reviewer` instance",
+            "You were given these to act through",
+            "- `files`, a binding the host holds",
+            "You answer requests",
+            "`runtime.channels[\"review\"]`: Review a path.",
+            "Your whole conversation is in",
+            "`await asyncio.to_thread(lambda: files.f(x))`",
+        ]
+        .map(|needle| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} in {text}"))
+        })
+        .to_vec();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{positions:?} in {text}"
+        );
+        assert!(!told(&[]).contains("## "), "{}", told(&[]));
+    }
+
+    /// A root is told that the program that owns the session constructed it and that no user
+    /// reaches it, not that an agent's code launched it, and that its `self` is the instance that
+    /// program constructed, which the program asks through its request methods. One the owner
+    /// constructed in its kernel is told the session's skills, without how the user's message
+    /// names one, ahead of what every agent is told last; a host program's root has no `self` and
+    /// no skills, and a child an agent made is told of neither.
+    #[test]
+    fn a_root_is_told_the_program_constructed_it() {
+        let channels = [channel("review")];
+        let skills = [SkillBrief {
+            name: "review-diff".into(),
+            description: "Review a diff.".into(),
+            package: Some("outrig_skills.review_diff".into()),
+        }];
+        let told = |own: Option<(&str, &[&str])>, root: bool, skills: &[SkillBrief]| {
+            preamble(
+                &ChildBrief::Instance {
+                    channels: &channels,
+                    own,
+                    sections: &[],
+                    root,
+                    skills,
+                },
+                &[],
+            )
+        };
+        let owned = told(Some(("Reviewer", &["task"])), true, &skills);
+        for said in [
+            "You are a root agent: the program that owns this session constructed you; no user \
+             reaches you, and that program is who you answer.",
+            "`self` is the `Reviewer` instance that program constructed in this interpreter for you",
+            "`task` is the `task` its constructor was given, the same object.",
+            "You run until that program releases you, or as the session ends.",
+            "These skills come with the session",
+            "- `review-diff` (`outrig_skills.review_diff`): Review a diff.",
+        ] {
+            assert!(owned.contains(said), "{said:?} in {owned}");
+        }
+        for unsaid in [
+            "another agent's code",
+            "Your parent's code holds",
+            "d.skill",
+            "`/name`",
+        ] {
+            assert!(!owned.contains(unsaid), "{unsaid:?} in {owned}");
+        }
+        assert!(
+            owned.find("These skills come with the session")
+                < owned.find("Your whole conversation"),
+            "{owned}"
+        );
+
+        let hosted = told(None, true, &[]);
+        assert!(hosted.contains("You are a root agent"), "{hosted}");
+        assert!(
+            !hosted.contains("`self`") && !hosted.contains("These skills"),
+            "{hosted}"
+        );
+        let child = told(Some(("Reviewer", &[])), false, &[]);
+        assert!(
+            !child.contains("These skills") && !child.contains("root agent"),
+            "{child}"
+        );
+    }
+
+    /// A root whose class declares no request channel is told so, and nothing of answering; it
+    /// still has the wait rules, and its one round begins as it is launched.
+    #[test]
+    fn a_root_that_declares_no_channel_is_told_of_none() {
+        let text = preamble(
+            &ChildBrief::Instance {
+                channels: &[],
+                own: Some(("Reviewer", &[])),
+                sections: &[],
+                root: true,
+                skills: &[],
+            },
+            &[],
+        );
+        for said in [
+            "Your class declares no request channel, so no request arrives and you have no \
+             `runtime.complete`.",
+            "Ending your round is not waiting",
+            "A round begins as you are launched, and its opening line",
+        ] {
+            assert!(text.contains(said), "{said:?} in {text}");
+        }
+        assert!(!text.contains("You answer requests"), "{text}");
+    }
+
+    /// A root's catalog is bounded as the primary's is: at most [`SKILLS_LISTED_MAX`] skills, then
+    /// how many more there are.
+    #[test]
+    fn a_roots_catalog_is_bounded_as_the_primarys_is() {
+        let many: Vec<SkillBrief> = (0..SKILLS_LISTED_MAX + 10)
+            .map(|n| SkillBrief {
+                name: format!("skill-{n}"),
+                description: "Does a thing.".into(),
+                package: None,
+            })
+            .collect();
+        let text = preamble(
+            &ChildBrief::Instance {
+                channels: &[],
+                own: None,
+                sections: &[],
+                root: true,
+                skills: &many,
+            },
+            &[],
+        );
+        assert_eq!(text.matches("\n- `skill-").count(), SKILLS_LISTED_MAX);
+        assert!(
+            text.contains("10 more are not listed here; `outrig.skills.catalog()` has every one."),
+            "{text}"
+        );
+    }
+
+    /// The orienting round opens on its lead: that it is for getting ready; for a root whose
+    /// instructions carry a task, that the task is in them and the round is where it begins; and,
+    /// when a request already waits, what waits, by channel and count, after the lead -- never
+    /// what it says.
+    #[test]
+    fn the_orienting_lead_adds_the_task_and_what_waits_after_it() {
+        assert_eq!(orienting(false, ""), ORIENTING);
+        let waiting = "1 request is waiting on runtime.channels[\"review\"]";
+        assert_eq!(
+            orienting(true, ""),
+            format!("{ORIENTING}. {ORIENTING_TASK}")
+        );
+        assert_eq!(orienting(false, waiting), format!("{ORIENTING}. {waiting}"));
+        let opened = opening(&orienting(true, waiting), 0);
+        assert!(
+            opened.starts_with("[outrig] you have just been launched"),
+            "{opened}"
+        );
+        assert!(
+            opened.find("where you begin it") < opened.find("1 request is waiting"),
+            "{opened}"
+        );
+        assert!(
+            opened.ends_with("runtime.channels[\"review\"]."),
+            "{opened}"
+        );
+    }
+
     /// Every child's preamble states the rule: up to two more rounds, the last a warning, then the
     /// cancel, and that ending a round is not waiting. A request child is also told that only
     /// `d.reply` and `d.fail` answer, and that code left running keeps no request open; a work
@@ -1149,8 +1488,8 @@ mod tests {
             ChildBrief::Work,
             call,
             ChildBrief::Request(&channels),
-            ChildBrief::Instance(&channels, None),
-            ChildBrief::Instance(&channels, Some(("Reviewer", &[]))),
+            instance(&channels, None),
+            instance(&channels, Some(("Reviewer", &[]))),
         ] {
             let text = preamble(&brief, &[]);
             assert!(
@@ -1159,13 +1498,14 @@ mod tests {
                     && text.contains("Ending your round is not waiting"),
                 "{text}"
             );
-            let request = matches!(brief, ChildBrief::Request(_) | ChildBrief::Instance(..));
+            let request = matches!(brief, ChildBrief::Request(_) | ChildBrief::Instance { .. });
             assert_eq!(
                 text.contains("what you write yourself is not delivered"),
                 request,
                 "{text}"
             );
             assert_eq!(text.contains("keeps no request open"), request, "{text}");
+            assert_eq!(text.contains("never what it holds"), request, "{text}");
             assert_eq!(
                 text.contains("`await runtime.fail(message)`"),
                 !request,

@@ -54,13 +54,15 @@ Construction in a kernel, as `0003-41`, `0003-42`, `0003-45` and `0003-47` build
 1. `Reviewer(...)` runs the most-derived `__init__` to its end, as any class call does. The base's
    `__init__` records `model`, `facilities` and the data inputs and launches nothing.
 2. The optional attach hook runs, if the class defines one, on the instance, with no `super()`.
-3. OutRig attaches the instance: it makes the runtime's record of it (`_Instance`), classifies the
-   facility mapping (`facilities.md`, "What a dict may hold"), schedules the launch on the
-   constructing kernel's loop, and returns the instance. A `TypeError` from a bad input or key is
-   raised here, synchronously, with nothing launched (`agent-classes.md`, "Construction and
-   readiness").
-4. On the loop, before the spawn line is sent, the instruction hook runs, if the class defines
-   one, and its sections go on the line as text (`0003-47`).
+3. OutRig attaches the instance: it makes the runtime's record of it (`_Instance`) and classifies
+   the facility mapping (`facilities.md`, "What a dict may hold"). A `TypeError` from a bad input
+   or key is raised here, synchronously, with nothing launched (`agent-classes.md`, "Construction
+   and readiness").
+4. As attachment's checks pass, the instruction hook runs, if the class defines one, in the
+   constructor call: its sections are checked against their bounds and kept with the record, and
+   an exception of the hook's, or a section past a bound, is the constructor call's, with nothing
+   launched (`0003-47`). OutRig then schedules the launch on the constructing kernel's loop and
+   returns the instance; the sections go on the spawn line as text.
 5. The host launches the child: it opens the kernel, which binds `self` (`0003-45`), the facility
    view (`0003-42`), the inputs and the classes; composes the orientation from OutRig's rules,
    the docstring, the sections, the facility manifest and the channels (`0003-47`); starts the
@@ -299,7 +301,8 @@ own, none interpolated into another (`0003-47`):
    name, kind and the bounded description its kind allows.
 5. The channels: each request channel with its docstring and the schema text of its request and
    reply types, and how to answer (`orientation.rs:213-241`); and the external channels the agent
-   holds, with their manifest (`external-channels.md`, "What the agent is told"; `0003-51`).
+   holds, with their manifest (`external-channels.md`, "What the agent is told"; `0003-51`). For
+   an owner-constructed root, the session's skill catalog follows, under `0003-32`'s bound.
 6. What every agent is told last: the history window, the working directory, the interpreter,
    and the hosted-call rule when a facility is a binding (`rest()`, `orientation.rs:111-142`).
 
@@ -314,10 +317,11 @@ order OR-A1-5 and OR-A7-3 ask for: `ACT` and the rules, the docstring, the contr
 manifests and the channels, then the opening lead, then the announcement, with the first delivery
 privileged in nothing. `0003-47` states it and `0003-51` records each delivery.
 
-The hook is called by OutRig once per instance, after attachment, in the kernel that constructed
-the instance -- the constructing kernel for an in-VM child, the root's own kernel for an
-owner-constructed root -- and its result crosses to the host as bounded text sections on the
-spawn line or the root's construct answer. It may read `self`: the task the constructor stored,
+The hook is called by OutRig once per instance, in the constructor call, as attachment's checks
+pass and before the launch is scheduled, in the kernel that constructed the instance -- the
+constructing kernel for an in-VM child, the root's own kernel for an owner-constructed root, the
+program for a host-declared class -- and its result crosses to the host as bounded text sections
+on the spawn line or the root's construct answer. It may read `self`: the task the constructor stored,
 the mapping's keys and kinds. OutRig reads nothing it did not return: no `__dict__`, no `repr`,
 no property, which is `discovery.md`'s governing constraint applied to instructions. A section
 past its bound fails the construction before any round, under `0003-47`'s recommended fork, as a
@@ -395,7 +399,8 @@ the loss of the declaration-as-data path for a class the owner does not want in 
 
 - The spellings: the attach hook's name (`0003-41`), the instruction hook's name (`0003-47`),
   the mapping's attribute (`0003-42`), the owner's construct operation and the control handle
-  (`0003-46`). Each is its task's fork, recommended there.
+  (`0003-46`). Each is its task's fork, recommended there. **Decided in `0003-47`:** the
+  instruction hook is `__outrig_instructions__`, as the attach hook is `__outrig_attach__`.
 - Whether a dict-less child of a dict-constructed parent -- a `runtime.spawn` from a reviewer --
   should inherit the parent's view rather than the session's. The phase decided the session's
   view for an agent constructed without a dict; the consequence, a narrowed child widening by
@@ -406,6 +411,8 @@ the loss of the declaration-as-data path for a class the owner does not want in 
   the construction names it (`0003-46`'s fork).
 - The orienting lead for a root with contributions: `ORIENTING`'s text (`orientation.rs:360-362`)
   says the round is for getting ready; a task agent also begins its task in it. `0003-47`'s fork.
+  **Decided in `0003-47`:** `ORIENTING`, then a sentence that the task is in the instructions and
+  the round is where it begins, for a root whose class contributed sections.
 - Python-host parity for construction and the reads (`0003-46`'s fork; `rust-owner.md`).
 - Whether the owner's `ready()` should settle at the end of the orienting round, as the kernel
   caller's does, or when construction succeeded; `0003-46` recommends the first.

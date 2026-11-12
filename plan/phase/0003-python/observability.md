@@ -260,7 +260,8 @@ Four more tasks add events beside them that are execution diagnostics, not integ
   since `0003-45` is only one a host program constructed -- and `agent.instance.handle.collected`
   for the handle of a request made of one, collected before the request ended. Execution
   diagnostics like the rest, with any body they carry as a bounded preview, under the subject of
-  the instance's child. `0003-45` adds `self` to `agent.instance.started`.
+  the instance's child. `0003-45` adds `self` to `agent.instance.started`, and `0003-47`
+  `contributions`: each section its class contributed, as `{title, length}`.
 - `0003-51` through `0003-53`: the external channel events, `channel.*`, and `message.*` generalized
   to a backend's end (`external-channels.md`, "Events").
 

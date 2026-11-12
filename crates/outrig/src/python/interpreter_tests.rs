@@ -7176,6 +7176,11 @@ fn an_instance_holds_what_is_asked_of_it_until_its_child_exists() {
     assert_eq!(asked["prompt"], "ROLE foo. {message} and {} stay braces.");
     assert_eq!(asked["kind"], "request");
     assert_eq!(
+        asked["contributions"],
+        json!([]),
+        "a class with no hook sends none"
+    );
+    assert_eq!(
         asked["manifest"],
         json!([{"name": "seed", "type": "int", "preview": "5"}])
     );
@@ -7252,6 +7257,129 @@ fn an_instance_holds_what_is_asked_of_it_until_its_child_exists() {
     let (late, notices) = k.exec_collecting(PRIMARY, 7, "foo.fizz('late')");
     assert!(text(&late["error"]).contains("AgentReleased"), "{late}");
     assert!(notices.is_empty(), "nothing sent: {notices:?}");
+}
+
+/// An instance's `__outrig_instructions__` runs once, in its constructor call, after `__init__` and
+/// the checks attachment makes and before the host is asked anything: it reads `self` and the
+/// mapping as classified, and a request method called in it raises, the instance not yet being
+/// attached. Its sections go on the spawn line as `{title, text}`, in order, braces and non-ASCII
+/// text intact. Every bound is accepted at its limit and refused one past it, naming the section;
+/// so are a return that is not an iterable of `Section`, a field that is not a `str` and a hook
+/// that raises, and each asks the host nothing. What `for` reads as an iterable is one, a class
+/// with only `__getitem__` included.
+#[test]
+fn an_instances_sections_are_checked_in_its_constructor_and_sent_on_its_spawn() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        &py(r#"
+            import outrig
+            class Probe:
+                pass
+            class Indexed:
+                def __getitem__(self, i):
+                    return [outrig.Section('A', 'a'), outrig.Section('B', 'b')][i]
+            class Briefed(outrig.Agent):
+                """ROLE briefed."""
+                def __init__(self, what):
+                    super().__init__(facilities={'probe': Probe()})
+                    self.what, self.calls = what, 0
+                def __outrig_instructions__(self):
+                    self.calls += 1
+                    what = self.what
+                    if what == 'ok':
+                        try:
+                            self.ask('early')
+                        except TypeError as e:
+                            early = 'not attached yet' in str(e)
+                        return [outrig.Section('Task', 'Review {x} and {} caf\u00e9'),
+                                outrig.Section('Facilities', ', '.join(self.facilities)),
+                                outrig.Section('Early', str(early))]
+                    if what == 'edge':
+                        return [outrig.Section('t' * 64, 'a' * 16384),
+                                outrig.Section('b', 'b' * 16319)]
+                    if what == 'over':
+                        return [outrig.Section('t' * 64, 'a' * 16384),
+                                outrig.Section('b', 'b' * 16320)]
+                    if what == 'wide':
+                        return [outrig.Section('Wide', '\u00e9' * 8193)]
+                    if what == 'indexed':
+                        return Indexed()
+                    if what == 'str':
+                        return 'abc'
+                    if what == 'none':
+                        return None
+                    if what == 'tuple':
+                        return [('Task', 'x')]
+                    if what == 'field':
+                        return [outrig.Section('Task', 3)]
+                    if what == 'title':
+                        return [outrig.Section('t' * 65, 'x')]
+                    if what == 'empty':
+                        return [outrig.Section('', 'x')]
+                    raise RuntimeError('the hook raised')
+                @outrig.agent
+                async def ask(self, question: str) -> str:
+                    """Ask it."""
+            "#),
+    );
+    let (said, notices) = k.noted(
+        PRIMARY,
+        2,
+        &py(r#"
+            for what, said in [
+                    ('over', "section 2, 'b', brings the sections to 32769 bytes"),
+                    ('wide', "section 1, 'Wide', has 16386 bytes of text"), ('str', 'not str'),
+                    ('none', 'not NoneType'), ('tuple', 'item 1 is tuple'),
+                    ('field', 'title and text are each a str'),
+                    ('title', 'has a title of 65 characters'),
+                    ('empty', 'has a title of 0 characters'), ('raises', 'the hook raised')]:
+                try:
+                    Briefed(what)
+                except (TypeError, ValueError, RuntimeError) as e:
+                    print(what, type(e).__name__, said in str(e))
+            "#),
+    );
+    assert_eq!(
+        said,
+        "over ValueError True\nwide ValueError True\nstr TypeError True\nnone TypeError True\n\
+         tuple TypeError True\nfield TypeError True\ntitle ValueError True\n\
+         empty ValueError True\nraises RuntimeError True\n"
+    );
+    assert!(notices.is_empty(), "nothing asked: {notices:?}");
+
+    let (said, notices) = k.noted(PRIMARY, 3, "ok = Briefed('ok'); print(ok.calls)");
+    assert_eq!(said, "1\n", "the hook runs once");
+    let (before, asked) = k.until("agent.spawn", notices);
+    assert!(before.is_empty(), "nothing before the spawn: {before:?}");
+    assert_eq!(
+        asked["contributions"],
+        json!([
+            {"title": "Task", "text": "Review {x} and {} caf\u{e9}"},
+            {"title": "Facilities", "text": "probe"},
+            {"title": "Early", "text": "True"},
+        ])
+    );
+
+    let (_, notices) = k.noted(PRIMARY, 4, "edge = Briefed('edge')");
+    let (_, asked) = k.until("agent.spawn", notices);
+    let sections = asked["contributions"].as_array().expect("sections");
+    assert_eq!(
+        sections
+            .iter()
+            .map(|section| (text(&section["title"]).len(), text(&section["text"]).len()))
+            .collect::<Vec<_>>(),
+        [(64, 16384), (1, 16319)],
+        "a title of 64 characters, a text of 16 KiB and 32 KiB in all are accepted"
+    );
+
+    let (_, notices) = k.noted(PRIMARY, 5, "indexed = Briefed('indexed')");
+    let (_, asked) = k.until("agent.spawn", notices);
+    assert_eq!(
+        asked["contributions"],
+        json!([{"title": "A", "text": "a"}, {"title": "B", "text": "b"}]),
+        "an iterable with only __getitem__ is read as `for` reads it"
+    );
 }
 
 /// What the session's owner constructs, as the interpreter sees it: a root's kernel, opened with
@@ -7331,6 +7459,7 @@ fn a_root_is_constructed_in_its_own_kernel() {
     assert_eq!(answer["t"], "constructed", "{answer}");
     let declared = &answer["declaration"];
     assert_eq!(declared["prompt"], "ROLE thing.");
+    assert_eq!(declared["contributions"], json!([]));
     assert_eq!(declared["channels"][0]["name"], "ask");
     assert_eq!(declared["instance"]["qualname"], "Thing");
     assert_eq!(declared["instance"]["self"], true);
@@ -7354,6 +7483,60 @@ fn a_root_is_constructed_in_its_own_kernel() {
         !names.iter().any(|name| name == "self" || name == "note"),
         "hidden as bound at boot: {names:?}"
     );
+}
+
+/// A root's sections are on its construct answer, as `{title, text}`, from the hook run in its own
+/// kernel after `__init__`; a hook that raises, or returns a section past its bound, fails the
+/// construction as a constructor does -- `raised`, naming what is wrong -- and the answer carries
+/// no declaration.
+#[test]
+fn a_roots_sections_are_on_its_construct_answer() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        &py(r#"
+            import outrig
+            class Task(outrig.Agent):
+                """ROLE task."""
+                def __init__(self, title, big=False, *, model=None):
+                    super().__init__(model=model)
+                    self.title, self.big = title, big
+                def __outrig_instructions__(self):
+                    if self.big:
+                        return [outrig.Section('Big', 'x' * (16 * 1024 + 1))]
+                    return [outrig.Section('Task', f'Review {self.title}.')]
+            "#),
+    );
+    let class = format!("{PRIMARY_MODULE}:Task");
+    let construct = |agent: &str, id: u64, big: bool| {
+        json!({"t": "construct", "agent": agent, "id": id, "class": class,
+               "args": [{"name": "title", "data": "\"the parser\"", "type": null},
+                        {"name": "big", "data": if big { "true" } else { "false" },
+                         "type": null}],
+               "aliases": []})
+    };
+    let open = |agent: &str| {
+        json!({"t": "open", "agent": agent, "main": false,
+               "child": {"kind": "request", "construct": "Task", "model": "m",
+                         "requests_max": 2}})
+    };
+    k.opened(open("c1"));
+    k.send(construct("c1", 2, false));
+    let answer = k.recv();
+    assert_eq!(
+        answer["declaration"]["contributions"],
+        json!([{"title": "Task", "text": "Review the parser."}]),
+        "{answer}"
+    );
+    k.opened(open("c2"));
+    k.send(construct("c2", 3, true));
+    let refused = k.recv();
+    assert_eq!(refused["error"]["code"], "raised", "{refused}");
+    assert!(
+        text(&refused["error"]["message"]).contains("has 16385 bytes of text"),
+        "{refused}"
+    );
+    assert!(refused.get("declaration").is_none(), "{refused}");
 }
 
 /// The host's word that an instance cannot be ready raises at `ready()`, as the error it names;

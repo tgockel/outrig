@@ -1002,6 +1002,10 @@ fn each_event_has_exactly_its_data_fields() {
                     request: text("str"),
                     reply: text("Thing"),
                 }],
+                contributions: vec![ContributionBrief {
+                    title: text("Task"),
+                    length: 17,
+                }],
                 has_self: true,
             },
             "agent.instance.started",
@@ -1014,6 +1018,7 @@ fn each_event_has_exactly_its_data_fields() {
                 "inputs",
                 "facilities",
                 "channels",
+                "contributions",
                 "self",
             ],
         ),

@@ -143,7 +143,10 @@ category says what it may hold.
   - `model`: the `[models.<name>]` row every call is tried against first. For an alias, that is
     the first of its models this build can reach.
   - `preamble`: the system prompt: OutRig's orientation, the agent's configured preamble, then
-    the repository's instructions for agents when the agent loaded any.
+    the repository's instructions for agents when the agent loaded any. For a child, the prompt
+    its parent wrote, or the docstring of its class for an agent class's instance, then the
+    sections that class contributed, each under its title, the inputs and facilities it was
+    given, and its channels, with what every agent is told last; composed once, as it started.
   - `tools`: each tool's `name`, `description`, and `parameters` schema.
   - `max_tokens`: that model's reply ceiling, after its published ceiling filled it in or
     lowered it; `null` when none is sent. A call that moves to another of an alias's models
@@ -304,8 +307,9 @@ three times for one call before the rejection ends it.
   `native-extension-unavailable` for a module that did not import, `class-missing` for a name
   the module lacks, `not-an-agent-class`, `invalid-argument` for an argument that could not be
   made -- a facility the session does not give, data its class refuses, an alias naming no
-  argument -- `raised` for a constructor or `__outrig_attach__` that raised, or `closing` when
-  the session closed first; and `reason`, what was wrong followed by the last 16 KiB of its
+  argument -- `raised` for a constructor, `__outrig_attach__` or `__outrig_instructions__` that
+  raised or that returned what is not sections or a section past its bound, or `closing` when the
+  session closed first; and `reason`, what was wrong followed by the last 16 KiB of its
   traceback when there is one.
 - `skill.discovered` -- what the session's skill sources hold, published once as it starts when it
   was given any source, read from each skill's metadata with no Python run:
@@ -569,13 +573,17 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
   function in its body; `inputs`, each `{name, type, preview}`; `facilities`, as `agent.spawned`
   carries them;
   `channels`, one per request method, each `{name, request, reply}`, empty for a root whose class
-  has none; and `self`, `true` when the child has the instance as its `self`, as every instance an
-  agent's code constructs is and every root the session's owner constructs in its own kernel, and
-  `false` for one a program constructed, which stays in the program. An instance whose launch was
-  refused, by a limit say, has no child and records none of these events; its `ready()` and its
-  requests raise the refusal. Nor does one whose construction raised -- its class's `__init__` or
-  `__outrig_attach__`, which run before the launch -- whose exception is the constructor call's,
-  in its execution's traceback; or, for a root its owner asked for, in `agent.construct.failed`.
+  has none; `contributions`, the sections its class's `__outrig_instructions__` returned, in the
+  order the child's instructions carry them, each `{title, length}` with `length` the bytes of its
+  text, empty for a class that defines none; and `self`, `true` when the child has the instance as
+  its `self`, as every instance an agent's code constructs is and every root the session's owner
+  constructs in its own kernel, and `false` for one a program constructed, which stays in the
+  program. An instance whose launch was refused, by a limit say, has no child and records none of
+  these events; its `ready()` and its requests raise the refusal. Nor does one whose construction
+  raised -- its class's `__init__`, `__outrig_attach__` or `__outrig_instructions__`, which run
+  before the launch, the last with its sections checked against their bounds -- whose exception is
+  the constructor call's, in its execution's traceback; or, for a root its owner asked for, in
+  `agent.construct.failed`.
 - `agent.instance.ready` -- the child has had the round it gets as it launches, in which it reads
   its instructions and prepares: `instance`, and `error`, `null`, or why it cannot have that round
   -- the token budget spent, or a model that cannot answer. A request sent before this may already

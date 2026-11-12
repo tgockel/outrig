@@ -101,9 +101,11 @@ SECTIONS = [
         "A program's agents are instances of `outrig.Agent` subclasses, each a child agent in a "
         "session the program owns, whose methods marked `@outrig.agent` are its request channels. "
         "A call of one returns a `Handle` at once, whose `status` is an `outrig.Status`; a program "
-        "never constructs a `Handle`. See [Host programs](../usage/host-programs.md#agent-classes).",
+        "never constructs a `Handle`. A class adds to its child's instructions by returning "
+        "`outrig.Section`s from `__outrig_instructions__`. See "
+        "[Host programs](../usage/host-programs.md#agent-classes).",
         "_agents.py",
-        ["outrig.Agent", "outrig.agent", "Handle", "outrig.Status"],
+        ["outrig.Agent", "outrig.agent", "Handle", "outrig.Status", "outrig.Section"],
     ),
     (
         "Errors",

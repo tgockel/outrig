@@ -471,5 +471,9 @@ mod facilities_tests;
 mod self_tests;
 
 #[cfg(test)]
+#[path = "contributions_tests.rs"]
+mod contributions_tests;
+
+#[cfg(test)]
 #[path = "root_tests.rs"]
 mod root_tests;

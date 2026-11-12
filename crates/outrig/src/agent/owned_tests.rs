@@ -12,10 +12,10 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::agent_tests::keyed;
-use super::children_tests::{Hold, held};
+use super::children_tests::{Hold, held, of_agent, serving};
 use super::instance_tests::ready_then;
 use super::mock_http::{
-    self, Gauge, MODEL, RecordedRequest, Responder, scripted, submit, text_reply,
+    self, Gauge, MODEL, RecordedRequest, Responder, scripted, submit, system_text, text_reply,
 };
 use crate::config::Config;
 use crate::events::of_kind;
@@ -137,6 +137,96 @@ class ProjectReader(outrig.Agent):
         """Answer `question` about the project."""
         ...
 "#;
+
+/// A host program's class that defines `__outrig_instructions__`: the hook runs once, in the
+/// program, and its sections cross with the declaration, appear in the child's instructions after
+/// the docstring as returned, and are listed by the start event; a class whose hook returns a
+/// section past its bound fails the constructor call in the program, and launches nothing.
+#[tokio::test]
+async fn a_programs_class_contributes_sections_that_cross_with_its_declaration() {
+    let script = r#"
+import asyncio, json
+import outrig
+
+class Counted(outrig.Agent):
+    """ROLE counted. You answer questions on your task."""
+    def __init__(self, task):
+        super().__init__()
+        self.task = task
+        self.calls = 0
+    def __outrig_instructions__(self):
+        self.calls += 1
+        return [outrig.Section('Task', f'Answer about {self.task}; {{x}} and {{}} stay.')]
+    @outrig.agent
+    async def explain(self, question: str) -> str:
+        """Answer `question`."""
+
+class Raising(outrig.Agent):
+    """ROLE raising. You are never launched."""
+    def __outrig_instructions__(self):
+        return [outrig.Section('Big', 'x' * (16 * 1024 + 1))]
+    @outrig.agent
+    async def explain(self, question: str) -> str:
+        """Answer `question`."""
+
+async def main():
+    async with outrig.Session() as session:
+        try:
+            Raising()
+        except ValueError as e:
+            print(json.dumps(['raised', "has 16385 bytes of text" in str(e)]), flush=True)
+        agent = Counted('the parser')
+        print(json.dumps([await agent.explain('why?'), agent.calls]), flush=True)
+        await agent.release()
+    print(json.dumps(session.shutdown_report.verdict), flush=True)
+
+asyncio.run(main())
+"#;
+    let run = owned(
+        "OUTRIG_TEST_OWNED_CONTRIBUTIONS",
+        "",
+        script,
+        vec![(
+            "ROLE counted",
+            ready_then(serving(
+                "d = await runtime.channels['explain'].receive()\nawait d.reply('because ' + d.body)",
+            )),
+        )],
+    )
+    .await;
+    let (ran, records, requests) = run.finish().await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    assert_eq!(
+        ran.json(),
+        [
+            json!(["raised", true]),
+            json!(["because why?", 1]),
+            json!("clean")
+        ],
+        "{}",
+        ran.stderr
+    );
+    let told = system_text(&of_agent(&requests, "ROLE counted")[0].body);
+    let section = "Answer about the parser; {x} and {} stay.";
+    let docstring = told
+        .find("ROLE counted. You answer questions on your task.")
+        .expect("the docstring");
+    let at = told
+        .find(&format!("## Task\n\n{section}\n\n"))
+        .unwrap_or_else(|| panic!("the section in {told}"));
+    assert!(docstring < at, "{told}");
+    assert!(
+        of_agent(&requests, "ROLE raising").is_empty(),
+        "no model call"
+    );
+    assert_eq!(of_kind(&records, "agent.spawned").len(), 1, "one spawn");
+    let started = of_kind(&records, "agent.instance.started");
+    assert_eq!(started.len(), 1);
+    assert_eq!(
+        started[0]["contributions"],
+        json!([{"title": "Task", "length": section.len()}])
+    );
+}
 
 /// The requirements' program against a mock model: the constructor and the first call return
 /// while the child's first model call is held at the provider, `asyncio.wait` takes the handle's

@@ -4098,6 +4098,7 @@ class Runtime:
                 "prompt": prompt, "model": model, "kind": kind, "manifest": manifest,
                 "facilities": None if facilities is None else _manifest(facilities),
                 "channels": said,
+                "contributions": [] if instance is None else instance.contributions,
                 "invocations": [] if _skills is None else _skills._current(),
                 "instance": None if instance is None else {**instance.said,
                                                            "aliases": list(instance.aliases)}}
@@ -4106,7 +4107,8 @@ class Runtime:
             line["call"] = {"signature": d.signature,
                             "result": {"type": d.result_type,
                                        "schema": d.schema.text()}}
-        _refuse_long(line, "spawn", "shorten the prompt, or give fewer inputs or channels")
+        _refuse_long(line, "spawn",
+                     "shorten the prompt, or give fewer inputs, channels or contributions")
         _spawning[spawn] = {"parent": kernel, "name": name, "kind": kind, "channels": channels,
                             "inputs": copies, "classes": bound, "facilities": facilities,
                             "record": None if instance is None else instance.record,
@@ -5402,6 +5404,9 @@ class _Attached:
                          for name, m in methods.items()}
         self.lock = threading.Lock()
         self.how = self.child = self.error = self.task = self.ending = None
+        # Last, as the checks have passed and nothing is registered: what the hook raises is the
+        # constructor call's, and launches nothing.
+        self.contributions = _agents.contributions(agent)
 
     def alias(self, aliases):
         """Bind each of `aliases` -- a name, and the object the constructor argument of that name
@@ -5659,6 +5664,7 @@ class _Adopted(_Attached):
             "prompt": self.prompt, "manifest": self.manifest,
             "facilities": None if self.facilities is None else _manifest(self.facilities),
             "channels": [channel.said(name) for name, channel in self.channels.items()],
+            "contributions": self.contributions,
             "instance": {**self.said, "aliases": list(self.aliases)},
         }
 
@@ -7273,8 +7279,9 @@ def _constructing(kernel, request_id, message):
     answer = {"t": "constructed", "agent": kernel.agent, "id": request_id}
     try:
         answer["declaration"] = _constructed(kernel, message)
-        line = _refuse_long(answer, "construction's answer",
-                            "give the class shorter docstrings, or fewer inputs or channels")
+        line = _refuse_long(
+            answer, "construction's answer",
+            "give the class shorter docstrings, or fewer inputs, channels or contributions")
     except BaseException as e:
         failed = e if type(e) is _NotConstructed else _NotConstructed(
             "raised", _said_of(e), _traceback_text(e))

@@ -43,10 +43,11 @@
 //! only if a model call keeps it past `RELEASE_WAIT`.
 //!
 //! An agent class instance's child has one round before the rule applies: its
-//! orienting round, which opens as it launches, to get ready in. Requests that
-//! arrive meanwhile are announced as in any round, and its baseline is empty,
-//! so whatever is still open when it ends opens the next round. Its instance's
-//! `ready()` hears when it ended, or why it cannot be had.
+//! orienting round, which opens as it launches, to get ready in. Its opening
+//! line announces what already waits, by channel and count, after its lead;
+//! requests that arrive meanwhile are announced as in any round. Its baseline
+//! is empty, so whatever is still open when it ends opens the next round. Its
+//! instance's `ready()` hears when it ended, or why it cannot be had.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,8 +79,19 @@ const SETTLE_WAIT: Duration = Duration::from_secs(1);
 /// time, and one that refuses it refuses it again.
 pub(super) const ROUND_FAILURES_MAX: u32 = 5;
 
+#[cfg(test)]
+thread_local! {
+    /// What a test holds the next runner to start on its thread by: it waits to be notified
+    /// before its first round. The registry starts a runner before it answers the program that
+    /// asked for the child, so no request a program makes can otherwise be waiting as it opens.
+    pub(super) static HOLD: std::cell::RefCell<Option<Arc<Notify>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Drive child `id`'s rounds until its registry, or the session, ends.
-/// `instance` is the agent class instance whose child it is, if it is one.
+/// `instance` is the agent class instance whose child it is, if it is one, and
+/// `task` whether its instructions carry the task it begins in its orienting
+/// round: a root's, from its class's contributions.
 pub(crate) async fn run(
     registry: Registry,
     id: String,
@@ -87,7 +99,12 @@ pub(crate) async fn run(
     agent: Agent,
     wake: Arc<Notify>,
     instance: Option<u64>,
+    task: bool,
 ) {
+    #[cfg(test)]
+    if let Some(hold) = HOLD.with(|hold| hold.borrow_mut().take()) {
+        hold.notified().await;
+    }
     let mut baseline = Summary::default();
     // Whether the round that ended last on the baseline was the warning: the
     // next to find the summary unchanged cancels what it holds.
@@ -200,7 +217,10 @@ pub(crate) async fn run(
         // Whether this round is the warning: a submission given now is new.
         let mut warning = unchanged;
         let (lead, detail) = match kind {
-            _ if orienting.is_some() => (orientation::ORIENTING.to_string(), String::new()),
+            _ if orienting.is_some() => (
+                orientation::orienting(task, &children.unread_text(&id)),
+                String::new(),
+            ),
             ChildKind::Request => {
                 let outstanding =
                     orientation::requests(&children.unread_text(&id), &children.taken(&id));

@@ -468,13 +468,19 @@ impl SessionBuilder {
         ))
     }
 
-    /// What the session's child agents are made from.
-    fn child_setup(&self, workspace: Option<std::path::PathBuf>) -> super::session::ChildSetup {
+    /// What the session's child agents are made from, `catalog` the skills the root its owner
+    /// constructs is told of.
+    fn child_setup(
+        &self,
+        workspace: Option<std::path::PathBuf>,
+        catalog: &Catalog,
+    ) -> super::session::ChildSetup {
         super::session::ChildSetup {
             config: Arc::new(self.config.clone()),
             secrets: Arc::clone(&self.secrets),
             agent: self.agent.clone(),
             workspace,
+            skills: catalog.briefs(),
         }
     }
 
@@ -614,7 +620,7 @@ impl SessionBuilder {
                 .map(Path::to_path_buf)
         });
         let name = primary.name().to_string();
-        let setup = self.child_setup(workspace.clone());
+        let setup = self.child_setup(workspace.clone(), &catalog);
         let session = Session::new(
             id,
             interpreter,
@@ -814,7 +820,7 @@ impl SessionBuilder {
         let services = self.serve_services(&interpreter, &lifecycle);
         self.report(Progress::Finished(Step::Python));
         let workspace = self.host_workspace.take().or(self.workdir.clone());
-        let setup = self.child_setup(workspace.clone());
+        let setup = self.child_setup(workspace.clone(), &catalog);
         let session = Session::new(
             id,
             interpreter,

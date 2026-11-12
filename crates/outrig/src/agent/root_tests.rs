@@ -14,13 +14,15 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::children_tests::{
-    Hold, Tree, data, exec_outputs, held, kind, of_agent, primary_runs, printed, serving,
+    Hold, Tree, data, exec_outputs, held, kind, of_agent, opening, primary_runs, printed, serving,
     tree_built,
 };
 use super::instance_tests::{launching, ready_then};
 use super::mock_http::{RecordedRequest, Responder, scripted, submit, system_text, text_reply};
+use super::{orientation, runner};
 use crate::harness::event::RequestEnd;
 use crate::harness::services_tests::Fixture;
+use crate::harness::skills::DirectorySource;
 use crate::harness::{
     ApplicationSpec, Argument, ConstructSpec, Facility, RootError, RootHandle, Service,
     SessionBuilder, SessionError, Verdict,
@@ -73,6 +75,25 @@ class Holder(outrig.Agent):
 
     def summary(self):
         return f"holding {self.task.title} at {self.task.priority}"
+
+
+class Briefed(outrig.Agent):
+    """ROLE briefed. You review the task you hold."""
+
+    def __init__(self, task):
+        super().__init__()
+        self._task = task
+
+    def __outrig_instructions__(self):
+        return [outrig.Section(
+            "Task", f"Review {self._task.title} at priority {self._task.priority}.")]
+
+
+class Advised(Reviewer):
+    """ROLE advised. You review the files your task names."""
+
+    def __outrig_instructions__(self):
+        return [outrig.Section("Task", f"Review {self._task.title}.")]
 
 
 class Raising(outrig.Agent):
@@ -288,6 +309,216 @@ async fn a_request_on_a_roots_channel_is_answered_as_json() {
         data(completed[0])["background"],
         json!([{"id": null, "output": "constructing Reviewer\n", "dropped": 0}])
     );
+}
+
+/// A root's instructions say first that the program that owns the session constructed it, then its
+/// docstring and the sections its hook returned -- which its construct answer carried -- `self` as
+/// that program's instance, what it does with no request channel or with one, and, ahead of what
+/// every agent is told last, the session's skills. Its first round opens on the lead alone, with
+/// the task's sentence when its class contributed a section, and announces nothing: no request
+/// waits, and nothing is invented. A request body is never in the instructions. The start event
+/// lists each section.
+#[tokio::test]
+async fn a_roots_instructions_carry_the_programs_line_its_sections_and_the_skills() {
+    let skills = tempfile::tempdir().expect("a skills directory");
+    std::fs::create_dir(skills.path().join("review")).expect("a skill");
+    std::fs::write(
+        skills.path().join("review/SKILL.md"),
+        "---\nname: review\ndescription: Reviews a change.\n---\nSteps.\n",
+    )
+    .expect("its instructions");
+    let source = skills.path().to_path_buf();
+    let (tree, _app) = owned(
+        "OUTRIG_TEST_ROOT_CONTRIBUTIONS_KEY",
+        "",
+        vec![
+            ("ROLE briefed", stalling()),
+            ("ROLE advised", reviewing(REVIEWS)),
+            ("ROLE reviewer", reviewing(REVIEWS)),
+        ],
+        move |builder| builder.skill_source("test", DirectorySource::new(source)),
+    )
+    .await;
+    let mut roots = Vec::new();
+    for class in ["Briefed", "Advised", "Reviewer"] {
+        let spec = ConstructSpec::new(format!("review.agents:{class}"), "fast").arg(
+            "task",
+            Argument::data_as(
+                json!({"title": "the parser", "priority": 2}),
+                "review.agents:Task",
+            ),
+        );
+        let root = within(tree.session.construct(spec))
+            .await
+            .expect("constructed");
+        within(root.ready()).await.expect("ready");
+        roots.push(root);
+    }
+    // A request's body is a part of no root's instructions.
+    let request = roots[1]
+        .request("review", json!("src/secret-path.py"))
+        .expect("sent");
+    within(request.outcome()).await.expect("answered");
+    let (report, events, requests) = tree.end().await;
+    assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
+
+    let told = |role: &str| {
+        let made = of_agent(&requests, role);
+        assert!(launching(made[0]), "{}", opening(made[0]));
+        (system_text(&made[0].body), opening(made[0]))
+    };
+    let before = |text: &str, needles: &[&str]| {
+        let at: Vec<usize> = needles
+            .iter()
+            .map(|needle| {
+                text.find(needle)
+                    .unwrap_or_else(|| panic!("{needle:?} in {text}"))
+            })
+            .collect();
+        assert!(
+            at.windows(2).all(|pair| pair[0] < pair[1]),
+            "{at:?} in {text}"
+        );
+    };
+    let line = "You are a root agent: the program that owns this session constructed you; no user \
+                reaches you, and that program is who you answer.";
+    let section = "## Task\n\nReview the parser at priority 2.";
+
+    // No request channel: its one round, with the task's sentence in its lead.
+    let (briefed, lead) = told("ROLE briefed");
+    let recorded = |role: &str| {
+        let child = agent_of(&roots[usize::from(role != "briefed")]);
+        let events = kind(
+            &events,
+            "model.instructions",
+            Some(&format!("agent/{child}")),
+        );
+        assert_eq!(events.len(), 1, "recorded once");
+        data(events[0])["preamble"].clone()
+    };
+    assert_eq!(
+        recorded("briefed"),
+        json!(briefed),
+        "the event holds what the model was sent"
+    );
+    before(
+        &briefed,
+        &[
+            line,
+            "ROLE briefed. You review the task you hold.",
+            section,
+            "`self` is the `Briefed` instance that program constructed in this interpreter for you",
+            "Your class declares no request channel, so no request arrives",
+            "These skills come with the session",
+            "- `review`: Reviews a change.",
+            "Your whole conversation is in",
+        ],
+    );
+    assert!(!briefed.contains("another agent's code"), "{briefed}");
+    assert!(!briefed.contains("`/name`"), "{briefed}");
+    assert_eq!(
+        lead,
+        orientation::opening(&orientation::orienting(true, ""), 0),
+        "nothing waits and nothing is invented"
+    );
+
+    // A channel and a section: told how to answer, the skills, and the same lead.
+    let (advised, lead) = told("ROLE advised");
+    before(
+        &advised,
+        &[
+            line,
+            "## Task\n\nReview the parser.",
+            "`self` is the `Advised` instance that program constructed",
+            "You answer requests, which arrive on these channels:",
+            "These skills come with the session",
+            "Your whole conversation is in",
+        ],
+    );
+    assert!(!advised.contains("secret-path"), "{advised}");
+    assert_eq!(
+        lead,
+        orientation::opening(&orientation::orienting(true, ""), 0)
+    );
+
+    // No section: no heading, and the lead without the task's sentence.
+    let (reviewer, lead) = told("ROLE reviewer");
+    assert!(
+        reviewer.contains(line) && !reviewer.contains("## "),
+        "{reviewer}"
+    );
+    assert_eq!(
+        lead,
+        orientation::opening(&orientation::orienting(false, ""), 0)
+    );
+
+    let started = kind(&events, "agent.instance.started", None);
+    let by = |qualname: &str| {
+        data(
+            started
+                .iter()
+                .find(|event| data(event)["qualname"] == qualname)
+                .unwrap_or_else(|| panic!("{qualname} started")),
+        )
+    };
+    assert_eq!(
+        by("Briefed")["contributions"],
+        json!([{"title": "Task", "length": "Review the parser at priority 2.".len()}])
+    );
+    assert_eq!(by("Reviewer")["contributions"], json!([]));
+}
+
+/// A request already waiting as a root's first round opens is announced in its opening line, by
+/// channel and count, after the lead, and its body is in no instructions: the round reads it in
+/// code, and the next opens on nothing more. The runner is held until the request is made, since
+/// the registry starts it before it answers the owner.
+#[tokio::test]
+async fn a_request_already_waiting_is_announced_after_the_roots_lead() {
+    let (tree, _app) = owned(
+        "OUTRIG_TEST_ROOT_WAITING_KEY",
+        "",
+        vec![("ROLE reviewer", reviewing(REVIEWS))],
+        |builder| builder,
+    )
+    .await;
+    let hold = Arc::new(tokio::sync::Notify::new());
+    runner::HOLD.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&hold)));
+    let root = within(tree.session.construct(reviewer())).await;
+    // Whatever happens, no later runner on this thread waits for a hold nobody lifts.
+    runner::HOLD.with(|slot| slot.borrow_mut().take());
+    let root = root.expect("constructed");
+    let request = root
+        .request("review", json!("src/secret-path.py"))
+        .expect("sent");
+    // It has an id once the registry has recorded it, which the runner's lead then counts.
+    within(async {
+        while request.id().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    hold.notify_one();
+    within(root.ready()).await.expect("ready");
+    within(request.outcome()).await.expect("answered");
+    let (report, events, requests) = tree.end().await;
+    assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
+    let made = of_agent(&requests, "ROLE reviewer");
+    assert!(launching(made[0]), "{}", opening(made[0]));
+    let waiting = "1 request is waiting on runtime.channels[\"review\"]";
+    assert_eq!(
+        opening(made[0]),
+        orientation::opening(&orientation::orienting(false, waiting), 0)
+    );
+    let told = system_text(&made[0].body);
+    assert!(!told.contains("secret-path"), "{told}");
+    // What the model was sent as its instructions is what the event records, once.
+    let recorded = kind(
+        &events,
+        "model.instructions",
+        Some(&format!("agent/{}", agent_of(&root))),
+    );
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(data(recorded[0])["preamble"], told);
 }
 
 /// The fixture library bound as `files`, where no approval is asked for.

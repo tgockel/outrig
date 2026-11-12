@@ -15,7 +15,7 @@ use super::report::{
 };
 use super::root::{ConstructSpec, Owner, RootError, RootHandle};
 use super::services::Services;
-use super::skills::Catalog;
+use super::skills::{Catalog, SkillBrief};
 use super::{Closed, ClosedBy, Failure, SessionError, UserChannel};
 use crate::Outrig;
 use crate::agent::children::{self, Children};
@@ -82,12 +82,14 @@ pub struct Session {
 
 /// What a session's child agents are made from: the configuration and the
 /// secrets the session was started with, the session's agent, whose limits
-/// apply, and the workspace their instructions name.
+/// apply, the workspace their instructions name, and the session's skills,
+/// which the root its owner constructs is told of.
 pub(crate) struct ChildSetup {
     pub(crate) config: Arc<Config>,
     pub(crate) secrets: Arc<dyn Secrets>,
     pub(crate) agent: Option<String>,
     pub(crate) workspace: Option<PathBuf>,
+    pub(crate) skills: Vec<SkillBrief>,
 }
 
 impl Session {
@@ -137,6 +139,7 @@ impl Session {
                 windows: Windows::default(),
                 bindings: bindings.briefs(),
                 services: services.briefs(),
+                skills: setup.skills,
                 container: container_name.clone(),
             },
         );

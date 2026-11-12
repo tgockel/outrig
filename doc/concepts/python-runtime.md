@@ -301,9 +301,9 @@ annotation raises `TypeError` when it is made, naming it.
 
 ## Agent classes: `outrig.Agent`
 
-A subclass of `outrig.Agent` declares a long-lived child instead. Its docstring is the child's
-instructions, and each `async def` it marks `@outrig.agent` is a request channel of that name,
-whose parameters make the request and whose return annotation is the reply's type:
+A subclass of `outrig.Agent` declares a long-lived child instead. Its docstring is the first part
+of the child's instructions, and each `async def` it marks `@outrig.agent` is a request channel of
+that name, whose parameters make the request and whose return annotation is the reply's type:
 
 ```python
 class Reviewer(outrig.Agent):
@@ -402,6 +402,49 @@ kernel can reach every binding and service, as
 [`SECURITY.md`](https://github.com/tgockel/outrig/blob/trunk/SECURITY.md) says under "Known
 boundaries". A host program cannot give facilities yet; its `facilities=` raises
 `NotImplementedError`.
+
+### Instructions
+
+OutRig composes a child's instructions from parts, each its own and none formatted into another.
+In order: how an agent acts and what it is; the class's docstring, as written, braces and all; the
+sections the class contributes; the inputs; `self`; the facilities it was given; the channels it
+answers on and how to answer; and what every agent is told last -- its history, its working
+directory, the interpreter and the rule for a binding. They are composed once, as the child
+launches, and recorded once, as `model.instructions`.
+
+A class contributes sections by defining `__outrig_instructions__`, which returns
+`outrig.Section`s, each a title and a text:
+
+```python
+class Reviewer(outrig.Agent):
+    """You review the change your task describes."""
+
+    def __init__(self, task):
+        super().__init__()
+        self._task = task
+
+    def __outrig_instructions__(self):
+        return [outrig.Section("Task", f"Review {self._task.title}.")]
+```
+
+OutRig calls it once, as the constructor call finishes: after `__init__`, `__outrig_attach__` and
+the checks attachment makes, so it reads `self` and `self.facilities` as the child will. It should
+call no model and make no hosted call, and it cannot send a request. Each text goes in the
+instructions as returned, under its title, in the order returned. OutRig reads nothing of the
+instance that the hook does not return -- no attribute, no property, no `repr` -- so what an
+application wants its agent told, it returns. A title is 1 to 64 characters, a text at most 16 KiB
+and every title and text together at most 32 KiB, as UTF-8. A hook that raises, a return that is
+not an iterable of sections and a section past a bound each fail the constructor call, naming
+the section, with nothing launched. The start event, `agent.instance.started`, lists each title
+and the length of its text.
+
+An agent's work is in its instructions and its channels, and a round opens on a line that says
+what waits, by channel and count, never what it says: the agent reads each request in code. The
+child's first round, which opens as it launches, is for getting ready. A root the session's
+owner constructs is told that the program that owns the session constructed it and that no user
+reaches it, that its `self` is the instance that program constructed, and the session's skills,
+which no other child is told; when its class contributed sections, its first round is also where
+its task begins.
 
 ## Services
 

@@ -174,9 +174,17 @@ asyncio.run(main())
   after `__outrig_attach__(self)`, a method the class may define to finish its setup, so either
   can raise without starting anything.
 - **Its model.** `model=` names a configured model or alias; without it, `default-model`. No
-  `[agents.<name>]` table, `default-agent`, image or preamble applies: the class's docstring is
-  the agent's instructions. An unknown model, a full `children-max`, or a session that has closed
-  raises at `ready()` and at the first request, not in the constructor.
+  `[agents.<name>]` table, `default-agent`, image or preamble applies: the class's docstring and
+  the sections it contributes are the agent's instructions. An unknown model, a full
+  `children-max`, or a session that has closed raises at `ready()` and at the first request, not
+  in the constructor.
+- **Its instructions.** A class adds to its docstring by defining `__outrig_instructions__(self)`,
+  which returns `outrig.Section(title, text)`s. The program calls it once, as the constructor
+  call finishes, and the sections cross with the class's declaration. Each goes in the agent's
+  instructions as returned, under its title, after the docstring; a title is at most 64
+  characters, a text at most 16 KiB, and all of them together at most 32 KiB. A hook that raises
+  or a section past a bound raises in the constructor call, and starts nothing. See [Python
+  runtime -> Instructions](../concepts/python-runtime.md#instructions).
 - **A call sends a request.** `agent.explain(...)` checks its arguments against their types --
   `explain(1)` raises `TypeError` and sends nothing -- and returns a handle at once: `await` it
   for the reply, or pass `handle.future` to `asyncio.wait`. Cancelling the code that awaits it

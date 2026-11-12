@@ -871,8 +871,9 @@ pub enum Payload {
     /// An agent class's instance, made by `parent`'s code, launched its child,
     /// the event's subject: the class's `__module__` and `__qualname__`, the
     /// SHA-256 digest of the source that declared it, or `None` when none
-    /// could be read, the child's inputs, its request channels, and whether
-    /// the child has the instance as its `self`.
+    /// could be read, the child's inputs, its request channels, the sections
+    /// its class contributed to the child's instructions, and whether the
+    /// child has the instance as its `self`.
     #[non_exhaustive]
     AgentInstanceStarted {
         /// The instance's id, which its other events carry.
@@ -894,6 +895,10 @@ pub enum Payload {
         facilities: Option<Vec<FacilityBrief>>,
         /// The child's request channels, one per request method.
         channels: Vec<ChannelBrief>,
+        /// The sections its class's `__outrig_instructions__` returned, in the
+        /// order the child's instructions carry them: none for a class that
+        /// defines no such hook.
+        contributions: Vec<ContributionBrief>,
         /// Whether the child has the instance as its `self`, which every
         /// instance an agent's code constructs is: `false` for one a host
         /// program constructed, which stays in the program. Serialized as
@@ -2291,6 +2296,17 @@ pub struct ChannelBrief {
     pub request: String,
     /// The type of a reply to one, as text.
     pub reply: String,
+}
+
+/// One section an agent class contributed to its child's instructions: its
+/// title, and how long its text is.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct ContributionBrief {
+    /// The section's title.
+    pub title: String,
+    /// The length of its text in bytes, as UTF-8.
+    pub length: usize,
 }
 
 /// How a request an agent made of a child ended.

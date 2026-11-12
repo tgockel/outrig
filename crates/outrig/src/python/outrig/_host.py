@@ -1223,6 +1223,9 @@ class _Root:
                  "reply": m.reply.text()}
                 for name, m in self.methods.items()
             ],
+            # Asked last of the checks, and before anything is registered: what the hook raises is
+            # the constructor call's, and launches nothing.
+            "contributions": _agents.contributions(agent),
             "instance": {"id": self.id, "module": cls.__module__, "qualname": cls.__qualname__,
                          "digest": cls._outrig_digest},
             # As text, so the engine, which parses a line into JSON values that sort an object's

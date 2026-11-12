@@ -342,10 +342,15 @@ class MemoAgent(outrig.Agent):
         "\"text\"",
         "You have no `runtime.complete`",
         "as you are launched, to get ready in",
+        // The `self` sentence, which 0003-45 added, comes after the inputs.
+        "`self` is the `MemoAgent` instance your parent's code constructed",
     ] {
         assert!(system.contains(expected), "{expected:?} in {system}");
     }
+    // A class that contributes no section has none in its instructions.
+    assert!(!system.contains("## "), "{system}");
     let started = data(kind(&events, "agent.instance.started", None)[0]);
+    assert_eq!(started["contributions"], json!([]));
     assert_eq!(started["module"], "memo_agent");
     assert_eq!(started["qualname"], "MemoAgent");
     assert_eq!(started["digest"], sha256_hex(MEMO.as_bytes()));

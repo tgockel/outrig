@@ -106,7 +106,6 @@ phase.
 
 | Task      | What it settles                                     |
 | --------- | ----------------------------------------------------|
-| `0003-47` | Instructions are composed from contributions        |
 | `0003-48` | The owner reads an agent's stop                     |
 | `0003-49` | The owner reads the roster                          |
 | `0003-50` | An agent has a model-request limit                  |

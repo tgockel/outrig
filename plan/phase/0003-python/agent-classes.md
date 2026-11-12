@@ -168,17 +168,19 @@ and the instructions carry a manifest -- name, type, bounded preview -- as a sub
 (`typed-agents.md`). Everything else on the instance stays in the parent -- and since `0003-45`
 the instance itself is the child's `self` ("The declaration").
 
-**The child's instructions** are the class docstring; the input manifest; one entry per channel,
-with its name, the method's docstring, and the schema text of its request and reply types; and how
-to answer -- receive a delivery, reply or fail by it -- with the statement that this child has no
-`runtime.complete`.
+**The child's instructions** are the class docstring; since `0003-47` the sections the class
+contributes; the input manifest; one entry per channel, with its name, the method's docstring, and
+the schema text of its request and reply types; and how to answer -- receive a delivery, reply or
+fail by it -- with the statement that this child has no `runtime.complete`. `task-agents.md`,
+"Instructions are composed from contributions", gives the order.
 
 **The orienting round.** The launch starts the child's first round, in which the model reads its
 instructions and may prepare before any request arrives: import what it will need, open the
 repository, bind helpers. A request arriving during it is announced on the next tool result like
 any other and can be answered in the same round ("The child's rounds"). The round opens on no
-request, so its baseline is empty: a request that arrived before or during it and is still open
-when it ends opens the round after it. The round costs one model
+request, but since `0003-47` its opening line announces, by channel and count after its lead, a
+request that already waits as it opens. Its baseline is empty: a request that arrived before or
+during it and is still open when it ends opens the round after it. The round costs one model
 call for an instance that may never receive a request, which is the cost of a child that is
 oriented when the first one arrives; a caller that does not want to pay it before it has a request
 constructs the instance when it has one.

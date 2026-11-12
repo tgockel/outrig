@@ -225,6 +225,16 @@ root.release().await;
 cannot be, and `SessionBuilder::check` resolves its model and keys before any container exists;
 `Session::constructed` is its handle, and `Session::root` finds any root by its instance id.
 
+The application supplies what the root is told of its task and OutRig composes the instructions:
+the class's docstring, then the `outrig.Section(title, text)`s its optional
+`__outrig_instructions__(self)` returns, which Python calls once as the constructor call finishes
+and may read `self` in, each under its title as returned; then the arguments, `self`, the
+facilities, the channels and the session's skills. A section past its bound -- 16 KiB, 32 KiB in
+all, a title of 64 characters -- or a hook that raises fails the construction. The first round
+opens on a line that says the program that owns the session constructed the root and, when its
+class contributed sections, that its task is in them; `agent.instance.started` lists each
+section's title and length.
+
 ## The container facade beside `harness`
 
 An application can run an engine of its own over the container facade beside one over `harness`,

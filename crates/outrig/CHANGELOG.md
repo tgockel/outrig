@@ -19,6 +19,30 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **An agent class contributes sections to its child's instructions.** `outrig.Section(title,
+  text)`, a frozen dataclass, is what the optional `__outrig_instructions__(self)` of an
+  `outrig.Agent` subclass returns an iterable of. OutRig calls it once, in the constructor call --
+  after `__init__`, `__outrig_attach__` and the checks attachment makes, so `self.facilities` reads
+  as the child's will, and before the launch is scheduled -- in the constructing kernel, in the
+  root's own kernel for a root the session's owner constructs, and in the program for a host
+  program's class, whose sections cross with its declaration. A title is 1 to 64 characters, a
+  text at most 16 KiB and every title and text together at most 32 KiB, in UTF-8. A hook that
+  raises, a return that is not `Section`s and a section past a bound each raise from the
+  constructor call -- `TypeError`, or `ValueError` naming the section -- launch nothing and call
+  no model; for an owner's root they fail the construction as `agent.construct.failed` `raised`.
+  The child's instructions are composed once, as it launches, in a fixed order: how it acts and
+  what it is, its docstring as written, each section under its title as returned, its inputs,
+  `self`, the facilities it was given, its channels and how to answer, the session's skills for a
+  root the owner constructed, and what every agent is told last, with the rule for a binding.
+  Nothing of the instance is read that the hook does not return: no attribute, no property, no
+  `repr`. A root is told that the program that owns the session constructed it and that no user
+  reaches it -- not that an agent's code launched it -- and that its `self` is the instance that
+  program constructed; one whose class contributed sections is also told that its task is in its
+  instructions and that its first round is where it begins. Any instance's first round opens on a
+  line that now announces what already waits, by channel and count, after its lead. A root that
+  declares no request channel is told so, and nothing of answering. `agent.instance.started`
+  gains `contributions`, each `{title, length}` with `length` the text's bytes;
+  `harness::event::ContributionBrief` is its Rust type.
 - **An owner constructs the root in its kernel.** `Session::construct(ConstructSpec)`, on a session
   started with `no_primary`, constructs an `outrig.Agent` subclass the session's application code
   holds -- named `module:qualname`, called with keyword `Argument`s, each data as JSON (decoded

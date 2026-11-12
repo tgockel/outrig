@@ -50,12 +50,13 @@ use crate::config::{Config, Limits, Secrets};
 use crate::events::Events;
 use crate::harness::bindings::Brief;
 use crate::harness::event::{
-    AgentInstanceId, AgentRequestId, ChannelBrief, ChildKind, FacilityBrief, FacilityKind,
-    InputBrief, InstanceRelease, InvocationEnd, InvocationId, ParamsBy, Payload, RequestEnd,
-    Subject, Usage,
+    AgentInstanceId, AgentRequestId, ChannelBrief, ChildKind, ContributionBrief, FacilityBrief,
+    FacilityKind, InputBrief, InstanceRelease, InvocationEnd, InvocationId, ParamsBy, Payload,
+    RequestEnd, Subject, Usage,
 };
 use crate::harness::lifecycle::Lifecycle;
 use crate::harness::services::ServiceBrief;
+use crate::harness::skills::SkillBrief;
 use crate::harness::{ClosedBy, RequestOutcome};
 use crate::python::host::{
     Channels, ChildLines, Counts, ImportFailure, Interpreter, InterpreterError, OWNER,
@@ -92,6 +93,9 @@ pub(crate) struct Settings {
     pub(crate) windows: Windows,
     pub(crate) bindings: Vec<Brief>,
     pub(crate) services: Vec<ServiceBrief>,
+    /// The session's skills, which only a root its owner constructed in its
+    /// kernel is told of: the application's primary.
+    pub(crate) skills: Vec<SkillBrief>,
     pub(crate) container: String,
 }
 
@@ -876,6 +880,18 @@ impl Inner {
             .as_ref()
             .map(|given| given.iter().map(|given| given.brief.clone()).collect());
         let channels = channel_texts(&line["channels"]);
+        // The sections its class contributed to its instructions, each a title and a text.
+        let sections: Vec<(&str, &str)> = line["contributions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|section| {
+                (
+                    section["title"].as_str().unwrap_or_default(),
+                    section["text"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
         let minted = match constructed {
             // Opened already, and its instance's id said with the rest.
             Some(_) => line["instance"]["id"].as_u64(),
@@ -924,6 +940,8 @@ impl Inner {
             .flatten()
             .filter_map(Value::as_str)
             .collect();
+        // A root's parent is the session's owner, and no agent's code made it.
+        let rooted = parent == OWNER;
         let call = &line["call"];
         let brief = match kind {
             ChildKind::Work if call.is_object() => ChildBrief::Call {
@@ -931,13 +949,22 @@ impl Inner {
                 result_type: call["result"]["type"].as_str().unwrap_or_default(),
                 schema: call["result"]["schema"].as_str().unwrap_or_default(),
             },
-            ChildKind::Request if instance.is_some() => ChildBrief::Instance(
-                &channels,
-                has_self.then(|| {
+            ChildKind::Request if instance.is_some() => ChildBrief::Instance {
+                channels: &channels,
+                own: has_self.then(|| {
                     let qualname = line["instance"]["qualname"].as_str().unwrap_or_default();
                     (qualname, &aliases[..])
                 }),
-            ),
+                sections: &sections,
+                root: rooted,
+                // The skills are the owner-constructed root's alone: the application's primary,
+                // constructed in its own kernel.
+                skills: if constructed.is_some() {
+                    &settings.skills
+                } else {
+                    &[]
+                },
+            },
             ChildKind::Request => ChildBrief::Request(&channels),
             _ => ChildBrief::Work,
         };
@@ -1047,6 +1074,13 @@ impl Inner {
                         inputs,
                         facilities,
                         channels: briefed,
+                        contributions: sections
+                            .iter()
+                            .map(|(title, text)| ContributionBrief {
+                                title: title.to_string(),
+                                length: text.len(),
+                            })
+                            .collect(),
                         has_self,
                     });
                 }
@@ -1058,6 +1092,8 @@ impl Inner {
                     agent,
                     Arc::clone(&child.wake),
                     instance,
+                    // A root begins the task its class's contributions carry in its first round.
+                    rooted && !sections.is_empty(),
                 ));
                 child.abort = Some(runner.abort_handle());
                 child.runner = Some(runner);

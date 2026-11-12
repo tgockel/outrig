@@ -570,8 +570,9 @@ session, not about an agent's work.
 
 A program's agents are instances of `outrig.Agent` subclasses, each a child agent in a session the
 program owns, whose methods marked `@outrig.agent` are its request channels. A call of one returns a
-`Handle` at once, whose `status` is an `outrig.Status`; a program never constructs a `Handle`. See
-[Host programs](../usage/host-programs.md#agent-classes).
+`Handle` at once, whose `status` is an `outrig.Status`; a program never constructs a `Handle`. A
+class adds to its child's instructions by returning `outrig.Section`s from
+`__outrig_instructions__`. See [Host programs](../usage/host-programs.md#agent-classes).
 
 ### `outrig.Agent`
 
@@ -603,57 +604,56 @@ Methods not marked are ordinary ones. What a class cannot declare raises `TypeEr
 class is made, naming the member.
 
 `Reviewer(**inputs, model=None)` runs the class's `__init__` to its end, then its
-`__outrig_attach__`, and only then attaches the instance: binds each input, which must be
-data, in the child as a variable, launches the child in the background -- on `model`, a
-configured model or alias, or on yours -- and returns at once; a request made before the
-child exists waits for it. The child's first round is its own, to get ready in: `await
-reviewer.ready()` returns once it has ended, and raises what the launch met instead. `await
-reviewer.release()` ends the child and every request still open on it; `async with
-Reviewer() as reviewer:` waits for `ready()` on entry and releases on leaving.
+`__outrig_attach__`, and only then attaches the instance: binds each input, which must be data,
+in the child as a variable, launches the child in the background -- on `model`, or on yours --
+and returns at once; a request made before the child exists waits for it. The child's first
+round is its own, to get ready in: `await reviewer.ready()` returns once it has ended, and
+raises what the launch met instead. `await reviewer.release()` ends the child and every request
+still open on it; `async with Reviewer() as reviewer:` waits for `ready()` on entry and releases
+on leaving.
 
-In the child, the instance is `self`: the same object, not a copy, so `self._task` there is
-what `__init__` stored, and an ordinary method runs in whichever agent calls it. A request
-method called on `self` there raises `TypeError`: requests are how its maker asks. The two
-agents share `self` from two threads: one attribute read or write is atomic, a compound
-update is not, and a request is how to ask the child for something. A module's globals are
-shared by every agent that imports it; keep per-agent state on `self`. The child holds
-`self`, so nothing collects an instance while its child lives: it ends as it is released, as
-the agent that made it is, or as the session ends. A session's owner can construct one as a
-root, in a kernel of its own, where it is `self` and needs no marked method.
+In the child, the instance is `self`: the same object, not a copy, so `self._task` there is what
+`__init__` stored, and an ordinary method runs in whichever agent calls it. A request method
+called on `self` there raises `TypeError`: requests are how its maker asks. The two agents share
+`self` from two threads: one attribute read or write is atomic, a compound update is not. A
+module's globals are shared by every agent that imports it; keep per-agent state on `self`. The
+child holds `self`, so nothing collects an instance while its child lives: it ends as it is
+released, as the agent that made it is, or as the session ends. A session's owner can construct
+one as a root, in a kernel of its own, where it is `self` and needs no marked method.
 
-`Reviewer(**inputs, facilities={"files": files})` gives the child, beside its data, the
-objects it acts through, by name, kept as `reviewer.facilities`; a name follows an input's
-rules, and is not `outrig`, `self`, an input's name or a class bound in the child. A
-binding's proxy becomes a reference to that binding (`help(outrig.Facility)`), which
-resolves in each kernel to that kernel's own proxy; a proxy of an object a binding returned,
-a coroutine and a generator are refused, naming the entry; anything else is the object
-itself, shared. The child is told of these and of no other binding -- in its instructions,
-as globals where the name is free, by `outrig.bindings` and `runtime.bindings` -- and
-without `facilities=` sees what this agent sees. The mapping decides what an agent is told,
-not what it may reach, which is the session's either way.
+`Reviewer(**inputs, facilities={"files": files})` gives the child, beside its data, the objects
+it acts through, by name, kept as `reviewer.facilities`; a name is a variable's, not `outrig`,
+`self`, an input's name or a bound class's. A binding's proxy becomes a reference to that
+binding (`help(outrig.Facility)`); a proxy of an object a binding returned, a coroutine and a
+generator are refused, naming the entry; anything else is the object itself, shared. The child
+is told of these and of no other binding -- in its instructions, as globals where the name is
+free, by `outrig.bindings` and `runtime.bindings` -- and without `facilities=` sees what this
+agent sees. The mapping decides what an agent is told, not what it may reach, which is the
+session's either way.
 
 A subclass's `__init__` passes the base its keywords with `super().__init__(**inputs,
 model=...)`, which launches nothing; one that does not raises `TypeError` once it returns.
-Define `__outrig_attach__(self)` to finish what `__init__` cannot -- state a mixin's
-`__init__` sets after the subclass's own, say: OutRig calls it on the class, so it needs no
-`super()`, and ignores what it returns. A request method called before the instance is
-attached -- in `__init__` or `__outrig_attach__` -- raises `TypeError`. A constructor or hook
-that raises launches nothing, and its exception is the constructor call's; what it did to
-your own objects stands, since OutRig rolls nothing back. An agent constructed inside
-`__init__` or `__outrig_attach__` is attached at once, and its child runs on if the
-constructor then raises, until its maker is released or the session ends. The class's
-metaclass derives from `abc.ABCMeta`: a subclass that leaves an abstract method
-unimplemented raises `TypeError` at the call, before its `__init__`; and mixing in a class
-whose metaclass is another, not derived from it, raises `TypeError` as the class is made.
+Define `__outrig_attach__(self)` to finish what `__init__` cannot -- state a mixin's `__init__`
+sets after the subclass's own, say: OutRig calls it on the class, so it needs no `super()`, and
+ignores what it returns. Define `__outrig_instructions__(self)` to return the `outrig.Section`s
+-- say, the task the constructor stored -- that the child's instructions carry after the
+docstring: OutRig calls it once, after attachment's checks, so `self.facilities` reads as the
+child's will. It should call no model and make no hosted call; nothing else of the instance is
+read. A request method called before the instance is attached -- in `__init__` or either hook --
+raises `TypeError`. A constructor or hook that raises, a return that is not `Section`s or a
+section past its bound launches nothing, and the exception is the constructor call's; what it
+did to your own objects stands, since OutRig rolls nothing back. An agent constructed inside one
+is attached at once, and its child runs on if the constructor then raises, until its maker is
+released or the session ends. The metaclass derives from `abc.ABCMeta`, so abstract mixins work;
+a mixin whose metaclass is another raises `TypeError` as the class is made.
 
-In a program `outrig run-new` runs on the host, `Reviewer(**inputs, model=None,
-session=None)` is constructed on the running event loop its handles belong to, and its child
-is a root child of `session`, the current `outrig.Session` when not given, on `model` or
-`default-model`. Its types reach the child as data, made into classes again there, and each
-reply is decoded here, into this program's own. The instance stays here, so its child has no
-`self`, and one collected unreleased is released then. Construct it, and leave its `async
-with`, inside the session's; the session's exit releases it. In an agent's kernel,
-`session=` is refused; on the host, `facilities=` is, with `NotImplementedError`.
+In a program `outrig run-new` runs on the host, `Reviewer(**inputs, model=None, session=None)`
+is constructed on the running event loop its handles belong to, and its child is a root child of
+`session`, the current `outrig.Session` when not given, on `model` or `default-model`. Its types
+reach the child as data, and each reply is decoded here, into this program's own. The instance
+stays here, so its child has no `self`, and one collected unreleased is released then. Construct
+it, and leave its `async with`, inside the session's, whose exit releases it. In an agent's
+kernel `session=` is refused; on the host, `facilities=` is, with `NotImplementedError`.
 
 #### `outrig.Agent.facilities`
 
@@ -663,11 +663,11 @@ def facilities(self): ...
 ```
 
 This agent's facilities, by name: a copy of the dict its constructor was given as
-`facilities=`, the one mapping its child's view follows, read as it stands. Read-only as
-an attribute; the dict is the agent's to change. Once the instance is attached, a
-binding's proxy in it is a reference to that binding (`outrig.Facility`). Without
-`facilities=`, it is a copy of its maker's, taken as it is attached, or `None` where its
-maker's view is the session's, every binding, as its child's then is.
+`facilities=`, which its child's view follows, read as it stands. Read-only as an
+attribute; the dict is the agent's to change. Once the instance is attached, a binding's
+proxy in it is a reference to that binding (`outrig.Facility`). Without `facilities=`, it
+is a copy of its maker's, taken as it is attached, or `None` where its maker's view is the
+session's, every binding.
 
 #### `outrig.Agent.ready`
 
@@ -680,8 +680,8 @@ Return once the child has ended its first round, which is its own, to get ready 
 Raises what the launch met instead -- `ValueError` for an unknown model,
 `outrig.AgentLimitReached`, `outrig.SessionClosing` -- or `outrig.BudgetExhausted` or
 `outrig.AgentRequestFailed` when the child cannot have that round, or
-`outrig.AgentReleased` when the instance was released first. It settles once: awaiting
-again answers the same at once.
+`outrig.AgentReleased` when the instance was released first. Awaiting it again answers
+the same.
 
 #### `outrig.Agent.release`
 
@@ -826,6 +826,23 @@ channel, and `accepted` or `failed` once it has ended; `reason` says why a faile
 `rejected`, `failed`, `cancelled`, `released`, `budget`, `closed`, `terminated`, or `limit`
 for a typed call whose child a limit refused -- and is `None` otherwise. `child` is its
 child's state: `running`, `idle`, `wedged` or `released`. Fixed once the request has ended.
+
+### `outrig.Section`
+
+```python
+@dataclasses.dataclass(frozen=True)
+class Section:
+    title: str
+    text: str
+```
+
+One titled part of an agent's instructions, which its class's `__outrig_instructions__`
+returns: `Section("Task", f"Review {self._task.title}")`.
+
+OutRig puts `text` in the instructions as it is, under `title`, after the class's docstring
+and in the order returned; nothing is formatted into it. A title is 1 to 64 characters, a
+text at most 16 KiB, and every title and text together at most 32 KiB, in UTF-8: past a bound
+the agent's construction raises `ValueError`.
 
 ## Errors
 
