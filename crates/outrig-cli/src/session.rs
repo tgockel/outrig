@@ -290,11 +290,39 @@ impl SessionStore {
     /// `discard` may remove from under it before its container exists (#366).
     /// Every launch holds it until teardown has finalized the record; the
     /// tests that only want a record on disk drop it.
+    ///
+    /// The claim is taken before the record is published, never after: a
+    /// record that is visible while unclaimed reads to a concurrent `discard`
+    /// or `clean` as a dead launch's leftovers, and goes (#655).
     pub fn create(
         &self,
         sid: &SessionId,
         explicit_dir: Option<&Path>,
         session: &mut Session,
+    ) -> Result<(PathBuf, Option<SessionLock>)> {
+        self.create_publishing_after(sid, explicit_dir, session, |_| {})
+    }
+
+    /// [`SessionStore::create`], calling `at_publish` with the session
+    /// directory once it is claimed and just before its record is written --
+    /// the window #655 was about, which a test cannot otherwise stop in.
+    #[cfg(feature = "internal-test-api")]
+    pub fn create_pausing_before_publish(
+        &self,
+        sid: &SessionId,
+        explicit_dir: Option<&Path>,
+        session: &mut Session,
+        at_publish: impl FnOnce(&Path),
+    ) -> Result<(PathBuf, Option<SessionLock>)> {
+        self.create_publishing_after(sid, explicit_dir, session, at_publish)
+    }
+
+    fn create_publishing_after(
+        &self,
+        sid: &SessionId,
+        explicit_dir: Option<&Path>,
+        session: &mut Session,
+        at_publish: impl FnOnce(&Path),
     ) -> Result<(PathBuf, Option<SessionLock>)> {
         // The longest resolved prefix of the explicit directory that was
         // already on disk before this call touched anything, so a failure
@@ -351,11 +379,37 @@ impl SessionStore {
         }
         fs::create_dir_all(&self.root).path_ctx("create directory", &self.root)?;
 
-        let actual_dir = match explicit_dir {
+        // The claim on the directory as live is taken after the checks above
+        // and before the record is written. After the checks, so a launch they
+        // turn away never reads as the live owner of a directory it does not
+        // own; before the write, so the record is never visible unclaimed --
+        // a `discard` or `clean` reading the directory in that gap saw no
+        // owner and no container, and removed a session that was starting
+        // (#655). A write that fails returns with the claim, which drops it.
+        let (actual_dir, lock) = match explicit_dir {
             Some(dir) => {
                 let canon = fs::canonicalize(dir).path_ctx("resolve", dir)?;
                 session.session_dir = canon.clone();
-                claim_session_json(&canon, session)?;
+                // The claim is on an inode, so the record goes in -- and, on
+                // failure, comes back out -- through that inode rather than
+                // the path, which a concurrent `discard` and relaunch can
+                // point at a different directory (#655). Without a claim (no
+                // lock support) the path is all there is.
+                let lock = match try_claim_owner(&canon) {
+                    Ok(lock) => Some(lock),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(OutrigError::Configuration(format!(
+                            "--session-dir {} was removed while its session started; \
+                             try again",
+                            canon.display()
+                        ))
+                        .into());
+                    }
+                    Err(_) => None,
+                };
+                let pinned = lock.as_ref().map_or_else(|| canon.clone(), SessionLock::pinned_path);
+                at_publish(&canon);
+                claim_session_json(&pinned, session)?;
                 let link = self.root.join(&sid.0);
                 let symlinked = std::os::unix::fs::symlink(&canon, &link);
                 if symlinked.is_err() {
@@ -368,7 +422,7 @@ impl SessionStore {
                     // directory at a time and stopping the moment that prefix
                     // is reached, so nothing that predates this call goes
                     // with it.
-                    let _ = fs::remove_file(canon.join(SESSION_JSON));
+                    let _ = fs::remove_file(pinned.join(SESSION_JSON));
                     if let Some(boundary) = &created_from {
                         let mut cur = canon.as_path();
                         while cur != boundary.as_path() {
@@ -383,7 +437,7 @@ impl SessionStore {
                     }
                 }
                 symlinked.path_ctx("symlink", &link)?;
-                canon
+                (canon, lock)
             }
             None => {
                 // The claim: `create_dir` fails on anything already under the
@@ -399,17 +453,12 @@ impl SessionStore {
                     created => created.path_ctx("create directory", &dir)?,
                 }
                 session.session_dir = dir.clone();
+                let lock = claim_owner(&dir);
+                at_publish(&dir);
                 write_session_json_atomic(&dir, session)?;
-                dir
+                (dir, lock)
             }
         };
-
-        // After the record, so the claim covers a directory that is already
-        // the session's: taken before it, the explicit-directory checks above
-        // could still turn this launch away, and a claim outliving them by
-        // even a moment would read as a live owner of a directory this
-        // process does not own.
-        let lock = claim_owner(&actual_dir);
         Ok((actual_dir, lock))
     }
 
@@ -850,6 +899,16 @@ pub struct SessionLock {
     _dir: fs::File,
 }
 
+impl SessionLock {
+    /// A path to the claimed directory itself, which keeps naming that inode
+    /// if the directory is removed or replaced: operations through it fail
+    /// with `ENOENT` instead of landing in a successor (#655).
+    fn pinned_path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", self._dir.as_raw_fd()))
+    }
+}
+
 /// Describe a whole-file lock of `kind`, as both the claim and the probe want
 /// it: `l_whence`/`l_start`/`l_len` of `SEEK_SET`/0/0 is "the entire file".
 fn whole_file_lock(kind: libc::c_short) -> libc::flock {
@@ -873,17 +932,7 @@ fn whole_file_lock(kind: libc::c_short) -> libc::flock {
 /// read-only, and `F_WRLCK` on such a descriptor is `EBADF`; the probe asks
 /// for a write lock, which a read lock is enough to block.
 pub fn claim_owner(dir: &Path) -> Option<SessionLock> {
-    let file = fs::File::open(dir)
-        .inspect_err(|e| {
-            tracing::debug!(
-                target: "outrig::cli::session",
-                "session directory {} could not be opened to claim: {e}",
-                dir.display()
-            );
-        })
-        .ok()?;
-    let lock = whole_file_lock(libc::F_RDLCK as libc::c_short);
-    fcntl(&file, FcntlArg::F_OFD_SETLK(&lock))
+    try_claim_owner(dir)
         .inspect_err(|e| {
             tracing::debug!(
                 target: "outrig::cli::session",
@@ -891,8 +940,15 @@ pub fn claim_owner(dir: &Path) -> Option<SessionLock> {
                 dir.display()
             );
         })
-        .ok()?;
-    Some(SessionLock { _dir: file })
+        .ok()
+}
+
+/// [`claim_owner`], with the reason it could not claim.
+fn try_claim_owner(dir: &Path) -> std::io::Result<SessionLock> {
+    let file = fs::File::open(dir)?;
+    let lock = whole_file_lock(libc::F_RDLCK as libc::c_short);
+    fcntl(&file, FcntlArg::F_OFD_SETLK(&lock)).map_err(std::io::Error::from)?;
+    Ok(SessionLock { _dir: file })
 }
 
 /// Whether a live process holds `dir` through [`claim_owner`] -- the session
