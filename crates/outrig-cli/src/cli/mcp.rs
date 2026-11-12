@@ -463,7 +463,7 @@ async fn serve_unix_http_transport(
     signals: &mut Signals,
 ) -> Result<i32> {
     prepare_unix_socket(path)?;
-    let (listener, _cleanup) = bind_unix_listener(path)?;
+    let listener = bind_unix_listener(path)?;
     eprintln!("[outrig] listen: unix:{}", path.display());
     let shutdown = http_shutdown(ct.clone());
     let server = axum::serve(listener, router).with_graceful_shutdown(shutdown);
@@ -829,7 +829,7 @@ fn clear_stale_unix_socket(path: &Path) -> Result<()> {
 /// leaves a socket this user cannot connect to, and only that case is
 /// repaired, by [`restore_socket_mode`].
 #[cfg(unix)]
-fn bind_unix_listener(path: &Path) -> Result<(tokio::net::UnixListener, UnixSocketCleanup)> {
+fn bind_unix_listener(path: &Path) -> Result<OwnedUnixListener> {
     use std::os::fd::{AsFd as _, AsRawFd as _};
 
     use nix::sys::socket::{
@@ -859,16 +859,19 @@ fn bind_unix_listener(path: &Path) -> Result<(tokio::net::UnixListener, UnixSock
 
     errno_ctx(bind(sock.as_raw_fd(), &addr), "bind", path)?;
     // The name exists from here on, so own its removal before anything else
-    // can fail.
-    let cleanup = UnixSocketCleanup {
-        path: path.to_path_buf(),
-    };
+    // can fail. Nothing has had a chance to replace the entry yet: our socket
+    // is bound to it and is not refusing connections, so no other `outrig
+    // mcp` would clear it.
+    let cleanup = UnixSocketCleanup::claim(path)?;
     errno_ctx(listen(&sock, Backlog::MAXCONN), "listen", path)?;
     restore_socket_mode(path)?;
 
     let listener = tokio::net::UnixListener::from_std(std::os::unix::net::UnixListener::from(sock))
         .path_ctx("listen", path)?;
-    Ok((listener, cleanup))
+    Ok(OwnedUnixListener {
+        _cleanup: cleanup,
+        listener,
+    })
 }
 
 /// Put back owner bits the umask took off the socket just bound at `path`,
@@ -945,15 +948,85 @@ fn errno_ctx<T>(result: nix::Result<T>, op: &'static str, path: &Path) -> Result
         .map_err(Into::into)
 }
 
+/// A Unix listener that takes its socket's name with it when it closes.
+///
+/// The name goes *before* the listening socket does, and that order is the
+/// point (#911). axum drops its listener the moment graceful shutdown starts,
+/// then drains open requests for up to [`HTTP_SERVER_SHUTDOWN_GRACE`]. Were
+/// the name to outlive the listener through that drain, a second `outrig mcp`
+/// started for the same path would find a socket refusing connections, clear
+/// it as stale, and bind its own -- which this process would then unlink on
+/// its way out, leaving the new server running and unreachable. While this
+/// listener is open, a probe of the path connects rather than being refused,
+/// so no other `outrig mcp` clears it before it is gone.
+///
+/// Fields drop in declaration order: `_cleanup` before `listener`.
+#[cfg(unix)]
+struct OwnedUnixListener {
+    _cleanup: UnixSocketCleanup,
+    listener: tokio::net::UnixListener,
+}
+
+#[cfg(unix)]
+impl axum::serve::Listener for OwnedUnixListener {
+    type Io = <tokio::net::UnixListener as axum::serve::Listener>::Io;
+    type Addr = <tokio::net::UnixListener as axum::serve::Listener>::Addr;
+
+    fn accept(&mut self) -> impl Future<Output = (Self::Io, Self::Addr)> + Send {
+        axum::serve::Listener::accept(&mut self.listener)
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        axum::serve::Listener::local_addr(&self.listener)
+    }
+}
+
+/// Removes the socket bound at `path` -- and only that socket.
+///
+/// The path is checked against the device and inode recorded at bind time,
+/// so an entry someone else has put there since is left alone. The check is
+/// exact only while the socket it recorded still exists: once the listener
+/// closes and the entry is unlinked, the filesystem may hand the same inode
+/// number to the next socket bound there. [`OwnedUnixListener`] runs this
+/// while its listener is still open, which keeps that inode allocated.
 #[cfg(unix)]
 struct UnixSocketCleanup {
     path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+impl UnixSocketCleanup {
+    /// Take ownership of the socket that `path` names now.
+    fn claim(path: &Path) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let meta = std::fs::symlink_metadata(path).path_ctx("stat", path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
 }
 
 #[cfg(unix)]
 impl Drop for UnixSocketCleanup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        use std::os::unix::fs::MetadataExt as _;
+
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) if meta.dev() == self.dev && meta.ino() == self.ino => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+            Ok(_) => tracing::warn!(
+                target: "outrig::cli::mcp",
+                "unix listen path {} no longer names this server's socket; leaving it",
+                self.path.display()
+            ),
+            Err(_) => {}
+        }
     }
 }
 
@@ -1733,14 +1806,14 @@ named  = { sidecar = "serve" }
         let previous = umask(Mode::empty());
         let bound = bind_unix_listener(&path);
         umask(previous);
-        let (listener, _cleanup) = bound.expect("bind");
+        let listener = bound.expect("bind");
 
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
         assert_eq!(mode, UNIX_SOCKET_MODE, "socket mode is {mode:o}, want 0600");
 
         // Owner-only is not the same as unusable: this user still connects.
         let client = std::os::unix::net::UnixStream::connect(&path).expect("connect");
-        listener.accept().await.expect("accept");
+        listener.listener.accept().await.expect("accept");
         drop(client);
     }
 
@@ -1787,10 +1860,95 @@ named  = { sidecar = "serve" }
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("outrig.sock");
 
-        let (listener, cleanup) = bind_unix_listener(&path).expect("bind");
+        let listener = bind_unix_listener(&path).expect("bind");
         assert!(path.exists());
         drop(listener);
-        drop(cleanup);
         assert!(!path.exists(), "the socket file should be gone");
+    }
+
+    /// A socket bound at the same path after this one was removed belongs to
+    /// someone else, and closing this listener must not take it (#911).
+    #[tokio::test]
+    async fn dropping_the_listener_leaves_a_socket_that_replaced_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+
+        let listener = bind_unix_listener(&path).expect("bind");
+        std::fs::remove_file(&path).expect("unlink");
+        let replacement = std::os::unix::net::UnixListener::bind(&path).expect("rebind");
+
+        drop(listener);
+        assert!(path.exists(), "the replacement's socket must survive");
+        std::os::unix::net::UnixStream::connect(&path).expect("the replacement is reachable");
+        drop(replacement);
+    }
+
+    /// The race in #911, end to end: a server draining a request after
+    /// shutdown has already given up its name, so a second server can take
+    /// the path, and the first one finishing does not cut the second off.
+    #[tokio::test]
+    async fn a_draining_server_gives_up_its_socket_to_the_next_one() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let router = axum::Router::new().route(
+            "/slow",
+            axum::routing::get({
+                let release = release.clone();
+                let entered = entered.clone();
+                move || async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    "done"
+                }
+            }),
+        );
+
+        let ct = CancellationToken::new();
+        let listener = bind_unix_listener(&path).expect("bind");
+        let first = tokio::spawn(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(http_shutdown(ct.clone()))
+                .into_future(),
+        );
+
+        // Hold a request open so the shutdown has something to drain.
+        let mut client = tokio::net::UnixStream::connect(&path).await.expect("connect");
+        client
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write request");
+        entered.notified().await;
+
+        ct.cancel();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a stopping server should give up its name before draining");
+        assert!(!first.is_finished(), "the first server is still draining");
+
+        // The second server starts in the drain window.
+        prepare_unix_socket(&path).expect("the path is free");
+        let second = bind_unix_listener(&path).expect("second bind");
+
+        release.notify_one();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("read response");
+        assert!(
+            String::from_utf8_lossy(&response).contains("done"),
+            "the drained request still completes"
+        );
+        first.await.expect("join").expect("first server");
+
+        assert!(path.exists(), "the second server's socket must survive the first");
+        let _client = std::os::unix::net::UnixStream::connect(&path).expect("connect to second");
+        second.listener.accept().await.expect("the second server is reachable");
     }
 }

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A stopping `outrig mcp` no longer unlinks the socket of the server that replaced it.** A
+  Unix-socket server stopped accepting at once but removed its socket only after its open requests
+  drained, up to 5 s later. A second `outrig mcp` started for the same path in that window cleared
+  the refusing socket as stale and bound its own, which the first then unlinked on exit, leaving
+  the new server running and unreachable. The socket's name now goes with the listener, before the
+  drain, and is removed only while it still names the socket this server bound. (#911)
+
 - **A cold `outrig run` no longer builds, discards, and refuses a session whose directory lies
   in its own build context.** An explicit `--session-dir`, or an auto-allocated one under
   `--session-root`, left unignored inside an `[images.<name>]` build's context meant the session's
