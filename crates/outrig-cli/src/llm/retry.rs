@@ -738,20 +738,42 @@ fn textless_line(finish_reason: Option<&str>, max_tokens: Option<u64>) -> String
     ))
 }
 
-/// The provider's own word for why generation stopped, from the completion's
+/// The provider's own word for why generation stopped, read from a reply's
 /// document: the provider's reply as rig received it, which it keeps beside
-/// the normalized reason. Both dialects are checked because both are
-/// reachable: `choices[].finish_reason` is the OpenAI shape and `stop_reason`
-/// the Anthropic one. Returns `None` for a provider that names neither, which
-/// costs the report one clause and nothing else.
+/// the normalized reason, or the body of a `200` rig made no completion of at
+/// all ([`RetryingModel::name_finish_reason`]).
+///
+/// Every dialect is checked because all three are reachable:
+/// `choices[0].finish_reason` is the Chat Completions shape, `stop_reason` the
+/// Anthropic one and `status` the Responses one. Returns `None` for a provider
+/// that names none, which costs the message one clause and nothing else.
 fn provider_finish_reason(raw: &serde_json::Value) -> Option<String> {
     let word = raw
         .get("choices")
         .and_then(|choices| choices.get(0))
         .and_then(|choice| choice.get("finish_reason"))
-        .or_else(|| raw.get("stop_reason"))?
-        .as_str()?;
-    Some(word.to_string())
+        .or_else(|| raw.get("stop_reason"))
+        .and_then(serde_json::Value::as_str);
+    match word {
+        Some(word) => Some(word.to_string()),
+        None => responses_word(
+            raw.get("status").and_then(serde_json::Value::as_str),
+            raw.pointer("/incomplete_details/reason")
+                .and_then(serde_json::Value::as_str),
+        ),
+    }
+}
+
+/// A Responses reply's word for why generation stopped: its `status`, which is
+/// `completed` for a reply that ran its course, and for one `incomplete` the
+/// reason it gives, `max_output_tokens` or `content_filter`. The reading the
+/// library's retry layer does, so a model served over `/responses` names its
+/// reason in `outrig run` as it does for a host program (#743).
+fn responses_word(status: Option<&str>, incomplete_reason: Option<&str>) -> Option<String> {
+    match (status?, incomplete_reason) {
+        ("incomplete", Some(reason)) => Some(reason.to_string()),
+        (status, _) => Some(status.to_string()),
+    }
 }
 
 /// The retry loop. A free function rather than a method because the future
@@ -1369,39 +1391,79 @@ mod tests {
         assert!(chain_label_of(ProviderError::Provider("nope".into())).is_none());
     }
 
+    /// A reply with nothing in it, as `raw` says the provider ended it and
+    /// rig normalized that to `finish`.
+    fn empty_reply(finish: FinishReason, raw: serde_json::Value) -> CompletionResponse {
+        CompletionResponse::new(
+            Vec::new(),
+            rig::completion::Usage::new(),
+            Origin::new(MOCK_API, MOCK_PROVIDER, ""),
+            raw,
+        )
+        .with_optional_finish_reason(Some(finish))
+    }
+
     /// An empty reply the provider ends in a tool call holds no call: the
     /// provider says one was made and none came, so the reply is defective, not
     /// a model that stopped. One it ends `stop` is the model's own.
     #[test]
     fn an_empty_reply_that_ends_in_a_tool_call_is_unusable() {
-        let reply = |finish: FinishReason, raw: serde_json::Value| {
-            CompletionResponse::new(
-                Vec::new(),
-                rig::completion::Usage::new(),
-                Origin::new(MOCK_API, MOCK_PROVIDER, ""),
-                raw,
-            )
-            .with_optional_finish_reason(Some(finish))
-        };
-
         assert_eq!(
-            unusable_reply(&reply(
+            unusable_reply(&empty_reply(
                 FinishReason::ToolCalls,
                 serde_json::json!({ "stop_reason": "tool_use" })
             )),
             Some("finish reason tool_use: the reply holds no text and no tool call".into())
         );
         assert_eq!(
-            unusable_reply(&reply(
+            unusable_reply(&empty_reply(
                 FinishReason::ToolCalls,
                 serde_json::json!({ "choices": [{ "finish_reason": "tool_calls" }] })
             )),
             Some("finish reason tool_calls: the reply holds no text and no tool call".into())
         );
         assert_eq!(
-            unusable_reply(&reply(
+            unusable_reply(&empty_reply(
                 FinishReason::Stop,
                 serde_json::json!({ "stop_reason": "end_turn" })
+            )),
+            None
+        );
+    }
+
+    /// A model served over `/responses` says why it stopped in a `status` and
+    /// an `incomplete_details.reason` rather than a `finish_reason`, so a
+    /// reader of the other two dialects alone named nothing for it. The
+    /// message names the provider's own words, not rig's normalization of
+    /// them: `max_output_tokens`, not `length` (#743).
+    #[test]
+    fn a_responses_reply_names_the_word_the_provider_used() {
+        let incomplete = |reason: &str| {
+            serde_json::json!({
+                "status": "incomplete",
+                "incomplete_details": { "reason": reason },
+            })
+        };
+
+        assert_eq!(
+            unusable_reply(&empty_reply(FinishReason::Length, incomplete("max_output_tokens"))),
+            Some("finish reason max_output_tokens: the reply holds no text and no tool call".into())
+        );
+        assert_eq!(
+            unusable_reply(&empty_reply(
+                FinishReason::ContentFilter,
+                incomplete("content_filter")
+            )),
+            Some(
+                "finish reason content_filter: the provider ended the reply for its content".into()
+            )
+        );
+        // A reply that ran its course and still held nothing is the model's
+        // own doing, in this dialect as in the others.
+        assert_eq!(
+            unusable_reply(&empty_reply(
+                FinishReason::Stop,
+                serde_json::json!({ "status": "completed" })
             )),
             None
         );
@@ -1501,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn the_finish_reason_is_read_from_either_dialect_and_only_when_present() {
+    fn the_finish_reason_is_read_from_any_dialect_and_only_when_present() {
         let model = RetryingModel::new(always_unusable(&Arc::default()), RetryPolicy::default());
         let named = |body: &'static str| {
             let answered = AnsweredBody::default();
@@ -1511,6 +1573,14 @@ mod tests {
                 .name_finish_reason("empty".into())
         };
         assert_eq!(named(r#"{"stop_reason":"refusal"}"#), "finish reason refusal: empty");
+        // A Responses reply names its reason under the status that calls for
+        // one, and otherwise the status is the whole of what it says.
+        assert_eq!(
+            named(r#"{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}"#),
+            "finish reason content_filter: empty"
+        );
+        assert_eq!(named(r#"{"status":"incomplete"}"#), "finish reason incomplete: empty");
+        assert_eq!(named(r#"{"status":"completed"}"#), "finish reason completed: empty");
         assert_eq!(named(r#"{"choices":[{}]}"#), "empty");
         assert_eq!(named("not json"), "empty");
         assert_eq!(model.name_finish_reason("empty".into()), "empty");

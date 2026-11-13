@@ -437,7 +437,9 @@ calls that already ran, where a resent prompt could have it run them a second ti
 
 A provider that answers with nothing usable is handled the same way, down to what the
 conversation keeps. The call is retried twice before outrig gives up. When the provider named
-a finish reason for the reply, such as `content_filter` or `length`, it leads the message:
+a finish reason for the reply, it leads the message, in the provider's own word for it:
+`content_filter` or `length` from a `chat-completions` model, `refusal` or `max_tokens` from a
+`messages` one, and `content_filter` or `max_output_tokens` from a `responses` one:
 
 ```
 [outrig] model returned an unusable response (finish reason content_filter: Response

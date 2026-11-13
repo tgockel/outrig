@@ -349,6 +349,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forwarded SIGINT and SIGTERM to the program's process group but left SIGHUP at its default, so a
   closed terminal ended outrig along with the engine that stops the sessions the program left
   open. It is now forwarded as a SIGTERM, starting the same grace.
+- **`outrig run` reads a Responses reply's finish reason.** 0.2.3 taught the retry line and the
+  final error to lead with the reason the provider's reply named -- `finish reason
+  content_filter: ...` -- read from Chat Completions' `choices[0].finish_reason` or Anthropic's
+  `stop_reason`. A model called over `/responses`, the style this line added, names it in
+  neither: the reply's `status` carries it, and an `incomplete` one's
+  `incomplete_details.reason`. So a `responses` body outrig could make no turn of named no reason
+  at all, one cut at the ceiling read as rig's `length` rather than the provider's
+  `max_output_tokens`, and a turn that showed nothing named none. That dialect is read now, as
+  the library's retry layer reads it. (#743)
 
 ### Deprecated
 
