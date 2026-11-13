@@ -563,7 +563,10 @@ async fn a_failed_model_call_keeps_the_python_the_round_ran() {
         .expect_err("the second model call failed");
     let err = err.to_string();
     assert!(
-        err.contains("already run Python") && err.contains("rather than repeating one"),
+        err.contains("failed after the agent ran Python")
+            && err.contains("What ran is kept in the conversation")
+            && err.contains(SEND_TO_CONTINUE)
+            && err.contains("not a copy of an earlier one"),
         "{err}"
     );
     assert_eq!(round(&mut agent, "continue").await, "carried on");
@@ -595,9 +598,13 @@ async fn a_failed_first_model_call_leaves_the_conversation_alone() {
         .expect_err("the model call failed")
         .to_string();
     assert!(
-        err.starts_with("agent round failed:") && !err.contains("already run Python"),
+        err.starts_with("a model call failed: ")
+            && err.contains("Nothing ran and the agent has not read your messages")
+            && err.contains("still queued")
+            && err.contains(SEND_ANY),
         "{err}"
     );
+    assert!(!err.contains("ran Python"), "nothing ran: {err}");
     assert_eq!(round(&mut agent, "hello").await, "ok");
 
     let recorded = mock_http::drain(&mut requests);
@@ -632,13 +639,10 @@ async fn a_round_that_ends_on_a_refused_connection_names_the_cause() {
 
     let cause = mock_http::refused_cause().await;
     assert!(
-        err.starts_with("agent round failed: connection error: ") && err.contains(&cause),
+        err.starts_with("a model call failed: connection error: ") && err.contains(&cause),
         "{err}"
     );
-    assert!(
-        err.contains(RESEND_WORKS),
-        "a refused connect may clear: {err}"
-    );
+    assert!(says_to_send(&err), "a refused connect may clear: {err}");
     assert!(!ran, "no Python ran: {err}");
     shut_down(agent).await;
 }
@@ -4347,7 +4351,7 @@ async fn failed_dropped_and_truncated_are_recorded() {
         failed[0]["error"]
             .as_str()
             .expect("an error")
-            .contains("agent round failed"),
+            .contains("a model call failed"),
         "{}",
         failed[0]
     );
@@ -5804,7 +5808,9 @@ async fn an_exhausted_chain_ends_the_round_and_keeps_what_it_ran() {
         assert!(err.contains(reason), "{reason}: {err}");
     }
     assert!(
-        err.contains("already run Python") && err.contains("rather than repeating one"),
+        err.contains("failed after the agent ran Python")
+            && err.contains(SEND_TO_CONTINUE)
+            && err.contains("not a copy of an earlier one"),
         "{err}"
     );
 
@@ -5827,12 +5833,74 @@ fn failed_round(err: SessionError) -> (String, bool) {
     }
 }
 
-/// What every failed round said of resending before a failure could be told to
-/// repeat itself.
-const RESEND_WORKS: &str = "send another";
+/// What a failed round that ran no Python tells the reader to do, when the
+/// failure may clear.
+const SEND_ANY: &str = "Send any message to try again";
 
-/// What a failure that does not clear says in its place.
-const RESEND_FAILS: &str = "does not clear on its own";
+/// ...and what one that had already run some tells them instead: continue,
+/// rather than repeat what already ran.
+const SEND_TO_CONTINUE: &str = "Send a message to continue";
+
+/// What a failure that does not clear says in place of either.
+const RESEND_FAILS: &str = "fails the same way until the cause is fixed";
+
+/// Whether `err` says that sending a message is worth anything, which only a
+/// failure that may clear does.
+fn says_to_send(err: &str) -> bool {
+    err.contains(SEND_ANY) || err.contains(SEND_TO_CONTINUE)
+}
+
+/// Every form a failed round takes is written for the person who sent the
+/// messages: it names the failed model call, carries its cause, says what
+/// became of the messages the agent had not read, and tells them what to do
+/// next. None speaks of a "round", which is the agent's unit rather than
+/// theirs, nor of what the model "was told of" (#848).
+#[test]
+fn a_failed_rounds_wording_is_written_for_the_person_who_sent_the_messages() {
+    let cause = "ProviderResponseError: status 500 Internal Server Error";
+    let forms = [
+        AgentError::Prompt(cause.into()),
+        AgentError::PromptAfterWork(cause.into()),
+        AgentError::PromptTerminal(cause.into()),
+        AgentError::PromptAfterWorkTerminal(cause.into()),
+    ];
+    for form in &forms {
+        let text = form.to_string();
+        assert!(text.starts_with("a model call failed"), "{text}");
+        assert!(text.contains(cause), "{text}");
+        assert!(!text.contains("round"), "{text}");
+        assert!(!text.contains("told of"), "{text}");
+    }
+
+    let [prompt, after_work, terminal, after_work_terminal] = forms.map(|e| e.to_string());
+    assert!(
+        prompt.contains("Nothing ran")
+            && prompt.contains("has not read your messages")
+            && prompt.contains("still queued")
+            && prompt.contains(SEND_ANY),
+        "{prompt}"
+    );
+    assert!(
+        after_work.contains("ran Python")
+            && after_work.contains("What ran is kept in the conversation")
+            && after_work.contains("still queued")
+            && after_work.contains(SEND_TO_CONTINUE)
+            && after_work.contains("not a copy of an earlier one"),
+        "{after_work}"
+    );
+    for text in [&terminal, &after_work_terminal] {
+        assert!(
+            text.contains(RESEND_FAILS) && text.contains("start a new session"),
+            "{text}"
+        );
+        assert!(!says_to_send(text), "{text}");
+    }
+    assert!(
+        after_work_terminal.contains("What ran is kept in the conversation"),
+        "{after_work_terminal}"
+    );
+    assert!(!terminal.contains("ran Python"), "{terminal}");
+}
 
 /// A key every model of an alias refuses is not an outage to wait out, and the
 /// round says so rather than advising a resend that fails the same way. The
@@ -5866,7 +5934,7 @@ async fn a_key_every_model_refuses_is_not_worth_resending() {
         err.contains(RESEND_FAILS) && err.contains("start a new session"),
         "{err}"
     );
-    assert!(!err.contains(RESEND_WORKS), "{err}");
+    assert!(!says_to_send(&err), "{err}");
     assert!(!ran, "no Python ran: {err}");
     shut_down(agent).await;
 }
@@ -5896,7 +5964,8 @@ async fn a_refusal_after_python_ran_keeps_it_and_says_resending_will_not_help() 
     assert!(ran, "{err}");
     assert_eq!(submissions(&mut submitted), ["x = 41"]);
     assert!(
-        err.contains("already run Python") && err.contains("kept in the conversation"),
+        err.contains("failed after the agent ran Python")
+            && err.contains("What ran is kept in the conversation"),
         "{err}"
     );
     assert!(
@@ -5904,7 +5973,7 @@ async fn a_refusal_after_python_ran_keeps_it_and_says_resending_will_not_help() 
         "{err}"
     );
     assert!(
-        !err.contains(RESEND_WORKS) && !err.contains("rather than repeating one"),
+        !says_to_send(&err) && !err.contains("not a copy of an earlier one"),
         "{err}"
     );
     shut_down(agent).await;
@@ -5925,10 +5994,7 @@ async fn a_lone_model_that_is_refused_says_resending_will_not_help() {
     post(&agent, "hello").await;
     let (err, ran) = failed_round(within(agent.round()).await.expect_err("the model refused"));
     assert!(err.contains("401"), "{err}");
-    assert!(
-        err.contains(RESEND_FAILS) && !err.contains(RESEND_WORKS),
-        "{err}"
-    );
+    assert!(err.contains(RESEND_FAILS) && !says_to_send(&err), "{err}");
     assert!(!ran, "{err}");
     shut_down(agent).await;
 }
@@ -5947,10 +6013,7 @@ async fn a_rate_limit_that_outlasted_the_budget_still_says_to_send_another() {
     .await;
     post(&agent, "hello").await;
     let (err, _) = failed_round(within(agent.round()).await.expect_err("rate limited"));
-    assert!(
-        err.contains("429") && err.contains("send another to try again"),
-        "{err}"
-    );
+    assert!(err.contains("429") && err.contains(SEND_ANY), "{err}");
     assert!(!err.contains(RESEND_FAILS), "{err}");
     shut_down(agent).await;
 
@@ -5966,8 +6029,7 @@ async fn a_rate_limit_that_outlasted_the_budget_still_says_to_send_another() {
     post(&agent, "hello").await;
     let (err, _) = failed_round(within(agent.round()).await.expect_err("every model failed"));
     assert!(
-        err.contains("every model candidate failed; tried:")
-            && err.contains("send another to try again"),
+        err.contains("every model candidate failed; tried:") && err.contains(SEND_ANY),
         "{err}"
     );
     assert!(!err.contains(RESEND_FAILS), "{err}");
@@ -6000,7 +6062,7 @@ async fn a_response_that_did_not_decode_still_says_to_send_another() {
         "{err}"
     );
     assert!(
-        err.contains("send another to try again") && !err.contains(RESEND_FAILS),
+        err.contains(SEND_ANY) && !err.contains(RESEND_FAILS),
         "{err}"
     );
     assert!(!ran, "{err}");
@@ -6035,7 +6097,7 @@ async fn an_error_sent_with_a_success_status_still_says_to_send_another() {
         );
         assert!(err.contains("ProviderResponseError"), "{style:?}: {err}");
         assert!(
-            err.contains("send another to try again") && !err.contains(RESEND_FAILS),
+            err.contains(SEND_ANY) && !err.contains(RESEND_FAILS),
             "{style:?}: {err}"
         );
         assert!(!ran, "{style:?}: {err}");
@@ -6083,7 +6145,7 @@ async fn a_turn_a_fallback_cannot_hold_does_not_end_the_session() {
         "{err}"
     );
     assert!(
-        err.contains("send another to continue") && !err.contains(RESEND_FAILS),
+        err.contains(SEND_TO_CONTINUE) && !err.contains(RESEND_FAILS),
         "{err}"
     );
     assert!(!err.contains("failed terminally"), "{err}");
@@ -7758,7 +7820,7 @@ async fn a_reasoning_only_reply_cut_at_the_ceiling_fails_the_round() {
     assert!(
         err.contains("finish_reason=Length")
             && err.contains("raise max_tokens")
-            && err.contains("send another to try again"),
+            && err.contains(SEND_ANY),
         "{err}"
     );
     assert!(!ran, "{err}");

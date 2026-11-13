@@ -1032,6 +1032,22 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Fixed
 
+- **A failed round's error says what became of your messages.** The advice it carried was written
+  from the agent's side -- "The messages it was told of are still waiting; send another to try
+  again" -- where "it" was the agent and "told of" meant the model had been told how many messages
+  waited, not what they said, so the sentence never said that the messages were unread, that they
+  stay queued, or that sending any message starts another round. All four forms now speak to the
+  person who sent them, and none says "round" or "told of": a call that failed before any Python
+  ran says `a model call failed: <cause>. Nothing ran and the agent has not read your messages,
+  which are still queued. Send any message to try again`; one that failed after Python ran says
+  what ran is kept in the conversation and to send a message that continues rather than a copy of
+  an earlier one, which would ask for that work again; and a failure that does not clear -- a key
+  every model refuses -- says that sending another message fails the same way until the cause is
+  fixed, and to fix what the error names and then start a new session. The text reaches a `run-new`
+  user as `[outrig] error: ...` and is the `error` of `model.round.failed`. A child's parent, which
+  can neither fix a key nor start a session, is told the cause of a terminal failure without that
+  advice. (#848)
+
 - **A call the provider rejects as over its input limit is sent again smaller.** A gateway or
   provider whose own limit is below the model row's `context-window` -- a LiteLLM proxy capping a
   model at 200,000 tokens in front of a row set to 1,000,000 -- rejected a call that fit the

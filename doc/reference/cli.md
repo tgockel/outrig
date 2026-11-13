@@ -548,13 +548,18 @@ several, a call that still fails moves to the next, as in `run`, and each call s
 the first. Each model a call goes to is sent a conversation chosen for its own window, which may
 leave out more than another's did. When every model has failed, the round ends with each one's
 reason and keeps any Python it ran. Unlike `run`, no failure ends the session; `/quit` does.
-The error says whether another message could help. If any model failed in
-a way that may clear -- a rate limit that outlasted the budget, an unreachable host, a response
-that could not be decoded, an error a gateway sent with a success status, a turn too large for a
-later model's window, which the next call leaves out -- it says to send another. If none did,
-such as a key every model refuses, it says that sending another fails the same way, and to
-correct the cause and start a new session. With `[events] mode = "record"`, the event log
-records each retry and each move, and names the model that answered each call.
+The error, printed as `[outrig] error: a model call failed: ...`, says what became of your messages
+and whether another one could help. It says whether any Python ran: when none did, nothing of the
+round is kept, and when some did, what ran is kept in the conversation. Either way the messages the
+agent had not read are unread and still queued, and the round that a message starts announces them
+again. If any model failed in a way that may clear -- a rate limit that outlasted the budget, an
+unreachable host, a response that could not be decoded, an error a gateway sent with a success
+status, a turn too large for a later model's window, which the next call leaves out -- it says to
+send any message to try again, or, when Python ran, to send one that continues rather than a copy
+of an earlier one, which would ask for that work a second time. If none did, such as a key every
+model refuses, it says that sending another message fails the same way until the cause is fixed,
+and to fix what the error names and then start a new session. With `[events] mode = "record"`, the
+event log records each retry and each move, and names the model that answered each call.
 
 **On a terminal.** When stdin and stdout are both the terminal `run-new` was started from, it holds
 that terminal with a screen. The conversation -- each line you send, marked `›`, and each message

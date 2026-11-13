@@ -383,11 +383,16 @@ pub(crate) enum AgentError {
     #[error("the Python interpreter did not say what messages are waiting within {0:?}")]
     Unanswered(Duration),
 
-    /// A model call failed before the round ran any Python. The messages it
-    /// announced are still waiting.
+    /// A model call failed before the round ran any Python. The messages the
+    /// round announced are unread and still queued, and the next round
+    /// announces them again.
+    ///
+    /// This text is read by the person at the session rather than by the
+    /// model, so it speaks of the agent in the third person and of the
+    /// messages as theirs.
     #[error(
-        "agent round failed: {0}. The messages it was told of are still waiting; send another \
-         to try again"
+        "a model call failed: {0}. Nothing ran and the agent has not read your messages, which \
+         are still queued. Send any message to try again"
     )]
     Prompt(String),
 
@@ -395,9 +400,9 @@ pub(crate) enum AgentError {
     /// in the conversation, and a message that repeated an earlier one would
     /// ask for it again.
     #[error(
-        "agent round failed after it had already run Python: {0}. What it ran is kept in the \
-         conversation, and the messages it did not read are still waiting -- send another to \
-         continue rather than repeating one"
+        "a model call failed after the agent ran Python: {0}. What ran is kept in the \
+         conversation, and the messages the agent had not read are still queued. Send a message \
+         to continue, but not a copy of an earlier one: the agent would do that work again"
     )]
     PromptAfterWork(String),
 
@@ -406,17 +411,17 @@ pub(crate) enum AgentError {
     /// fails the same way until the configuration changes, which takes a new
     /// session.
     #[error(
-        "agent round failed: {0}. That failure does not clear on its own, so sending another \
-         message fails the same way; correct what it names and start a new session"
+        "a model call failed: {0}. Sending another message fails the same way until the cause \
+         is fixed. Fix what the error names, then start a new session"
     )]
     PromptTerminal(String),
 
     /// [`PromptAfterWork`](Self::PromptAfterWork) for a failure that does not
     /// clear on its own.
     #[error(
-        "agent round failed after it had already run Python: {0}. What it ran is kept in the \
-         conversation, but that failure does not clear on its own, so sending another message \
-         fails the same way; correct what it names and start a new session"
+        "a model call failed after the agent ran Python: {0}. What ran is kept in the \
+         conversation, but sending another message fails the same way until the cause is fixed. \
+         Fix what the error names, then start a new session"
     )]
     PromptAfterWorkTerminal(String),
 }

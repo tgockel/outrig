@@ -342,10 +342,18 @@ pub(crate) async fn run(
                 ));
             }
             // Its model can answer nothing until the configuration changes,
-            // so what it holds cannot be answered either.
+            // so what it holds cannot be answered either. The terminal forms'
+            // own advice -- fix the cause, then start a new session -- is for
+            // the person at the session rather than for the parent reading why
+            // its child stopped, so those are carried by their cause alone.
             Err(failed) => {
+                let why = match &failed {
+                    AgentError::PromptTerminal(cause)
+                    | AgentError::PromptAfterWorkTerminal(cause) => cause.clone(),
+                    other => other.to_string(),
+                };
                 broken = Some(format!(
-                    "the child's model call failed, and will not recover: {failed}"
+                    "the child's model call failed, and will not recover: {why}"
                 ));
             }
         }
