@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An exec-stdio MCP server whose startup fails with an empty stderr file now says the output
+  may have been dropped.** podman can return the exit status of a process that exits within
+  milliseconds without the stderr it wrote (#422), and a `podman exec` session keeps no container
+  log, so #422's recovery -- which refills `<server>.stderr` from that log -- has nothing to read
+  for one of these. The failure arrived as an exit status beside `(empty)`, which reads as a
+  server that said nothing at all. `McpStartupFailure` now carries `stderr_may_be_lost`, set when
+  the transport exited, the tail is empty, and nothing could account for the silence, and its
+  `Display` adds a `note:` line saying the file may not be everything the server wrote. An
+  entrypoint-stdio server is unaffected: its container log is read first, and a log holding no
+  stderr confirms the silence, so no note is added. Where that log is missing -- an SELinux host,
+  a log path podman and conmon cannot be given -- the note is added for the same reason an exec'd
+  server gets it. (#727)
+
 - **A build whose context was edited and put back while buildah ran is no longer saved under
   the original key.** buildah reads the context at each `COPY`, and the check after the build
   compared only the key hashed before it with the one hashed after, so an edit made during an

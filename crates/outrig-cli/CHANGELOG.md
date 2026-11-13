@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An MCP server that crashes at startup with an empty stderr log is no longer reported as a
+  server that said nothing.** Fixed in `outrig` (#727). `mcp server "probe" ... stderr
+  (<session_dir>/logs/probe.stderr): (empty)` for a server started with `podman exec -i` could
+  mean either that the server printed nothing or that podman dropped what it printed on its way
+  out (#422), and nothing in the error told the two apart. Such an error now carries a `note:`
+  line saying the stderr may not be everything the server wrote, so the empty log is not read as
+  a silent server. Entrypoint-stdio servers, whose container log is read for exactly that text,
+  are unchanged.
+
 - **A stopping `outrig mcp` no longer unlinks the socket of the server that replaced it.** A
   Unix-socket server stopped accepting at once but removed its socket only after its open requests
   drained, up to 5 s later. A second `outrig mcp` started for the same path in that window cleared

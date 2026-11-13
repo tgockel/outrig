@@ -430,6 +430,13 @@ including one that [stops answering](#what-if-a-server-hangs) -- `outrig run` re
 on stderr, with the server's stderr so far, and exits before the REPL starts. You don't get
 partial sandboxes.
 
+A server that writes to stderr and exits within milliseconds can have that output dropped by
+podman before it reaches outrig, which leaves the failure holding an exit status and an empty
+stderr. For an entrypoint-stdio server the text is recovered from the container's own log. For
+an exec-stdio one there is no such log, so the error cannot recover it and says so instead: it
+ends with a `note:` line saying the stderr may not be everything the server wrote. An empty
+stderr with no such note is a server that really wrote nothing.
+
 When the REPL terminates (Ctrl-D, Ctrl-C, or LLM error), outrig closes each server's stdin in
 turn, waits up to 5 seconds for the process to exit, then stops the containers -- sidecars
 first, primary last. Servers don't see SIGTERM directly; they see EOF on stdin, which the MCP

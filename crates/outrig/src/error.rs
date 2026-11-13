@@ -477,9 +477,10 @@ impl McpSessionError {
     "mcp server {name:?}{declaration} failed to start: {source}\n  \
      exit: {exit}\n  \
      command: {command}\n  \
-     stderr ({stderr_path}):\n{stderr_tail}",
+     stderr ({stderr_path}):\n{stderr_tail}{note}",
     declaration = format_mcp_declaration_source(declaration_source),
     stderr_path = stderr_path.display(),
+    note = format_stderr_loss_note(*stderr_may_be_lost),
 )]
 #[non_exhaustive]
 pub struct McpStartupFailure {
@@ -489,6 +490,17 @@ pub struct McpStartupFailure {
     pub exit: String,
     pub stderr_path: PathBuf,
     pub stderr_tail: String,
+    /// Set when the empty `stderr_tail` above is not evidence that the server
+    /// was silent: podman can report the exit status of a process that exits
+    /// within milliseconds without the output it wrote (#422), and nothing
+    /// here could confirm what it wrote. An exec-stdio server is the case
+    /// that reaches it -- a `podman exec` session has no container log to
+    /// recover the text from.
+    ///
+    /// Never set while the server wrote anything, which is read from the file
+    /// rather than from `stderr_tail`: an empty file renders as `(empty)`, and
+    /// a server can write that itself.
+    pub stderr_may_be_lost: bool,
     #[source]
     pub source: Box<dyn std::error::Error + Send + Sync>,
 }
@@ -677,6 +689,19 @@ impl<T> IoPathExt<T> for std::result::Result<T, std::io::Error> {
             path: path.into(),
             source,
         })
+    }
+}
+
+/// The line [`McpStartupFailure`] adds under an empty stderr tail it cannot
+/// vouch for. Phrased as what may have happened to the output rather than as
+/// what the server did, because which of the two it was is exactly what is
+/// not known here.
+fn format_stderr_loss_note(may_be_lost: bool) -> &'static str {
+    if may_be_lost {
+        "\n  note: podman can report the exit status of a server that exits at once without \
+         the stderr it wrote, so this may not be everything the server said"
+    } else {
+        ""
     }
 }
 

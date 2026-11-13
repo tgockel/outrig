@@ -158,7 +158,9 @@ impl McpClient {
             declaration_source,
             log_dir,
             container.transcript(),
-            // An exec'd server's output is not in the container's log.
+            // An exec'd server's output is not in the container's log, so
+            // there is nothing to recover an empty stderr file from --
+            // and nothing to read one as silence on, either (#727).
             None,
             &command,
             STARTUP_TIMEOUT,
@@ -345,7 +347,9 @@ impl McpClient {
             stderr_path: self.stderr_path.clone(),
             // Read once: the server may still be running, and the settle wait
             // exists for a writer that has just exited.
-            stderr_tail: read_stderr_tail_settling_for(&self.stderr_path, Duration::ZERO).await,
+            stderr_tail: read_stderr_tail_settling_for(&self.stderr_path, Duration::ZERO)
+                .await
+                .text,
         })
     }
 
@@ -597,6 +601,13 @@ pub fn resolve_mcp_env_values(
 /// stderr, and it can relay none of it for a container that exits within
 /// milliseconds. `ctr_log` is where that text still is: see
 /// [`restore_lost_stderr`].
+///
+/// A transport without a log -- `podman exec`, which keeps none -- cannot
+/// recover that text, and cannot tell the loss from a server that wrote
+/// nothing either. Its empty tail is marked as possibly lost rather than
+/// reported as silence: see [`McpStartupFailure::stderr_may_be_lost`].
+///
+/// [`McpStartupFailure::stderr_may_be_lost`]: crate::error::McpStartupFailure::stderr_may_be_lost
 async fn enrich_startup_error(
     name: &str,
     declaration_source: Option<&str>,
@@ -613,10 +624,21 @@ async fn enrich_startup_error(
     let exit = format_exit(exit_status);
     // Not before the client has exited: until then it may still be writing the
     // file, and what is in it is not yet what it will hold.
-    if let (Some(ctr_log), Some(_)) = (ctr_log, exit_status) {
-        restore_lost_stderr(name, stderr_path, ctr_log).await;
-    }
-    let stderr_tail = read_stderr_tail_settled(stderr_path).await;
+    let lookup = match (ctr_log, exit_status) {
+        (Some(ctr_log), Some(_)) => restore_lost_stderr(name, stderr_path, ctr_log).await,
+        // A transport with no log to read, or a client still running: neither
+        // has anything to say about a file that came back empty.
+        _ => LogLookup::Inconclusive,
+    };
+    let stderr = read_stderr_tail_settled(stderr_path).await;
+    // An empty file is the server's silence only where something can vouch for
+    // it. Where nothing can, it may instead be output podman dropped on its
+    // way here (#422), and the error says so rather than leave the reader to
+    // conclude the server said nothing (#727). A client that has not exited is
+    // excluded by its own clause: it has not finished writing, so no output of
+    // its server has been dropped yet.
+    let stderr_may_be_lost =
+        exit_status.is_some() && stderr.empty && matches!(lookup, LogLookup::Inconclusive);
 
     let what = match exit_status {
         Some(status) if status.success() => None,
@@ -641,7 +663,8 @@ async fn enrich_startup_error(
         command: render_command(command),
         exit,
         stderr_path: stderr_path.to_path_buf(),
-        stderr_tail,
+        stderr_tail: stderr.text,
+        stderr_may_be_lost,
         source,
     }))
 }
@@ -656,9 +679,12 @@ async fn enrich_startup_error(
 /// error agree. The client has exited, so nothing else writes the file and the
 /// log is complete: one look is enough, which is why this is not part of the
 /// settle that follows. A file that holds anything is left as it is.
-async fn restore_lost_stderr(name: &str, stderr_path: &Path, ctr_log: &Path) {
+///
+/// What comes back says what the look settled, which is what tells a still-empty
+/// file apart from one the reader may trust: see [`LogLookup`].
+async fn restore_lost_stderr(name: &str, stderr_path: &Path, ctr_log: &Path) -> LogLookup {
     if !matches!(tokio::fs::metadata(stderr_path).await, Ok(metadata) if metadata.len() == 0) {
-        return;
+        return LogLookup::NotNeeded;
     }
     let text = match crate::container::ctr_log::stderr_text(ctr_log).await {
         Ok(text) if !text.is_empty() => text,
@@ -669,7 +695,7 @@ async fn restore_lost_stderr(name: &str, stderr_path: &Path, ctr_log: &Path) {
                 "mcp server {name:?}: neither podman's attach stream nor the container's log \
                  holds any stderr"
             );
-            return;
+            return LogLookup::ConfirmedSilent;
         }
         Err(e) => {
             tracing::debug!(
@@ -678,25 +704,52 @@ async fn restore_lost_stderr(name: &str, stderr_path: &Path, ctr_log: &Path) {
                 "mcp server {name:?}: could not read the container's log {}: {e}",
                 ctr_log.display()
             );
-            return;
+            return LogLookup::Inconclusive;
         }
     };
     match tokio::fs::write(stderr_path, &text).await {
-        Ok(()) => tracing::warn!(
-            target: "outrig::mcp",
-            server = name,
-            "mcp server {name:?}: podman's attach stream carried none of its stderr; restored \
-             {} bytes of it from the container's log into {}",
-            text.len(),
-            stderr_path.display()
-        ),
-        Err(e) => tracing::warn!(
-            target: "outrig::mcp",
-            server = name,
-            "mcp server {name:?}: could not restore its stderr into {}: {e}",
-            stderr_path.display()
-        ),
+        Ok(()) => {
+            tracing::warn!(
+                target: "outrig::mcp",
+                server = name,
+                "mcp server {name:?}: podman's attach stream carried none of its stderr; restored \
+                 {} bytes of it from the container's log into {}",
+                text.len(),
+                stderr_path.display()
+            );
+            LogLookup::Restored
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "outrig::mcp",
+                server = name,
+                "mcp server {name:?}: could not restore its stderr into {}: {e}",
+                stderr_path.display()
+            );
+            // The text exists and the file still does not hold it, which is
+            // the one thing the empty tail must not be read as silence for.
+            LogLookup::Inconclusive
+        }
     }
+}
+
+/// What a look in the container's log settled about an empty `<server>.stderr`
+/// -- the question [`enrich_startup_error`] has to answer before it reports
+/// one as the server's silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogLookup {
+    /// Nothing was missing: the file already held what the client relayed.
+    NotNeeded,
+    /// The log held stderr the client did not relay, and the file holds it now.
+    Restored,
+    /// The log is readable and carries no stderr of its own. conmon logs
+    /// everything the container writes, so the server wrote nothing and the
+    /// empty file is the whole story.
+    ConfirmedSilent,
+    /// Nothing was settled: there is no log for this transport, the log could
+    /// not be read, or what it held could not be written into the file. An
+    /// empty file here is not evidence of anything.
+    Inconclusive,
 }
 
 /// How long [`enrich_startup_error`] gives the child to exit.
@@ -767,15 +820,28 @@ fn render_stderr_tail(read: std::io::Result<Vec<u8>>) -> String {
     }
 }
 
+/// A stderr tail as it will be shown, beside what only the read it came from
+/// knows.
+///
+/// `empty` is carried rather than recovered from `text`: `(empty)` is what the
+/// rendering shows for a file holding nothing, and it is also something a
+/// server can write to its stderr, so the text cannot be asked which of the
+/// two it is. A read that failed is neither -- it renders as its own sentinel
+/// and is not empty, because nothing was seen.
+struct StderrTail {
+    text: String,
+    empty: bool,
+}
+
 /// The tail of `path`, giving a writer that has not caught up a bounded chance
 /// to land. See [`STDERR_SETTLE_CEILING`] for why one read is not enough.
-async fn read_stderr_tail_settled(path: &Path) -> String {
+async fn read_stderr_tail_settled(path: &Path) -> StderrTail {
     read_stderr_tail_settling_for(path, STDERR_SETTLE_CEILING).await
 }
 
 /// The above with the ceiling named, so a test can assert the giving-up branch
 /// without waiting out the real one.
-async fn read_stderr_tail_settling_for(path: &Path, ceiling: Duration) -> String {
+async fn read_stderr_tail_settling_for(path: &Path, ceiling: Duration) -> StderrTail {
     let deadline = tokio::time::Instant::now() + ceiling;
     loop {
         let read = read_stderr_bytes(path).await;
@@ -784,7 +850,10 @@ async fn read_stderr_tail_settling_for(path: &Path, ceiling: Duration) -> String
         // already the answer -- so neither spins.
         let still_empty = matches!(&read, Ok(bytes) if bytes.is_empty());
         if !still_empty || tokio::time::Instant::now() >= deadline {
-            return render_stderr_tail(read);
+            return StderrTail {
+                text: render_stderr_tail(read),
+                empty: still_empty,
+            };
         }
         tokio::time::sleep(STDERR_SETTLE_POLL).await;
     }
@@ -1390,31 +1459,38 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let missing = dir.path().join("nope.stderr");
-        assert_eq!(
-            read_stderr_tail_settling_for(&missing, Duration::ZERO).await,
-            "(could not read stderr file)"
-        );
+        let tail = read_stderr_tail_settling_for(&missing, Duration::ZERO).await;
+        assert_eq!(tail.text, "(could not read stderr file)");
+        // Nothing was seen, which is not the same as seeing nothing.
+        assert!(!tail.empty);
 
         let empty = dir.path().join("empty.stderr");
         tokio::fs::write(&empty, b"").await.unwrap();
-        assert_eq!(
-            read_stderr_tail_settling_for(&empty, Duration::ZERO).await,
-            "(empty)"
-        );
+        let tail = read_stderr_tail_settling_for(&empty, Duration::ZERO).await;
+        assert_eq!(tail.text, "(empty)");
+        assert!(tail.empty);
 
         let normal = dir.path().join("normal.stderr");
         tokio::fs::write(&normal, b"line one\nline two\n")
             .await
             .unwrap();
-        assert_eq!(
-            read_stderr_tail_settling_for(&normal, Duration::ZERO).await,
-            "line one\nline two"
-        );
+        let tail = read_stderr_tail_settling_for(&normal, Duration::ZERO).await;
+        assert_eq!(tail.text, "line one\nline two");
+        assert!(!tail.empty);
+
+        // A server may write the rendering of an empty file itself, and that is output.
+        let sentinel = dir.path().join("sentinel.stderr");
+        tokio::fs::write(&sentinel, b"(empty)\n").await.unwrap();
+        let tail = read_stderr_tail_settling_for(&sentinel, Duration::ZERO).await;
+        assert_eq!(tail.text, "(empty)");
+        assert!(!tail.empty);
 
         let big = dir.path().join("big.stderr");
         let payload: Vec<u8> = (0..10_000).map(|i| b'A' + (i % 26) as u8).collect();
         tokio::fs::write(&big, &payload).await.unwrap();
-        let tail = read_stderr_tail_settling_for(&big, Duration::ZERO).await;
+        let tail = read_stderr_tail_settling_for(&big, Duration::ZERO)
+            .await
+            .text;
         assert!(tail.len() <= 2048, "tail was {} bytes", tail.len());
         assert!(payload.ends_with(tail.trim_end().as_bytes()));
     }
@@ -1480,7 +1556,9 @@ pub(crate) mod tests {
             }
         });
 
-        let tail = read_stderr_tail_settling_for(&path, Duration::from_secs(5)).await;
+        let tail = read_stderr_tail_settling_for(&path, Duration::from_secs(5))
+            .await
+            .text;
         assert!(
             tail.contains("executable file not found"),
             "a late write must still reach the tail, got: {tail:?}"
@@ -1498,7 +1576,8 @@ pub(crate) mod tests {
 
         let started = std::time::Instant::now();
         let tail = read_stderr_tail_settling_for(&path, Duration::from_millis(50)).await;
-        assert_eq!(tail, "(empty)");
+        assert_eq!(tail.text, "(empty)");
+        assert!(tail.empty);
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "giving up took {:?}",
@@ -1554,6 +1633,9 @@ pub(crate) mod tests {
             "stderr_tail={:?}",
             payload.stderr_tail
         );
+        // Stderr that arrived is never qualified: the note is for the file
+        // that came back empty.
+        assert!(!payload.stderr_may_be_lost);
 
         let display = err.to_string();
         assert!(display.contains("svc"));
@@ -1678,8 +1760,10 @@ pub(crate) mod tests {
         std::fs::write(&stderr_path, b"").unwrap();
         let log = log_holding(&entry("stdout", "F", "protocol only"));
 
-        restore_lost_stderr("svc", &stderr_path, log.path()).await;
+        let lookup = restore_lost_stderr("svc", &stderr_path, log.path()).await;
 
+        // Which is the answer that lets the empty file be reported as the server's silence.
+        assert_eq!(lookup, LogLookup::ConfirmedSilent);
         assert_eq!(std::fs::read_to_string(&stderr_path).unwrap(), "");
     }
 
@@ -1709,6 +1793,134 @@ pub(crate) mod tests {
         assert_eq!(failure.exit, "still running (wait timed out)");
         assert_eq!(failure.stderr_tail, "(empty)");
         assert_eq!(std::fs::read_to_string(&stderr_path).unwrap(), "");
+        // Nothing has been dropped: the client is alive and the file is still
+        // its to fill, so the empty tail gets no note about lost output.
+        assert!(!failure.stderr_may_be_lost);
+        assert!(!err.to_string().contains("note:"), "{err}");
+    }
+
+    /// #727: an exec-stdio server has no container log behind it, so an empty `<server>.stderr`
+    /// is either a server that said nothing or stderr podman dropped on the way (#422), and
+    /// nothing here can tell which. The error says as much, so the exit status beside `(empty)`
+    /// is not read as proof the server was silent.
+    #[tokio::test(start_paused = true)]
+    async fn an_exec_whose_stderr_file_came_back_empty_says_it_may_have_been_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut child, stderr_path, argv) =
+            silent_child_with_stderr_file(dir.path(), "exit 0").await;
+        // Reaped on the real clock, before the paused one can run the wait out: this is about
+        // the client that exited, which is the only one whose file is final.
+        child.wait().await.unwrap();
+
+        let err = enrich_startup_error(
+            "probe",
+            Some("config.toml"),
+            &argv,
+            &stderr_path,
+            // An exec'd server's output is not in the container's log.
+            None,
+            &mut child,
+            connection_closed(),
+        )
+        .await;
+
+        let OutrigError::McpStartupFailed(failure) = &err else {
+            panic!("expected McpStartupFailed, got {err:?}");
+        };
+        assert_eq!(failure.exit, "code 0");
+        assert_eq!(failure.stderr_tail, "(empty)");
+        assert!(failure.stderr_may_be_lost);
+        let rendered = err.to_string();
+        assert!(rendered.contains("(empty)"), "{rendered}");
+        let note = "note: podman can report the exit status of a server that exits at once \
+                    without the stderr it wrote";
+        assert!(rendered.contains(note), "{rendered}");
+    }
+
+    /// `(empty)` is how an empty file is shown, and it is also something a server can write.
+    /// A server that writes it has written stderr: the tail is its output, and the note that
+    /// qualifies a *missing* one would deny what is right there.
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_wrote_the_empty_sentinel_keeps_it_unqualified() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut child, stderr_path, argv) =
+            silent_child_with_stderr_file(dir.path(), "printf '(empty)\\n' >&2; exit 0").await;
+        child.wait().await.unwrap();
+
+        let err = enrich_startup_error(
+            "probe",
+            None,
+            &argv,
+            &stderr_path,
+            None,
+            &mut child,
+            connection_closed(),
+        )
+        .await;
+
+        let OutrigError::McpStartupFailed(failure) = &err else {
+            panic!("expected McpStartupFailed, got {err:?}");
+        };
+        assert_eq!(failure.stderr_tail, "(empty)");
+        assert!(!failure.stderr_may_be_lost);
+        assert!(!err.to_string().contains("note:"), "{err}");
+    }
+
+    /// And a transport that does have a log keeps its silence silence: conmon logged everything
+    /// the container wrote, so a log without stderr settles the empty file rather than leaving
+    /// it open to #422's doubt.
+    #[tokio::test(start_paused = true)]
+    async fn a_log_that_carries_no_stderr_leaves_the_empty_file_unqualified() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut child, stderr_path, argv) =
+            silent_child_with_stderr_file(dir.path(), "exit 0").await;
+        child.wait().await.unwrap();
+        let log = log_holding(&entry("stdout", "F", r#"{"jsonrpc":"2.0","id":0}"#));
+
+        let err = enrich_startup_error(
+            "svc",
+            None,
+            &argv,
+            &stderr_path,
+            Some(log.path()),
+            &mut child,
+            connection_closed(),
+        )
+        .await;
+
+        let OutrigError::McpStartupFailed(failure) = &err else {
+            panic!("expected McpStartupFailed, got {err:?}");
+        };
+        assert_eq!(failure.stderr_tail, "(empty)");
+        assert!(!failure.stderr_may_be_lost);
+        assert!(!err.to_string().contains("note:"), "{err}");
+    }
+
+    /// A log that cannot be read settles nothing, so the doubt stands -- the same answer the
+    /// transport without a log gets, for the same reason.
+    #[tokio::test(start_paused = true)]
+    async fn a_log_that_cannot_be_read_leaves_the_doubt_standing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut child, stderr_path, argv) =
+            silent_child_with_stderr_file(dir.path(), "exit 0").await;
+        child.wait().await.unwrap();
+
+        let err = enrich_startup_error(
+            "svc",
+            None,
+            &argv,
+            &stderr_path,
+            Some(&dir.path().join("no-such-container.log")),
+            &mut child,
+            connection_closed(),
+        )
+        .await;
+
+        let OutrigError::McpStartupFailed(failure) = &err else {
+            panic!("expected McpStartupFailed, got {err:?}");
+        };
+        assert_eq!(failure.stderr_tail, "(empty)");
+        assert!(failure.stderr_may_be_lost);
     }
 
     /// The whole path inside `McpClient`: a transport that exits at once with nothing on its
