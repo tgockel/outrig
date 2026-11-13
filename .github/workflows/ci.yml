@@ -29,6 +29,13 @@ jobs:
       # Both musl targets are installed below, so every row can satisfy it. The
       # fallback is `fallback-e2e`'s to test.
       OUTRIG_REQUIRE_ENTER: "1"
+      # `network::tests` reads `SO_ORIGINAL_DST` on a loopback connection, which
+      # needs conntrack. Where there is none -- a rootless container, which is
+      # where this repo's own agent runs -- the test that needs it returns early
+      # with a line on stderr instead of failing. A runner has conntrack, so a
+      # missing option there is a broken runner rather than a sandbox: this
+      # makes that test panic rather than pass having tested nothing.
+      OUTRIG_TEST_REQUIRE_CONNTRACK: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -169,6 +176,9 @@ jobs:
       # about the musl launcher, so a missing musl build fails the row here
       # instead; `fallback-e2e` runs the primary-view tests on the fallback.
       OUTRIG_REQUIRE_ENTER: "1"
+      # This row runs the library's unit tests too, and the runner has
+      # conntrack; see the `cargo` job.
+      OUTRIG_TEST_REQUIRE_CONNTRACK: "1"
     strategy:
       fail-fast: false
       matrix:

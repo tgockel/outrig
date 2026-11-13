@@ -26,6 +26,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+One unit test needs conntrack:
+`network::tests::a_direct_connection_to_the_listener_is_refused_not_dialed` reads
+`SO_ORIGINAL_DST` on a loopback connection, which a rootless container -- including the one
+this repo's own agent runs in -- cannot answer. There it returns early with a line on stderr
+rather than failing. CI sets `OUTRIG_TEST_REQUIRE_CONNTRACK=1`, which makes it panic
+instead; set it locally when the environment is supposed to have conntrack and the skip would
+hide a real break.
+
 ## Public-API snapshots
 
 `crates/outrig/public-api.txt` and `crates/outrig-cli/public-api.txt` are generated records of
