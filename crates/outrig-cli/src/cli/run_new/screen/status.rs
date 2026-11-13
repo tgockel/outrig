@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use super::facts::{Fact, Phase, cut};
+use crate::cli::session_setup::plural;
 
 /// How many characters of a retried or moved call's error the line shows.
 const ERROR_MAX: usize = 60;
@@ -31,6 +32,11 @@ pub(super) struct Status {
     /// The user's messages the agent has yet to take; `None` once a gap in
     /// the events may have hidden one being posted or taken.
     waiting: Option<u64>,
+    /// Whether the round that ended last ended on an error: what an idle
+    /// session says in place of `ready`. A child agent's rounds never reach
+    /// here -- [`super::facts`] keeps them apart -- so this is the main
+    /// agent's.
+    round_failed: bool,
     /// What the last round's code left running.
     still_running: Option<String>,
     /// What the model last said this round, which stands in for "is working"
@@ -95,6 +101,7 @@ impl Default for Status {
             failed: None,
             tokens: 0,
             waiting: Some(0),
+            round_failed: false,
             still_running: None,
             said: None,
             sent: false,
@@ -119,6 +126,7 @@ impl Status {
             Fact::AgentStarted { model } => self.model = Some(model.clone()),
             Fact::RoundStarted { .. } => {
                 self.sent = false;
+                self.round_failed = false;
                 self.still_running = None;
                 self.said = None;
             }
@@ -197,10 +205,15 @@ impl Status {
                 }
             }
             Fact::Attempted => self.failed = None,
-            Fact::RoundEnded { tokens, .. } => {
+            Fact::RoundEnded { tokens, error, .. } => {
                 self.tokens += tokens.unwrap_or(0);
                 self.failed = None;
                 self.said = None;
+                // The call that failed is forgotten with the round; how the
+                // round ended is kept until another round ends. Reading it
+                // from each end as well as clearing it at the next start
+                // leaves the line right when a gap hid that start.
+                self.round_failed = error.is_some();
             }
             Fact::Spent(tokens) => {
                 self.tokens += tokens;
@@ -297,7 +310,11 @@ impl Status {
                 }
             }
             Phase::Ready => {
-                parts.push("ready".to_string());
+                parts.push(if self.round_failed {
+                    "last round failed".to_string()
+                } else {
+                    "ready".to_string()
+                });
                 if let Some(running) = &self.still_running {
                     parts.push(format!("still running: {running}"));
                 }
@@ -305,8 +322,11 @@ impl Status {
         }
         match self.waiting {
             Some(0) => {}
-            Some(waiting) => parts.push(format!("{waiting} waiting for the agent")),
-            None => parts.push("messages waiting unknown".to_string()),
+            Some(waiting) => parts.push(format!(
+                "{waiting} {} unread by the agent",
+                plural(waiting as usize, "message", "messages")
+            )),
+            None => parts.push("unread messages: unknown".to_string()),
         }
         if self.tokens > 0 {
             parts.push(format!("{} tokens", count(self.tokens)));
@@ -534,11 +554,11 @@ mod tests {
         assert_eq!(status.shown(now).text, "a is working");
     }
 
-    /// The count of the user's messages waiting rises as they are posted and
-    /// falls as the agent takes them; the agent's own sends do not touch it.
-    /// After a gap it is unknown until the channel next says.
+    /// The count of the user's messages the agent has not read rises as they
+    /// are posted and falls as the agent takes them; the agent's own sends do
+    /// not touch it. After a gap it is unknown until the channel next says.
     #[test]
-    fn the_waiting_count_follows_the_users_messages_only() {
+    fn the_unread_count_follows_the_users_messages_only() {
         let now = Instant::now();
         let mut status = after(
             &[
@@ -552,17 +572,17 @@ mod tests {
         );
         assert_eq!(
             status.shown(now).text,
-            "the model is working · 1 waiting for the agent"
+            "the model is working · 1 message unread by the agent"
         );
         status.apply(&Fact::Missed(2), now);
         assert_eq!(
             status.shown(now).text,
-            "the model is working · messages waiting unknown"
+            "the model is working · unread messages: unknown"
         );
         status.queued(2);
         assert_eq!(
             status.shown(now).text,
-            "the model is working · 2 waiting for the agent"
+            "the model is working · 2 messages unread by the agent"
         );
         status.queued(5);
         assert_eq!(status.waiting, Some(2), "a known count is not overwritten");
@@ -593,6 +613,71 @@ mod tests {
         status.apply(&Fact::AgentSent, now);
         assert!(status.ended(None), "the agent sent something");
         assert_eq!(status.shown(now).text, "ready · 12.3k tokens");
+    }
+
+    /// A round that ended on an error leaves the idle line saying so in place
+    /// of `ready`: the call that failed is forgotten with the round, that the
+    /// round failed is not, until the next round begins. A child agent's
+    /// failed round reaches the screen as a note (see [`super::facts`]), which
+    /// leaves the line alone.
+    #[test]
+    fn an_idle_session_says_the_last_round_failed() {
+        let now = Instant::now();
+        let ended = |round: u32, error: Option<&str>| Fact::RoundEnded {
+            round,
+            tokens: Some(2_000),
+            error: error.map(str::to_string),
+        };
+        let mut status = after(
+            &[
+                Fact::RoundStarted { round: 1 },
+                Fact::Phase(Phase::Model),
+                Fact::Posted,
+                Fact::Posted,
+                ended(1, Some("HTTP 500 Internal Server Error")),
+                Fact::Phase(Phase::Ready),
+            ],
+            now,
+        );
+        assert_eq!(
+            status.shown(now).text,
+            "last round failed · 2 messages unread by the agent · 2.0k tokens"
+        );
+        assert!(!status.apply(
+            &Fact::Note {
+                text: "c3: round 2's model calls failed: boom".into(),
+                inline: false,
+            },
+            now
+        ));
+        assert!(status.shown(now).text.starts_with("last round failed"));
+        status.apply(&Fact::RoundStarted { round: 2 }, now);
+        assert!(status.shown(now).text.starts_with("ready"));
+    }
+
+    /// A gap in the events can hide the next round's start, which is what
+    /// clears the failure; the round's own end says how it went, so a round
+    /// that succeeded puts `ready` back without it.
+    #[test]
+    fn a_round_that_succeeded_clears_a_failure_whose_start_was_missed() {
+        let now = Instant::now();
+        let ended = |round: u32, error: Option<&str>| Fact::RoundEnded {
+            round,
+            tokens: None,
+            error: error.map(str::to_string),
+        };
+        let mut status = after(
+            &[
+                Fact::RoundStarted { round: 1 },
+                ended(1, Some("HTTP 500 Internal Server Error")),
+                Fact::Phase(Phase::Ready),
+            ],
+            now,
+        );
+        assert_eq!(status.shown(now).text, "last round failed");
+        status.apply(&Fact::Missed(4), now);
+        status.apply(&ended(2, None), now);
+        assert_eq!(status.shown(now).text, "ready · unread messages: unknown");
     }
 
     /// Facts that leave the line as it was say so, so the screen draws no
@@ -724,12 +809,12 @@ mod tests {
         status.apply(&Fact::Missed(3), now);
         assert_eq!(
             status.shown(now).text,
-            "Python running · execution 4 · 0.0s · messages waiting unknown"
+            "Python running · execution 4 · 0.0s · unread messages: unknown"
         );
         status.apply(&awaiting, now);
         assert_eq!(
             status.shown(now).text,
-            "awaiting ci_run · execution 4 · 0.0s · messages waiting unknown"
+            "awaiting ci_run · execution 4 · 0.0s · unread messages: unknown"
         );
     }
 

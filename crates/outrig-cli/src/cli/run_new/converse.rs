@@ -821,7 +821,10 @@ impl Terminal<'_> {
             screen.queued(waiting);
         }
         if mid_round {
-            let note = format!("[outrig] queued for the agent ({waiting} waiting)");
+            let note = format!(
+                "[outrig] queued; the agent has {waiting} {} unread",
+                crate::cli::session_setup::plural(waiting, "message", "messages")
+            );
             match self.view {
                 Frontend::Lines(out) => out.line(&note),
                 Frontend::Screen(screen) => screen.detail(&note),

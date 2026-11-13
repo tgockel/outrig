@@ -286,6 +286,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig run-new`'s status line says what is unread, and that a round failed.** The count of
+  the user's messages the agent has not read read `2 waiting for the agent`, which named neither
+  messages nor reading and, beside `ready`, read as a contradiction; it now reads `2 messages
+  unread by the agent`, and `unread messages: unknown` after a gap in the events. An idle session
+  whose last round ended on an error reads `last round failed` in place of `ready` until the next
+  round starts, so a session that never got an answer does not look idle and well; why it failed
+  stays on the error line printed into the conversation. The note for a line typed while the agent
+  works reads `[outrig] queued; the agent has 1 message unread`. A child agent's failed round
+  leaves the line alone, as its rounds are its own. (#849)
 - **A child agent is shown by its name as well as its id in `outrig run-new`.** Its rows read
   `city_fact (c3)`, from the name its `agent.spawned` gave it, and the bare `c3` when that event
   was missed. `events.jsonl` is unchanged.

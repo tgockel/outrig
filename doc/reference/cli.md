@@ -429,8 +429,8 @@ describes anything in at most 8 KiB.
 `runtime.channels["user"]` in its Python, and the model is told how many messages are waiting
 there -- never what they say. It reads one by running code that receives it, and answers by
 sending on the same channel. A line typed while the agent is still working is queued the same
-way, and `[outrig] queued for the agent (N waiting)` says so, or on a terminal the status line
-counts it; it does not start a second round.
+way, and `[outrig] queued; the agent has N messages unread` says so, or on a terminal the status
+line counts it; it does not start a second round.
 The model hears of it in the next result its code returns, or in a round of its own once the
 current one ends. A channel holds 256 unread messages and refuses the next, saying so; a message
 is at most 1 MiB either way.
@@ -568,8 +568,11 @@ session ends, and a status line and an input box sit below it. The status line s
 is doing: the model working -- the latest thing it said, once it has said anything, each message
 replacing the last -- Python running and for how long, and what it awaits once its code has been
 in `runtime.wait` for a second, a failed call and when it is retried, the model a call moved from
-and why, how many of your messages the agent has yet to read, what the last round left running,
-and the tokens spent. The agent's working -- the model's own text in
+and why, how many of your messages the agent has yet to read -- `2 messages unread by the agent`,
+or `unread messages: unknown` after a gap in the events -- what the last round left running, and
+the tokens spent. An idle session reads `ready`, or `last round failed` when the round that ended
+last ended on an error, until the next round begins; why it failed is on the error line printed
+into the conversation. The agent's working -- the model's own text in
 full, each submission's source and what it printed, retries and failovers, and log lines -- stays
 out of the conversation. Ctrl-O opens it in a view of its own, scrolled with the arrow keys, PgUp
 and PgDn, Home and End, and closed with Esc; with `-v` it is printed in the conversation too. A

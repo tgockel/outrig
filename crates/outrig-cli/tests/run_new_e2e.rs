@@ -684,7 +684,7 @@ async fn typed_input_reaches_the_agent_mid_round_and_its_sends_reach_the_termina
         "stdout is the agent's sends alone"
     );
     assert!(
-        stderr.contains("[outrig] queued for the agent (1 waiting)"),
+        stderr.contains("[outrig] queued; the agent has 1 message unread"),
         "the line typed mid-round was queued, and said so: {stderr}"
     );
 
@@ -802,7 +802,7 @@ async fn a_typed_line_ends_a_wait_and_the_round_goes_on() {
     assert!(status.success(), "{status}: {stderr}");
     assert_eq!(stdout, "", "the agent sent nothing");
     assert!(
-        stderr.contains("[outrig] queued for the agent (1 waiting)"),
+        stderr.contains("[outrig] queued; the agent has 1 message unread"),
         "the line typed mid-wait was queued, and said so: {stderr}"
     );
 
@@ -2936,7 +2936,7 @@ async fn on_a_terminal_the_conversation_is_what_was_sent() {
     terminal.shows("echo: hello").await;
     terminal.shows("Python running").await;
     terminal.press("second\r");
-    terminal.shows("1 waiting for the agent").await;
+    terminal.shows("1 message unread by the agent").await;
     assert!(
         !terminal.screen().contains("ch.receive()"),
         "the Python is detail:\n{}",
@@ -2952,11 +2952,11 @@ async fn on_a_terminal_the_conversation_is_what_was_sent() {
     terminal.shows("echo: hello").await;
 
     std::fs::write(repo.path().join("release"), b"").expect("release the first round");
-    terminal.shows("ready · 1 waiting").await;
+    terminal.shows("ready · 1 message unread").await;
     // A round of its own, whose code reads the oldest message waiting.
     terminal.press("third\r");
     terminal.shows("got second").await;
-    terminal.shows("ready · 1 waiting").await;
+    terminal.shows("ready · 1 message unread").await;
     assert!(
         !terminal.screen().contains("commentary"),
         "the model's own text is detail:\n{}",
