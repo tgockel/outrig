@@ -1102,6 +1102,11 @@ async fn drive_rounds(
         //
         // The steers a result carried are in the history already, on that
         // result: the turn took back any whose result it lost.
+        //
+        // Kept for the transcript, which records them below the round's
+        // outcome (#708). They are the parent's words, like the delivered
+        // ones recorded above, but the model reads them only in the round
+        // after this one, so the log gives them a block of their own.
         let steers = shared.close_injections(failure.is_none());
         history.extend(steers.iter().map(|text| injection::steer_message(text)));
 
@@ -1144,6 +1149,17 @@ async fn drive_rounds(
             Some(Outcome::Result(text)) => log.record_outcome("result", &text),
             Some(Outcome::Error(text)) => log.record_outcome("error", &text),
             None => log.record_outcome("no result", "round ended without outrig__set_result"),
+        }
+
+        // The steers the round folded into its history without sending, in the
+        // order the parent sent them (#708). Written after the outcome and
+        // ahead of the next round's prompt, which is where the model reads
+        // them, and under a kind of their own, since no model call this round
+        // carried them. A round that did not fail hands back none: its
+        // leftovers queue as the next round's prompt, which `record_prompt`
+        // writes.
+        for steer in &steers {
+            log.record_pending_steer(steer);
         }
     }
 }
@@ -3135,10 +3151,15 @@ mod tests {
     /// the failure, sends next. One that went out, with the results of a batch
     /// before the failure, stays on its result where the round keeps that, and
     /// is folded in where it does not. Either way the next round sees it once.
+    ///
+    /// The transcript says which of the two happened (#708): a steer the round
+    /// delivered and kept is a `--- steer ---` block, and one it folded in is a
+    /// `--- pending steer ---` block between the round's outcome and the next
+    /// round's prompt, where the model reads it.
     async fn a_failed_round_passes_its_steer_on_once(status: StatusCode, delivered: bool) {
         let (_live, tools) = counted_tools();
         let mut provider = ScriptedProvider::start().await;
-        let (registry, _log_dir) = launch_probe_with(&provider, 4, tools).await;
+        let (registry, log_dir) = launch_probe_with(&provider, 4, tools).await;
 
         let mut call = provider.next_call().await;
         steer(&registry);
@@ -3162,7 +3183,44 @@ mod tests {
             1,
             "marked as the parent's"
         );
+        // A failed endpoint keeps the tool call and the result the steer rode
+        // on (#197); an error keeps nothing of the turn, so the delivery is
+        // taken back and the steer is folded in like one never sent.
+        let kept = delivered && status == StatusCode::SERVICE_UNAVAILABLE;
+        assert_steer_blocks(&log_dir, kept).await;
         call.reply("ok");
+    }
+
+    /// The transcript `probe` wrote for the failed round above: the steer is in
+    /// it exactly once, as the block that says whether the round delivered it,
+    /// and a folded-in one sits between that round's outcome and the prompt of
+    /// the round the parent started next.
+    async fn assert_steer_blocks(log_dir: &tempfile::TempDir, kept: bool) {
+        let transcript = probe_transcript(log_dir).await;
+        let block = |kind: &str| format!("\n--- {kind} ---\n{STEER}\n");
+        let count = |kind: &str| transcript.matches(&block(kind)).count();
+        let (steers, pending) = if kept { (1, 0) } else { (0, 1) };
+        assert_eq!(
+            (count("steer"), count("pending steer")),
+            (steers, pending),
+            "the steer is recorded once, under the block its delivery calls for: {transcript}"
+        );
+        if kept {
+            return;
+        }
+        let pending_at = transcript
+            .find(&block("pending steer"))
+            .expect("the folded-in steer is recorded");
+        let failure_at = transcript
+            .find("\n--- error ---\nround failed")
+            .expect("the failed round's outcome is recorded");
+        let prompt_at = transcript
+            .find(&format!("\n=== prompt ===\n{FOLLOW_UP}\n"))
+            .expect("the next round's prompt is recorded");
+        assert!(
+            failure_at < pending_at && pending_at < prompt_at,
+            "the steer is recorded after the failure and before the next prompt: {transcript}"
+        );
     }
 
     /// The `Err` arm: a 400 is terminal, so the turn errors out of

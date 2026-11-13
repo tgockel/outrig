@@ -114,14 +114,25 @@ impl Transcript {
     }
 
     /// A steer the parent's `outrig__subagent_send` put in front of the model
-    /// mid-round (#386). One line per steer that actually reached it --
-    /// `run_rounds` reads [`super::state::SubagentShared::delivered_injections`]
+    /// mid-round (#386). One block per steer that actually reached it --
+    /// `drive_rounds` reads [`super::state::SubagentShared::delivered_injections`]
     /// for the list, so a steer a failed turn took the delivery back on is not
-    /// recorded here as read, even though the round folds it into history
-    /// afterwards (`record_outcome` and the next round's prompt cover that
-    /// case, same as any other message in the history).
+    /// recorded here as read. That one, and every other the round left
+    /// undelivered, goes to [`Self::record_pending_steer`] instead (#708).
     pub fn record_steer(&mut self, text: &str) {
         self.write(&format!("\n--- steer ---\n{text}\n"));
+    }
+
+    /// A steer no model call of a failed round carried, which that round
+    /// appended to the subagent's history to reach the model with whatever
+    /// the parent sends next (#708). One block per steer, in the order the
+    /// parent sent them, after the round's outcome and ahead of the next
+    /// round's prompt -- the order the model reads them in.
+    ///
+    /// A kind of its own rather than `--- steer ---`, which says the model
+    /// read it within the round recorded above.
+    pub fn record_pending_steer(&mut self, text: &str) {
+        self.write(&format!("\n--- pending steer ---\n{text}\n"));
     }
 
     pub fn record_outcome(&mut self, kind: &str, body: &str) {

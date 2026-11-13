@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cache key hashes, so the build was discarded as changed every time and the retry failed the same
   way. `setup` now refuses the run before anything is hashed or built, naming the directory. (#909)
 
+- **A steer a failed round could not deliver now reaches the subagent transcript.** A round that
+  fails folds every steer no tool result carried into the subagent's history, so the round the
+  parent starts next sends them to the model -- but nothing wrote them to `subagent-<name>.log`,
+  and #386's `--- steer ---` block covers only the ones a round delivered. Reading the transcript
+  afterwards showed the next round act on a parent message no line named, the symptom #386
+  reported, and a `outrig__subagent_send` the parent never followed up on appeared nowhere at all.
+  Each one is now a `--- pending steer ---` block, in the order the parent sent them, between the
+  failed round's outcome and the next round's prompt -- the order the model reads them in, and a
+  kind of its own so they are not read as having been delivered. A round that does not fail writes
+  the transcript it did before. (#708)
+
 - **A global config with a hard link now gets a warning.** The global-config guards compare
   pathnames, so a second name for the file inside a read-write workspace or mount is invisible to
   them, and a write through it (`>>`) rewrites the global config. Finding the aliases would take a

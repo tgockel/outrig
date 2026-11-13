@@ -293,13 +293,15 @@ only the model's text. Subagent activity shows up two other ways:
   that produced no text -- so a fan-out's waits and failures are attributable to the round that
   is having them. A subagent whose task ended unexpectedly says so on a line labeled the same
   way. The primary agent's own lines are unlabeled.
-- In a transcript holding that subagent's prompts, any steer delivered mid-round, replies,
-  published outcomes, and the end of a task that stopped unexpectedly. A subagent the primary
-  launched writes `<session_dir>/logs/subagent-<name>.log`, beside the MCP servers' stderr
-  logs. One launched by a subagent writes into a directory named for its parent, beside the
-  parent's own transcript: `audit`'s subagent `scan` writes `logs/subagent-audit/subagent-scan.log`,
-  and `scan`'s own go in `logs/subagent-audit/subagent-scan/`. Subagents sharing a name under
-  different parents never share a file.
+- In a transcript holding that subagent's prompts, any steer delivered mid-round as a
+  `--- steer ---` block, any a failed round could not deliver and folded into its history as a
+  `--- pending steer ---` block below that round's outcome, replies, published outcomes, and the
+  end of a task that stopped unexpectedly. A subagent the primary launched writes
+  `<session_dir>/logs/subagent-<name>.log`, beside the MCP servers' stderr logs. One launched by a
+  subagent writes into a directory named for its parent, beside the parent's own transcript:
+  `audit`'s subagent `scan` writes `logs/subagent-audit/subagent-scan.log`, and `scan`'s own go in
+  `logs/subagent-audit/subagent-scan/`. Subagents sharing a name under different parents never
+  share a file.
 
 Each launch starts its transcript with a header naming the subagent's whole path, and its model
 when the launch named one, such as `=== subagent audit/scan ===`. A name released and launched
