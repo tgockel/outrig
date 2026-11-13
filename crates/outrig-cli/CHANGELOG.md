@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`discard` and `clean` no longer remove a session in the moment its launch publishes its
+  record.** A launch wrote `session.json` before taking the claim that marks its directory as
+  live, so a `discard --yes` or `clean` that read the directory in between found a record with no
+  owner and no container, and removed the record and logs of a session that was starting. The
+  claim is now taken after the `--session-dir` checks and before the record is written, and a
+  write that fails gives it back. (#655)
+
 - **A stopping `outrig mcp` no longer unlinks the socket of the server that replaced it.** A
   Unix-socket server stopped accepting at once but removed its socket only after its open requests
   drained, up to 5 s later. A second `outrig mcp` started for the same path in that window cleared
