@@ -727,10 +727,8 @@ fn pin_repo_declared_mounts_with(
             return Ok(None);
         };
         let host = canonical_or_normalized(&host);
-        let reason = if home.as_ref().is_some_and(|h| h.starts_with(&host)) {
-            "it is your home directory or above it".to_string()
-        } else if access == MountAccess::ReadWrite
-            && let Some(why) = global.as_ref().and_then(|g| g.rewritable_through(&host))
+        let reason = if let Some(why) =
+            reaches_the_operators_files(&host, access, home.as_deref(), global.as_ref())
         {
             why
         } else if host.to_str().is_none() {
@@ -746,14 +744,7 @@ fn pin_repo_declared_mounts_with(
             });
             return Ok(Some(host));
         };
-        Err(OutrigError::Configuration(format!(
-            "refusing {what} {} declared in {}: {reason}, so an agent could edit files \
-             that govern the next session\n\
-             help: a repo config may not do this; declare it in the global config if you \
-             mean it, or pass --volume",
-            host.display(),
-            source.config_path().display()
-        )))
+        Err(repo_declared_refusal(what, &host, source, &reason))
     };
     let bound = starts_bindings && !cfg.bindings.is_empty();
     let workspace = &mut cfg.workspace;
@@ -797,6 +788,127 @@ fn pin_repo_declared_mounts_with(
         }
     }
     Ok(pinned)
+}
+
+/// Why a repo-declared host path may not be mounted: it reaches the
+/// operator's own files. `host` and `home` are both canonical, as the home
+/// rule compares them; only a read-write mount is asked about the global
+/// config, since a read-only one cannot rewrite it.
+fn reaches_the_operators_files(
+    host: &Path,
+    access: MountAccess,
+    home: Option<&Path>,
+    global: Option<&GlobalConfigReach>,
+) -> Option<String> {
+    if home.is_some_and(|home| home.starts_with(host)) {
+        return Some("it is your home directory or above it".to_string());
+    }
+    if access != MountAccess::ReadWrite {
+        return None;
+    }
+    global.and_then(|global| global.rewritable_through(host))
+}
+
+/// The refusal of `what` at `host`, which `source` declared, for `reason`:
+/// one wording for every launch that holds a repo config to these rules.
+fn repo_declared_refusal(
+    what: &str,
+    host: &Path,
+    source: &ConfigSource,
+    reason: &str,
+) -> OutrigError {
+    OutrigError::Configuration(format!(
+        "refusing {what} {} declared in {}: {reason}, so an agent could edit files \
+         that govern the next session\n\
+         help: a repo config may not do this; declare it in the global config if you \
+         mean it, or pass --volume",
+        host.display(),
+        source.config_path().display()
+    ))
+}
+
+/// Refuse a repo-declared host path that reaches the operator's own files,
+/// for a launch that mounts none of them itself: `outrig run-new
+/// <script.py>`, whose sessions are the host program's and mount what it asks
+/// for, never the configuration's workspace or its mounts.
+///
+/// The program is shown both, as `outrig.config()`, and mounting what the
+/// configuration names is one thing a program is written to do -- so a repo
+/// config that names the home directory, or the global config read-write,
+/// reaches the next session's agent through it. What a repository declares is
+/// held to [`pin_repo_declared_mounts`]' rules, with its wording, before the
+/// program starts (#646).
+///
+/// Nothing is pinned, and a path that is not UTF-8 is not refused: outrig
+/// binds none of these paths, so there is no bind to hold to the path checked
+/// nor one to render it. A program that mounts a path it was shown names it
+/// itself, and the session it asks for checks what it named.
+pub(crate) fn refuse_repo_declared_mounts(
+    cfg: &Config,
+    repo_root: &Path,
+    global_cfg: Option<&Path>,
+) -> Result<()> {
+    let home = BaseDirs::new().map(|d| d.home_dir().to_path_buf());
+    refuse_repo_declared_mounts_with(cfg, repo_root, home.as_deref(), global_cfg)
+}
+
+/// [`refuse_repo_declared_mounts`] against an explicit `home` (`None` skips
+/// the home rule), as [`pin_repo_declared_mounts_with`] is.
+fn refuse_repo_declared_mounts_with(
+    cfg: &Config,
+    repo_root: &Path,
+    home: Option<&Path>,
+    global_cfg: Option<&Path>,
+) -> Result<()> {
+    let home = home.map(canonical_or_normalized);
+    let global = global_cfg.map(GlobalConfigReach::of);
+    for (what, source, host, access) in declared_host_paths(cfg, repo_root) {
+        let Some(source) = source.filter(|s| !matches!(s, ConfigSource::Global { .. })) else {
+            continue;
+        };
+        let host = canonical_or_normalized(&host);
+        if let Some(reason) =
+            reaches_the_operators_files(&host, access, home.as_deref(), global.as_ref())
+        {
+            return Err(repo_declared_refusal(&what, &host, source, &reason));
+        }
+    }
+    Ok(())
+}
+
+/// Every host path `cfg` declares for a bind mount -- the workspace's, each
+/// `[[workspace.mounts]]` entry's, and each sidecar mount's -- as what a
+/// diagnostic calls it, what declared it, where it resolves, and how it would
+/// be mounted. The workspace is always read-write.
+fn declared_host_paths<'a>(
+    cfg: &'a Config,
+    repo_root: &'a Path,
+) -> impl Iterator<Item = (String, Option<&'a ConfigSource>, PathBuf, MountAccess)> + 'a {
+    let workspace = std::iter::once((
+        "workspace host-path".to_string(),
+        cfg.workspace.config_source(),
+        cfg.workspace.resolved_host_path(repo_root),
+        MountAccess::ReadWrite,
+    ));
+    let mounts = cfg.workspace.mounts.iter().map(move |m| {
+        (
+            "mount".to_string(),
+            m.config_source(),
+            m.resolved_host_path(repo_root),
+            m.access(),
+        )
+    });
+    let sidecars = cfg.sidecars.iter().flat_map(move |(name, sidecar)| {
+        sidecar.mounts.iter().map(move |m| {
+            (
+                format!("sidecar {name:?} mount"),
+                m.config_source(),
+                m.resolved_host_path(repo_root),
+                m.access(),
+            )
+        })
+    });
+    workspace.chain(mounts).chain(sidecars)
 }
 
 /// `path` with `.` and `..` resolved textually, as the harness places a
@@ -1609,6 +1721,97 @@ mod tests {
                 assert_eq!(mount.declared_container_path(), Some(link.as_path()));
             }
         }
+    }
+
+    /// A host program's launch mounts nothing the configuration names, but is
+    /// shown all of it, so a repo-declared path is held to the same rules,
+    /// refused in the same words, and never pinned (#646). A path that is not
+    /// UTF-8 is the pin's own rule: nothing renders a bind of it here.
+    #[test]
+    fn the_program_guard_refuses_what_a_repo_may_not_declare_and_pins_nothing() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let home = root.join("home/u");
+        let conf = root.join("conf");
+        let data = root.join("data");
+        for dir in [&home, &conf, &data] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let global = conf.join("config.toml");
+        let odd = root.join(OsStr::from_bytes(b"odd\xff"));
+        fs::create_dir_all(&odd).unwrap();
+        let [odd_link, data_link] = [("link", &odd), ("data-link", &data)].map(|(name, real)| {
+            let link = root.join(name);
+            std::os::unix::fs::symlink(real, &link).unwrap();
+            link
+        });
+        let repo = root.join("repo");
+        let file = repo_config_path(&repo);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+
+        // The refusals of `repo_body`, merged over a `global_body`: the host
+        // program's, then the interactive launch's pin, and the config the
+        // program's guard left behind.
+        let refusals = |repo_body: &str, global_body: &str| {
+            fs::write(&file, repo_body).unwrap();
+            fs::write(&global, global_body).unwrap();
+            let cfg = Config::load_unvalidated(&repo, Some(&global)).unwrap();
+            let program = refuse_repo_declared_mounts_with(&cfg, &repo, Some(&home), Some(&global))
+                .err()
+                .map(|e| e.to_string());
+            let mut pinning = cfg.clone();
+            let pinned = pin_repo_declared_mounts_with(
+                &mut pinning,
+                &repo,
+                Some(&home),
+                Some(&global),
+                false,
+            )
+            .err()
+            .map(|e| e.to_string());
+            (program, pinned, cfg)
+        };
+        let mount = |host: &Path, access: &str| {
+            format!(
+                "[[workspace.mounts]]\nhost-path = \"{}\"\ncontainer-path = \"/g\"\n\
+                 access = \"{access}\"\n",
+                host.display()
+            )
+        };
+
+        // The home rule and the global-config rule, in the pin's own words.
+        let workspace = format!("[workspace]\nhost-path = \"{}\"\n", home.display());
+        let (program, pinned, _) = refusals(&workspace, "");
+        assert_eq!(program, pinned);
+        let err = program.expect("the home directory");
+        assert!(err.contains("it is your home directory or above it"), "{err}");
+        assert!(err.contains(&format!("declared in {}", file.display())), "{err}");
+
+        let (program, pinned, _) = refusals(&mount(&conf, "read-write"), "");
+        assert_eq!(program, pinned);
+        assert!(
+            program.expect("the global config").contains("covers the global config"),
+            "the global config's directory read-write",
+        );
+        // Read-only, it rewrites nothing; and the global config declares for
+        // the operator, who may name what a repository may not.
+        let (program, pinned, _) = refusals(&mount(&conf, "read-only"), "");
+        assert_eq!((program, pinned), (None, None));
+        let (program, pinned, _) = refusals("", &mount(&home, "read-write"));
+        assert_eq!((program, pinned), (None, None));
+
+        // The pin's own rule, about a bind this launch does not make.
+        let (program, pinned, _) = refusals(&mount(&odd_link, "read-only"), "");
+        assert_eq!(program, None);
+        assert!(pinned.expect("non-UTF-8").contains("not valid UTF-8"), "the pin refuses it");
+
+        // Nothing is pinned: the mount still resolves as the config spells it.
+        let (program, _, cfg) = refusals(&mount(&data_link, "read-only"), "");
+        assert_eq!(program, None);
+        assert_eq!(cfg.workspace.mounts[0].resolved_host_path(&repo), data_link);
     }
 
     /// How a refusal names a directory the global config path is looked up

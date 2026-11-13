@@ -28,7 +28,7 @@ use crate::builtin_image;
 use crate::cli::eprint_best_effort;
 use crate::cli::report::render_left_open;
 use crate::error::{OutrigError, Result};
-use crate::paths::{RepoConfig, default_session_root};
+use crate::paths::{RepoConfig, default_session_root, refuse_repo_declared_mounts};
 use crate::session::resolve_session_root;
 
 /// Run the program `program` names -- its script, then its arguments -- to its end, stop what it
@@ -45,6 +45,13 @@ pub async fn execute(
         .split_first()
         .expect("a program is its script and then its arguments");
     let mut cfg = repo.load(global_cfg_path)?;
+    // The repo config sits in a directory an agent can write, and a program is shown what it
+    // declares (`outrig.config()`) to mount in a session of its own, so what it declares is held
+    // to the rules `run-new` holds it to before the program starts: a mount of the home
+    // directory, or of the global config read-write, is refused here, naming the file (#646). The
+    // workspace outrig would pick itself is not asked about: a program's session mounts neither
+    // it nor the configuration's mounts, and the view does not show an undeclared one.
+    refuse_repo_declared_mounts(&cfg, &repo.root, global_cfg_path)?;
     cfg.session_root = Some(resolve_session_root(
         session_root,
         &cfg,

@@ -682,3 +682,53 @@ fn report_json(report: &ShutdownReport) -> Value {
     value["verdict"] = json!(report.verdict());
     value
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    /// What a session a program asks for mounts is the program's alone: the configuration's
+    /// `[workspace]` and `[[workspace.mounts]]` are left out of the config each session starts
+    /// from, whoever declared them. `outrig run-new <script.py>` refuses a repository that
+    /// declares one reaching the operator's own files before the program starts (#646), because
+    /// the program is shown them and may ask for them -- but what it did not ask for is not
+    /// mounted here.
+    #[test]
+    fn a_sessions_mounts_are_the_programs_and_not_the_configurations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let [repo, asked, configured] = ["repo", "asked", "configured"].map(|name| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            dir
+        });
+        let mut config = Config::default();
+        config.workspace = Workspace::new(&configured, "/workspace");
+        config
+            .workspace
+            .mounts
+            .push(MountConfig::new(&configured, "/also", MountAccess::ReadWrite));
+        let context = Context {
+            config,
+            repo_root: repo.clone(),
+            shutdowns: Arc::new(AtomicUsize::new(0)),
+            testing: crate::owner::tests::Sessions::default(),
+        };
+        let mounts = vec![MountRequest {
+            host_path: asked.clone(),
+            access: MountAccess::ReadOnly,
+        }];
+
+        let prepared = prepare(&context, &mounts, None, None, &[]).expect("the session's config");
+        assert_eq!(prepared.workspace.declared_host_path(), None);
+        let mounted: Vec<_> = prepared
+            .workspace
+            .mounts
+            .iter()
+            .map(|m| (m.resolved_host_path(&repo), m.access()))
+            .collect();
+        assert_eq!(mounted, vec![(asked, MountAccess::ReadOnly)]);
+    }
+}

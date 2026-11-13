@@ -292,6 +292,51 @@ async fn the_configuration_comes_from_the_invocation() {
     assert_eq!(text(&chosen.stdout), "from-flag ['from-flag']\n");
 }
 
+/// A repository's config is inside a directory the agent of a session can write, and a program is
+/// shown what it declares, for mounting in a session of its own -- so a repo config that mounts
+/// the global config's directory read-write is refused before the program starts, naming the file
+/// that declared it, and nothing of the program runs (#646). The same mount in the global config
+/// is the operator's own choice, and the program is shown it.
+#[tokio::test]
+async fn a_repo_mount_covering_the_global_config_is_refused_before_the_program_starts() {
+    let case = Case::new();
+    let global_dir = case.global.path().to_path_buf();
+    let mount = format!(
+        "[[workspace.mounts]]\nhost-path = \"{}\"\ncontainer-path = \"/g\"\n\
+         access = \"read-write\"\n",
+        global_dir.display()
+    );
+    case.write(
+        "shows.py",
+        "import outrig\nprint([(str(m.host_path), m.access) for m in outrig.config().mounts])\n",
+    );
+
+    case.write(".agents/outrig/config.toml", &mount);
+    let refused = case.run(&["run-new", "shows.py"]).await;
+    assert_eq!(refused.status.code(), Some(1), "{}", text(&refused.stderr));
+    assert_eq!(text(&refused.stdout), "");
+    let stderr = text(&refused.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "refusing mount {} declared in {}",
+            global_dir.display(),
+            case.path().join(".agents/outrig/config.toml").display()
+        )),
+        "{stderr}"
+    );
+    assert!(stderr.contains("covers the global config"), "{stderr}");
+
+    case.write(".agents/outrig/config.toml", "");
+    case.write_global(&mount);
+    let ran = case.run(&["run-new", "shows.py"]).await;
+    assert_eq!(ran.status.code(), Some(0), "{}", text(&ran.stderr));
+    assert_eq!(
+        text(&ran.stdout),
+        format!("[('{}', 'read-write')]\n", global_dir.display())
+    );
+    assert_eq!(case.runtime_calls(), "", "a container runtime was called");
+}
+
 /// In a repository whose directory name is not UTF-8, which Linux allows, a declared workspace is
 /// a launcher diagnostic and status 1 with nothing started -- `outrig.config()` could not carry
 /// its path -- not a panic. A configuration there that declares no workspace runs the program.

@@ -84,7 +84,11 @@ print(session.shutdown_report)
   [Application code](../concepts/python-runtime.md#application-code) says how.
 - **The configuration's workspace is not mounted.** `[workspace]` and `[[workspace.mounts]]` are
   the interactive session's; `outrig.config().workspace` and `outrig.config().mounts` show them
-  to a program that mounts them itself.
+  to a program that mounts them itself. Because a program may, a repository's config may not name
+  your home directory there, nor the global config read-write: `outrig run-new <script.py>` says
+  so and stops before the program starts, naming the file that declared it, as `outrig run`
+  refuses such a config (see [Workspace](../concepts/workspace.md#whats-mounted-what-isnt)). The
+  same entry in your global config is your own choice, and the program is shown it.
 - **Entering it starts it.** It runs in the image `default-image` names -- or OutRig's built-in
   default, as for `outrig run-new` -- with the configured bindings; one a repository's config
   declares starts only if its exact declaration was approved in that repository before, since

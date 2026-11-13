@@ -738,6 +738,11 @@ outrig [--config <path>] [--global-config <path>] [--session-root <path>] [--ver
   spelling of an OutRig flag included. A script whose name starts with `-` follows `--`.
 - The configuration is loaded and validated once, from the invocation's directory as for every
   command, before the program starts. The program reads it as `outrig.config()`.
+- A repository's config may not declare a `[workspace] host-path`, a `[[workspace.mounts]]` entry
+  or a sidecar mount that is your home directory or above it, nor one read-write over the global
+  config: the run is refused, naming the file that declared it, before the program starts. The
+  program is shown what the configuration declares and may mount it in a session of its own,
+  which a repository is not trusted to choose. The same entry in the global config is yours.
 - `SIGINT` and `SIGTERM` that `outrig` receives are forwarded to the program's process group, and
   so is a `SIGHUP` -- a closed terminal, a CI timeout -- which reaches the program as the
   `SIGTERM` it asks for. The first starts the program's grace, `--grace` seconds -- else

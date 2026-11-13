@@ -65,6 +65,24 @@ impl Fixture {
         run_outrig_with_env(cwd, &args, &env).await
     }
 
+    /// [`run`](Self::run) for the host-program form, `outrig run-new
+    /// <script>`, which takes no `--image`: the whole `Output`, since a
+    /// program that ran would have written on stdout.
+    async fn run_program(&self, cwd: &Path, script: &str) -> std::process::Output {
+        let sessions = self.tmp.path().join("sessions");
+        let global = self.tmp.path().join("cfg/global.toml");
+        let args = [
+            "--global-config",
+            global.to_str().unwrap(),
+            "--session-root",
+            sessions.to_str().unwrap(),
+            "run-new",
+            script,
+        ];
+        let home = self.home();
+        common::run_outrig_output(cwd, &args, &[("HOME", home.as_path())]).await
+    }
+
     fn sessions(&self) -> Vec<Session> {
         SessionStore::new(self.tmp.path().join("sessions"))
             .list()
@@ -245,6 +263,56 @@ async fn a_repo_sidecar_mount_covering_the_global_config_is_refused() {
     let (ok, stderr) = fx.run(&proj, &["run"]).await;
     assert_repo_refused(&fx, ok, &stderr, &proj.join(".agents/outrig/config.toml"));
     assert!(stderr.contains("sidecar \"tools\" mount"), "{stderr}");
+}
+
+/// A host program's own sessions mount neither the workspace nor the
+/// configuration's mounts -- `outrig.config()` shows both, for a program that
+/// mounts them itself -- so a repo config that names the home directory would
+/// reach the agent through such a program. It is refused before the program
+/// starts, naming the file, and the program does not run (#646).
+#[tokio::test]
+async fn a_repo_declared_host_path_naming_home_is_refused_for_a_host_program() {
+    let fx = Fixture::new();
+    let proj = fx.home().join("proj");
+    write_repo_config(&proj, "[workspace]\nhost-path = \"~\"\n");
+    fs::write(proj.join("prints.py"), "print('ran')\n").unwrap();
+
+    let refused = fx.run_program(&proj, "prints.py").await;
+    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert_repo_refused(
+        &fx,
+        refused.status.success(),
+        &stderr,
+        &proj.join(".agents/outrig/config.toml"),
+    );
+    assert!(
+        stderr.contains("it is your home directory or above it"),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8_lossy(&refused.stdout), "");
+}
+
+/// A mount the global config declares is the operator's own, for a program as
+/// for a session: it is not refused, and the program runs.
+#[tokio::test]
+async fn a_global_declared_mount_of_home_runs_a_host_program() {
+    let fx = Fixture::new();
+    let proj = fx.home().join("proj");
+    fs::create_dir_all(&proj).unwrap();
+    fs::write(
+        fx.tmp.path().join("cfg/global.toml"),
+        format!(
+            "{GLOBAL_WITH_MODEL}\n{}",
+            mount_of(&fx.home(), "read-write")
+        ),
+    )
+    .unwrap();
+    fs::write(proj.join("prints.py"), "print('ran')\n").unwrap();
+
+    let ran = fx.run_program(&proj, "prints.py").await;
+    let stderr = String::from_utf8_lossy(&ran.stderr).into_owned();
+    assert!(ran.status.success(), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&ran.stdout), "ran\n");
 }
 
 /// A global-declared host path is the operator's own choice.

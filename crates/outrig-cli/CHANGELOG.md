@@ -333,6 +333,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A signal that cancels a start whose cleanup is not proven exits `3`, not its own status. A build cancelled
   before it created its temporary image owes the removal of nothing, and does not count as one
   that failed.
+- **`outrig run-new <script.py>` holds a repository's config to the mount rules the other
+  commands apply.** A repo config declaring a `[workspace] host-path`, a `[[workspace.mounts]]`
+  entry or a sidecar mount that is the home directory, or that is read-write over the global
+  config, was loaded and handed to the program as `outrig.config()`. A program that mounts what
+  the configuration names -- which is what the view is there for -- would have given the
+  session's agent the operator's own files, and through the global config a provider at any
+  `base-url` with any `${VAR}` as its key, or a wider `[network]`, for the next run. Such a
+  config is now refused before the program starts, naming the file that declared it, with the
+  wording `run`, `mcp` and the interactive `run-new` use. The same entry in the global config is
+  the operator's own choice and still runs. A workspace outrig would pick itself is not asked
+  about here: a program's sessions mount neither it nor the configuration's mounts, and
+  `outrig.config()` does not show an undeclared one. (#646)
 - **A SIGHUP reaches a host program as the SIGTERM it asks for.** `outrig run-new <script.py>`
   forwarded SIGINT and SIGTERM to the program's process group but left SIGHUP at its default, so a
   closed terminal ended outrig along with the engine that stops the sessions the program left
