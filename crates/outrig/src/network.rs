@@ -9825,11 +9825,17 @@ mod tests {
         // Many to a write, so the buffers fill in few of them.
         let frame = frame.repeat(512);
         // Until the kernel will take no more in either direction, which is
-        // when the loop is parked in a write.
+        // when the loop is parked in a write. Continue a short write from
+        // where it stopped: restarting the batch would cut a frame short
+        // and make the server misread the following frames.
         let mut full = 0;
+        let mut offset = 0;
         while full < 2 {
-            match client.try_write(&frame) {
-                Ok(_) => tokio::task::yield_now().await,
+            match client.try_write(&frame[offset..]) {
+                Ok(n) => {
+                    offset = (offset + n) % frame.len();
+                    tokio::task::yield_now().await;
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     full += 1;
                     tokio::time::sleep(Duration::from_millis(200)).await;
