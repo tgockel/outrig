@@ -725,11 +725,52 @@ pub(crate) fn refuse_mount_field_separators(cfg: &Config, repo_root: &Path) -> R
 /// canonical host path the guard saw, which is what the launch now binds.
 #[derive(Debug, Clone)]
 pub(crate) struct PinnedMount {
-    what: String,
+    kind: PinnedMountKind,
     host: PathBuf,
     /// The config file that declared the mount, or `None` for the default
     /// workspace, which no file declared.
     source: Option<PathBuf>,
+}
+
+/// What a pinned mount is: how a refusal names it, and which container binds
+/// it. The primary binds the workspace and the `[[workspace.mounts]]`
+/// entries; a sidecar binds the entries its own block declared, plus the
+/// workspace when it has a view onto it.
+#[derive(Debug, Clone)]
+pub(crate) enum PinnedMountKind {
+    /// The workspace no config declared, which outrig picked itself.
+    Workspace,
+    /// A `[workspace] host-path` a repo config declared.
+    WorkspaceHostPath,
+    /// A `[[workspace.mounts]]` entry.
+    WorkspaceMount,
+    /// A `[[sidecars.<name>.mounts]]` entry, named by its sidecar.
+    SidecarMount(String),
+}
+
+impl PinnedMountKind {
+    /// Whether the sidecar `name` binds a mount of this kind: the entries its
+    /// own block declared, and the workspace when `workspace` says it has a
+    /// view onto it. The `[[workspace.mounts]]` entries are the primary's
+    /// alone.
+    fn bound_by_sidecar(&self, name: &str, workspace: bool) -> bool {
+        match self {
+            Self::Workspace | Self::WorkspaceHostPath => workspace,
+            Self::WorkspaceMount => false,
+            Self::SidecarMount(sidecar) => sidecar == name,
+        }
+    }
+}
+
+impl std::fmt::Display for PinnedMountKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Workspace => f.write_str("workspace"),
+            Self::WorkspaceHostPath => f.write_str("workspace host-path"),
+            Self::WorkspaceMount => f.write_str("mount"),
+            Self::SidecarMount(name) => write!(f, "sidecar {name:?} mount"),
+        }
+    }
 }
 
 impl PinnedMount {
@@ -738,6 +779,7 @@ impl PinnedMount {
         &self.host
     }
 }
+
 
 /// Run the guards for a workspace no config declared, and pin it: the returned
 /// mount names the canonical path the guards saw, which the caller binds in
@@ -765,7 +807,7 @@ pub(crate) fn pin_default_workspace(
         )));
     }
     Ok(PinnedMount {
-        what: "workspace".to_string(),
+        kind: PinnedMountKind::Workspace,
         host: canonical,
         source: None,
     })
@@ -807,7 +849,7 @@ fn pin_repo_declared_mounts_with(
     let home = home.map(canonical_or_normalized).transpose()?;
     let global = global_cfg.map(GlobalConfigReach::of).transpose()?;
     let mut pinned = Vec::new();
-    let mut check = |what: &str,
+    let mut check = |kind: PinnedMountKind,
                      source: Option<&ConfigSource>,
                      host: PathBuf,
                      access: MountAccess|
@@ -829,14 +871,14 @@ fn pin_repo_declared_mounts_with(
                 .to_string()
         } else {
             pinned.push(PinnedMount {
-                what: what.to_string(),
+                kind,
                 host: host.clone(),
                 source: Some(source.config_path()),
             });
             return Ok(Some(host));
         };
         Err(OutrigError::Configuration(format!(
-            "refusing {what} {} declared in {}: {reason}, so an agent could edit files \
+            "refusing {kind} {} declared in {}: {reason}, so an agent could edit files \
              that govern the next session\n\
              help: a repo config may not do this; declare it in the global config if you \
              mean it, or pass --volume",
@@ -846,7 +888,7 @@ fn pin_repo_declared_mounts_with(
     };
     let workspace = &mut cfg.workspace;
     if let Some(host) = check(
-        "workspace host-path",
+        PinnedMountKind::WorkspaceHostPath,
         workspace.config_source(),
         workspace.resolved_host_path(repo_root),
         MountAccess::ReadWrite,
@@ -855,7 +897,7 @@ fn pin_repo_declared_mounts_with(
     }
     for m in &mut workspace.mounts {
         if let Some(host) = check(
-            "mount",
+            PinnedMountKind::WorkspaceMount,
             m.config_source(),
             m.resolved_host_path(repo_root),
             m.access(),
@@ -864,10 +906,9 @@ fn pin_repo_declared_mounts_with(
         }
     }
     for (name, sc) in &mut cfg.sidecars {
-        let what = format!("sidecar {name:?} mount");
         for m in &mut sc.mounts {
             if let Some(host) = check(
-                &what,
+                PinnedMountKind::SidecarMount(name.clone()),
                 m.config_source(),
                 m.resolved_host_path(repo_root),
                 m.access(),
@@ -884,7 +925,14 @@ fn pin_repo_declared_mounts_with(
 /// validated. Run right before the container starts, after the image work that
 /// can take minutes: a symlink swap is already defeated by the pin, but an
 /// agent replacing a parent directory is seen here.
-pub(crate) fn recheck_pinned_mounts(pinned: &[PinnedMount]) -> Result<()> {
+///
+/// Takes an iterator rather than the whole list: the primary passes every
+/// pinned mount, while a sidecar -- which starts later, and for `/sidecar
+/// add` much later -- passes the ones it is about to bind
+/// ([`pinned_mounts_for_sidecar`]).
+pub(crate) fn recheck_pinned_mounts<'a>(
+    pinned: impl IntoIterator<Item = &'a PinnedMount>,
+) -> Result<()> {
     for p in pinned {
         let now = canonical_or_normalized(&p.host)?;
         if now != p.host {
@@ -895,13 +943,29 @@ pub(crate) fn recheck_pinned_mounts(pinned: &[PinnedMount]) -> Result<()> {
             return Err(OutrigError::Configuration(format!(
                 "refusing {} {}{declared}: it now resolves to {}, so a component of it \
                  was replaced after it was checked",
-                p.what,
+                p.kind,
                 p.host.display(),
                 now.display()
             )));
         }
     }
     Ok(())
+}
+
+/// The pinned mounts one sidecar's launch binds: the entries its own block
+/// declared, and the workspace when `mounts_workspace` says it has a view onto
+/// it. Each sidecar is created after the primary is already running -- after
+/// its own image work, or, through `/sidecar add`, minutes into the session --
+/// so [`recheck_pinned_mounts`] runs over these when it starts rather than
+/// only when the primary did (#732).
+pub(crate) fn pinned_mounts_for_sidecar<'a>(
+    pinned: &'a [PinnedMount],
+    name: &str,
+    mounts_workspace: bool,
+) -> impl Iterator<Item = &'a PinnedMount> {
+    pinned
+        .iter()
+        .filter(move |p| p.kind.bound_by_sidecar(name, mounts_workspace))
 }
 
 /// Build context for one of outrig's built-in images, under the user cache
@@ -1636,6 +1700,91 @@ mod tests {
         std::os::unix::fs::symlink(&other, &safe).unwrap();
         let err = recheck_pinned_mounts(&pinned).unwrap_err().to_string();
         assert!(err.contains(&other.display().to_string()), "{err}");
+    }
+
+    /// A repo config under `root/repo` declaring `[workspace] host-path`, one
+    /// `[[workspace.mounts]]`, and a mount on each of two sidecars, with every
+    /// host path pinned. The four kinds a launch can bind, so a filter over
+    /// them is checked against all of them at once.
+    fn pin_a_sidecar_repo(root: &Path) -> (PathBuf, Vec<PinnedMount>) {
+        let repo = root.join("repo");
+        let file = repo_config_path(&repo);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            &file,
+            format!(
+                "[workspace]\nhost-path = \"{ws}\"\n\n\
+                 [[workspace.mounts]]\nhost-path = \"{extra}\"\ncontainer-path = \"/x\"\n\n\
+                 [sidecars.tools]\nimage = \"img\"\nworkspace = \"ro\"\n\n\
+                 [[sidecars.tools.mounts]]\nhost-path = \"{tools}\"\ncontainer-path = \"/t\"\n\n\
+                 [sidecars.docs]\nimage = \"img\"\n\n\
+                 [[sidecars.docs.mounts]]\nhost-path = \"{docs}\"\ncontainer-path = \"/d\"\n",
+                ws = root.join("ws").display(),
+                extra = root.join("extra").display(),
+                tools = root.join("tools").display(),
+                docs = root.join("docs").display(),
+            ),
+        )
+        .unwrap();
+        for dir in ["ws", "extra", "tools", "docs"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let mut cfg = Config::load_unvalidated(&repo, None).unwrap();
+        let global = root.join("conf/outrig/config.toml");
+        let pinned = pin_repo_declared_mounts_with(&mut cfg, &repo, None, Some(&global)).unwrap();
+        (repo, pinned)
+    }
+
+    /// Each sidecar is created after the primary is already running, so what
+    /// it is about to bind is its own question: its declared mounts, and the
+    /// workspace when it has a view onto it. The primary's extra mounts are
+    /// never a sidecar's to answer for (#732).
+    #[test]
+    fn a_sidecars_pinned_mounts_are_its_own_plus_the_workspace_it_views() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let (_, pinned) = pin_a_sidecar_repo(&root);
+        assert_eq!(pinned.len(), 4, "every repo-declared entry is pinned");
+
+        let hosts = |name: &str, workspace: bool| -> Vec<PathBuf> {
+            pinned_mounts_for_sidecar(&pinned, name, workspace)
+                .map(|p| p.host().to_path_buf())
+                .collect()
+        };
+        assert_eq!(hosts("tools", true), [root.join("ws"), root.join("tools")]);
+        assert_eq!(hosts("docs", false), [root.join("docs")]);
+        assert_eq!(hosts("absent", false), Vec::<PathBuf>::new());
+    }
+
+    /// A sidecar binds long after the guard ran -- after its own image work,
+    /// or whenever `/sidecar add` asks -- and the pin only defeats a swapped
+    /// symlink. A pinned source directory replaced by a link elsewhere in
+    /// that window is refused when the sidecar starts, naming the sidecar
+    /// whose mount it is (#732).
+    #[test]
+    fn a_sidecar_mount_replaced_after_setup_is_refused_when_the_sidecar_starts() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let (repo, pinned) = pin_a_sidecar_repo(&root);
+        let (tools, other) = (root.join("tools"), root.join("other"));
+        fs::create_dir_all(&other).unwrap();
+        let for_tools = || pinned_mounts_for_sidecar(&pinned, "tools", true);
+        recheck_pinned_mounts(for_tools()).unwrap();
+
+        // The directory the guard validated now leads somewhere else.
+        fs::remove_dir(&tools).unwrap();
+        std::os::unix::fs::symlink(&other, &tools).unwrap();
+
+        let err = recheck_pinned_mounts(for_tools()).unwrap_err().to_string();
+        assert!(err.contains("sidecar \"tools\" mount"), "{err}");
+        assert!(err.contains(&tools.display().to_string()), "{err}");
+        assert!(err.contains(&other.display().to_string()), "{err}");
+        assert!(
+            err.contains(&repo_config_path(&repo).display().to_string()),
+            "{err}"
+        );
+        // The sidecar that did not declare it starts regardless.
+        recheck_pinned_mounts(pinned_mounts_for_sidecar(&pinned, "docs", false)).unwrap();
     }
 
     /// The default workspace is pinned to the canonical path the guards saw: a

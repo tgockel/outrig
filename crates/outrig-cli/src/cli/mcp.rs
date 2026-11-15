@@ -183,6 +183,7 @@ async fn serve(
         cfg: _,
         session: _,
         repo_root: _,
+        pinned_mounts: _,
     } = setup;
     // Nothing between here and `teardown` may return early: `teardown` is
     // the only thing that finalizes the session record -- and the only thing
@@ -228,6 +229,7 @@ async fn show_merged(setup: SessionSetup) -> Result<i32> {
         log_dir: _,
         repo_root: _,
         used_builtin_default: _,
+        pinned_mounts: _,
         mut signals,
     } = setup;
 

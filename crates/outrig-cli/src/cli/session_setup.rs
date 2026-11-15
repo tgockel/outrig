@@ -39,8 +39,8 @@ use crate::cli::watcher::{LABEL_INSTANCE, SessionWatcher, SidecarRef};
 use crate::error::{CliError, OutrigError, Result};
 use crate::llm;
 use crate::paths::{
-    RepoConfig, default_session_root, pin_default_workspace, pin_repo_declared_mounts,
-    warn_if_global_config_is_hard_linked,
+    PinnedMount, RepoConfig, default_session_root, pin_default_workspace,
+    pin_repo_declared_mounts, pinned_mounts_for_sidecar, warn_if_global_config_is_hard_linked,
     recheck_pinned_mounts, refuse_mount_field_separators, refuse_workspace_field_separator,
     repo_config_path,
 };
@@ -298,6 +298,12 @@ pub struct SessionSetup {
     /// The repo the session runs against; mid-session sidecar starts resolve
     /// mount paths without a declaring file against it.
     pub repo_root: PathBuf,
+    /// What the guards pinned, kept past setup for `/sidecar add`: a sidecar
+    /// started mid-session binds its own entries minutes after the primary's
+    /// were checked, and looks at them again then (#732). `pub(crate)` because
+    /// [`PinnedMount`] is the CLI's own and nothing outside assembles a
+    /// [`SessionSetup`].
+    pub(crate) pinned_mounts: Vec<PinnedMount>,
     pub attached: bool,
     /// The session fell through to outrig's built-in default image-config.
     /// Drives the banner's `(built-in default)` marker and, for `outrig run`,
@@ -832,6 +838,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         instance_salt: &instance_salt,
         cfg: &cfg,
         repo_root: &repo_root,
+        pinned_mounts: &pinned_mounts,
         image_cfg_name: &image_cfg_name,
         image_cfg: &image_cfg,
         sid: &sid,
@@ -883,6 +890,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         log_dir,
         store,
         repo_root,
+        pinned_mounts,
         attached: attach.is_some(),
         used_builtin_default,
         network,
@@ -898,6 +906,8 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
 struct SidecarPhaseArgs<'a> {
     cfg: &'a Config,
     repo_root: &'a Path,
+    /// See [`SidecarStartCtx::pinned_mounts`].
+    pinned_mounts: &'a [PinnedMount],
     /// See [`SessionContainers::instance_salt`].
     instance_salt: &'a str,
     image_cfg_name: &'a str,
@@ -921,6 +931,7 @@ impl<'a> SidecarPhaseArgs<'a> {
         SidecarStartCtx {
             cfg: self.cfg,
             repo_root: self.repo_root,
+            pinned_mounts: self.pinned_mounts,
             sid: self.sid.as_str(),
             instance_salt: self.instance_salt,
             host_workspace: self.host_workspace,
@@ -936,6 +947,9 @@ impl<'a> SidecarPhaseArgs<'a> {
 pub(crate) struct SidecarStartCtx<'a> {
     pub cfg: &'a Config,
     pub repo_root: &'a Path,
+    /// The mounts the guards pinned at setup, rechecked for this sidecar
+    /// right before its container is created (#732).
+    pub pinned_mounts: &'a [PinnedMount],
     /// Container-name suffix: sidecars are named `outrig-<sid>-<sc>`.
     pub sid: &'a str,
     /// This session's half of every sidecar's `org.outrig.instance` label.
@@ -1539,6 +1553,22 @@ fn sidecar_container_name(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> String
     outrig::container::sidecar_container_name(ctx.sid, &sc.name)
 }
 
+/// Look again at the pinned mounts this sidecar is about to bind: the entries
+/// its own block declared, and the workspace when it has a view onto it.
+///
+/// The primary's recheck ran before the primary started, and every sidecar
+/// binds later than that -- an automatic one after its own image work, which
+/// is a cold build's worth of minutes, and one from `/sidecar add` whenever
+/// the session asks for it. A source directory replaced in between is caught
+/// here rather than mounted unchecked (#732).
+fn recheck_sidecar_mounts(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> Result<()> {
+    Ok(recheck_pinned_mounts(pinned_mounts_for_sidecar(
+        ctx.pinned_mounts,
+        &sc.name,
+        sc.workspace.mount_access().is_some(),
+    ))?)
+}
+
 /// Start one sidecar container (`outrig-<sid>-<sc>`, session + sidecar
 /// labels, keep-id) and bootstrap its user when identity matters.
 async fn start_one_sidecar(
@@ -1552,6 +1582,7 @@ async fn start_one_sidecar(
 ) -> Result<Container> {
     let launch = sidecar_launch_base(ctx, sc);
     let container_name = sidecar_container_name(ctx, sc);
+    recheck_sidecar_mounts(ctx, sc)?;
     let span = ProgressSpan::start(format!("starting sidecar {}", sc.name));
     let mut container =
         Container::start_named(tag, launch, container_name, ctx.transcript.cloned()).await?;
@@ -1640,6 +1671,7 @@ async fn create_one_entrypoint_sidecar(
     );
 
     let container_name = sidecar_container_name(&ctx, sc);
+    recheck_sidecar_mounts(&ctx, sc)?;
     let span = ProgressSpan::start(format!("creating sidecar {} (entrypoint held)", sc.name));
     let options = ContainerCreateOptions::new(tag.clone(), launch, container_name)
         .with_transcript(args.transcript.cloned())
@@ -2111,6 +2143,125 @@ lint = { command = ["mcp-lint"], sidecar = "lint" }
         check_env(&["fs:A=1", "lint:B=2"]).expect("a manual sidecar's server is declared");
         check_env(&["GLOBAL=1"]).expect("a global entry names no server");
         check_env(&[]).expect("an empty overlay names no server");
+    }
+
+    /// A repo under a tempdir declaring `[sidecars.tools]` with one mount of
+    /// `<root>/tools`, loaded and pinned the way `setup` pins it. Returns the
+    /// repo root, the config, and the pinned list the start sequence carries.
+    fn pinned_sidecar_repo(root: &Path) -> (PathBuf, Config, Vec<PinnedMount>) {
+        let repo = root.join("repo");
+        let file = crate::paths::repo_config_path(&repo);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            format!(
+                "[images.x]\ndockerfile = \"D\"\ncontext = \".\"\n\n\
+                 [images.x.mcp]\nfs = {{ command = [\"mcp-fs\"], sidecar = \"tools\" }}\n\n\
+                 [sidecars.tools]\nimage = \"img\"\n\n\
+                 [[sidecars.tools.mounts]]\nhost-path = \"{tools}\"\ncontainer-path = \"/t\"\n",
+                tools = root.join("tools").display(),
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("tools")).unwrap();
+        let mut cfg = Config::load_unvalidated(&repo, None).unwrap();
+        let pinned = pin_repo_declared_mounts(&mut cfg, &repo, None).unwrap();
+        assert_eq!(pinned.len(), 1, "the sidecar's mount is pinned");
+        (repo, cfg, pinned)
+    }
+
+    /// The sidecar's pinned source, replaced by a link elsewhere after the
+    /// guard validated it, the way a concurrent session's agent with the repo
+    /// could.
+    fn replace_with_a_link_elsewhere(root: &Path) -> PathBuf {
+        let (tools, other) = (root.join("tools"), root.join("other"));
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::remove_dir(&tools).unwrap();
+        std::os::unix::fs::symlink(&other, &tools).unwrap();
+        other
+    }
+
+    /// A sidecar binds minutes after the primary's mounts were rechecked --
+    /// after its own image work, or, through `/sidecar add`
+    /// ([`launch_declared_sidecar`], which ends here), whenever the session
+    /// asks. A pinned source replaced in that window refuses the sidecar, and
+    /// refuses it before anything is handed to podman, which is what lets
+    /// this run without one (#732).
+    #[tokio::test]
+    async fn a_sidecar_whose_pinned_mount_was_replaced_is_refused_before_it_starts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (repo, cfg, pinned) = pinned_sidecar_repo(&root);
+        let plan = sidecar::plan_from_config(&cfg, &cfg.images["x"]);
+        let sc = plan.sidecars["tools"].clone();
+        let other = replace_with_a_link_elsewhere(&root);
+        let ctx = SidecarStartCtx {
+            cfg: &cfg,
+            repo_root: &repo,
+            pinned_mounts: &pinned,
+            sid: "test",
+            instance_salt: "salt",
+            host_workspace: &root.join("ws"),
+            container_workspace: Path::new("/workspace"),
+            transcript: None,
+        };
+
+        let mut abandoned = Vec::new();
+        let err = start_one_sidecar(&ctx, &ImageTag::new("img"), &sc, false, &mut abandoned)
+            .await
+            .expect_err("a replaced mount refuses the sidecar");
+
+        let text = err.to_string();
+        assert!(text.contains("sidecar \"tools\" mount"), "{text}");
+        assert!(text.contains(&other.display().to_string()), "{text}");
+        assert!(abandoned.is_empty(), "no container was created: {text}");
+    }
+
+    /// The entrypoint-stdio path creates its container instead of running
+    /// one, and reaches it by another route; the mounts it is about to bind
+    /// are rechecked there too (#732).
+    #[tokio::test]
+    async fn an_entrypoint_sidecar_whose_pinned_mount_was_replaced_is_refused_before_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (repo, cfg, pinned) = pinned_sidecar_repo(&root);
+        let plan = sidecar::plan_from_config(&cfg, &cfg.images["x"]);
+        let sc = plan.sidecars["tools"].clone();
+        let other = replace_with_a_link_elsewhere(&root);
+        let sid = SessionId::from("test".to_string());
+        let cli_env = CliEnvEntries::parse(&[]).unwrap();
+        let args = SidecarPhaseArgs {
+            cfg: &cfg,
+            repo_root: &repo,
+            pinned_mounts: &pinned,
+            instance_salt: "salt",
+            image_cfg_name: "x",
+            image_cfg: &cfg.images["x"],
+            sid: &sid,
+            host_workspace: &root.join("ws"),
+            container_workspace: Path::new("/workspace"),
+            session_dir: &root.join("session"),
+            intercept_dns: false,
+            start_sidecars: true,
+            cli_env: &cli_env,
+            transcript: None,
+        };
+
+        let err = create_one_entrypoint_sidecar(
+            &args,
+            &ImageTag::new("img"),
+            &sc,
+            "fs",
+            &McpServerSpec::entrypoint_in_sidecar("tools"),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a replaced mount refuses the sidecar");
+
+        let text = err.to_string();
+        assert!(text.contains("sidecar \"tools\" mount"), "{text}");
+        assert!(text.contains(&other.display().to_string()), "{text}");
     }
 
     /// A plan of `[images.x]` over `config`, as `setup_sidecars`

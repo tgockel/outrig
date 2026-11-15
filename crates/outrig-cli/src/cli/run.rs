@@ -30,7 +30,7 @@ use crate::cli::signals::{self, Signals};
 use crate::cli::volume_arg::{CliVolume, parse_volume};
 use crate::error::{OutrigError, Result};
 use crate::llm;
-use crate::paths::{RepoConfig, model_cache_root};
+use crate::paths::{PinnedMount, RepoConfig, model_cache_root};
 use crate::repl::{HelpEntry, Repl};
 use crate::rig_tool::McpToolAdapter;
 use crate::session::{SessionId, SessionStore};
@@ -144,6 +144,7 @@ pub async fn execute(
         log_dir,
         store,
         repo_root,
+        pinned_mounts,
         network,
         mcp_plan,
         watcher,
@@ -172,6 +173,7 @@ pub async fn execute(
         log_dir: &log_dir,
         sid: &sid,
         repo_root: &repo_root,
+        pinned_mounts: &pinned_mounts,
         cache_root: &cache_root,
         max_tool_calls: args.max_tool_calls,
         max_tool_result_bytes: args.max_tool_result_bytes,
@@ -214,6 +216,9 @@ struct RunInnerArgs<'a> {
     log_dir: &'a Path,
     sid: &'a SessionId,
     repo_root: &'a Path,
+    /// The mounts the guards pinned at setup, rechecked against the host
+    /// again when `/sidecar add` starts a sidecar (#732).
+    pinned_mounts: &'a [PinnedMount],
     cache_root: &'a Path,
     max_tool_calls: Option<u32>,
     max_tool_result_bytes: Option<u32>,
@@ -238,6 +243,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         log_dir,
         sid,
         repo_root,
+        pinned_mounts,
         cache_root,
         max_tool_calls,
         max_tool_result_bytes,
@@ -394,6 +400,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         sid,
         cfg: &cfg,
         repo_root,
+        pinned_mounts,
         log_dir,
         cli_env,
         mcp_plan,
@@ -445,6 +452,7 @@ struct ReplSession<'a> {
     sid: &'a SessionId,
     cfg: &'a Config,
     repo_root: &'a Path,
+    pinned_mounts: &'a [PinnedMount],
     log_dir: &'a Path,
     cli_env: &'a CliEnvEntries,
     mcp_plan: &'a SessionMcpPlan,
@@ -818,6 +826,7 @@ async fn try_sidecar_add(
     let ctx = SidecarStartCtx {
         cfg: state.cfg,
         repo_root: state.repo_root,
+        pinned_mounts: state.pinned_mounts,
         sid: state.sid.as_str(),
         instance_salt: &instance_salt,
         host_workspace: &host_workspace,
@@ -1586,6 +1595,9 @@ mod tests {
             log_dir: PathBuf,
             cli_env: CliEnvEntries,
             mcp_plan: SessionMcpPlan,
+            /// No repo config declared a mount here, so the sidecar starts
+            /// these tests drive have nothing to recheck.
+            pinned_mounts: Vec<PinnedMount>,
         }
 
         impl Fixture {
@@ -1660,6 +1672,7 @@ mod tests {
                     log_dir: PathBuf::from("logs"),
                     cli_env: CliEnvEntries::parse(&[]).expect("empty env parses"),
                     mcp_plan: plan_from_config(&cfg, &image_cfg),
+                    pinned_mounts: Vec::new(),
                 }
             }
 
@@ -1671,6 +1684,7 @@ mod tests {
                     sid: &self.sid,
                     cfg: &self.cfg,
                     repo_root: &self.repo_root,
+                    pinned_mounts: &self.pinned_mounts,
                     log_dir: &self.log_dir,
                     cli_env: &self.cli_env,
                     mcp_plan: &self.mcp_plan,
