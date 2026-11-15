@@ -228,6 +228,12 @@ round opened on:
   it, and `agent.request.cancelled` records the engine's `reason`.
 
 So a request sent to a child is either being worked on or cancelled, and its sender is told which.
+One round is the exception: one the provider would not answer for what it carried -- a reply it
+ended with `content_filter` or `refusal`, sent once more without the turn's results and refused
+again. Sent again, it would be refused the same way, so the engine opens no round, the warning
+included, until the requests the child holds change -- one arrives, or one ends. Its requests stay
+open meanwhile, for their senders to cancel or to wait on. Taking a request in the refused round,
+or being given a submission for it, is no change.
 A child's closing text is never delivered to the sender: only `reply`, `complete` and `fail`
 answer.
 

@@ -14,10 +14,11 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::children_tests::{
-    Hold, Tree, data, exec_outputs, held, kind, of_agent, opening, primary_runs, printed, serving,
-    tree_built,
+    Hold, Tree, Watch, data, exec_outputs, held, kind, of_agent, opening, primary_runs, printed,
+    serving, tree_built, tree_watched,
 };
 use super::instance_tests::{launching, ready_then};
+use super::mock_http;
 use super::mock_http::{RecordedRequest, Responder, scripted, submit, system_text, text_reply};
 use super::{orientation, runner};
 use crate::harness::event::RequestEnd;
@@ -191,8 +192,20 @@ async fn owned(
     routes: Vec<(&'static str, Responder)>,
     build: impl FnOnce(SessionBuilder) -> SessionBuilder,
 ) -> (Tree, tempfile::TempDir) {
+    owned_watched(var, top, routes, Watch::Gathered, build).await
+}
+
+/// [`owned`], its events watched as `watch` says.
+pub(super) async fn owned_watched(
+    var: &str,
+    top: &str,
+    routes: Vec<(&'static str, Responder)>,
+    watch: Watch,
+    build: impl FnOnce(SessionBuilder) -> SessionBuilder,
+) -> (Tree, tempfile::TempDir) {
     let (dir, spec) = application();
-    let tree = tree_built(var, top, routes, None, move |builder| {
+    let mock = mock_http::routed(routes, None).await;
+    let tree = tree_watched(var, top, mock, watch, move |builder| {
         build(builder.no_primary().application(spec))
     })
     .await;
@@ -207,7 +220,7 @@ struct Reviewed {
 }
 
 /// What a root runs to answer one request on `review` well.
-const REVIEWS: &str =
+pub(super) const REVIEWS: &str =
     "d = await runtime.channels['review'].receive()\nawait d.reply(Verdict(path=d.body, ok=True))";
 
 /// A root's rounds: its orienting round ends at once, and each later one runs `source`.
@@ -224,18 +237,18 @@ fn stalling() -> Responder {
 }
 
 /// A `Reviewer`, its task a data argument.
-fn reviewer() -> ConstructSpec {
+pub(super) fn reviewer() -> ConstructSpec {
     ConstructSpec::new("review.agents:Reviewer", "fast")
         .arg("task", Argument::data(json!({"title": "t", "priority": 1})))
 }
 
 /// The root's agent id.
-fn agent_of(root: &RootHandle) -> String {
+pub(super) fn agent_of(root: &RootHandle) -> String {
     root.agent().expect("a launched root").to_string()
 }
 
 /// What a root's launch failed with.
-async fn not_ready(root: &RootHandle) -> RootError {
+pub(super) async fn not_ready(root: &RootHandle) -> RootError {
     within(root.ready())
         .await
         .expect_err("the root is not ready")

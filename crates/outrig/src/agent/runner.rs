@@ -36,6 +36,22 @@
 //! the child's model can never answer, no round opens: what the child holds
 //! open ends instead, and so does anything that arrives later.
 //!
+//! A round the provider would not answer for what it carried -- a reply it
+//! ended with `content_filter` or `refusal`, refused again when sent without
+//! the turn's results -- is not opened again, since the same request is
+//! refused the same way, and does not break the child, since another may not
+//! be. No round opens, the warning included, until the requests the child
+//! holds change -- one arrives, or one it holds ends -- and what it holds
+//! stays open meanwhile, for its sender to cancel or to wait on. What the
+//! refused round itself did with them, taking one or being given its
+//! submission, is no change; one that arrived while it ran is, and opens the
+//! next round at once. An orienting round so refused has ended all the same.
+//!
+//! What the child is doing -- a round open, a failed round it will try again
+//! and when, a refusal, a model that can answer nothing more -- the runner
+//! says to the registry as it moves, with what each round that ended said
+//! (`stopped`, `round_ended`), for the child's owner to read.
+//!
 //! A round also ends once the child holds nothing: before the model call that
 //! would follow a work child's accepted submission, when no other waits, so a
 //! round is not spent speaking after the work. A release ends the runner. The
@@ -49,8 +65,9 @@
 //! is empty, so whatever is still open when it ends opens the next round. Its
 //! instance's `ready()` hears when it ended, or why it cannot be had.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -58,7 +75,8 @@ use tokio::time::Instant;
 use super::children::{Registry, Summary};
 use super::orientation;
 use super::{Agent, AgentError};
-use crate::harness::event::ChildKind;
+use crate::harness::event::{AttemptId, ChildKind};
+use crate::harness::stop::{AgentState, RoundFacts};
 
 /// How long a child waits after a round fails before the next opens. Each
 /// failure in a row doubles it, up to [`RETRY_MAX`]. Short under test, where
@@ -86,6 +104,12 @@ thread_local! {
     /// asked for the child, so no request a program makes can otherwise be waiting as it opens.
     pub(super) static HOLD: std::cell::RefCell<Option<Arc<Notify>>> =
         const { std::cell::RefCell::new(None) };
+
+    /// What the next runner to start on its thread waits after a round fails, where it would
+    /// wait [`RETRY_FIRST`]: long enough for a test to read its child unavailable before it
+    /// tries again.
+    pub(super) static FIRST_WAIT: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Drive child `id`'s rounds until its registry, or the session, ends.
@@ -101,6 +125,12 @@ pub(crate) async fn run(
     instance: Option<u64>,
     task: bool,
 ) {
+    // The first wait after a failed round, and what a round that ends resets it to.
+    #[cfg(test)]
+    let first = FIRST_WAIT.take().unwrap_or(RETRY_FIRST);
+    #[cfg(not(test))]
+    let first = RETRY_FIRST;
+    let mut wait = first;
     #[cfg(test)]
     if let Some(hold) = HOLD.with(|hold| hold.borrow_mut().take()) {
         hold.notified().await;
@@ -120,7 +150,15 @@ pub(crate) async fn run(
     // opened on and how it failed: the cause a cancel of that submission
     // carries, and no other's.
     let mut cut: Option<(u64, String)> = None;
-    let mut wait = RETRY_FIRST;
+    // The requests the child held after a round the provider refused for what
+    // it carried: no round opens while it holds those and no other, whether
+    // waiting or taken.
+    let mut resting: Option<BTreeSet<u64>> = None;
+    // When the first of the latest run of failed rounds failed, while it lasts.
+    let mut since: Option<SystemTime> = None;
+    // The round opened last, by its number in the conversation: what a spent
+    // budget, found between rounds, names.
+    let mut round: Option<u32> = None;
     // The instance, until its child's orienting round has ended or cannot be had.
     let mut orienting = instance;
     loop {
@@ -147,13 +185,27 @@ pub(crate) async fn run(
             continue;
         }
         let ended = match (children.spent_budget(), &broken) {
-            (Some(budget), _) => Some((
-                "budget",
-                format!(
-                    "the session's token-budget ({budget} tokens) was spent before this was \
-                     answered"
-                ),
-            )),
+            (Some(budget), _) => {
+                // A model that can answer nothing more was said so as the
+                // round found it.
+                if broken.is_none() {
+                    children.stopped(
+                        &id,
+                        AgentState::Failed {
+                            class: format!("the session's token-budget ({budget} tokens) is spent"),
+                            round,
+                            attempt: None,
+                        },
+                    );
+                }
+                Some((
+                    "budget",
+                    format!(
+                        "the session's token-budget ({budget} tokens) was spent before this was \
+                         answered"
+                    ),
+                ))
+            }
             (None, Some(why)) => Some(("failed", why.clone())),
             (None, None) => None,
         };
@@ -181,6 +233,12 @@ pub(crate) async fn run(
             wake.notified().await;
             continue;
         }
+        if resting.as_ref() == Some(&live.held()) {
+            drop(children);
+            wake.notified().await;
+            continue;
+        }
+        resting = None;
         // Unchanged since the last round opened on it, and holding something.
         let unchanged = orienting.is_none() && live == baseline;
         if !unchanged {
@@ -209,7 +267,9 @@ pub(crate) async fn run(
             continue;
         }
         // Opened before a submission is given, so its taking names this round.
-        if !children.round_opened(&id, agent.history.next_round()) {
+        let opened = agent.history.next_round();
+        round = Some(opened);
+        if !children.round_opened(&id, opened) {
             return;
         }
         // The submission the round opens on, if it opens on one.
@@ -254,7 +314,7 @@ pub(crate) async fn run(
                         None => None,
                     };
                     let Some((submission, given)) = given else {
-                        children.round_ended(&id);
+                        children.round_ended(&id, None);
                         continue;
                     };
                     opened_on = Some(submission);
@@ -282,10 +342,17 @@ pub(crate) async fn run(
                 break ended;
             }
             tracing::warn!("child agent {id}'s round failed; trying again in {wait:?}: {failed}");
+            match registry.upgrade() {
+                Some(children) => {
+                    children.stopped(&id, unavailable(&agent, failed, opened, &mut since, wait))
+                }
+                None => return,
+            }
             back_off(&mut wait).await;
             match registry.upgrade() {
                 Some(children) if !children.closed() => {
-                    if !children.round_opened(&id, agent.history.next_round()) {
+                    // Nothing of the round was kept, so its number is the same.
+                    if !children.round_opened(&id, opened) {
                         return;
                     }
                 }
@@ -295,7 +362,14 @@ pub(crate) async fn run(
         let Some(children) = registry.upgrade() else {
             return;
         };
-        children.round_ended(&id);
+        let facts = ended.as_ref().ok().map(|finished| RoundFacts {
+            round: opened,
+            reply: finished.reply.clone(),
+            stopped: finished.stopped.clone(),
+            reasoning: finished.reasoning.clone(),
+            sends: Vec::new(),
+        });
+        children.round_ended(&id, facts);
         // A release ended the round, or let it end, so what it held is no
         // longer the runner's to decide: an orienting round that ended so
         // is not ready.
@@ -315,12 +389,43 @@ pub(crate) async fn run(
                         warned = warning;
                     }
                 }
-                wait = RETRY_FIRST;
+                wait = first;
+                since = None;
             }
             Err(AgentError::Closed(_)) => return,
+            // Not opened again, and the child rests on what it holds until
+            // that changes; what an orienting round ran, or did not, it has
+            // ended all the same.
+            Err(AgentError::Refused(failed)) => {
+                let attempt = agent.slot().last_recorded().map(|(attempt, _)| attempt);
+                children.stopped(
+                    &id,
+                    AgentState::Refused {
+                        round: opened,
+                        attempt,
+                    },
+                );
+                if let Some(instance) = orienting.take() {
+                    children.oriented(&id, instance, None);
+                }
+                tracing::warn!(
+                    "child agent {id}'s round was refused for what it carried; it waits for \
+                     what it holds to change: {failed}"
+                );
+                // What the round did with what it held is no change; a request
+                // that arrived while it ran is one, so the next round opens.
+                let held = children.summary(&id, kind).held();
+                if held.is_subset(&live.held()) {
+                    resting = Some(held);
+                }
+                baseline = live;
+                wait = first;
+                since = None;
+            }
             // The baseline and the warning stay as they were: a round that
             // failed is neither the warning nor the round after it.
             Err(AgentError::PromptAfterWork(failed)) => {
+                children.stopped(&id, unavailable(&agent, &failed, opened, &mut since, wait));
                 // Its code ran, so an orienting round has ended all the same.
                 if let Some(instance) = orienting.take() {
                     children.oriented(&id, instance, None);
@@ -333,28 +438,30 @@ pub(crate) async fn run(
                 cut = opened_on.map(|submission| (submission, failed));
                 back_off(&mut wait).await;
             }
-            // Only the last of a run of failures gets here, the others having
-            // been opened again. The request was the same each time.
-            Err(AgentError::Prompt(failed)) => {
-                broken = Some(format!(
-                    "the child's round failed {ROUND_FAILURES_MAX} times in a row on the same \
-                     request, so it is not sent again: {failed}"
-                ));
-            }
-            // Its model can answer nothing until the configuration changes,
-            // so what it holds cannot be answered either. The terminal forms'
-            // own advice -- fix the cause, then start a new session -- is for
-            // the person at the session rather than for the parent reading why
-            // its child stopped, so those are carried by their cause alone.
+            // Its model can answer nothing more: the last of a run of failures
+            // before its code ran -- the others having been opened again, and
+            // the request the same each time -- or one that does not clear
+            // until the configuration changes, or one that was no model
+            // call's. What it holds cannot be answered either. The terminal
+            // forms' own advice -- fix the cause, then start a new session --
+            // is for the person at the session rather than for the parent
+            // reading why its child stopped, so those are carried by their
+            // cause alone.
             Err(failed) => {
-                let why = match &failed {
+                children.stopped(&id, broken_by(&agent, &failed, opened));
+                broken = Some(match failed {
+                    AgentError::Prompt(cause) => format!(
+                        "the child's round failed {ROUND_FAILURES_MAX} times in a row on the \
+                         same request, so it is not sent again: {cause}"
+                    ),
                     AgentError::PromptTerminal(cause)
-                    | AgentError::PromptAfterWorkTerminal(cause) => cause.clone(),
-                    other => other.to_string(),
-                };
-                broken = Some(format!(
-                    "the child's model call failed, and will not recover: {why}"
-                ));
+                    | AgentError::PromptAfterWorkTerminal(cause) => {
+                        format!("the child's model call failed, and will not recover: {cause}")
+                    }
+                    other => {
+                        format!("the child's model call failed, and will not recover: {other}")
+                    }
+                });
             }
         }
     }
@@ -369,6 +476,55 @@ pub(crate) async fn run(
 fn cause_of(cut: Option<&(u64, String)>, submission: u64) -> Option<&str> {
     cut.filter(|(of, _)| *of == submission)
         .map(|(_, failure)| failure.as_str())
+}
+
+/// Why `agent`'s latest model call failed, as its last request's
+/// `model.attempt` says, whichever of an alias's models it went to, or
+/// `failed`, the round's error, when it says none; and that request.
+fn failure(agent: &Agent, failed: &str) -> (String, Option<AttemptId>) {
+    match agent.slot().last_recorded() {
+        Some((attempt, error)) => (error.unwrap_or_else(|| failed.to_string()), Some(attempt)),
+        None => (failed.to_string(), None),
+    }
+}
+
+/// What a child whose model can answer nothing more, once its round `round`
+/// failed with `failed`, is: failed, with the last request of a model call
+/// that failed, and the error itself for anything else.
+fn broken_by(agent: &Agent, failed: &AgentError, round: u32) -> AgentState {
+    let (class, attempt) = match failed {
+        AgentError::Prompt(cause)
+        | AgentError::PromptTerminal(cause)
+        | AgentError::PromptAfterWorkTerminal(cause) => failure(agent, cause),
+        other => (other.to_string(), None),
+    };
+    AgentState::Failed {
+        class,
+        round: Some(round),
+        attempt,
+    }
+}
+
+/// What a child whose round `round` failed with `failed`, in a way that may
+/// clear, is: unavailable until it tries again, `wait` from now. `since` is
+/// when the first of this run of failures failed, which this is when it is
+/// unset.
+fn unavailable(
+    agent: &Agent,
+    failed: &str,
+    round: u32,
+    since: &mut Option<SystemTime>,
+    wait: Duration,
+) -> AgentState {
+    let now = SystemTime::now();
+    let (class, attempt) = failure(agent, failed);
+    AgentState::Unavailable {
+        class,
+        since: *since.get_or_insert(now),
+        next_attempt: now + wait,
+        round,
+        attempt,
+    }
 }
 
 /// Wait `wait`, and double it for the failure after, up to [`RETRY_MAX`].

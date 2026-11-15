@@ -5873,6 +5873,13 @@ fn a_failed_rounds_wording_is_written_for_the_person_who_sent_the_messages() {
     }
 
     let [prompt, after_work, terminal, after_work_terminal] = forms.map(|e| e.to_string());
+    // A refused call is worded as the failure it holds.
+    for (refused, worded) in [
+        (AgentError::Prompt(cause.into()), &prompt),
+        (AgentError::PromptAfterWork(cause.into()), &after_work),
+    ] {
+        assert_eq!(&AgentError::Refused(Box::new(refused)).to_string(), worded);
+    }
     assert!(
         prompt.contains("Nothing ran")
             && prompt.contains("has not read your messages")

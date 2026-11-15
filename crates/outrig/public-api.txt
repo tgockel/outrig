@@ -1956,6 +1956,30 @@ pub outrig::harness::event::Usage::total_tokens: u64
 impl core::iter::traits::accum::Sum for outrig::harness::event::Usage
 pub fn outrig::harness::event::Usage::sum<I: core::iter::traits::iterator::Iterator<Item = outrig::harness::event::Usage>>(I) -> outrig::harness::event::Usage
 pub const outrig::harness::event::DEFAULT_CAPACITY: usize
+#[non_exhaustive] pub enum outrig::harness::AgentState
+pub outrig::harness::AgentState::Cancelled
+#[non_exhaustive] pub outrig::harness::AgentState::Failed
+pub outrig::harness::AgentState::Failed::attempt: core::option::Option<outrig::harness::event::AttemptId>
+pub outrig::harness::AgentState::Failed::class: alloc::string::String
+pub outrig::harness::AgentState::Failed::round: core::option::Option<u32>
+#[non_exhaustive] pub outrig::harness::AgentState::Idle
+pub outrig::harness::AgentState::Idle::round: u32
+pub outrig::harness::AgentState::Launching
+#[non_exhaustive] pub outrig::harness::AgentState::Refused
+pub outrig::harness::AgentState::Refused::attempt: core::option::Option<outrig::harness::event::AttemptId>
+pub outrig::harness::AgentState::Refused::round: u32
+pub outrig::harness::AgentState::Released
+#[non_exhaustive] pub outrig::harness::AgentState::Running
+pub outrig::harness::AgentState::Running::round: u32
+pub outrig::harness::AgentState::Terminated
+#[non_exhaustive] pub outrig::harness::AgentState::Unavailable
+pub outrig::harness::AgentState::Unavailable::attempt: core::option::Option<outrig::harness::event::AttemptId>
+pub outrig::harness::AgentState::Unavailable::class: alloc::string::String
+pub outrig::harness::AgentState::Unavailable::next_attempt: std::time::SystemTime
+pub outrig::harness::AgentState::Unavailable::round: u32
+pub outrig::harness::AgentState::Unavailable::since: std::time::SystemTime
+impl outrig::harness::AgentState
+pub fn outrig::harness::AgentState::at_rest(&self) -> bool
 #[non_exhaustive] pub enum outrig::harness::Approval
 pub outrig::harness::Approval::Approve
 pub outrig::harness::Approval::CannotAsk
@@ -2200,11 +2224,15 @@ pub outrig::harness::RequestOutcome::request: outrig::harness::event::AgentReque
 pub struct outrig::harness::RootHandle(_)
 impl outrig::harness::RootHandle
 pub fn outrig::harness::RootHandle::agent(&self) -> core::option::Option<&str>
+pub async fn outrig::harness::RootHandle::changed(&self, u64) -> outrig::harness::Status
 pub fn outrig::harness::RootHandle::channels(&self) -> &[outrig::harness::RequestChannel]
 pub fn outrig::harness::RootHandle::id(&self) -> core::option::Option<outrig::harness::event::AgentInstanceId>
+pub async fn outrig::harness::RootHandle::next_stop(&self, u64) -> outrig::harness::Status
 pub async fn outrig::harness::RootHandle::ready(&self) -> core::result::Result<(), outrig::harness::RootError>
 pub async fn outrig::harness::RootHandle::release(&self)
 pub fn outrig::harness::RootHandle::request(&self, &str, serde_json::value::Value) -> core::result::Result<outrig::harness::RequestHandle, outrig::harness::RootError>
+pub fn outrig::harness::RootHandle::rounds(&self) -> alloc::vec::Vec<outrig::harness::RoundFacts>
+pub fn outrig::harness::RootHandle::status(&self) -> outrig::harness::Status
 impl core::fmt::Debug for outrig::harness::RootHandle
 pub fn outrig::harness::RootHandle::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::harness::RoundEnd
@@ -2212,6 +2240,17 @@ pub outrig::harness::RoundEnd::reasoning: core::option::Option<alloc::string::St
 pub outrig::harness::RoundEnd::reply: alloc::string::String
 pub outrig::harness::RoundEnd::still_running: outrig::harness::StillRunning
 pub outrig::harness::RoundEnd::stopped: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub struct outrig::harness::RoundFacts
+pub outrig::harness::RoundFacts::reasoning: core::option::Option<alloc::string::String>
+pub outrig::harness::RoundFacts::reply: alloc::string::String
+pub outrig::harness::RoundFacts::round: u32
+pub outrig::harness::RoundFacts::sends: alloc::vec::Vec<outrig::harness::RoundSend>
+pub outrig::harness::RoundFacts::stopped: core::option::Option<alloc::string::String>
+impl outrig::harness::RoundFacts
+pub fn outrig::harness::RoundFacts::any_send(&self) -> bool
+#[non_exhaustive] pub struct outrig::harness::RoundSend
+pub outrig::harness::RoundSend::channel: alloc::string::String
+pub outrig::harness::RoundSend::items: alloc::vec::Vec<alloc::string::String>
 pub struct outrig::harness::RunningProgram
 impl outrig::harness::RunningProgram
 pub fn outrig::harness::RunningProgram::interrupt(&self)
@@ -2304,6 +2343,10 @@ pub outrig::harness::SkillFile::path: alloc::string::String
 pub outrig::harness::SkillFile::version: alloc::string::String
 impl outrig::harness::SkillFile
 pub fn outrig::harness::SkillFile::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+#[non_exhaustive] pub struct outrig::harness::Status
+pub outrig::harness::Status::last: core::option::Option<outrig::harness::RoundFacts>
+pub outrig::harness::Status::seq: u64
+pub outrig::harness::Status::state: outrig::harness::AgentState
 #[non_exhaustive] pub struct outrig::harness::StillRunning
 pub outrig::harness::StillRunning::tasks: outrig::harness::Tasks
 impl outrig::harness::StillRunning

@@ -27,7 +27,7 @@ use super::mock_http::{
 };
 use super::runner::ROUND_FAILURES_MAX;
 use crate::config::Config;
-use crate::harness::event::{Event, Received};
+use crate::harness::event::{Event, Received, Subscription};
 use crate::harness::{Session, SessionBuilder, ShutdownReport};
 use crate::python::testing::{Flag, py};
 
@@ -74,6 +74,23 @@ pub(super) struct Tree {
     pub(super) events: Arc<std::sync::Mutex<Vec<Arc<Event>>>>,
     /// The task gathering them, which ends with the subscription.
     gathering: JoinHandle<()>,
+    /// A subscription held and never read, for [`Watch::Stalled`].
+    _stalled: Option<Subscription>,
+}
+
+/// How a test session's events are watched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Watch {
+    /// Every event is gathered into [`Tree::events`], and a gap fails the test.
+    Gathered,
+    /// Nothing subscribes.
+    Unwatched,
+    /// One subscription, holding one event, is never read.
+    Stalled,
+}
+
+impl Watch {
+    pub(super) const ALL: [Watch; 3] = [Watch::Gathered, Watch::Unwatched, Watch::Stalled];
 }
 
 pub(super) async fn tree(var: &str, top: &str, routes: Vec<(&'static str, Responder)>) -> Tree {
@@ -105,18 +122,41 @@ pub(super) async fn tree_built(
 pub(super) async fn tree_over(
     var: &str,
     top: &str,
-    (addr, requests, gauge): (
+    mock: (
         std::net::SocketAddr,
         UnboundedReceiver<RecordedRequest>,
         Arc<Gauge>,
     ),
     build: impl FnOnce(SessionBuilder) -> SessionBuilder,
 ) -> Tree {
+    tree_watched(var, top, mock, Watch::Gathered, build).await
+}
+
+/// [`tree_over`], its events watched as `watch` says: only [`Watch::Gathered`] fills
+/// [`Tree::events`].
+pub(super) async fn tree_watched(
+    var: &str,
+    top: &str,
+    (addr, requests, gauge): (
+        std::net::SocketAddr,
+        UnboundedReceiver<RecordedRequest>,
+        Arc<Gauge>,
+    ),
+    watch: Watch,
+    build: impl FnOnce(SessionBuilder) -> SessionBuilder,
+) -> Tree {
     let cfg = config(addr, var, top);
-    let (events_out, mut subscription) = watched(None).await;
-    let builder = SessionBuilder::new(cfg, Some("coding"), None)
-        .events(events_out)
-        .secrets(keyed(var));
+    let mut builder = SessionBuilder::new(cfg, Some("coding"), None).secrets(keyed(var));
+    let (mut subscription, mut stalled) = (None, None);
+    match watch {
+        Watch::Gathered => {
+            let (events_out, gathered) = watched(None).await;
+            builder = builder.events(events_out);
+            subscription = Some(gathered);
+        }
+        Watch::Unwatched => {}
+        Watch::Stalled => stalled = Some(builder.subscribe_with_capacity(1)),
+    }
     let session = build(builder)
         .start_on_host()
         .await
@@ -124,6 +164,9 @@ pub(super) async fn tree_over(
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = Arc::clone(&events);
     let gathering = tokio::spawn(async move {
+        let Some(mut subscription) = subscription else {
+            return;
+        };
         while let Some(received) = subscription.recv().await {
             match received {
                 Received::Event(event) => seen.lock().expect("events").push(event),
@@ -137,6 +180,7 @@ pub(super) async fn tree_over(
         gauge,
         events,
         gathering,
+        _stalled: stalled,
     }
 }
 
@@ -589,32 +633,27 @@ async fn a_work_child_that_never_completes_is_cancelled_after_three_rounds() {
     );
 }
 
-/// The model calls a filtered reply costs a round: the call, and the call sent again without the
-/// latest results. The config's `retry-budget-secs = 0` leaves no retry between them.
-const FILTERED_CALLS: usize = 2;
-
-/// A work child whose round runs code and then meets only replies the provider filtered fails
-/// that round; the next two end on plain stops without completing, and the submission is
-/// cancelled. The parent's exception chains the failed round as its `__cause__`, an
-/// `AgentRequestFailed` naming the finish reason, which the settled event carries too.
+/// A work child whose round runs code and then meets a reply it cannot use fails that round; the
+/// next two end on plain stops without completing, and the submission is cancelled. The parent's
+/// exception chains the failed round as its `__cause__`, an `AgentRequestFailed` naming the
+/// finish reason, which the settled event carries too.
 #[tokio::test]
-async fn a_cancel_chains_the_round_a_filtered_reply_failed() {
-    let mut child = vec![submit("c1", &py("print('ran')"))];
-    child.extend(std::iter::repeat_n(
-        mock_http::Style::Messages.empty("refusal"),
-        FILTERED_CALLS,
-    ));
-    child.push(text_reply("done"));
+async fn a_cancel_chains_the_round_an_unusable_reply_failed() {
+    let child = vec![
+        submit("c1", &py("print('ran')")),
+        mock_http::Style::Messages.unusable(),
+        text_reply("done"),
+    ];
     let mut tree = tree(
         "OUTRIG_TEST_CHILD_CHAINED_CAUSE",
         "",
         vec![
-            ("ROLE filtered", scripted(child)),
+            ("ROLE cut", scripted(child)),
             (
                 "",
                 primary_runs(&format!(
                     "{TOTAL}\nimport outrig\n\
-                     child = await runtime.spawn('s', prompt='ROLE filtered')\n\
+                     child = await runtime.spawn('s', prompt='ROLE cut')\n\
                      first = child.submit({{'xs': [1]}}, result=Total)\n\
                      try:\n    await first\n\
                      except outrig.RequestCancelled as e:\n    \
@@ -628,12 +667,12 @@ async fn a_cancel_chains_the_round_a_filtered_reply_failed() {
     let (_, events, requests) = tree.end().await;
     let said = printed(&requests, "p1");
     assert!(
-        said.starts_with("AgentRequestFailed ") && said.contains("finish reason refusal"),
+        said.starts_with("AgentRequestFailed ") && said.contains("finish reason max_tokens"),
         "{said}"
     );
     assert_eq!(
-        of_agent(&requests, "ROLE filtered").len(),
-        1 + FILTERED_CALLS + 2,
+        of_agent(&requests, "ROLE cut").len(),
+        2 + 2,
         "the failed round's calls, then the nudge and the warning"
     );
     let settled = data(kind(&events, "agent.request.settled", None)[0]);
@@ -641,8 +680,52 @@ async fn a_cancel_chains_the_round_a_filtered_reply_failed() {
     assert!(
         settled["cause"]
             .as_str()
-            .is_some_and(|cause| cause.contains("finish reason refusal")),
+            .is_some_and(|cause| cause.contains("finish reason max_tokens")),
         "{settled}"
+    );
+}
+
+/// A work child whose round the provider refused for what it carried -- its opening, as it was
+/// given its submission -- opens no other: being given the submission was that round's own doing
+/// and no change, so the submission stays open, and the child is sent nothing more, until its
+/// sender cancels it.
+#[tokio::test]
+async fn a_submission_given_to_a_refused_round_waits_for_its_sender() {
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_REFUSED_REST",
+        "",
+        vec![
+            (
+                "ROLE refused",
+                scripted(vec![
+                    mock_http::Style::Messages.empty("refusal"),
+                    text_reply("never"),
+                ]),
+            ),
+            (
+                "",
+                primary_runs(&format!(
+                    "{TOTAL}\nimport asyncio\n\
+                     child = await runtime.spawn('s', prompt='ROLE refused')\n\
+                     first = child.submit({{'xs': [1]}}, result=Total)\n\
+                     await asyncio.sleep(1)\n\
+                     print(first.cancel())"
+                )),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, _, requests) = tree.end().await;
+    assert_eq!(
+        printed(&requests, "p1"),
+        "True\n",
+        "still open, so the cancel ended it"
+    );
+    assert_eq!(
+        of_agent(&requests, "ROLE refused").len(),
+        1,
+        "the refused opening, and nothing after it"
     );
 }
 

@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 
 use super::channel::{Announcer, Injected};
@@ -57,6 +57,7 @@ use crate::harness::event::{
 use crate::harness::lifecycle::Lifecycle;
 use crate::harness::services::ServiceBrief;
 use crate::harness::skills::SkillBrief;
+use crate::harness::stop::{AgentState, RoundFacts, Snapshot};
 use crate::harness::{ClosedBy, RequestOutcome};
 use crate::python::host::{
     Channels, ChildLines, Counts, ImportFailure, Interpreter, InterpreterError, OWNER,
@@ -149,6 +150,9 @@ struct State {
     /// have been recorded -- each once, whichever of the program and the
     /// close says the release first.
     owned: HashMap<String, Owned>,
+    /// How many times a child's state has changed, which numbers each change
+    /// ([`ChildNode::say`]).
+    seq: u64,
 }
 
 #[derive(Default)]
@@ -192,6 +196,27 @@ struct ChildNode {
     /// The agent class instance it serves, if it serves one: for a root
     /// child, the program's number for it, which what it is told names.
     instance: Option<u64>,
+    /// What it is doing, as its owner reads it, and, for a root, its latest
+    /// rounds' facts: changed only under the state's lock.
+    status: watch::Sender<Snapshot>,
+}
+
+impl ChildNode {
+    /// Move what the child's readers see to what `to` makes of its state, as
+    /// the change after `seq`, which this counts. A final state is the last,
+    /// and the state it is in already is no change.
+    fn say(&self, seq: &mut u64, to: impl FnOnce(&AgentState) -> Option<AgentState>) {
+        self.status.send_if_modified(|snapshot| {
+            let now = &snapshot.state;
+            let Some(next) = to(now).filter(|next| next != now && !now.is_final()) else {
+                return false;
+            };
+            *seq += 1;
+            snapshot.seq = *seq;
+            snapshot.state = next;
+            true
+        });
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +282,11 @@ pub(crate) struct Summary {
 impl Summary {
     pub(crate) fn is_empty(&self) -> bool {
         self.unread.is_empty() && self.taken.is_empty()
+    }
+
+    /// Every request it holds, whether waiting or taken.
+    pub(crate) fn held(&self) -> BTreeSet<u64> {
+        self.unread.union(&self.taken).copied().collect()
     }
 }
 
@@ -333,6 +363,12 @@ impl Children {
             }
         }));
         Self(inner)
+    }
+
+    /// What child `child` is doing, as its owner reads it, from now on;
+    /// `None` for an agent that is no child.
+    pub(crate) fn status_of(&self, child: &str) -> Option<watch::Receiver<Snapshot>> {
+        Some(self.0.state().child(child)?.status.subscribe())
     }
 
     /// The program on the host injected the live object `brief` describes:
@@ -485,6 +521,7 @@ impl State {
         }
         node.round = Some(round);
         node.life = Life::Running;
+        self.say(child, |_| Some(AgentState::Running { round }));
         for record in self
             .requests
             .values_mut()
@@ -496,6 +533,13 @@ impl State {
             }
         }
         true
+    }
+
+    /// Move what `child`'s readers see: see [`ChildNode::say`].
+    fn say(&mut self, child: &str, to: impl FnOnce(&AgentState) -> Option<AgentState>) {
+        if let Some(node) = self.agents.get(child).and_then(|node| node.child.as_ref()) {
+            node.say(&mut self.seq, to);
+        }
     }
 
     /// Whether `child` was released: its release has begun, or it is wedged.
@@ -522,6 +566,13 @@ impl State {
             }
             let launching = child.life == Life::Launching;
             child.life = Life::Released;
+            // Cancelled when no round of it had opened yet.
+            child.say(&mut self.seq, |now| {
+                Some(match now {
+                    AgentState::Launching => AgentState::Cancelled,
+                    _ => AgentState::Released,
+                })
+            });
             // Woken to see it, and not stopped: a round in flight is given until its next model
             // call to end (`Inner::end_released`).
             child.wake.notify_one();
@@ -743,6 +794,8 @@ impl Inner {
             let lineage = (node.slot.clone(), node.slot.current_round());
             let depth = node.depth + 1;
             state.launched += 1;
+            state.seq += 1;
+            let launched = Snapshot::launching(state.seq);
             let id = format!("c{}", state.launched);
             state.agents.insert(
                 id.clone(),
@@ -761,6 +814,7 @@ impl Inner {
                         delivered: BTreeMap::new(),
                         round: None,
                         instance: line["instance"]["id"].as_u64(),
+                        status: watch::Sender::new(launched),
                     }),
                     invocations,
                 },
@@ -1684,13 +1738,29 @@ impl Inner {
         opened
     }
 
-    /// `child`'s round has ended. Whether it is idle is said only once its
-    /// runner waits, so a round that follows at once is never seen apart from
-    /// the one before.
-    pub(crate) fn round_ended(&self, child: &str) {
-        if let Some(node) = self.state().child_mut(child) {
-            node.round = None;
+    /// `child`'s round has ended, with `facts` when it ended with a reply,
+    /// which a root keeps for its owner to read; no other child's are read.
+    /// Whether it is idle is said only once its runner waits, so a round that
+    /// follows at once is never seen apart from the one before.
+    pub(crate) fn round_ended(&self, child: &str, facts: Option<RoundFacts>) {
+        let mut state = self.state();
+        let Some(node) = state.agents.get_mut(child) else {
+            return;
+        };
+        let rooted = node.parent.as_deref() == Some(OWNER);
+        let Some(child) = node.child.as_mut() else {
+            return;
+        };
+        child.round = None;
+        if let Some(facts) = facts.filter(|_| rooted) {
+            child.status.send_modify(|snapshot| snapshot.keep(facts));
         }
+    }
+
+    /// `child`'s runner put it in `state`: a round failed, or the provider
+    /// refused it, or its model can answer nothing more.
+    pub(crate) fn stopped(&self, child: &str, state: AgentState) {
+        self.state().say(child, |_| Some(state));
     }
 
     /// `child`'s runner found it holding nothing, and waits for a change: it is
@@ -1720,6 +1790,15 @@ impl Inner {
             return;
         }
         node.life = Life::Idle;
+        // From a round, or a failure the runner was to try again: a refusal and
+        // a model that can answer nothing more stay what the child is at rest
+        // on, since nothing has changed either.
+        state.say(child, |now| match *now {
+            AgentState::Running { round } | AgentState::Unavailable { round, .. } => {
+                Some(AgentState::Idle { round })
+            }
+            _ => None,
+        });
         drop(state);
         self.tell_life(child);
     }
@@ -1985,6 +2064,16 @@ impl Inner {
             state.closed = Some(by.clone());
             let terminated = matches!(by, ClosedBy::InterpreterExited { .. });
             self.to_owner(json!({"t": "agent.closed", "terminated": terminated}));
+            // Every child the close comes to is released by it, or, when the interpreter died,
+            // ended under it.
+            let ended = match terminated {
+                true => AgentState::Terminated,
+                false => AgentState::Released,
+            };
+            let State { agents, seq, .. } = &mut *state;
+            for child in agents.values().filter_map(|node| node.child.as_ref()) {
+                child.say(seq, |_| Some(ended.clone()));
+            }
             state.at_close = state
                 .requests
                 .iter()
@@ -2122,6 +2211,7 @@ mod tests {
                     delivered: BTreeMap::new(),
                     round: None,
                     instance: None,
+                    status: watch::Sender::new(Snapshot::launching(0)),
                 }),
                 invocations: Vec::new(),
             },

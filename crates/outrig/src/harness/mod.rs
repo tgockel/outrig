@@ -32,6 +32,9 @@
 //!   serving it. Their metadata is read as the session starts, with no Python
 //!   run, and the primary agent is told each by name and description; a
 //!   skill's files reach the container only as its code imports or reads them.
+//! - **Reading a root.** A [`RootHandle`] says what the root its owner constructed is doing --
+//!   a round open, or why it is at rest -- and what each round said, read from the session's
+//!   own record of its agents rather than from its events ([`RootHandle::status`]).
 //! - **Stopping.** [`Session::close_admission`] refuses new work at once, and
 //!   [`Session::shutdown`] stops what is left and returns a
 //!   [`ShutdownReport`]: whether everything is proven stopped, and how each
@@ -63,6 +66,7 @@ mod root;
 pub(crate) mod services;
 mod session;
 pub(crate) mod skills;
+pub(crate) mod stop;
 
 use std::time::Duration;
 
@@ -86,6 +90,7 @@ pub use self::services::{
 };
 pub use self::session::{Closer, RoundEnd, RoundOutcome, Session, StillRunning, Tasks};
 pub use self::skills::{DirectorySource, SkillFile, SkillSource};
+pub use self::stop::{AgentState, RoundFacts, RoundSend, Status};
 pub use crate::agent::UserChannel;
 pub use crate::config::{EnvSecrets, Secrets};
 pub use crate::owner::{HostProgram, LeftOpen, ProgramExit, RunningProgram, SessionEnd};

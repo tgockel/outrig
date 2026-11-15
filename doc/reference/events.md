@@ -484,6 +484,14 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
   working in a background task: `round`, `attempts`, and `usage`, their sum. Its subject is the
   agent whose round it was, and what it adds belongs to that round's `total`. One that lands as
   the round ends can come before the round's own event.
+
+The `model.round.*` events say what each round did, for diagnosis. An owner acting on why the
+root it constructed is at rest -- idle, waiting to try a failed call again and until when,
+refused, failed for good, released -- reads it from the root's handle (`RootHandle::status` in
+`outrig::harness`), which the session keeps whether or not anything subscribes, so a dropped
+event changes nothing it reads. The wait between a child's failed rounds is in that read and has
+no event of its own.
+
 - `model.retry` -- a model call that failed and will be made again, after a wait.
   - `model`: the `[models.<name>]` row being retried.
   - `attempt`: the try that failed, counted from 1 among this call's retries.

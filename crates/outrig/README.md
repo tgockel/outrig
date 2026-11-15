@@ -225,6 +225,31 @@ root.release().await;
 cannot be, and `SessionBuilder::check` resolves its model and keys before any container exists;
 `Session::constructed` is its handle, and `Session::root` finds any root by its instance id.
 
+The handle also says what the root is doing, and why it is at rest, read from the session's own
+record of its agents rather than from its events, so a subscription that drops events, or none at
+all, changes nothing it reads. `status()` gives an `AgentState` -- a round running; `Unavailable`,
+with the provider's failure, since when and when the root tries again; `Idle`; `Refused`, for a
+round the provider would not answer for what it carried; `Failed`, once its model can answer
+nothing more; `Released`, `Cancelled` or `Terminated` -- numbered by a sequence that
+`changed(seq)` and `next_stop(seq)` wait past. The status's `last`, and `rounds()` for up to
+sixteen, give each round's closing text and why it was cut short, which OutRig delivers to no one:
+
+```rust,no_run
+# async fn example(root: outrig::harness::RootHandle) -> Result<(), outrig::harness::RootError> {
+use outrig::harness::AgentState;
+
+let seq = root.status().seq;
+let request = root.request("review", serde_json::json!("src/main.py"))?;
+let stop = root.next_stop(seq).await;
+match stop.state {
+    AgentState::Unavailable { next_attempt, .. } => println!("trying again at {next_attempt:?}"),
+    AgentState::Idle { .. } => println!("{}", request.outcome().await?),
+    other => println!("at rest: {other:?}"),
+}
+# Ok(())
+# }
+```
+
 The application supplies what the root is told of its task and OutRig composes the instructions:
 the class's docstring, then the `outrig.Section(title, text)`s its optional
 `__outrig_instructions__(self)` returns, which Python calls once as the constructor call finishes

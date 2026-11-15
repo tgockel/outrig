@@ -13,6 +13,10 @@
 //! is that the spawn carries a construct record, which the root's kernel runs, and that the
 //! kernel judges each reply against the declared type, as it does for a parent kernel, so the
 //! owner hears the accepted reply as JSON.
+//!
+//! What a root is doing, and why it is at rest, the owner reads from the session's registry of
+//! its agents, which the root's runner moves under the registry's lock ([`super::stop`]): never
+//! from its events, and never by asking the interpreter.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,6 +27,7 @@ use serde_json::{Value, json};
 use tokio::sync::{oneshot, watch};
 
 use super::event::{AgentInstanceId, AgentRequestId};
+use super::stop::{AgentState, RoundFacts, Snapshot, Status};
 use crate::agent::children::{Children, channel_texts};
 use crate::agent::orientation::ChannelText;
 
@@ -396,16 +401,29 @@ impl Owner {
             "model": spec.model, "instance": {"id": number}, "construct": spec.record(),
         });
         let answer = self.asked(number, line).await;
+        let child = answer["child"].as_str().map(str::to_string);
+        // A root that was not launched was given up before its first round, and reads so.
+        let status = child
+            .as_deref()
+            .and_then(|child| self.children.status_of(child))
+            .unwrap_or_else(|| {
+                let never = Snapshot {
+                    state: AgentState::Cancelled,
+                    ..Snapshot::launching(0)
+                };
+                watch::channel(never).1
+            });
         let root = Arc::new(Root {
             owner: Arc::downgrade(self),
             number,
-            child: answer["child"].as_str().map(str::to_string),
+            child,
             instance: answer["instance"].as_u64().map(AgentInstanceId::new),
             channels: channel_texts(&answer["channels"])
                 .into_iter()
                 .map(RequestChannel::from)
                 .collect(),
             ready,
+            status,
             releasing: AtomicBool::new(false),
             released: watch::Sender::new(None),
         });
@@ -599,6 +617,8 @@ struct Root {
     instance: Option<AgentInstanceId>,
     channels: Vec<RequestChannel>,
     ready: Ready,
+    /// What it is doing, as the session's registry of its agents says.
+    status: watch::Receiver<Snapshot>,
     /// Whether its release has begun, and, once it has ended, that it has: the release is a task
     /// of its own, so a caller that stops waiting leaves it to finish.
     releasing: AtomicBool,
@@ -676,6 +696,57 @@ impl RootHandle {
             tokio::spawn(Arc::clone(&self.0).release());
         }
         let _ = settled(&self.0.released).await;
+    }
+
+    /// What the root is doing: a round open, or why it is at rest, numbered by the change that
+    /// made it so, with the facts of the latest round that ended with a reply. Read from the
+    /// session's own record of its agents, as the root's runner moves it, so it waits on
+    /// nothing -- not the interpreter, not a busy kernel -- and no event subscription, or the
+    /// lack of one, changes it. A root that was not launched reads [`AgentState::Cancelled`].
+    pub fn status(&self) -> Status {
+        self.0.status.borrow().status()
+    }
+
+    /// Wait for the root's state to change past `seq`, a [`Status::seq`] read earlier, and
+    /// return the status it changed to. Once the session has ended, nothing changes any more,
+    /// and this returns the last status at once.
+    pub async fn changed(&self, seq: u64) -> Status {
+        self.waited(|snapshot| snapshot.seq > seq).await
+    }
+
+    /// Wait until the root is at rest in a state it came to after `seq`, a [`Status::seq`] read
+    /// earlier, and return that status. Read before a request is sent, `seq` loses no stop to a
+    /// round that ends before this is called:
+    ///
+    /// ```no_run
+    /// # async fn f(root: outrig::harness::RootHandle) -> Result<(), outrig::harness::RootError> {
+    /// let seq = root.status().seq;
+    /// let request = root.request("review", serde_json::json!("src/main.py"))?;
+    /// let stop = root.next_stop(seq).await;
+    /// println!("{:?} {:?}", stop.state, request.outcome().await);
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// A read shows the state the root is in as it reads; one the root passed through between
+    /// two reads is not kept. Once the session has ended, this returns the last status at once.
+    pub async fn next_stop(&self, seq: u64) -> Status {
+        self.waited(|snapshot| snapshot.seq > seq && snapshot.state.at_rest())
+            .await
+    }
+
+    /// The facts of the root's latest rounds that ended with a reply, the oldest first: at most
+    /// sixteen.
+    pub fn rounds(&self) -> Vec<RoundFacts> {
+        self.0.status.borrow().rounds.iter().cloned().collect()
+    }
+
+    /// The status once `until` holds of it, or the last, once nothing can change it.
+    async fn waited(&self, until: impl FnMut(&Snapshot) -> bool) -> Status {
+        let mut status = self.0.status.clone();
+        if let Ok(snapshot) = status.wait_for(until).await {
+            return snapshot.status();
+        }
+        status.borrow().status()
     }
 
     /// The root's request channels, as its class declares them: empty for a class with none.

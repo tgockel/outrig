@@ -396,6 +396,10 @@ struct InFlight {
     answered: Option<AnsweredAttempt>,
     /// The latest attempt the current candidate was sent.
     last: Option<AttemptId>,
+    /// The latest attempt of the call recorded, whichever candidate it went to, and why it
+    /// failed, as its `model.attempt` says, or `None` when it was answered. A candidate passed
+    /// over without a request leaves it as it was.
+    recorded: Option<(AttemptId, Option<String>)>,
     /// The first request a candidate refused, of those whose conversation put
     /// one role after itself.
     refusal: Option<Refusal>,
@@ -553,6 +557,7 @@ impl CallSlot {
             settings: Arc::default(),
             answered: None,
             last: None,
+            recorded: None,
             refusal: None,
             filtered: None,
             once: false,
@@ -578,6 +583,13 @@ impl CallSlot {
     /// The latest request the current candidate was sent, if any was.
     pub(crate) fn last_attempt(&self) -> Option<AttemptId> {
         self.state().call.as_ref().and_then(|call| call.last)
+    }
+
+    /// The latest request the call was sent, whichever of its candidates it went to, and why
+    /// it failed, in the words its `model.attempt` records -- an HTTP status, a connection
+    /// error, an unusable response -- or `None` when it was answered; `None` when it sent none.
+    pub(crate) fn last_recorded(&self) -> Option<(AttemptId, Option<String>)> {
+        self.state().call.as_ref()?.recorded.clone()
     }
 
     /// The current candidate refused a request whose conversation put one role
@@ -673,7 +685,7 @@ impl CallSlot {
                 model: settings.model.clone(),
                 identifier: settings.identifier.clone(),
                 max_tokens: settings.max_tokens,
-                error,
+                error: error.clone(),
                 usage,
                 finish_reason,
             },
@@ -685,6 +697,7 @@ impl CallSlot {
                 && in_flight.call == call
             {
                 in_flight.last = Some(attempt);
+                in_flight.recorded = Some((attempt, error));
                 in_flight.filtered = filtered;
             }
             state.round.push(attempt);
@@ -1192,5 +1205,25 @@ mod tests {
                 usage: Some(plain(4, 4)),
             }
         );
+    }
+
+    /// The call's latest request, and why it failed, stand when the call moves on to a candidate
+    /// it sends nothing -- an alias's fallback whose window cannot hold the call -- so a round that
+    /// fails then names the request that did fail; and a new call starts with none.
+    #[test]
+    fn a_calls_last_request_outlives_a_candidate_that_sent_none() {
+        let slot = CallSlot::new(Ledger::new(Events::off(), None, None), Events::off(), None);
+        slot.begin_call();
+        slot.candidate("head", MODEL, None);
+        let pending = slot.sending().expect("a call in flight");
+        let (_, attempt) = pending.failed("HTTP 503 Service Unavailable".to_string());
+        slot.candidate("fallback", MODEL, None);
+        assert_eq!(slot.last_attempt(), None, "the fallback sent nothing");
+        assert_eq!(
+            slot.last_recorded(),
+            Some((attempt, Some("HTTP 503 Service Unavailable".to_string())))
+        );
+        slot.begin_call();
+        assert_eq!(slot.last_recorded(), None);
     }
 }

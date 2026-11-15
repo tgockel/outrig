@@ -19,6 +19,23 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **The owner reads a root's stop.** `RootHandle::status()` returns a `Status`: an `AgentState`
+  -- `Launching` until its first round opens, `Running { round }`, and at rest `Unavailable {
+  class, since, next_attempt, round, attempt }` while a model call that may clear is retried,
+  `Idle { round }`, `Refused { round, attempt }`, `Failed { class, round, attempt }`, `Released`,
+  `Cancelled` (released before its first round, or never launched) or `Terminated` -- with
+  `seq`, the change that made it so, and `last`, the facts of the latest round that ended with a
+  reply. `changed(seq)` waits for the next change past `seq`, `next_stop(seq)` for the root to be
+  at rest in a state it came to after `seq`, and `rounds()` gives up to sixteen rounds'
+  `RoundFacts`: `round`, `reply`, `stopped`, `reasoning`, and `sends`, which stays empty until
+  external channels land (`any_send()`). Rounds and attempts are the numbers `model.round.*` and
+  `model.attempt` carry, and `class` is the failed request's `model.attempt` error. The reads come
+  from the session's registry of its agents, which a child's runner moves under its lock, and
+  never from events or the interpreter; no event is added. A child's round the provider refused
+  for what it carried -- `content_filter` or `refusal`, refused again when sent without the
+  turn's results -- is no longer opened again five times and then taken for a broken model: no
+  round opens until a request it holds arrives or ends -- taking one in the refused round is no
+  change -- and its requests stay open.
 - **An agent class contributes sections to its child's instructions.** `outrig.Section(title,
   text)`, a frozen dataclass, is what the optional `__outrig_instructions__(self)` of an
   `outrig.Agent` subclass returns an iterable of. OutRig calls it once, in the constructor call --

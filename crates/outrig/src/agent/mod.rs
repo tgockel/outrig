@@ -424,6 +424,25 @@ pub(crate) enum AgentError {
          Fix what the error names, then start a new session"
     )]
     PromptAfterWorkTerminal(String),
+
+    /// [`Prompt`](Self::Prompt) or [`PromptAfterWork`](Self::PromptAfterWork),
+    /// the one it holds, for a call the provider would not answer for what
+    /// it carried: a reply it ended with `content_filter` or `refusal`, sent
+    /// once more without the turn's results and refused again. Worded as the
+    /// one it holds; a child's runner does not send the round again.
+    #[error(transparent)]
+    Refused(Box<AgentError>),
+}
+
+impl AgentError {
+    /// Whether the round had already run Python when it failed.
+    pub(crate) fn ran_python(&self) -> bool {
+        match self {
+            AgentError::PromptAfterWork(_) | AgentError::PromptAfterWorkTerminal(_) => true,
+            AgentError::Refused(failed) => failed.ran_python(),
+            _ => false,
+        }
+    }
 }
 
 impl From<OutrigError> for AgentError {
@@ -482,3 +501,7 @@ mod contributions_tests;
 #[cfg(test)]
 #[path = "root_tests.rs"]
 mod root_tests;
+
+#[cfg(test)]
+#[path = "stop_tests.rs"]
+mod stop_tests;

@@ -239,7 +239,9 @@ impl Drop for KeptIfDropped {
 /// errors carry no history, so what is kept is what the hook committed and
 /// journaled: see [`RoundHook::keep_what_ran`]. Dropping it would leave the
 /// interpreter holding what the calls did and the conversation saying they
-/// never ran, which is how a resent prompt runs a `git push` twice.
+/// never ran, which is how a resent prompt runs a `git push` twice. A call
+/// the provider would not answer for what it carried is
+/// [`AgentError::Refused`]: resent, it is refused the same way.
 fn stopped_short(err: PromptError, hook: &RoundHook) -> Result<Finished, AgentError> {
     let (reason, chat_history) = match (err, hook.stop_reason()) {
         (PromptError::Cancelled { chat_history, .. }, Some(ours)) => (ours, chat_history),
@@ -264,11 +266,15 @@ fn stopped_short(err: PromptError, hook: &RoundHook) -> Result<Finished, AgentEr
                     hook.refusal_hint(&other)
                 );
                 let ran = hook.keep_what_ran();
-                return Err(match (ran, may_clear(&other)) {
+                let failed = match (ran, may_clear(&other)) {
                     (false, true) => AgentError::Prompt(text),
                     (true, true) => AgentError::PromptAfterWork(text),
                     (false, false) => AgentError::PromptTerminal(text),
                     (true, false) => AgentError::PromptAfterWorkTerminal(text),
+                };
+                return Err(match hook.refused(&other) {
+                    true => AgentError::Refused(Box::new(failed)),
+                    false => failed,
                 });
             };
             // Nothing is left to flush: every turn the call answers is in the
@@ -614,6 +620,16 @@ impl RoundHook {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Whether `err`, a failed call, failed because the provider would not
+    /// answer for what it carried: the call's last request was a reply it
+    /// ended with `content_filter` or `refusal`. Only a failed call has such
+    /// a request; the slot holds the latest call's, which an error from
+    /// anywhere else is not about.
+    fn refused(&self, err: &PromptError) -> bool {
+        matches!(err, PromptError::Report(_) | PromptError::Provider(_))
+            && self.slot.filtered().is_some()
     }
 
     /// What to add to `err`, when a provider refused the latest call and the
