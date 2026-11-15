@@ -74,7 +74,11 @@ const SETTLE: Duration = Duration::from_millis(500);
 /// A `refuse.<verb>.<token>` marker makes the next *n* invocations of that verb
 /// fail with nothing done, *n* being the count the marker holds, and an
 /// `absent.rmi.<token>` marker makes an `rmi` answer as buildah does for a tag
-/// that does not exist. A working container's name carries no token, so for
+/// that does not exist. A `lostlayer.<verb>.<token>` marker is the same
+/// countdown with buildah's text for a commit whose reused layer went away
+/// under it. A `cacheon.<verb>.<token>` marker makes that verb mark its
+/// own target cached as it runs, which is another session's build landing on a
+/// tag mid-flight. A working container's name carries no token, so for
 /// these a `buildah rm` also matches against the `from` that made it. A
 /// `slow.<verb>.<token>` marker holds the seconds that verb sleeps before it
 /// answers, refusal or not.
@@ -153,6 +157,17 @@ if [ "$1" = rm ] && [ -f "$journal/origin.$target" ]; then
 fi
 seen=" $* $origin "
 
+# A `cacheon.<verb>.<token>` marker makes that verb mark its target cached as
+# it runs: another session's build landing on the tag while this one is still
+# working, rather than before it started.
+for marker in "$journal"/cacheon."$1".*; do
+  [ -e "$marker" ] || continue
+  token=${marker##*/cacheon.$1.}
+  case "$seen" in
+    *"$token"*) : > "$journal/cached.$(flat "$target")" ;;
+  esac
+done
+
 # A `slow.<verb>.<token>` marker holds the seconds this verb takes to answer.
 for marker in "$journal"/slow."$1".*; do
   [ -e "$marker" ] || continue
@@ -175,6 +190,27 @@ for marker in "$journal"/refuse."$1".*; do
       if [ "$left" -gt 0 ]; then
         printf '%s\n' "$((left - 1))" > "$marker"
         echo "Error: $1 $target: database is locked" 1>&2
+        publish
+        exit 125
+      fi
+      ;;
+  esac
+done
+
+# A `lostlayer.<verb>.<token>` marker holds a count, and that many invocations
+# fail the way containers/storage fails a commit whose reused layer another
+# build removed before the image record naming it was created (#728): exit 125,
+# with nothing committed and the working container left where it was, so the
+# attempt after it can be the same command again.
+for marker in "$journal"/lostlayer."$1".*; do
+  [ -e "$marker" ] || continue
+  token=${marker##*/lostlayer.$1.}
+  case "$seen" in
+    *"$token"*)
+      left=$(cat "$marker")
+      if [ "$left" -gt 0 ]; then
+        printf '%s\n' "$((left - 1))" > "$marker"
+        printf 'Error: committing container "c" to "%s": copying layers and metadata for container "73c77c04": committing the finished image: creating image "6c522665": layer not known\n' "$target" 1>&2
         publish
         exit 125
       fi
@@ -435,6 +471,14 @@ fn mark_cached_for(journal: &Path, tag: &ImageTag) {
     std::fs::write(journal.join(format!("cached.{flat}")), "").expect("write cached marker");
 }
 
+/// [`mark_cached_for`], except that the tag becomes cached only once the
+/// fake's `verb` runs with `token` in its argv: the winner lands while this
+/// build is between attempts rather than before it started.
+fn mark_cached_when(journal: &Path, verb: &str, token: &str) {
+    std::fs::write(journal.join(format!("cacheon.{verb}.{token}")), "")
+        .expect("write cacheon marker");
+}
+
 /// Make the fake's parked `build` record a stop and refuse it, so a test can
 /// reach the escalation waiting behind the grace.
 fn ignore_stop_for(journal: &Path, token: &str) {
@@ -485,6 +529,17 @@ fn slow_for(journal: &Path, verb: &str, token: &str, seconds: &str) {
         .expect("write slow marker");
 }
 
+/// Make the next `times` invocations of the fake's `verb` that mention `token`
+/// fail the way containers/storage fails a commit whose reused layer a
+/// concurrent build removed out from under it (#728).
+fn lose_layer_for(journal: &Path, verb: &str, token: &str, times: u32) {
+    std::fs::write(
+        journal.join(format!("lostlayer.{verb}.{token}")),
+        format!("{times}\n"),
+    )
+    .expect("write lostlayer marker");
+}
+
 /// Assert the refusals [`refuse_for`] armed have all been spent.
 ///
 /// What makes a later sighting of the target removed mean something: the
@@ -492,12 +547,23 @@ fn slow_for(journal: &Path, verb: &str, token: &str, seconds: &str) {
 /// not. Read off the marker rather than by counting invocations, because the
 /// fake records a removal before it publishes the invocation that made it.
 fn expect_refusals_spent(journal: &Path, verb: &str, token: &str) {
-    let left = std::fs::read_to_string(journal.join(format!("refuse.{verb}.{token}")))
-        .expect("read refuse marker");
+    expect_countdown_spent(journal, "refuse", verb, token);
+}
+
+/// The same for the failures [`lose_layer_for`] armed: a build that succeeded
+/// without spending them never met the race it is being tested against.
+fn expect_layer_losses_spent(journal: &Path, verb: &str, token: &str) {
+    expect_countdown_spent(journal, "lostlayer", verb, token);
+}
+
+/// Assert a countdown marker of `kind` armed for `verb` has run out.
+fn expect_countdown_spent(journal: &Path, kind: &str, verb: &str, token: &str) {
+    let left = std::fs::read_to_string(journal.join(format!("{kind}.{verb}.{token}")))
+        .unwrap_or_else(|e| panic!("read {kind} marker: {e}"));
     assert_eq!(
         left.trim(),
         "0",
-        "the fake's `{verb}` was not refused as armed, so this proves nothing"
+        "the fake's `{verb}` did not fail as `{kind}` armed it to, so this proves nothing"
     );
 }
 
@@ -661,6 +727,15 @@ fn invocations(journal: &Path) -> Vec<(u32, String)> {
             Some((pid.trim().parse().ok()?, argv.trim().to_string()))
         })
         .collect()
+}
+
+/// How many invocations of `verb` the fake was asked for that mention
+/// `subject`, whether or not they worked.
+fn invocations_of(journal: &Path, verb: &str, subject: &str) -> usize {
+    invocations(journal)
+        .iter()
+        .filter(|(_, argv)| verb_of(argv) == verb && argv.contains(subject))
+        .count()
 }
 
 /// Every removal the fake was asked for, as an argv.
@@ -1634,6 +1709,149 @@ async fn a_forced_rebuild_commits_over_an_existing_tag() {
         .expect("a forced rebuild still succeeds despite the existing tag");
 
     invocation(journal, "commit", &[token.as_str()]).await;
+}
+
+/// Issue #728: a commit containers/storage refuses because the layer it reused
+/// was removed under it is tried again, and the build succeeds.
+///
+/// The race is another process's: a concurrent build committing identical
+/// content puts the layer this one reuses in the store, and the temporary-tag
+/// removal ending that build takes it away between this commit's lookup and the
+/// image record naming it. It is self-clearing -- the layer is gone, so the next
+/// attempt creates its own -- which is why a retry is the whole fix. The fake
+/// stands in for the other build by failing the commit once with buildah's own
+/// text for it.
+#[tokio::test]
+async fn a_commit_that_lost_its_layer_is_committed_again() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+
+    let token = unique_name("lost-layer");
+    return_immediately_for(journal, "build", &token);
+    return_immediately_for(journal, "from", &token);
+    lose_layer_for(journal, "commit", &token, 1);
+
+    let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
+    let final_tag = keyed_tag(&token, &cfg, context.path()).await;
+    outrig::image::build_image_for(&token, &cfg, context.path(), &final_tag, false)
+        .await
+        .expect("a layer another build took is not this build's failure");
+
+    expect_layer_losses_spent(journal, "commit", &token);
+    assert_eq!(
+        invocations_of(journal, "commit", &token),
+        2,
+        "the commit should have been issued once more, not {:?}",
+        invocations(journal)
+    );
+}
+
+/// A retry looks again before it commits: #393's race can be won by somebody
+/// else *during* #728's backoff, and a retry that did not re-probe would
+/// re-point the tag over the winner's image -- the exact overwrite the probe
+/// before the first attempt exists to prevent.
+///
+/// The fake marks the tag cached as the first commit runs, which is what a
+/// concurrent winner finishing inside this build's backoff looks like from
+/// here. The build still succeeds, no second commit is issued, and the working
+/// container no commit took is removed.
+#[tokio::test]
+async fn a_retried_commit_looks_again_before_it_overwrites_a_winner() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+
+    let token = unique_name("lost-layer-raced");
+    return_immediately_for(journal, "build", &token);
+    return_immediately_for(journal, "from", &token);
+    lose_layer_for(journal, "commit", &token, 1);
+    mark_cached_when(journal, "commit", &token);
+
+    let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
+    let final_tag = keyed_tag(&token, &cfg, context.path()).await;
+    outrig::image::build_image_for(&token, &cfg, context.path(), &final_tag, false)
+        .await
+        .expect("a lost commit race is not a build failure");
+
+    expect_layer_losses_spent(journal, "commit", &token);
+    assert_eq!(
+        invocations_of(journal, "commit", &token),
+        1,
+        "the retry should have re-probed and skipped the commit, not {:?}",
+        invocations(journal)
+    );
+
+    let (_, from) = invocation(journal, "from", &["outrig-label-", token.as_str()]).await;
+    let builder = flag_value(&from, "--name");
+    expect_removed(journal, &builder).await;
+}
+
+/// A forced rebuild keeps committing across a retry: the re-probe is skipped
+/// for it before the first attempt (#393) and must stay skipped for the ones
+/// after, or `--no-cache` would quietly keep the stale image a concurrent
+/// winner left.
+#[tokio::test]
+async fn a_forced_rebuild_still_commits_after_a_lost_layer() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+
+    let token = unique_name("forced-lost-layer");
+    return_immediately_for(journal, "build", &token);
+    return_immediately_for(journal, "from", &token);
+    lose_layer_for(journal, "commit", &token, 1);
+    mark_cached_when(journal, "commit", &token);
+
+    let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
+    let final_tag = keyed_tag(&token, &cfg, context.path()).await;
+    outrig::image::build_image_for(&token, &cfg, context.path(), &final_tag, true)
+        .await
+        .expect("a forced rebuild commits whatever is at the tag");
+
+    expect_layer_losses_spent(journal, "commit", &token);
+    assert_eq!(
+        invocations_of(journal, "commit", &token),
+        2,
+        "the forced rebuild should have committed on its retry, not {:?}",
+        invocations(journal)
+    );
+}
+
+/// The retries are finite: a store that keeps refusing the commit is not one
+/// more attempts will fix, and the build reports the commit's failure as it
+/// always did -- with its working container removed behind it, which is the
+/// path that owes one.
+#[tokio::test]
+async fn a_commit_that_keeps_losing_its_layer_still_fails_the_build() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+
+    let token = unique_name("lost-layer-always");
+    return_immediately_for(journal, "build", &token);
+    return_immediately_for(journal, "from", &token);
+    lose_layer_for(journal, "commit", &token, 100);
+
+    let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
+    let final_tag = keyed_tag(&token, &cfg, context.path()).await;
+    let err = outrig::image::build_image_for(&token, &cfg, context.path(), &final_tag, false)
+        .await
+        .expect_err("the fake never lets the commit through");
+    assert!(
+        failed_at(&err, "commit"),
+        "the build should report the commit's failure, got {err}"
+    );
+    assert_eq!(
+        invocations_of(journal, "commit", &token),
+        3,
+        "the commit should have been tried three times, not {:?}",
+        invocations(journal)
+    );
+
+    let (_, from) = invocation(journal, "from", &["outrig-label-", token.as_str()]).await;
+    let builder = flag_value(&from, "--name");
+    expect_removed(journal, &builder).await;
 }
 
 /// Issue #275: the temporary tag cannot go while the working container made

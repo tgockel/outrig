@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A build whose label commit lost a reused layer to a concurrent build now tries the commit
+  again.** containers/storage reuses a layer already in the store rather than writing an identical
+  one -- two builds of the same content, each committing the same empty top layer, is the ordinary
+  way to reach that -- and creates the image record naming it afterwards, outside the same lock. A
+  removal landing in between leaves the record pointing at a layer the store no longer has, and
+  buildah fails the commit with `creating image "<id>": layer not known`. The removals outrig
+  issues are of exactly that shape: every build ends by removing its temporary tag, so two
+  `outrig build`s sharing a store can do this to each other, and six e2e tests sharing one did.
+  The commit is now reissued up to twice, 250 ms apart and doubling, when buildah refuses it that
+  way -- the layer it tried to reuse is gone by then, so the next attempt creates its own, and the
+  working container a failed `commit --rm` leaves where it was makes the retry the same command
+  against the same container. Every attempt re-probes the target tag first, so a build that loses
+  #393's race during a backoff skips its commit rather than re-pointing the tag over the winner's
+  image, and its working container is removed instead of committed; a forced rebuild (`no-cache`)
+  skips that probe on every attempt, as it already did on the first. Every other commit failure
+  still fails the build on the first attempt. (#728)
+
 - **An exec-stdio MCP server whose startup fails with an empty stderr file now says the output
   may have been dropped.** podman can return the exit status of a process that exits within
   milliseconds without the stderr it wrote (#422), and a `podman exec` session keeps no container

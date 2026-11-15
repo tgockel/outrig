@@ -1664,41 +1664,7 @@ async fn commit_image_with_labels(
         config = config.arg(&builder);
         run_buildah_capture(config, transcript).await?;
 
-        // Issue #393: two sessions that miss the content-addressed cache for
-        // the same tag at once both reach this commit, and `buildah commit`
-        // over an existing tag re-points it rather than refusing -- so the
-        // loser would overwrite the winner's image with its own
-        // (same-content, later-metadata) copy, leaving the winner's former
-        // image dangling with nothing left pointing at it. Re-probing `final_tag`
-        // immediately before committing to it cannot close the race outright
-        // (the two commits can still interleave), but it does close the far
-        // more common case: one build finished first and is already sitting
-        // there to be seen. Losing this probe means skipping the commit, not
-        // failing the build -- the caller asked for an image at `final_tag`,
-        // and one is there.
-        //
-        // A forced rebuild (`no_cache`) skips the probe and always commits: the
-        // caller asked to replace whatever is at `final_tag`, stale copied
-        // gitignored files and all, and treating another session's unrelated
-        // win as this one's own would silently keep it stale. `no_cache`
-        // callers are rarer and already pay for a full rebuild, so losing the
-        // ordinary race's protection here costs them only the same
-        // re-point-over-an-existing-tag outcome `buildah commit` always had.
-        if !no_cache && probe_cached_logged(final_tag, transcript).await? {
-            return Ok(false);
-        }
-
-        run_buildah_capture(
-            Cmd::new("buildah")
-                .arg("commit")
-                .arg("--rm")
-                .arg("--quiet")
-                .arg(&builder)
-                .arg(final_tag.as_str()),
-            transcript,
-        )
-        .await?;
-        Ok(true)
+        commit_builder(&builder, final_tag, no_cache, transcript).await
     }
     .await;
 
@@ -1712,6 +1678,118 @@ async fn commit_image_with_labels(
     }
     result.map(|_| ())
 }
+
+/// Commit `builder` to `final_tag` unless another build got there first,
+/// retrying a commit that lost a layer under it (#728).
+///
+/// `Ok(true)` means this call committed, `Ok(false)` that it found `final_tag`
+/// already there and left its working container alone for the caller to
+/// remove.
+///
+/// Issue #393: two sessions that miss the content-addressed cache for the same
+/// tag at once both reach this commit, and `buildah commit` over an existing
+/// tag re-points it rather than refusing -- so the loser would overwrite the
+/// winner's image with its own (same-content, later-metadata) copy, leaving the
+/// winner's former image dangling with nothing left pointing at it. Re-probing
+/// `final_tag` immediately before committing to it cannot close the race
+/// outright (the two commits can still interleave), but it does close the far
+/// more common case: one build finished first and is already sitting there to
+/// be seen. Losing this probe means skipping the commit, not failing the build
+/// -- the caller asked for an image at `final_tag`, and one is there.
+///
+/// A forced rebuild (`no_cache`) skips the probe and always commits: the caller
+/// asked to replace whatever is at `final_tag`, stale copied gitignored files
+/// and all, and treating another session's unrelated win as this one's own
+/// would silently keep it stale. `no_cache` callers are rarer and already pay
+/// for a full rebuild, so losing the ordinary race's protection here costs them
+/// only the same re-point-over-an-existing-tag outcome `buildah commit` always
+/// had.
+///
+/// The probe is the loop's own first statement rather than something done once
+/// before it, so every attempt is the probe-then-commit pair #393 asked for:
+/// the backoff below is a window a winner can land in, and a retry that did not
+/// look again would re-point the tag it had just been told to leave alone.
+///
+/// Issue #728, which the retry is for: containers/storage reuses an existing
+/// layer when a commit produces one that is already in the store -- two builds
+/// of the same content, each committing an identical empty top layer, is the
+/// ordinary way to reach that -- and the image record naming it is created
+/// afterwards, not under the same lock. A concurrent removal of the image that
+/// layer belonged to can land in between, and the record is then refused
+/// against a layer that no longer exists. The removals outrig itself issues are
+/// of exactly that shape: every build ends by removing its temporary tag, so
+/// two `outrig build`s on one store can do this to each other, and so can six
+/// e2e tests sharing one.
+///
+/// A retry clears it rather than hitting it again: the layer the commit tried
+/// to reuse is gone from the store now, so the next one creates its own. The
+/// working container survives a failed commit -- `--rm` takes it only once the
+/// commit has worked -- so the retry is the same command again, against the
+/// same container, and is as safe to reissue as the first attempt was. Nothing
+/// else is retried: every other failure is one the caller has to see.
+async fn commit_builder(
+    builder: &str,
+    final_tag: &ImageTag,
+    no_cache: bool,
+    transcript: Option<&Transcript>,
+) -> Result<bool> {
+    let mut backoff = RETRY_BACKOFF;
+    let mut retries_left = COMMIT_RETRIES;
+    loop {
+        if !no_cache && probe_cached_logged(final_tag, transcript).await? {
+            return Ok(false);
+        }
+
+        let commit = Cmd::new("buildah")
+            .arg("commit")
+            .arg("--rm")
+            .arg("--quiet")
+            .arg(builder)
+            .arg(final_tag.as_str());
+        match run_buildah_capture(commit, transcript).await {
+            Ok(()) => return Ok(true),
+            Err(failure) if retries_left > 0 && lost_a_layer(&failure) => {
+                retries_left -= 1;
+                tracing::warn!(
+                    target: "outrig::image",
+                    "a concurrent removal took the layer this commit reused; trying again: \
+                     {failure}"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            Err(failure) => return Err(failure),
+        }
+    }
+}
+
+/// Retries a commit gets against the layer race in [`commit_builder`].
+///
+/// The same shape, and the same reasoning, as [`CLEANUP_RETRIES`]: a transient
+/// loss clears on the attempt after it, and a third failure says the answer is
+/// not going to change -- a store that lost the layer for some other reason is
+/// not one more commits will fix. Separate from it because this is a build's
+/// own work rather than a cleanup it owes, and the two are free to diverge.
+const COMMIT_RETRIES: u8 = 2;
+
+/// Whether `failure` is buildah refusing to record an image because the layer
+/// it would point at went away (measured against buildah 1.33.7, whose wording
+/// is `creating image "<id>": layer not known`).
+///
+/// Matched on the storage layer's sentinel rather than on the whole message:
+/// what precedes it names the container and two ids, none of which are known
+/// here. Should a later buildah reword it, the retry is skipped and the build
+/// fails as it did before this -- never a retry of something else.
+fn lost_a_layer(failure: &OutrigError) -> bool {
+    matches!(
+        failure,
+        OutrigError::Process { stderr_tail, .. } if stderr_tail.contains(LAYER_LOST)
+    )
+}
+
+/// The storage layer's words for an image record that names a layer the store
+/// does not have.
+const LAYER_LOST: &str = "layer not known";
 
 async fn run_buildah_capture(cmd: Cmd, transcript: Option<&Transcript>) -> Result<()> {
     if transcript.is_some() {
@@ -2883,6 +2961,37 @@ mod tests {
             &output(125, "Error: container not known\n"),
             "image not known"
         ));
+    }
+
+    /// A commit is tried again only for the one failure another build can have
+    /// caused and the next attempt clears (#728). The text is buildah 1.33.7's,
+    /// as reported in that issue.
+    #[test]
+    fn only_a_lost_layer_is_worth_committing_again() {
+        let failed = |stderr: &str| OutrigError::Process {
+            program: "buildah",
+            argv: vec!["commit".into()],
+            exit_code: Some(125),
+            stderr_tail: stderr.to_string(),
+        };
+
+        assert!(lost_a_layer(&failed(
+            "Error: committing container \"outrig-label-35737-1324\" to \"coding:6712514987ad80b5\": \
+             copying layers and metadata for container \"73c77c04\": committing the finished \
+             image: creating image \"6c522665\": layer not known\n"
+        )));
+
+        // Anything else is the caller's to see on the first attempt.
+        assert!(!lost_a_layer(&failed(
+            "Error: committing container \"outrig-label-35737-1324\": no space left on device\n"
+        )));
+        assert!(!lost_a_layer(&failed(
+            "Error: 1 error occurred:\n\t* coding:671251: image not known\n\n"
+        )));
+        // A failure that never reached a process at all.
+        assert!(!lost_a_layer(&OutrigError::Configuration(
+            "layer not known".to_string()
+        )));
     }
 
     #[tokio::test(flavor = "current_thread")]
