@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Git build-context cache keys now distinguish hard links from independent copies.**
+  Replacing identical regular files with a hard-linked pair invalidates the image cache,
+  including pairs split across nested repositories, submodules, or subtrees hashed whole.
+  Breaking the pair restores the original key; links to paths outside the keyed context
+  have no effect, and inode numbers are not hashed. (#746)
+
 - **Session containers now reap orphaned exec workloads.** Primary containers (including
   network-held startup) and exec-stdio sidecars use Podman's `--init`, normally catatonit, as
   PID 1 instead of `sleep infinity` alone. Orphaned children are reaped rather than accumulating

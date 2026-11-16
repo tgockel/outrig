@@ -1097,73 +1097,193 @@ async fn nonexistent_non_git_context_names_the_path() {
 /// same bytes. The key must tell them apart with every byte and mode the same,
 /// and tell which files are linked, not only that some are.
 #[tokio::test]
-async fn non_git_key_sees_which_files_are_hard_links() {
-    let ctx = make_ctx(&[
-        ("Dockerfile", "FROM alpine\n"),
-        ("x/one", "same"),
-        ("y/two", "same"),
-        ("y/three", "same"),
-    ]);
-    let (one, two, three) = (
-        ctx.path().join("x/one"),
-        ctx.path().join("y/two"),
-        ctx.path().join("y/three"),
-    );
-    let dockerfile = ctx.path().join("Dockerfile");
-    let args = BTreeMap::new();
-    let copy_both = || {
-        for path in [&two, &three] {
-            std::fs::remove_file(path).unwrap();
-            std::fs::write(path, "same").unwrap();
+async fn key_sees_which_files_are_hard_links() {
+    for git_hosted in [false, true] {
+        let ctx = make_ctx(&[
+            ("Dockerfile", "FROM alpine\n"),
+            ("x/one", "same"),
+            ("y/two", "same"),
+            ("y/three", "same"),
+        ]);
+        let (one, two, three) = (
+            ctx.path().join("x/one"),
+            ctx.path().join("y/two"),
+            ctx.path().join("y/three"),
+        );
+        if git_hosted {
+            git_init(ctx.path());
         }
-    };
-    // `linked` becomes a link to `x/one`; the other stays a copy.
-    let link_only = |linked: &Path| {
+        let dockerfile = ctx.path().join("Dockerfile");
+        let args = BTreeMap::new();
+        let copy_both = || {
+            for path in [&two, &three] {
+                std::fs::remove_file(path).unwrap();
+                std::fs::write(path, "same").unwrap();
+            }
+        };
+        // `linked` becomes a link to `x/one`; the other stays a copy.
+        let link_only = |linked: &Path| {
+            copy_both();
+            std::fs::remove_file(linked).unwrap();
+            std::fs::hard_link(&one, linked).unwrap();
+        };
+
+        let copies = key(&dockerfile, &args, ctx.path()).await;
+        link_only(&two);
+        let one_two = key(&dockerfile, &args, ctx.path()).await;
+        assert_ne!(
+            copies, one_two,
+            "linking two identical files must change the key"
+        );
+        assert_eq!(one_two, key(&dockerfile, &args, ctx.path()).await);
+
+        link_only(&three);
+        let one_three = key(&dockerfile, &args, ctx.path()).await;
+        assert_ne!(
+            one_two, one_three,
+            "which file is linked must change the key"
+        );
+
         copy_both();
-        std::fs::remove_file(linked).unwrap();
-        std::fs::hard_link(&one, linked).unwrap();
-    };
-
-    let copies = key(&dockerfile, &args, ctx.path()).await;
-    link_only(&two);
-    let one_two = key(&dockerfile, &args, ctx.path()).await;
-    assert_ne!(
-        copies, one_two,
-        "linking two identical files must change the key"
-    );
-    assert_eq!(one_two, key(&dockerfile, &args, ctx.path()).await);
-
-    link_only(&three);
-    let one_three = key(&dockerfile, &args, ctx.path()).await;
-    assert_ne!(
-        one_two, one_three,
-        "which file is linked must change the key"
-    );
-
-    copy_both();
-    assert_eq!(
-        copies,
-        key(&dockerfile, &args, ctx.path()).await,
-        "breaking the links must return the key: only topology changed"
-    );
+        assert_eq!(
+            copies,
+            key(&dockerfile, &args, ctx.path()).await,
+            "breaking the links must return the key: only topology changed"
+        );
+    }
 }
 
 /// A file's other links outside the context are not in a `COPY .`, so it is
 /// keyed as the plain file it is there.
 #[tokio::test]
-async fn non_git_key_ignores_hard_links_that_leave_the_context() {
-    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n"), ("data", "same")]);
-    let elsewhere = tempfile::tempdir().expect("tempdir");
+async fn key_ignores_hard_links_that_leave_the_context() {
+    for git_hosted in [false, true] {
+        let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n"), ("data", "same")]);
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        if git_hosted {
+            git_init(ctx.path());
+        }
+        let dockerfile = ctx.path().join("Dockerfile");
+        let args = BTreeMap::new();
+
+        let before = key(&dockerfile, &args, ctx.path()).await;
+        std::fs::hard_link(ctx.path().join("data"), elsewhere.path().join("data")).unwrap();
+        assert_eq!(
+            before,
+            key(&dockerfile, &args, ctx.path()).await,
+            "a link from outside the context changes nothing `COPY` sees"
+        );
+    }
+}
+
+/// Topology belongs to the entire admitted context, not to an individual
+/// repository or blocking walk. Exercise both traversal directions.
+#[tokio::test]
+async fn git_key_sees_hard_links_across_recursive_boundaries() {
+    for boundary in [
+        "repository",
+        "submodule",
+        "plain subtree",
+        "ignored subtree",
+    ] {
+        for outer in ["a", "z"] {
+            let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n"), (outer, "same")]);
+            git_init(ctx.path());
+            let nested = ctx.path().join("nested");
+            std::fs::create_dir(&nested).unwrap();
+            std::fs::write(nested.join("data"), "same").unwrap();
+            match boundary {
+                "repository" | "submodule" => git_init(&nested),
+                "ignored subtree" => {
+                    std::fs::write(nested.join(".gitignore"), "*\n").unwrap();
+                    git_init(&nested);
+                }
+                _ => {}
+            }
+            if matches!(boundary, "submodule" | "plain subtree") {
+                git(
+                    ctx.path(),
+                    &[
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        "160000,0123456789abcdef0123456789abcdef01234567,nested",
+                    ],
+                );
+            }
+            let dockerfile = ctx.path().join("Dockerfile");
+            let args = BTreeMap::new();
+            let copies = key(&dockerfile, &args, ctx.path()).await;
+            std::fs::remove_file(nested.join("data")).unwrap();
+            std::fs::hard_link(ctx.path().join(outer), nested.join("data")).unwrap();
+            let linked = key(&dockerfile, &args, ctx.path()).await;
+            assert_ne!(copies, linked, "{boundary}, outer={outer}");
+            assert_eq!(linked, key(&dockerfile, &args, ctx.path()).await);
+            std::fs::remove_file(nested.join("data")).unwrap();
+            std::fs::write(nested.join("data"), "same").unwrap();
+            assert_eq!(copies, key(&dockerfile, &args, ctx.path()).await);
+        }
+    }
+}
+
+#[tokio::test]
+async fn git_key_ignores_a_hard_link_partner_excluded_by_git() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        ("data", "same"),
+        (".gitignore", "ignored\n"),
+    ]);
+    git_init(ctx.path());
     let dockerfile = ctx.path().join("Dockerfile");
     let args = BTreeMap::new();
-
     let before = key(&dockerfile, &args, ctx.path()).await;
-    std::fs::hard_link(ctx.path().join("data"), elsewhere.path().join("data")).unwrap();
-    assert_eq!(
-        before,
-        key(&dockerfile, &args, ctx.path()).await,
-        "a link from outside the context changes nothing `COPY` sees"
-    );
+    std::fs::hard_link(ctx.path().join("data"), ctx.path().join("ignored")).unwrap();
+    assert_ignored(ctx.path(), "ignored");
+    assert_eq!(before, key(&dockerfile, &args, ctx.path()).await);
+}
+
+/// Symlinks may be hashed before their referents' own entries. Resolving one
+/// must not turn that entry into a hard link to itself or consume its place.
+#[tokio::test]
+async fn git_hard_link_topology_ignores_symlink_resolution_order() {
+    let mut keys = Vec::new();
+    for _ in 0..2 {
+        let ctx = make_ctx(&[
+            ("Dockerfile", "FROM alpine\n"),
+            ("nested/a", "same"),
+            ("nested/b", "same"),
+        ]);
+        std::os::unix::fs::symlink("nested/a", ctx.path().join("a-link")).unwrap();
+        std::os::unix::fs::symlink("a", ctx.path().join("nested/0-link")).unwrap();
+        git_init(ctx.path());
+        // Force a whole-subtree walk, which still follows symlink referents.
+        git(ctx.path(), &["rm", "--cached", "-r", "nested"]);
+        git(
+            ctx.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000,0123456789abcdef0123456789abcdef01234567,nested",
+            ],
+        );
+        let dockerfile = ctx.path().join("Dockerfile");
+        let args = BTreeMap::new();
+        let copies = key(&dockerfile, &args, ctx.path()).await;
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::hard_link(ctx.path().join("nested/a"), elsewhere.path().join("a")).unwrap();
+        assert_eq!(
+            copies,
+            key(&dockerfile, &args, ctx.path()).await,
+            "a symlink referent must not consume the first hard-link slot"
+        );
+        std::fs::remove_file(ctx.path().join("nested/b")).unwrap();
+        std::fs::hard_link(ctx.path().join("nested/a"), ctx.path().join("nested/b")).unwrap();
+        let linked = key(&dockerfile, &args, ctx.path()).await;
+        assert_ne!(copies, linked);
+        keys.push(linked);
+    }
+    assert_eq!(keys[0], keys[1], "raw inode numbers must not enter the key");
 }
 
 /// A link to an ancestor leads back into what the walk is already hashing,
