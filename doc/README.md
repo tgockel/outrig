@@ -35,7 +35,7 @@ flowchart LR
         outrig --> rig
     end
 
-    subgraph container["podman container - sleep infinity"]
+    subgraph container["podman container - init + sleep infinity"]
         direction TB
         fs["fs MCP server"]
         shell["shell MCP server"]

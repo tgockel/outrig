@@ -22,7 +22,8 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use outrig::container::{Container, ContainerCreateOptions, ContainerLaunchSpec};
+use outrig::MountAccess;
+use outrig::container::{Container, ContainerCreateOptions, ContainerLaunchSpec, ContainerMount};
 use outrig::error::OutrigError;
 use outrig::image::ImageTag;
 
@@ -1296,6 +1297,89 @@ async fn a_caller_cannot_claim_the_attempt_label() {
         .filter(|(_, argv)| argv.contains(&name))
         .count();
     assert_eq!(started, 0, "nothing should have been spawned");
+}
+
+/// Both idle-start paths refuse mounts hiding podman's init before making a
+/// name claim or asking the engine to create anything. Exec-stdio sidecars use
+/// these same paths with their binds in `mounts`, rather than `workspace`.
+#[tokio::test]
+async fn idle_starts_refuse_init_mount_conflicts_before_launch() {
+    let journal = fake_runtime();
+    let tag = image();
+    for held in [false, true] {
+        for workspace in [false, true] {
+            for destination in [
+                "/run",
+                "/run/user/..",
+                "/run/podman-init",
+                "/var/run",
+                "/var/run/user/..",
+                "/var/run/podman-init",
+                "/var/run/podman-init/child",
+            ] {
+                let name = unique_name("init-mount-conflict");
+                let launch = if workspace {
+                    ContainerLaunchSpec::workspace("/host/runtime", destination)
+                } else {
+                    let mut launch = ContainerLaunchSpec::default();
+                    launch.mounts.push(ContainerMount::new(
+                        "/host/runtime",
+                        destination,
+                        MountAccess::ReadOnly,
+                    ));
+                    launch
+                };
+                let start = async {
+                    if held {
+                        Container::start_named_held(&tag, launch, name.clone(), None).await
+                    } else {
+                        Container::start_named(&tag, launch, name.clone(), None).await
+                    }
+                };
+                let error = tokio::time::timeout(CEILING, start)
+                    .await
+                    .expect("refusal must not reach the sleeping engine")
+                    .expect_err("the conflicting mount must be refused");
+                let OutrigError::Configuration(message) = error else {
+                    panic!("expected Configuration, got {error:?}");
+                };
+                assert!(message.contains("/host/runtime"), "{message}");
+                assert!(message.contains(destination), "{message}");
+                assert!(message.contains("needed subdirectory"), "{message}");
+                assert!(message.contains("/run/podman-init"), "{message}");
+                assert!(
+                    !invocations(journal)
+                        .iter()
+                        .any(|(_, argv)| argv.contains(&name)),
+                    "refusal must precede engine calls"
+                );
+            }
+        }
+    }
+}
+
+/// Entrypoint-stdio sidecars do not use --init, so this restriction must not
+/// leak into their create path. Reach the fake engine, then cancel as usual.
+#[tokio::test]
+async fn entrypoint_create_still_allows_a_run_mount() {
+    let journal = fake_runtime();
+    let name = unique_name("entrypoint-run-mount");
+    let mut launch = ContainerLaunchSpec::default();
+    launch.mounts.push(ContainerMount::new(
+        "/host/runtime",
+        "/run",
+        MountAccess::ReadOnly,
+    ));
+    let options = ContainerCreateOptions::new(image(), launch, &name);
+    let mut create = Box::pin(Container::create_initialized(options));
+    let creating = [name.as_str()];
+    let client = tokio::select! {
+        result = &mut create => panic!("should reach the sleeping create, got {result:?}"),
+        pid = invocation_pid(journal, "create", &creating) => pid,
+    };
+    drop(create);
+    expect_gone(client).await;
+    expect_removed(journal, &name).await;
 }
 
 /// A cancelled build asks buildah to stop before it kills it.

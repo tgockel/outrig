@@ -45,7 +45,7 @@ use tokio::process::Child;
 
 use crate::config::{
     CapabilityProfile, EnvValue, MountAccess, PRIMARY_VIEW_ADDED_CAPS, ResolvedEnvValue,
-    canonical_capability_name,
+    canonical_capability_name, fold_container_path,
 };
 use crate::engine_env;
 use crate::error::{OutrigError, Result};
@@ -718,6 +718,7 @@ impl Container {
         reject_reserved_labels(&launch.labels)?;
         reject_malformed_capabilities(&launch.capabilities)?;
         reject_bind_mount_separators(&launch)?;
+        reject_init_mount_conflicts(&launch)?;
         let reserved = NameGuard::reserve(&name);
 
         let build = if held {
@@ -1603,9 +1604,9 @@ impl Container {
     /// Stops the container, waiting up to `grace` for its PID 1 to exit on
     /// SIGTERM before podman kills it.
     ///
-    /// A container from [`Self::start`] runs `sleep infinity` as PID 1 and
-    /// is created with `--stop-signal=SIGKILL`, so it is killed at once and
-    /// `grace` is never spent on it.
+    /// A container from [`Self::start`] runs `sleep infinity` under podman's
+    /// reaping init (PID 1). It is created with `--stop-signal=SIGKILL`, so it
+    /// is killed at once and `grace` is never spent on it.
     pub async fn stop(mut self, grace: Duration) -> Result<()> {
         self.stop_inner(grace).await
     }
@@ -2143,6 +2144,37 @@ fn reject_bind_mount_separators(launch: &ContainerLaunchSpec) -> Result<()> {
     Ok(())
 }
 
+/// Podman's `--init` executes a host binary mounted at `/run/podman-init`.
+/// A bind over `/run` hides it and prevents startup. Check only idle starts:
+/// entrypoint-stdio containers do not use `--init` and may still bind `/run`.
+/// Treat `/var/run` as `/run` conservatively: common images symlink it there.
+fn reject_init_mount_conflicts(launch: &ContainerLaunchSpec) -> Result<()> {
+    let workspace = launch
+        .workspace
+        .as_ref()
+        .map(|ws| ("workspace", ws.host.as_path(), ws.container.as_path()));
+    let mounts = launch
+        .mounts
+        .iter()
+        .map(|mount| ("mount", mount.host.as_path(), mount.container.as_path()));
+    let init = Path::new("/run/podman-init");
+    for (what, host, container) in workspace.into_iter().chain(mounts) {
+        let mut destination = fold_container_path(container);
+        if let Ok(suffix) = destination.strip_prefix("/var/run") {
+            destination = Path::new("/run").join(suffix);
+        }
+        if init.starts_with(&destination) || destination.starts_with(init) {
+            return Err(OutrigError::Configuration(format!(
+                "{what} bind {host:?} -> {container:?} conflicts with podman's --init binary \
+                 at /run/podman-init: mount only the needed subdirectory (for example \
+                 /run/user) instead of /run or its common alias /var/run, and leave \
+                 /run/podman-init unobstructed"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Reject a `cap-add` or `cap-drop` entry that is not one capability name.
 ///
 /// podman reads each `--cap-add`/`--cap-drop` value as a CSV list: it would
@@ -2232,9 +2264,10 @@ fn build_podman_held_cmd(
 }
 
 /// What the two builders above share: a container whose command is `sleep
-/// infinity`. `held` makes it a `podman create` that [`Container::release`]
-/// starts later, and with that the resolver is baked in: nothing can install
-/// it in a container that has not started.
+/// infinity`, under podman's reaping init as PID 1. `held` makes it a
+/// `podman create` that [`Container::release`] starts later, and with that
+/// the resolver is baked in: nothing can install it in a container that has
+/// not started.
 fn build_idle_cmd(
     held: bool,
     image: &ImageTag,
@@ -2250,10 +2283,12 @@ fn build_idle_cmd(
     };
     let cmd = Cmd::new("podman")
         .args(verb)
-        // PID 1 is `sleep infinity`, which installs no SIGTERM handler, so the
-        // kernel discards the default stop signal and every stop would wait
-        // out its whole grace (and `rm -f` podman's 10 s) before the SIGKILL
-        // that ends it regardless.
+        // `sleep` cannot reap orphaned exec workloads. Let podman's init be
+        // PID 1 for both run and held-create, or zombies consume pids.max.
+        .arg("--init")
+        // Preserve immediate teardown of idle containers, even if an image's
+        // ENTRYPOINT ignores signals. Entrypoint-stdio servers keep their own
+        // stop policy in build_podman_create_cmd.
         .arg("--stop-signal=SIGKILL")
         .args(["--name"])
         .arg(name);
@@ -3570,6 +3605,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--init",
                 "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
@@ -3596,9 +3632,9 @@ mod tests {
     }
 
     /// A held primary is the run argv as a `podman create`, and nothing else
-    /// but the resolver: the same stop signal (so a stop is not spent waiting
-    /// out `sleep`'s ignored SIGTERM), the same flags in the same order, the
-    /// same command, and no `--interactive` or log driver, which would change
+    /// but the resolver: the same reaping init and immediate stop signal,
+    /// the same flags in the same order, the same command, and no
+    /// `--interactive` or log driver, which would change
     /// what the image's process is handed. The resolver sits before the
     /// attempt label, where `build_podman_create_cmd` puts it.
     #[test]
@@ -3626,6 +3662,7 @@ mod tests {
                 "podman",
                 "create",
                 "--rm",
+                "--init",
                 "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
@@ -3686,6 +3723,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--init",
                 "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-20260711T000000-abcd-tools",
@@ -3740,6 +3778,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--init",
                 "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
@@ -4130,6 +4169,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--init",
                 "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
@@ -4418,6 +4458,82 @@ mod tests {
         reject_bind_mount_separators(&ContainerLaunchSpec::default()).unwrap();
     }
 
+    #[test]
+    fn idle_mounts_must_leave_podmans_init_unobstructed() {
+        for destination in [
+            "/",
+            "/run",
+            "/run/",
+            "//run/./",
+            "/other/../run",
+            "/run/user/..",
+            "/run/podman-init",
+            "/run/podman-init/child",
+            "/var/run",
+            "/var/run/",
+            "/var/./run",
+            "/var/run/user/..",
+            "/var/run/podman-init",
+            "/var/run/podman-init/child",
+        ] {
+            for workspace in [true, false] {
+                let launch = if workspace {
+                    ContainerLaunchSpec::workspace("/host/runtime", destination)
+                } else {
+                    ContainerLaunchSpec {
+                        mounts: vec![ContainerMount::new(
+                            "/host/runtime",
+                            destination,
+                            MountAccess::ReadOnly,
+                        )],
+                        ..Default::default()
+                    }
+                };
+                let error = reject_init_mount_conflicts(&launch)
+                    .expect_err("a bind overlapping the init must be refused");
+                let OutrigError::Configuration(message) = error else {
+                    panic!("expected Configuration, got {error:?}");
+                };
+                for expected in [
+                    if workspace { "workspace" } else { "mount" },
+                    "/host/runtime",
+                    destination,
+                    "--init",
+                    "/run/podman-init",
+                    "needed subdirectory",
+                ] {
+                    assert!(
+                        message.contains(expected),
+                        "missing {expected:?}: {message}"
+                    );
+                }
+            }
+        }
+
+        for destination in [
+            "/workspace",
+            "/run/user",
+            "/run/user/1000",
+            "/run/podman",
+            "/run/podman-init.d",
+            "/runtime",
+            "/run/../workspace",
+            "/var",
+            "/var/run/user",
+            "/var/run/podman-init.d",
+            "/var/runtime",
+        ] {
+            let mut launch = ContainerLaunchSpec::workspace("/host", destination);
+            launch.mounts.push(ContainerMount::new(
+                "/extra",
+                destination,
+                MountAccess::ReadOnly,
+            ));
+            reject_init_mount_conflicts(&launch).expect("unrelated destinations are allowed");
+        }
+        reject_init_mount_conflicts(&ContainerLaunchSpec::default()).unwrap();
+    }
+
     /// The classifier and the flags are two readings of the same entry, so
     /// they must not drift: whatever spelling is accepted, podman is handed
     /// the one name the classifier compares. `podman_reads` is how podman
@@ -4531,6 +4647,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--init",
                 "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
@@ -4573,6 +4690,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--init",
                 "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
@@ -4616,6 +4734,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--init",
                 "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
@@ -4667,6 +4786,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--init",
                 "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
@@ -4713,6 +4833,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--init",
                 "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
@@ -4757,6 +4878,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--init",
                 "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",

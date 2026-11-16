@@ -249,12 +249,8 @@ async fn engine_holds(name: &str) -> bool {
 ///
 /// Polled far more loosely than `await_engine_holds`, because nothing asserts
 /// on the figure -- it is reported, not checked -- and a `podman ps` costs more
-/// than the interval would. Measured here: a cancel that landed before the
-/// container was running frees the name in 25-500 ms, while one that landed
-/// after a *start* had completed pays podman's full ten-second stop grace,
-/// because the container runs `sleep infinity` as PID 1 and PID 1 discards a
-/// SIGTERM it has no handler for. #255 owns that second figure. The
-/// ceiling is sized for it.
+/// than the interval would. Idle containers now select SIGKILL for immediate
+/// teardown; the ceiling also accommodates slower engine cleanup.
 async fn await_engine_free(name: &str) -> Duration {
     let started = Instant::now();
     loop {

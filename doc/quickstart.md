@@ -23,6 +23,10 @@ crates publish from this repository.
   podman does not accept. The engine must share this machine's kernel and PID namespace: a
   socket on this host is fine, but a remote engine (another host, a VM, another container) is not
   supported, and outrig refuses it.
+- Podman's host-side init binary, normally supplied by the `catatonit` package. Session
+  containers use `--init` to reap orphaned workloads; it must work for the container's
+  architecture. See [PID 1 and orphan reaping](concepts/containers.md#pid-1-and-orphan-reaping)
+  for configuration and startup failures.
 - [buildah](https://buildah.io) installed alongside podman. They share image storage by default.
 - An API key for an OpenAI-compatible chat endpoint, exported as `OPENAI_API_KEY`.
 

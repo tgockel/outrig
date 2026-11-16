@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Session containers now reap orphaned exec workloads.** Primary containers (including
+  network-held startup) and exec-stdio sidecars use Podman's `--init`, normally catatonit, as
+  PID 1 instead of `sleep infinity` alone. Orphaned children are reaped rather than accumulating
+  as zombies until the container's PID limit prevents further work. The engine host must have
+  a working init binary; a missing or incompatible one fails startup with Podman's error.
+  Workspace and extra binds covering `/run/podman-init` (including all of `/run` and its
+  common `/var/run` alias) are refused before normal or network-held launch, with an error
+  naming the mount and directing users to mount only the needed subdirectory instead.
+  Immediate SIGKILL teardown and entrypoint-stdio sidecars are unchanged. (#941)
+
 - **A build whose label commit lost a reused layer to a concurrent build now tries the commit
   again.** containers/storage reuses a layer already in the store rather than writing an identical
   one -- two builds of the same content, each committing the same empty top layer, is the ordinary

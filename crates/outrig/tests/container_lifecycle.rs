@@ -111,8 +111,8 @@ async fn start_then_stop_leaves_no_container() {
     );
     assert!(container::is_tracked(&name), "name should be tracked");
 
-    // The grace is a floor for a PID 1 that ignores SIGTERM, which is what
-    // `sleep infinity` would be without `--stop-signal=SIGKILL`.
+    // Idle containers retain immediate teardown, even with a reaping init.
+    // `--stop-signal=SIGKILL` must not spend the supplied grace.
     let started = Instant::now();
     container.stop(Duration::from_secs(10)).await.expect("stop");
     assert!(
@@ -129,6 +129,153 @@ async fn start_then_stop_leaves_no_container() {
         !container::is_tracked(&name),
         "name should be untracked after stop"
     );
+}
+
+/// Exercise the refusal with an actual image whose `/var/run` is a symlink,
+/// not only hand-built argv. Both workspace and exec-stdio-style extra binds
+/// must fail as configuration errors before normal or held launch.
+#[tokio::test]
+async fn symlinked_run_mounts_are_refused_before_normal_and_held_launch() {
+    common::init_tracing();
+    pull_alpine().await;
+    // Pin the precondition explicitly instead of silently relying on Alpine's
+    // layout. This command does not use --init or any conflicting mounts.
+    run_capture(Command::new("podman").args([
+        "run",
+        "--rm",
+        "--entrypoint=sh",
+        ALPINE,
+        "-c",
+        r#"test -L /var/run && test "$(readlink -f /var/run)" = /run"#,
+    ]));
+
+    let host_ws = tempfile::tempdir().expect("tempdir");
+    let tag = ImageTag::new(ALPINE);
+    for held in [false, true] {
+        for workspace in [false, true] {
+            for (index, destination) in [
+                "/var/run",
+                "/var/run/podman-init",
+                "/var/run/podman-init/child",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let name = format!(
+                    "outrig-init-alias-{}-{held}-{workspace}-{index}",
+                    std::process::id()
+                );
+                let mut launch = ContainerLaunchSpec::workspace(host_ws.path(), "/workspace");
+                if workspace {
+                    launch = ContainerLaunchSpec::workspace(host_ws.path(), destination);
+                } else {
+                    launch.mounts.push(ContainerMount::new(
+                        host_ws.path(),
+                        destination,
+                        MountAccess::ReadOnly,
+                    ));
+                }
+                let error = if held {
+                    Container::start_named_held(&tag, launch, name.clone(), None).await
+                } else {
+                    Container::start_named(&tag, launch, name.clone(), None).await
+                }
+                .expect_err("the alias must be refused before engine startup");
+                let outrig::error::OutrigError::Configuration(message) = error else {
+                    panic!("expected Configuration, not an engine startup error: {error:?}");
+                };
+                assert!(message.contains(destination), "{message}");
+                assert!(message.contains("/run/podman-init"), "{message}");
+                assert!(message.contains("needed subdirectory"), "{message}");
+                assert!(!container::is_tracked(&name));
+                assert!(!podman_ps_lists(&name, true).await);
+            }
+        }
+    }
+}
+
+/// An exec's child must be adopted *and reaped* by PID 1, not merely left as
+/// a zombie. Keep it alive behind a file gate until its parent has exited so
+/// the test cannot pass just because the parent happened to wait for it.
+#[tokio::test]
+async fn orphaned_exec_children_are_reaped() {
+    common::init_tracing();
+    pull_alpine().await;
+
+    let host_ws = tempfile::tempdir().expect("tempdir");
+    let container = Container::start(
+        &ImageTag::new(ALPINE),
+        ContainerLaunchSpec::workspace(host_ws.path(), "/workspace"),
+    )
+    .await
+    .expect("start");
+
+    // A batch catches accumulation as well as a single orphan. Redirect all
+    // child stdio so podman exec returns as soon as the parent shell exits.
+    let out = run_capture(Command::new("podman").args([
+        "exec",
+        container.name(),
+        "sh",
+        "-c",
+        r#"for i in $(seq 1 32); do
+            sh -c 'while [ ! -e /workspace/release-orphans ]; do sleep 1; done' \
+                </dev/null >/dev/null 2>&1 &
+            echo $!
+        done"#,
+    ]));
+    let pids: Vec<u32> = String::from_utf8(out.stdout)
+        .expect("UTF-8 pids")
+        .lines()
+        .map(|pid| pid.parse().expect("child PID"))
+        .collect();
+    assert_eq!(pids.len(), 32);
+
+    let paths: Vec<String> = pids
+        .iter()
+        .map(|pid| format!("/proc/{pid}/status"))
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = run_capture(
+            Command::new("podman")
+                .args(["exec", container.name(), "cat"])
+                .args(&paths),
+        );
+        if String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| *line == "PPid:\t1")
+            .count()
+            == pids.len()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "children were not adopted by PID 1"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    std::fs::write(host_ws.path().join("release-orphans"), "").expect("release children");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = try_capture(
+            Command::new("podman")
+                .args(["exec", container.name(), "sh", "-c"])
+                .arg("for pid do [ ! -e /proc/\"$pid\" ] || exit 1; done")
+                .arg("check-reaped")
+                .args(pids.iter().map(u32::to_string)),
+        );
+        if out.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "orphan PIDs still exist (zombies are not reaped): {pids:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    container.stop(Duration::from_secs(2)).await.expect("stop");
 }
 
 #[tokio::test]

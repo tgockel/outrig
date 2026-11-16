@@ -105,7 +105,7 @@ the exact command it is waiting on, which is the fastest way to reproduce the st
 ```sh
 $ RUST_LOG=debug outrig run
 [outrig] starting container outrig-20260726T170454-da0c6367
-DEBUG outrig::process: spawn command=podman run -d --rm --name outrig-... sleep infinity
+DEBUG outrig::process: spawn command=podman run -d --rm --init --name outrig-... sleep infinity
 ```
 
 An env value that came from a `${VAR}` reference appears in that line as `'KEY=${VAR}'`, never
@@ -213,9 +213,10 @@ of the workspace (same tools) and `shell` is unavailable. Full details in
    cache-hit. Config `image-name` images may be pulled. Raw `--image` refs are
    local-only and are checked with `podman image exists`. A build or pull streams
    its output to stderr while it runs.
-4. **Start the container.** `podman run -d --rm --name outrig-<sid> -v <repo>:/workspace:rw
+4. **Start the container.** `podman run -d --rm --init --name outrig-<sid> -v <repo>:/workspace:rw
    --userns=keep-id ... <image> sleep infinity`. Any `[workspace.mounts]` and `--volume` entries
-   become additional `-v` binds. The trailing `sleep infinity` is the container's command and
+   become additional `-v` binds. [Podman's init](../concepts/containers.md#pid-1-and-orphan-reaping)
+   is PID 1 and reaps orphaned workloads. The trailing `sleep infinity` is its child and
    overrides the image's `CMD`; an image that sets an `ENTRYPOINT` gets it appended instead, so
    a primary image should not set one (see
    [Concepts -> Containers](../concepts/containers.md#dont-set-an-entrypoint)). With network

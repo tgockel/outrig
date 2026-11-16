@@ -24,6 +24,38 @@ project's own Dockerfiles (which often live at the repo root or under `container
 `[images.<name>].dockerfile` and `.context` to point anywhere relative to the repo root -- or
 absolutely anywhere, with an absolute path.
 
+## PID 1 and orphan reaping
+
+Primary containers and exec-stdio sidecars run with `podman run --init` (or `podman create
+--init` for a network-held primary). Podman's init, normally **catatonit**, is PID 1;
+`sleep infinity` is its child. The init adopts orphaned descendants of `podman exec` workloads
+and waits for them when they exit, so zombies do not accumulate against the container's PID
+limit. `sleep` alone cannot do this.
+
+The init forwards catchable signals to its child. OutRig still creates these idle containers
+with `--stop-signal=SIGKILL`: stopping the session kills PID 1 immediately and tears down the
+PID namespace, without waiting out the stop grace. This is not a graceful shutdown contract
+for exec workloads. Entrypoint-stdio sidecars are unchanged: their server is the container's
+process and retains its own signal and shutdown behavior; OutRig does not add `--init` there.
+
+Podman mounts its init at `/run/podman-init`. For primary and exec-stdio containers, OutRig
+rejects workspace or extra bind destinations that cover this path, including `/run`, `/`,
+and `/run/podman-init` itself (or a path beneath it), before launch. The same check treats
+`/var/run` as `/run`, since common images symlink it there: `/var/run` and its init-path
+descendants are refused even if a particular image does not contain that symlink. Other image
+symlinks are not resolved by this pre-launch check. Mount only the needed subdirectory, such
+as `/run/user`, instead of all of `/run` or `/var/run`, and leave the init path alone.
+The error names the conflicting source and destination. This check applies to both normal
+and network-held startup; entrypoint-stdio sidecars do not use `--init` and are unaffected.
+
+`--init` bind-mounts a binary from the **Podman engine host**, not from the image. Install the
+engine's init package (normally `catatonit`) and ensure Podman's configured `init_path` in
+`containers.conf` names a working binary for the container's architecture. No init package is
+needed inside the image. If the binary is missing or incompatible, container creation or
+startup fails with Podman's error, which OutRig reports as a startup failure; there is no
+fallback to running without a reaper. Fix the engine host's installation or `init_path` and
+start a new session. OutRig does not supply its own `--init-path` override.
+
 ## Dockerfile conventions
 
 outrig expects a few things from your Dockerfile.
