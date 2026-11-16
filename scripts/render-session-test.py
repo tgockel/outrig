@@ -741,7 +741,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             "model.round.completed",
             {
                 "round": 1,
-                "stopped": "cap",
+                "stopped": {"kind": "model_request_limit", "spent": 3, "limit": 3},
                 "usage": usage,
                 "calls": calls,
                 "attempts": [1, 2],
@@ -862,6 +862,27 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             c,
         ),
         ("agent.wedged", {}, "agent/c2"),
+        (
+            "model.limit.warned",
+            {"threshold": 2, "remaining": 2, "spent": 1, "limit": 3},
+            "agent/c2",
+        ),
+        (
+            "model.limit.reached",
+            {"spent": 3, "limit": 3, "round": 2, "requests": [7]},
+            "agent/c2",
+        ),
+        (
+            "model.limit.reset",
+            {
+                "by": "parent",
+                "spent_before": 3,
+                "limit_before": 3,
+                "spent_after": 0,
+                "limit_after": 5,
+            },
+            "agent/c2",
+        ),
         ("model.usage.replaced", {"call_id": 1, "attempt_id": 1, "usage": usage}, a),
         (
             "model.usage.refused",

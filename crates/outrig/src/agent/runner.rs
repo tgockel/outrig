@@ -36,6 +36,18 @@
 //! the child's model can never answer, no round opens: what the child holds
 //! open ends instead, and so does anything that arrives later.
 //!
+//! So too at the child's model-request limit, which the runner checks after
+//! the budget and before it compares summaries: what the child holds ends
+//! `limit`, and so does what arrives while it stays there, with no round and
+//! no model call. It then holds nothing, so the comparison never finds it idle
+//! with work outstanding, and no warning round is spent on it; the warning is
+//! left as it was. A round the limit stopped part way ended, as one the cap
+//! stops does, and its baseline is set; one the warning opened that reaches
+//! the limit ends what it would have cancelled `limit` instead. The child
+//! stays resident, with its kernel and its history, and a reset or a raise
+//! wakes it to decide from what it holds then (`plan/phase/0003-python/
+//! model-policy.md`, "A child at its limit, and `0003-37`").
+//!
 //! A round the provider would not answer for what it carried -- a reply it
 //! ended with `content_filter` or `refusal`, refused again when sent without
 //! the turn's results -- is not opened again, since the same request is
@@ -75,6 +87,7 @@ use tokio::time::Instant;
 use super::children::{Registry, Summary};
 use super::orientation;
 use super::{Agent, AgentError};
+use crate::harness::RoundStop;
 use crate::harness::event::{AttemptId, ChildKind};
 use crate::harness::stop::{AgentState, RoundFacts};
 
@@ -110,6 +123,10 @@ thread_local! {
     /// tries again.
     pub(super) static FIRST_WAIT: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
+
+    /// The model requests the next runner to start on its thread counts as made before its
+    /// first round: a count a resume would carry.
+    pub(super) static SPENT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 /// Drive child `id`'s rounds until its registry, or the session, ends.
@@ -131,6 +148,10 @@ pub(crate) async fn run(
     #[cfg(not(test))]
     let first = RETRY_FIRST;
     let mut wait = first;
+    #[cfg(test)]
+    if let Some(spent) = SPENT.take() {
+        agent.slot().limit().seed(spent);
+    }
     #[cfg(test)]
     if let Some(hold) = HOLD.with(|hold| hold.borrow_mut().take()) {
         hold.notified().await;
@@ -184,37 +205,55 @@ pub(crate) async fn run(
             let _ = tokio::time::timeout(SETTLE_WAIT, wake.notified()).await;
             continue;
         }
-        let ended = match (children.spent_budget(), &broken) {
-            (Some(budget), _) => {
-                // A model that can answer nothing more was said so as the
-                // round found it.
-                if broken.is_none() {
-                    children.stopped(
-                        &id,
-                        AgentState::Failed {
-                            class: format!("the session's token-budget ({budget} tokens) is spent"),
-                            round,
-                            attempt: None,
-                        },
-                    );
-                }
-                Some((
-                    "budget",
-                    format!(
-                        "the session's token-budget ({budget} tokens) was spent before this was \
-                         answered"
-                    ),
-                ))
+        // The budget, which ends every agent's calls, before a broken model,
+        // before the limit, which ends this one's until it is lifted.
+        let ended = if let Some(budget) = children.spent_budget() {
+            // A model that can answer nothing more was said so as the round
+            // found it.
+            if broken.is_none() {
+                children.stopped(
+                    &id,
+                    AgentState::Failed {
+                        class: format!("the session's token-budget ({budget} tokens) is spent"),
+                        round,
+                        attempt: None,
+                    },
+                );
             }
-            (None, Some(why)) => Some(("failed", why.clone())),
-            (None, None) => None,
+            Some((
+                "budget",
+                format!(
+                    "the session's token-budget ({budget} tokens) was spent before this was \
+                     answered"
+                ),
+            ))
+        } else if let Some(why) = &broken {
+            Some(("failed", why.clone()))
+        } else if let Some(reached) = agent.slot().reached(round, &open) {
+            // Said once per arrival at the limit, before anything it holds
+            // ends, so each end reads the child at its limit. The parent's
+            // exception names the child.
+            if reached.first {
+                children.limit_reached(&id, reached.spent, reached.limit, round);
+            }
+            let stop = RoundStop::ModelRequestLimit {
+                spent: reached.spent,
+                limit: reached.limit,
+            };
+            Some(("limit", stop.to_string()))
+        } else {
+            None
         };
         if let Some((outcome, why)) = ended {
             if let Some(instance) = orienting.take() {
                 children.oriented(&id, instance, Some((outcome, &why)));
             }
             if open.is_empty() {
-                children.idle(&id);
+                // A child at its limit rests there, holding nothing, until a
+                // reset or a raise wakes it.
+                if outcome != "limit" {
+                    children.idle(&id);
+                }
                 drop(children);
                 wake.notified().await;
                 continue;
@@ -332,7 +371,9 @@ pub(crate) async fn run(
         let ended = loop {
             agent.announcer().opened();
             let ended = agent
-                .opened(|omitted| orientation::child_opening(&lead, &detail, omitted))
+                .opened(|omitted, notices| {
+                    orientation::child_opening(&lead, &detail, omitted, notices)
+                })
                 .await;
             let Err(AgentError::Prompt(failed)) = &ended else {
                 break ended;

@@ -947,6 +947,28 @@ class Session:
         if self.shutdown_report is None:
             await asyncio.wrap_future(_connection.post("admission.close", session=self._handle))
 
+    async def reset_model_requests(self, agent, limit=None):
+        """Set the model-request count of `agent`, an `outrig.Agent` this program constructed in
+        the session, to zero, keeping its limit, or replacing it with `limit`, an int of at least
+        1. An agent at its limit goes on: what is sent to it from now on opens its rounds again,
+        on what it kept. Its model is told once. What warrants a reset is this program's to
+        decide; only the session's owner can lift a limit, never an agent's code. Raises
+        `outrig.AgentReleased` for an agent released, and `outrig.SessionClosing` once the session
+        is closing."""
+        await self._model_requests(agent, True, _agents.model_request_count(limit, "limit", True))
+
+    async def raise_model_request_limit(self, agent, limit):
+        """Replace the model-request limit of `agent` with `limit`, an int of at least 1, keeping
+        its count: otherwise as `reset_model_requests`. A limit at or below the count leaves the
+        agent at its limit."""
+        await self._model_requests(agent, False, _agents.model_request_count(limit, "limit"))
+
+    async def _model_requests(self, agent, reset, limit):
+        root = _agents._runs(agent) if isinstance(agent, _agents.Agent) else None
+        if not isinstance(root, _Root) or root.session is not self:
+            raise TypeError(f"{agent!r} is no outrig.Agent this program constructed in this session")
+        await root.model_requests(reset, limit)
+
     def inject(self, name, obj, *, serialize=False):
         """Give every agent of the session `obj`, an object this program holds, as the binding
         `name`: in every kernel, now and made later, `outrig.bindings[name]` is a proxy of it,
@@ -1173,7 +1195,7 @@ class _Root:
     child of a session: its launch, the requests made before its child exists, and those open.
     Nothing here holds the instance, so that collecting it releases the child."""
 
-    def __init__(self, agent, inputs, model, session, facilities):
+    def __init__(self, agent, inputs, model, session, facilities, model_requests):
         cls = type(agent)
         if facilities is not None:
             raise NotImplementedError(
@@ -1217,6 +1239,7 @@ class _Root:
         line = {
             "session": session._handle, "name": self.name, "prompt": inspect.cleandoc(cls.__doc__),
             "model": model, "kind": "request", "manifest": manifest,
+            "model_requests": model_requests,
             "channels": [
                 {"name": name, "doc": m.doc, "request_type": schema._describe(m.request_type),
                  "reply_type": schema._describe(m.reply_type), "request": m.request.text(),
@@ -1351,7 +1374,13 @@ class _Root:
         be had; or the child is doing something else."""
         if message["t"] == "oriented":
             error = message["error"]
-            self.settle(error and _ERRORS.get(error["kind"], RuntimeError)(error["message"]))
+            if error is None:
+                self.settle(None)
+                return
+            text = error["message"]
+            if error["kind"] == "limit":
+                text = f"{self}: {text}"
+            self.settle(_ERRORS.get(error["kind"], RuntimeError)(text))
         else:
             self.life = message["state"]
 
@@ -1370,6 +1399,22 @@ class _Root:
         if self.releasing is None:
             self.releasing = self.loop.create_task(self._release(how))
         await asyncio.shield(self.releasing)
+
+    async def model_requests(self, reset, limit):
+        """Reset the child's model-request count, or raise its limit, as the program that owns its
+        session, once its launch has answered: `Session.reset_model_requests`'s."""
+        await asyncio.wait([self.launching])
+        if self.child is None or self.closed:
+            raise copy.copy(self.error or _agents.AgentReleased(f"{self} was released"))
+        try:
+            answer = await asyncio.wrap_future(_connection.post(
+                "agent.model_requests", session=self.session._handle, child=self.child,
+                reset=reset, limit=limit))
+        except RuntimeError as e:  # the session is not running, or the connection broke
+            raise _agents.SessionClosing(str(e)) from None
+        error = answer.get("error")
+        if error is not None:
+            raise _ERRORS.get(error.get("kind"), ValueError)(error.get("message"))
 
     async def _release(self, how):
         """Release the child `how` -- `explicit`, `async_with` or `collected` -- once its launch has

@@ -37,6 +37,7 @@ pub(crate) use validate::{
     validate_binding, validate_session_paths,
 };
 
+use crate::agent::request_limit::LimitConfig;
 use crate::error::{IoPathExt, OutrigError, Result};
 
 pub const DEFAULT_TOOL_CALL_MAX: u32 = 50;
@@ -77,7 +78,7 @@ pub(crate) const REQUESTS_MAX_CEILING: u32 = 4096;
 
 /// The limits a `run-new` session's agents run under, as the session's agent
 /// and the top level set them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Limits {
     /// The deepest an agent may be and still launch a child; the primary is
     /// at depth 1.
@@ -87,6 +88,9 @@ pub(crate) struct Limits {
     pub(crate) requests_max: u32,
     /// Tokens the session's model calls may spend in all; `None` caps nothing.
     pub(crate) token_budget: Option<u64>,
+    /// The model requests each agent may make, and the counts remaining at
+    /// which its model is warned, unless its launch names its own.
+    pub(crate) model_requests: LimitConfig,
 }
 
 /// Scratch state for [`Config::model_candidates`]' depth-first walk.
@@ -420,6 +424,19 @@ pub struct Config {
     /// makes another model call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<u64>,
+    /// How many model requests each agent of a `run-new` session may make,
+    /// at least 1: a request retried or moved to another model counts once,
+    /// and one no provider answered not at all. At it, the agent's round ends
+    /// before its next request, until its owner resets the count or raises
+    /// the limit. Unset, no agent has one. A child launched with a limit of
+    /// its own has that one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_request_limit: Option<u32>,
+    /// The counts of model requests remaining, each at least 1, at which an
+    /// agent's model is warned that its `model-request-limit` approaches:
+    /// once each, as the count remaining first falls to it. Unset, none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_request_warnings: Option<Vec<u32>>,
     /// Default transient-retry budget for every remote provider, in seconds.
     /// A `[providers.<name>]` row of its own overrides this. See
     /// [`DEFAULT_RETRY_BUDGET_SECS`].
@@ -1637,6 +1654,14 @@ pub struct Agent {
     /// agent runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<u64>,
+    /// Per-agent override of the top-level `model-request-limit`, for a
+    /// session this agent runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_request_limit: Option<u32>,
+    /// Per-agent override of the top-level `model-request-warnings`, for a
+    /// session this agent runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_request_warnings: Option<Vec<u32>>,
 }
 
 impl Agent {
@@ -1668,6 +1693,13 @@ impl Config {
                 .or(self.requests_max)
                 .unwrap_or(DEFAULT_REQUESTS_MAX),
             token_budget: agent.and_then(|a| a.token_budget).or(self.token_budget),
+            model_requests: LimitConfig {
+                limit: own(|a| a.model_request_limit).or(self.model_request_limit),
+                warnings: agent
+                    .and_then(|a| a.model_request_warnings.clone())
+                    .or_else(|| self.model_request_warnings.clone())
+                    .unwrap_or_default(),
+            },
         }
     }
 }
@@ -3479,12 +3511,14 @@ mod tests {
     use super::*;
 
     /// Each limit is the agent's own, else the top level's, else the default;
-    /// the token budget has none.
+    /// the token budget and the model-request limit have none.
     #[test]
     fn limits_read_the_agent_then_the_top_level_then_the_default() {
         let cfg = Config::load_from_str(
             "children-max = 10\nrequests-max = 20\ntoken-budget = 30\n\
-             [agents.coding]\nchildren-max = 2\nsubagent-depth-max = 5\n",
+             model-request-limit = 40\nmodel-request-warnings = [10, 1]\n\
+             [agents.coding]\nchildren-max = 2\nsubagent-depth-max = 5\n\
+             model-request-limit = 8\nmodel-request-warnings = [2]\n",
         )
         .expect("parses");
         let expected = Limits {
@@ -3493,6 +3527,10 @@ mod tests {
             model_concurrency_max: DEFAULT_MODEL_CONCURRENCY_MAX,
             requests_max: 20,
             token_budget: Some(30),
+            model_requests: LimitConfig {
+                limit: Some(8),
+                warnings: vec![2],
+            },
         };
         assert_eq!(cfg.limits(Some("coding")), expected);
         assert_eq!(
@@ -3500,6 +3538,10 @@ mod tests {
             Limits {
                 depth_max: DEFAULT_SUBAGENT_DEPTH_MAX,
                 children_max: 10,
+                model_requests: LimitConfig {
+                    limit: Some(40),
+                    warnings: vec![10, 1],
+                },
                 ..expected
             }
         );
@@ -3511,6 +3553,7 @@ mod tests {
                 model_concurrency_max: DEFAULT_MODEL_CONCURRENCY_MAX,
                 requests_max: DEFAULT_REQUESTS_MAX,
                 token_budget: None,
+                model_requests: LimitConfig::default(),
             }
         );
     }

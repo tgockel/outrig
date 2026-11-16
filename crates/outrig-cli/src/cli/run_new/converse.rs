@@ -61,7 +61,7 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesOrdered, StreamExt};
 use outrig::harness::event::{Payload, Received, Subscription};
 use outrig::harness::{
-    RoundEnd, RoundOutcome, Session, SessionError, StillRunning, Tasks, Waits,
+    RoundEnd, RoundOutcome, RoundStop, Session, SessionError, StillRunning, Tasks, Waits,
 };
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Mutex, mpsc};
@@ -439,9 +439,13 @@ async fn drive(
                 match ended {
                     Ok(RoundOutcome::Ended(end)) => {
                         term.ended(&end);
-                        // Anything that arrived after the round's last tool
-                        // result is told in a round of its own.
-                        round = Some(start(&session));
+                        if asks_again(end.stopped.as_ref()) {
+                            // Anything that arrived after the round's last tool
+                            // result is told in a round of its own.
+                            round = Some(start(&session));
+                        } else {
+                            term.prompt();
+                        }
                     }
                     // The interpreter's exit closed the session: the user's
                     // channel ending says so in a moment.
@@ -559,6 +563,15 @@ async fn show(view: Frontend<'_>, messages: Vec<String>) {
         };
         room.send(text, false);
     }
+}
+
+/// Whether a round that ended `stopped` is followed at once by another, for
+/// what arrived as it ran: not once the agent's model-request limit stopped
+/// it, since at the limit a round opens on nothing and what waits stays
+/// unread, so asking again would only say the limit again. The next line
+/// typed asks.
+fn asks_again(stopped: Option<&RoundStop>) -> bool {
+    !matches!(stopped, Some(RoundStop::ModelRequestLimit { .. }))
 }
 
 /// A round over the session, which [`Session::round`] runs only if a message
@@ -790,7 +803,8 @@ impl Terminal<'_> {
             silent.silent_report()
         });
         let running = tasks(&end.still_running);
-        let closing = closing_line(end.stopped.as_deref(), running);
+        let stopped = end.stopped.as_ref().map(ToString::to_string);
+        let closing = closing_line(stopped.as_deref(), running);
         match self.view {
             Frontend::Lines(_) => {
                 if !end.reply.trim().is_empty() {
@@ -898,5 +912,13 @@ mod tests {
             closing_line(None, None).as_deref(),
             Some("(still running: could not tell -- Python did not answer)")
         );
+    }
+
+    /// A round another stop ended is followed by one for what arrived as it ran; the stops a
+    /// round of the session's can end with otherwise are covered by `run_new_e2e`.
+    #[test]
+    fn a_round_a_release_ended_asks_again() {
+        assert!(asks_again(None));
+        assert!(asks_again(Some(&RoundStop::Released)));
     }
 }

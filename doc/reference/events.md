@@ -361,6 +361,18 @@ three times for one call before the rejection ends it.
 - `agent.wedged` -- no fields. The subject, a released child, did not stop within two seconds:
   its code holds its thread and never yields, so the thread runs until the session ends, and the
   child counts against `children-max` until then.
+- `model.limit.warned` -- the subject's model is warned that its model-request limit
+  approaches: `threshold`, the lowest of its warning thresholds the count remaining fell to;
+  `remaining`; `spent`, its count of model requests; and `limit`. The warning is in the next tool
+  result its model reads, after any delivery announcement, or in its next round's opening.
+- `model.limit.reached` -- the subject reached its model-request limit, so no model
+  request is made until its count is reset or its limit raised: `spent`, `limit`, `round`, the
+  latest round it opened or `null`, and `requests`, the requests it held, each ended `limit`,
+  empty for the main agent. Once per arrival at the limit; a request sent while it stays there
+  ends `limit` too, recorded only by its `agent.request.settled`.
+- `model.limit.reset` -- the session's owner reset the subject's count, or raised its limit:
+  `spent_before`, `limit_before`, `spent_after`, `limit_after`, a limit `null` for none. Its
+  model is told once, as a warning is. Only the owner can: no agent's code lifts a limit.
 - `round.started` -- `round`. A round is numbered as its first turn commits, so a round that
   fails or is interrupted before committing one leaves its number to the next. Each agent counts
   its own.
@@ -459,10 +471,14 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
     bills it; it is `null` when the body reported none.
 - `model.round.completed` -- the model yielded control: it finished a round, or OutRig stopped
   it. Not a claim that the round's work succeeded.
-  - `round`, and `stopped`: why OutRig ended it, such as the tool-call cap, or `null`. A child's
-    round also ends before a model call that could only speak after its work is done: a work
-    child's last submission was accepted and nothing else waits, or the child was released. A
-    typed call's child says the first, since its call releases it as the answer is accepted.
+  - `round`, and `stopped`: why OutRig ended it, or `null`: an object whose `kind` is
+    `tool_call_max` (with `max`), `token_budget` (`budget`), `no_room` (`reason`, each model tried
+    and why its window had no room for the call), or `model_request_limit` (`spent` and `limit`,
+    the agent's count and its limit). A child's round also ends before a model call that could
+    only speak after its work is done: `accepted` (`submission`), a work child's last submission
+    was accepted and nothing else waits, or `released`. A typed call's child says the first, since
+    its call releases it as the answer is accepted. A round the limit stopped is completed, not
+    failed: no request was sent past the limit, and every result of its last turn is kept.
   - `usage`: the round's tokens: the sum over its attempts, or `null` when none reported any.
   - `calls`: each call's `{index, model, call_id, attempt_id, usage}`, `index` counted from 0.
     `model` is the `[models.<name>]` row that answered it, which for an alias is not always the
@@ -486,11 +502,12 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
   the round ends can come before the round's own event.
 
 The `model.round.*` events say what each round did, for diagnosis. An owner acting on why the
-root it constructed is at rest -- idle, waiting to try a failed call again and until when,
-refused, failed for good, released -- reads it from the root's handle (`RootHandle::status` in
-`outrig::harness`), which the session keeps whether or not anything subscribes, so a dropped
-event changes nothing it reads; `Session::roster` reads every agent of the session from the same
-record. The wait between a child's failed rounds is in that read and has no event of its own.
+root it constructed is at rest -- idle, waiting to try a failed call again and until when, at
+its model-request limit, refused, failed for good, released -- reads it from the root's handle
+(`RootHandle::status` in `outrig::harness`), which the session keeps whether or not anything
+subscribes, so a dropped event changes nothing it reads; `Session::roster` reads every agent of
+the session from the same record, and `Session::model_requests` each agent's count. The wait
+between a child's failed rounds is in that read and has no event of its own.
 
 - `model.retry` -- a model call that failed and will be made again, after a wait.
   - `model`: the `[models.<name>]` row being retried.
@@ -548,7 +565,8 @@ record. The wait between a child's failed rounds is in that read and has no even
   when the engine cancelled it because the child ended its rounds without answering it after a
   warning, the text its sender's `RequestCancelled` carries.
 - `agent.request.settled` -- how it ended: `request`; `outcome`, which is `accepted`, `rejected`,
-  `failed`, `cancelled`, `released`, `budget`, `closed`, or `terminated`; `attempts`, the answers
+  `failed`, `cancelled`, `released`, `budget`, `limit` -- the child's model-request limit was
+  reached first -- `closed`, or `terminated`; `attempts`, the answers
   it took; `rounds`, the child's rounds it was open during; and `cause`, `null`, or, for a
   submission the engine cancelled after a round of the child failed on a model call once its code
   had run, the text of that failure: the sender's `RequestCancelled` carries it as its
@@ -594,7 +612,9 @@ record. The wait between a child's failed rounds is in that read and has no even
   `agent.construct.failed`.
 - `agent.instance.ready` -- the child has had the round it gets as it launches, in which it reads
   its instructions and prepares: `instance`, and `error`, `null`, or why it cannot have that round
-  -- the token budget spent, or a model that cannot answer. A request sent before this may already
+  -- the token budget spent, the child's model-request limit already reached, or a model that
+  cannot answer. A round the limit stops part way has ended, and is had. A request sent before
+  this may already
   be among the child's other events.
 - `agent.instance.released` -- the instance was released, and its child, the subject, with it:
   `instance`; `how`, which is `explicit`, `async_with`, `collected` when an instance a program

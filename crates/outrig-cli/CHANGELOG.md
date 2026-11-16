@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`run-new` stops at the agent's model-request limit.** With `model-request-limit` set, the
+  round that reaches it closes on `(round ended: model-request-limit (N) reached: ...)`, and a line
+  typed afterwards is answered with the same stop rather than a round, since `run-new` has no
+  command to lift it: see the library's changelog. `outrig run` warns at startup that it ignores
+  `model-request-limit` and `model-request-warnings`.
+
 - **The status line says what Python awaits.** While the running submission's code is in a
   `runtime.wait` the session has recorded, `run-new`'s line reads `awaiting ci_run, review ·
   execution 4 · 12m03s` in place of `Python running`: `the first of` for `FIRST_COMPLETED`, a

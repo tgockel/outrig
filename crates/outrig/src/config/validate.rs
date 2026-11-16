@@ -2711,6 +2711,8 @@ struct Limited {
     model_concurrency_max: Option<u32>,
     requests_max: Option<u32>,
     token_budget: Option<u64>,
+    model_request_limit: Option<u32>,
+    model_request_warnings: Option<Vec<u32>>,
 }
 
 impl Limited {
@@ -2720,6 +2722,8 @@ impl Limited {
             model_concurrency_max: cfg.model_concurrency_max,
             requests_max: cfg.requests_max,
             token_budget: cfg.token_budget,
+            model_request_limit: cfg.model_request_limit,
+            model_request_warnings: cfg.model_request_warnings.clone(),
         }
     }
 
@@ -2729,6 +2733,8 @@ impl Limited {
             model_concurrency_max: agent.model_concurrency_max,
             requests_max: agent.requests_max,
             token_budget: agent.token_budget,
+            model_request_limit: agent.model_request_limit,
+            model_request_warnings: agent.model_request_warnings.clone(),
         }
     }
 }
@@ -2757,13 +2763,29 @@ fn validate_limits(prefix: &str, limited: &Limited) -> Result<(), ConfigValidati
             });
         }
     }
-    if limited.token_budget == Some(0) {
-        return Err(ConfigValidationError::LimitOutOfRange {
-            path: format!("{prefix}token-budget"),
-            value: 0,
-            min: 1,
-            max: None,
-        });
+    let unbounded = [
+        ("token-budget".to_string(), limited.token_budget),
+        (
+            "model-request-limit".to_string(),
+            limited.model_request_limit.map(u64::from),
+        ),
+    ];
+    let warnings = limited.model_request_warnings.iter().flatten();
+    let warnings = warnings.enumerate().map(|(i, warning)| {
+        (
+            format!("model-request-warnings[{i}]"),
+            Some(u64::from(*warning)),
+        )
+    });
+    for (key, value) in unbounded.into_iter().chain(warnings) {
+        if value == Some(0) {
+            return Err(ConfigValidationError::LimitOutOfRange {
+                path: format!("{prefix}{key}"),
+                value: 0,
+                min: 1,
+                max: None,
+            });
+        }
     }
     Ok(())
 }

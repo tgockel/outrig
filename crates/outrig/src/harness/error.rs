@@ -49,6 +49,10 @@ pub enum SessionError {
         /// crate hands back is the size of its largest variant.
         error: Box<RootError>,
     },
+    /// The session holds no live agent of that id to change: none was
+    /// launched under it, or it was released. The text says which.
+    #[error("{0}")]
+    NoAgent(String),
 }
 
 /// What went wrong, rendered as text: what OutRig's own types and the model

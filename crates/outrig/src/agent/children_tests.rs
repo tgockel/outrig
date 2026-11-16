@@ -145,7 +145,29 @@ pub(super) async fn tree_watched(
     watch: Watch,
     build: impl FnOnce(SessionBuilder) -> SessionBuilder,
 ) -> Tree {
-    let cfg = config(addr, var, top);
+    tree_of(
+        config(addr, var, top),
+        var,
+        (addr, requests, gauge),
+        watch,
+        build,
+    )
+    .await
+}
+
+/// [`tree_watched`], its session's configuration `cfg`, whose providers' keys are read from
+/// `var`.
+pub(super) async fn tree_of(
+    cfg: Config,
+    var: &str,
+    (_, requests, gauge): (
+        std::net::SocketAddr,
+        UnboundedReceiver<RecordedRequest>,
+        Arc<Gauge>,
+    ),
+    watch: Watch,
+    build: impl FnOnce(SessionBuilder) -> SessionBuilder,
+) -> Tree {
     let mut builder = SessionBuilder::new(cfg, Some("coding"), None).secrets(keyed(var));
     let (mut subscription, mut stalled) = (None, None);
     match watch {
@@ -198,24 +220,33 @@ impl Tree {
     /// rather than hanging: for work a round left running, which the test
     /// has no other way to wait on.
     pub(super) async fn seen(&self, kind: &str, count: usize) {
-        let events = Arc::clone(&self.events);
-        tokio::time::timeout(Duration::from_secs(20), async move {
-            loop {
-                let so_far = events
-                    .lock()
-                    .expect("events")
-                    .iter()
-                    .filter(|event| event.kind() == kind)
-                    .count();
-                if so_far >= count {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{count} {kind} events in time"));
+        seen(&self.events, kind, count).await;
     }
+}
+
+/// Wait until `count` events of `kind` are among `events`, a [`Tree`]'s, failing rather than
+/// hanging: for a test that cannot borrow the tree while a round holds its session.
+pub(super) async fn seen(
+    events: &Arc<std::sync::Mutex<Vec<Arc<Event>>>>,
+    kind: &str,
+    count: usize,
+) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let so_far = events
+                .lock()
+                .expect("events")
+                .iter()
+                .filter(|event| event.kind() == kind)
+                .count();
+            if so_far >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{count} {kind} events in time"));
 }
 
 /// Every request `marker`'s agent made, in order.
@@ -272,6 +303,14 @@ pub(super) fn kind<'a>(
 /// The `data` an event carries.
 pub(super) fn data(event: &Event) -> Value {
     serde_json::to_value(&event.payload).expect("encodes")
+}
+
+/// The data of `subject`'s events of `what`.
+pub(super) fn data_of(events: &[Arc<Event>], what: &str, subject: &str) -> Vec<Value> {
+    kind(events, what, Some(subject))
+        .into_iter()
+        .map(data)
+        .collect()
 }
 
 /// The primary's one call: run `source`, then say `done`.
@@ -731,7 +770,7 @@ async fn a_submission_given_to_a_refused_round_waits_for_its_sender() {
 
 // ---------------------------------------------------------------------------- request children
 
-const THING: &str = r#"
+pub(super) const THING: &str = r#"
 from dataclasses import dataclass
 import outrig
 @dataclass
@@ -2978,12 +3017,7 @@ async fn a_work_child_with_a_second_submission_queued_keeps_its_round() {
         .collect();
     assert_eq!(stopped.len(), 2, "{stopped:?}");
     assert_eq!(stopped[0], Value::Null, "the first round was not cut");
-    assert!(
-        stopped[1]
-            .as_str()
-            .is_some_and(|why| why.contains("was accepted and nothing else waits")),
-        "{stopped:?}"
-    );
+    assert_eq!(stopped[1]["kind"], "accepted", "{stopped:?}");
     assert_eq!(
         of_agent(&requests, "ROLE adder").len(),
         3,

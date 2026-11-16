@@ -704,9 +704,15 @@ fn skilled(skills: &[SkillBrief], directive: bool) -> String {
 }
 
 /// The text that opens a child's round: `lead`, what the round is for, with
-/// how many earlier turns its model calls are not sent, then `detail`.
-pub(crate) fn child_opening(lead: &str, detail: &str, omitted: usize) -> String {
-    let mut text = opening(lead, omitted);
+/// how many earlier turns its model calls are not sent, then `notices`, then
+/// `detail`.
+pub(crate) fn child_opening(
+    lead: &str,
+    detail: &str,
+    omitted: usize,
+    notices: &[String],
+) -> String {
+    let mut text = told(opening(lead, omitted), notices);
     if !detail.is_empty() {
         text.push_str("\n\n");
         text.push_str(detail);
@@ -858,6 +864,18 @@ fn human(duration: Duration) -> String {
         60..3600 => format!("{}m {}s", secs / 60, secs % 60),
         _ => format!("{}h {}m", secs / 3600, secs % 3600 / 60),
     }
+}
+
+/// `opening`, then each of `notices` -- the agent's model-request warnings
+/// and the notice of a change to its count -- in a paragraph of its own: what
+/// the model reads before its next request, after what waits and before what
+/// the round is for.
+pub(crate) fn told(mut opening: String, notices: &[String]) -> String {
+    for notice in notices {
+        opening.push_str("\n\n");
+        opening.push_str(notice);
+    }
+    opening
 }
 
 /// The line that opens a round: what waits, told by `announcement`, and how

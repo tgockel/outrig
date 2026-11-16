@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::config::RoleAlternation;
+use crate::harness::stop::RoundStop;
 
 /// How many events a subscription holds for its reader before it starts
 /// losing the oldest, unless its owner chose otherwise.
@@ -822,6 +823,49 @@ pub enum Payload {
     /// yielded, so its thread runs on until the session ends.
     #[non_exhaustive]
     AgentWedged {},
+    /// The event's subject was warned that `remaining` of its model-request
+    /// `limit` remain: its count fell to `threshold`, the lowest of its
+    /// warning thresholds it reached, at `spent`. The warning is in the next
+    /// tool result its model reads, or its next round's opening.
+    #[non_exhaustive]
+    ModelLimitWarned {
+        /// The threshold, a count remaining.
+        threshold: u32,
+        /// How many model requests remain.
+        remaining: u32,
+        /// The subject's count of model requests.
+        spent: u32,
+        /// Its limit.
+        limit: u32,
+    },
+    /// The event's subject reached its model-request `limit`: no model request
+    /// is made until its count is reset or its limit raised. `requests` are
+    /// the requests a child held, which ended `limit`.
+    #[non_exhaustive]
+    ModelLimitReached {
+        /// Its count of model requests.
+        spent: u32,
+        /// Its limit.
+        limit: u32,
+        /// The latest round it opened, or `None` when it opened none.
+        round: Option<u32>,
+        /// The requests it held, each ended `limit`; none for the primary
+        /// agent.
+        requests: Vec<AgentRequestId>,
+    },
+    /// The session's owner reset the event's subject's model-request count,
+    /// or raised its limit: its count and its limit before and after.
+    #[non_exhaustive]
+    ModelLimitReset {
+        /// Its count before.
+        spent_before: u32,
+        /// Its limit before, or `None` for none.
+        limit_before: Option<u32>,
+        /// Its count after.
+        spent_after: u32,
+        /// Its limit after, or `None` for none.
+        limit_after: Option<u32>,
+    },
     /// A typed call -- `@outrig.agent`'s -- that `parent`'s code made, whose
     /// child is the event's subject: the declaration's `__module__` and
     /// `__qualname__`, and the SHA-256 digest of the source that declared it,
@@ -961,7 +1005,7 @@ pub enum Payload {
         round: u32,
         /// Why OutRig ended it, such as the tool-call cap, or `None` when it
         /// did not.
-        stopped: Option<String>,
+        stopped: Option<RoundStop>,
         /// The round's tokens: the sum over its attempts, or `None` when none
         /// reported any.
         usage: Option<Usage>,
@@ -1434,6 +1478,9 @@ impl Payload {
             Payload::AgentRequestRefused { .. } => "agent.request.refused",
             Payload::AgentReleased { .. } => "agent.released",
             Payload::AgentWedged {} => "agent.wedged",
+            Payload::ModelLimitWarned { .. } => "model.limit.warned",
+            Payload::ModelLimitReached { .. } => "model.limit.reached",
+            Payload::ModelLimitReset { .. } => "model.limit.reset",
             Payload::AgentCallStarted { .. } => "agent.call.started",
             Payload::AgentCallSettled { .. } => "agent.call.settled",
             Payload::AgentInstanceStarted { .. } => "agent.instance.started",
@@ -2327,6 +2374,8 @@ pub enum RequestEnd {
     Released,
     /// The session's token budget was spent before it was answered.
     Budget,
+    /// The child reached its model-request limit before it answered.
+    Limit,
     /// The session closed before it was answered.
     Closed,
     /// The interpreter died before it was answered.

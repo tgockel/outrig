@@ -139,6 +139,16 @@ NETWORK_COLUMNS = (
 # wrong-typed one renders as nothing rather than failing the page.
 
 
+def stop_text(value: object) -> str:
+    """Why OutRig stopped a round: its `kind`, then the fields beside it -- or, from a log
+    written before the stop had a kind, its text as it is."""
+    if not isinstance(value, dict):
+        return text(value)
+    kind = text(value.get("kind")).replace("_", " ")
+    fields = ", ".join(f"{name} {text(v)}" for name, v in value.items() if name != "kind")
+    return f"{kind} ({fields})" if fields else kind
+
+
 def text(value: object) -> str:
     """A field as text: a string as it is, nothing as nothing, anything else as JSON."""
     if value is None:
@@ -748,6 +758,30 @@ class Builder:
     def on_agent_wedged(self, d: dict) -> None:
         self.add("did not stop: its code never yielded, so its thread runs on")
 
+    def on_model_limit_warned(self, d: dict) -> None:
+        self.add(
+            f"warned: {text(d.get('remaining'))} of its limit of {text(d.get('limit'))} model "
+            f"requests remain ({text(d.get('spent'))} made; threshold {text(d.get('threshold'))})"
+        )
+
+    def on_model_limit_reached(self, d: dict) -> None:
+        requests = [text(r) for r in seq(d.get("requests"))]
+        round_ = d.get("round")
+        after = f", after round {text(round_)}" if round_ is not None else ""
+        self.add(
+            f"reached its model-request limit: {text(d.get('spent'))} of "
+            f"{text(d.get('limit'))}{after}",
+            parts=[Part("requests this ended", ", ".join(requests))] if requests else [],
+        )
+
+    def on_model_limit_reset(self, d: dict) -> None:
+        def count(spent: object, limit: object) -> str:
+            return f"{text(spent)} of {text(limit) or 'no limit'}"
+
+        before = count(d.get("spent_before"), d.get("limit_before"))
+        after = count(d.get("spent_after"), d.get("limit_after"))
+        self.add(f"model-request count changed by its {text(d.get('by'))}: {before} -> {after}")
+
     def request_outcome(self, req: Request, outcome: object) -> None:
         req.outcome = text(outcome)
 
@@ -1014,7 +1048,7 @@ class Builder:
         self.close(outcome, d)
 
     def on_model_round_completed(self, d: dict) -> None:
-        stopped = text(d.get("stopped"))
+        stopped = stop_text(d.get("stopped"))
         self.end_round(d, f"stopped by OutRig: {stopped}" if stopped else "completed", [])
 
     def on_model_round_failed(self, d: dict) -> None:

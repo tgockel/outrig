@@ -245,14 +245,17 @@ The owner **resets** an agent's count -- `spent` to zero, with the limit kept or
 mid-round or idle. Which inputs warrant a reset -- a person's message, an orchestrator's, a new
 claim -- is the owner's policy; OutRig applies none, and an arrival on a channel resets nothing.
 The surfaces: `Session`, by agent id, for the primary and for any child the owner names; the
-control handle of `0003-48`, for a root the owner constructed; and a parent's handle in Python --
-the instance, or `runtime.spawn`'s `Child` -- for a child it launched, as a kernel-to-host line the
-host answers. A reset of a child at its limit wakes its runner through the child's `wake`
+control handle of `0003-48`, for a root the owner constructed; and a host program's
+`outrig.Session`, over its own connection. A parent's handle in Python -- the instance, or
+`runtime.spawn`'s `Child` -- was designed here and dropped by `0003-50`: a line from the
+interpreter can claim any agent, since every agent's code shares one process and one pipe, so a
+parent's reset could not be told from a child's of itself, and "an agent cannot raise its own
+ceiling" (`work.md`). A reset of a child at its limit wakes its runner through the child's `wake`
 (`children.rs:114-126`, `ChildNode`), which clears the limit-reached state and decides from the
 live summary as `0003-30`'s rule has it: the requests the limit settled are gone, so an empty
 summary is idle, and the next arrival opens a round on the retained history. A reset mid-round
 changes the count the hook reads at the next `CompletionCall`, and the round goes on. Every reset
-and raise is an event naming who asked and what changed.
+and raise is an event saying what changed.
 
 ### A child at its limit, and `0003-37`
 
@@ -317,10 +320,11 @@ says so at startup, as it does `context-window`.
 
 ### Events
 
-Execution diagnostics, under the agent's subject: `agent.model_requests.warned` (`threshold`,
-`remaining`, `spent`, `limit`); `agent.model_requests.reached` (`spent`, `limit`, `round` or null,
-and `requests`, the ids settled `limit`); `agent.model_requests.reset` (`by`, `owner` or `parent`;
-`spent` and `limit` before and after). Beside them, `model.round.completed.stopped` carries the
+Execution diagnostics, under the agent's subject: `model.limit.warned` (`threshold`, `remaining`,
+`spent`, `limit`); `model.limit.reached` (`spent`, `limit`, `round` or null, and `requests`, the
+ids settled `limit`); `model.limit.reset` (`spent` and `limit` before and after). `0003-50`
+spelled them so, in place of this page's first `agent.model_requests.*`, since no event name
+holds an underscore. Beside them, `model.round.completed.stopped` carries the
 structured stop, `agent.request.settled.outcome` gains `limit`, and `agent.instance.ready.error`
 names the limit. The roster of `0003-49` shows `limit-reached` as an agent state, and the stop
 read of `0003-48` reports the limit with `spent` and `limit`; both are reads from the runner's

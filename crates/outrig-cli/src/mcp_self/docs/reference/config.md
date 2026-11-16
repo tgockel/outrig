@@ -47,6 +47,8 @@ children-max          = 64                            # optional; defaults to 64
 model-concurrency-max = 8                             # optional; defaults to 8
 requests-max          = 256                           # optional; defaults to 256
 token-budget          = 20000000                      # optional; no cap when unset
+model-request-limit   = 200                           # optional; no limit when unset
+model-request-warnings = [20, 1]                      # optional; no warning when unset
 retry-budget-secs     = 600                           # optional; defaults to 600
 mcp-call-timeout-secs = 600                           # optional; defaults to 600
 
@@ -66,29 +68,31 @@ grace-secs = 5                                        # optional; defaults to 5
 env-allow = ["GITHUB_TOKEN"]                          # optional; global only
 ```
 
-| Key                     | Type    | Required               | Where  | Description               |
-|-------------------------|---------|------------------------|--------|---------------------------|
-| `default-image`         | string  | no                     | repo   | Default `--image`.        |
-| `default-agent`         | string  | no                     | repo   | Default `--agent`.        |
-| `default-model`         | string  | if agent omits `model` | global | Fallback model name.      |
-| `session-root`          | path    | no                     | global | Sessions root dir.        |
-| `tool-call-max`         | integer | no                     | global | Tool calls per round.     |
-| `tool-result-max`       | integer | no                     | global | Per-tool-result byte max. |
-| `subagent-depth-max`    | integer | no                     | global | Max subagent nesting.     |
-| `subagent-width-max`    | integer | no                     | global | Max live subagents/agent. |
-| `children-max`          | integer | no                     | global | Max children (`run-new`). |
-| `model-concurrency-max` | integer | no                     | global | Model requests in flight. |
-| `requests-max`          | integer | no                     | global | Unsettled requests/child. |
-| `token-budget`          | integer | no                     | global | Session token cap.        |
-| `retry-budget-secs`     | integer | no                     | global | LLM retry budget (secs).  |
-| `mcp-call-timeout-secs` | integer | no                     | either | MCP tools/call deadline.  |
-| `network.mode`          | string  | no                     | either | Network mode.             |
-| `network.default`       | string  | no                     | global | Filter fallback action.   |
-| `network.allow`         | array   | no                     | global | Filter allow entries.     |
-| `network.deny`          | array   | no                     | global | Filter deny entries.      |
-| `events.mode`           | string  | no                     | either | Agent event log.          |
-| `host.grace-secs`       | integer | no                     | either | Host program grace (s).   |
-| `repo.env-allow`        | array   | no                     | global | Variables a repo may use. |
+| Key                      | Type    | Required               | Where  | Description               |
+|--------------------------|---------|------------------------|--------|---------------------------|
+| `default-image`          | string  | no                     | repo   | Default `--image`.        |
+| `default-agent`          | string  | no                     | repo   | Default `--agent`.        |
+| `default-model`          | string  | if agent omits `model` | global | Fallback model name.      |
+| `session-root`           | path    | no                     | global | Sessions root dir.        |
+| `tool-call-max`          | integer | no                     | global | Tool calls per round.     |
+| `tool-result-max`        | integer | no                     | global | Per-tool-result byte max. |
+| `subagent-depth-max`     | integer | no                     | global | Max subagent nesting.     |
+| `subagent-width-max`     | integer | no                     | global | Max live subagents/agent. |
+| `children-max`           | integer | no                     | global | Max children (`run-new`). |
+| `model-concurrency-max`  | integer | no                     | global | Model requests in flight. |
+| `requests-max`           | integer | no                     | global | Unsettled requests/child. |
+| `token-budget`           | integer | no                     | global | Session token cap.        |
+| `model-request-limit`    | integer | no                     | global | Model requests per agent. |
+| `model-request-warnings` | array   | no                     | global | Counts warned at.         |
+| `retry-budget-secs`      | integer | no                     | global | LLM retry budget (secs).  |
+| `mcp-call-timeout-secs`  | integer | no                     | either | MCP tools/call deadline.  |
+| `network.mode`           | string  | no                     | either | Network mode.             |
+| `network.default`        | string  | no                     | global | Filter fallback action.   |
+| `network.allow`          | array   | no                     | global | Filter allow entries.     |
+| `network.deny`           | array   | no                     | global | Filter deny entries.      |
+| `events.mode`            | string  | no                     | either | Agent event log.          |
+| `host.grace-secs`        | integer | no                     | either | Host program grace (s).   |
+| `repo.env-allow`         | array   | no                     | global | Variables a repo may use. |
 
 `default-agent` is optional. With neither `--agent` nor `default-agent`, `outrig run` starts
 with no agent: no preamble is sent, every knob comes from the top level, and the image cascade
@@ -172,12 +176,13 @@ compiled-in default is `8`; config may set any value from `1` through `16`.
 launching agent, so a subagent's own budget is independent of its parent's. A subagent stays live
 after it finishes, so `outrig__subagent_release` is what frees a slot.
 
-`children-max`, `model-concurrency-max`, `requests-max`, and `token-budget` bound the child agents
-`outrig run-new`'s Python agents launch with `runtime.spawn`, and that session's model calls.
-`outrig run` reads none of them; its subagents keep `subagent-width-max`, which `run-new` does not
-read. `subagent-depth-max` applies to both: a `run-new` agent at the limit cannot spawn. Each of
-the four can be set at the top level or in an `[agents.<name>]` block, whose value wins for a
-session that agent runs, and each is read when the session starts.
+`children-max`, `model-concurrency-max`, `requests-max`, `token-budget`, `model-request-limit`,
+and `model-request-warnings` bound the child agents `outrig run-new`'s Python agents launch with
+`runtime.spawn`, and that session's model calls. `outrig run` reads none of them, and says so as
+it starts; its subagents keep `subagent-width-max`, which `run-new` does not read.
+`subagent-depth-max` applies to both: a `run-new` agent at the limit cannot spawn. Each of the six
+can be set at the top level or in an `[agents.<name>]` block, whose value wins for a session that
+agent runs, and each is read when the session starts.
 
 `children-max` is how many children one session holds at once -- launching, working, idle, or
 wedged, since each is a thread and its memory in the interpreter. The compiled-in default is
@@ -207,6 +212,25 @@ another model call: a child's open work fails with `outrig.BudgetExhausted`, and
 round ends saying the budget is spent. Each request is checked as it is sent, once it has its
 place, so a retry of one whose response spent the budget is not sent. Requests already in flight
 when it runs out are counted as they finish, so the total can pass the budget by what they used.
+
+`model-request-limit` is how many model requests each agent of a `run-new` session may make: the
+main agent, and each child, each counting its own from zero, a child's not added to its parent's.
+A request is counted once, when a provider first answers it, however many retries or moves to
+another model of an alias it took; one no provider answered -- an outage past the retry budget --
+is not counted. Unset, no agent has one; config may set any value from `1`. At the limit, the
+agent's round ends before its next model request, with the limit as its stop: nothing is rolled
+back, and Python the round started keeps running. The main agent opens no round until the count
+is reset or the limit raised; `run-new` prints the stop, and has no command to lift it. A child
+ends what it holds with `outrig.AgentLimitReached`, and what is sent to it, until the session's
+owner resets its count or raises its limit, and stays resident meanwhile; no agent's code can
+lift it. A child launched with `model_requests=` has that limit instead ([Python Runtime ->
+Limits](https://tgockel.github.io/outrig/concepts/python-runtime.html#limits)).
+
+`model-request-warnings` lists counts remaining, each at least `1`, at which an agent's model is
+warned that its limit approaches: once each, as the count remaining first falls to it, in the next
+tool result the model reads or its next round's opening, whichever comes first. A reset or a raise
+re-arms each one below the count then remaining. Unset, no warning is given. Either key on a
+`[models.<name>]` row is refused rather than ignored, since there it would limit nothing.
 
 ## `[network]`
 
@@ -505,7 +529,8 @@ These apply:
 - `[models.<name>]`, `[providers.<name>]` and `default-model`: what an agent class the program
   constructs runs on -- its `model=`, else `default-model`.
 - The top-level `children-max`, `model-concurrency-max`, `requests-max`, `token-budget`,
-  `subagent-depth-max`, `tool-call-max`, `tool-result-max` and `retry-budget-secs`.
+  `model-request-limit`, `model-request-warnings`, `subagent-depth-max`, `tool-call-max`,
+  `tool-result-max` and `retry-budget-secs`.
 - `[host]`: the program's own grace.
 
 These do not:
@@ -1053,9 +1078,10 @@ preamble = "You are a meticulous code reviewer..."
   agent's subagents may nest. See the top-level `subagent-depth-max`.
 - `subagent-width-max` (integer, optional, default: top-level value or `8`): how many live
   subagents this agent may launch. See the top-level `subagent-width-max`.
-- `children-max`, `model-concurrency-max`, `requests-max`, `token-budget` (integers, optional,
-  default: the top-level value): the limits a `run-new` session this agent runs is held to. See
-  the top-level keys.
+- `children-max`, `model-concurrency-max`, `requests-max`, `token-budget`, `model-request-limit`
+  (integers, optional, default: the top-level value) and `model-request-warnings` (array of
+  integers, optional, default: the top-level value): the limits a `run-new` session this agent
+  runs is held to. See the top-level keys.
 
 If `model` is omitted, outrig falls back to the top-level `default-model`; an error if neither is
 set, except `outrig run --model <name>` may supply the selected agent's model for that run. When
@@ -1771,6 +1797,8 @@ children-max       = 64                          # optional; default = 64
 model-concurrency-max = 8                        # optional; default = 8
 requests-max       = 256                         # optional; default = 256
 token-budget       = 20000000                    # optional; no cap when unset
+model-request-limit = 200                        # optional; no limit when unset
+model-request-warnings = [20, 1]                 # optional; no warning when unset
 retry-budget-secs  = 600                         # optional; default = 600
 mcp-call-timeout-secs = 600                      # optional; default = 600
 
@@ -1972,6 +2000,8 @@ image-config in the merged config but does not require agent/model/provider wiri
 - `children-max`, `model-concurrency-max`, and `requests-max`, if set at the top level or on an
   agent, must be between `1` and `1024`, `128`, and `4096` respectively.
 - `token-budget`, if set at the top level or on an agent, must be at least `1`.
+- `model-request-limit`, and each of `model-request-warnings`, if set at the top level or on an
+  agent, must be at least `1`. Either on a `[models.<name>]` row fails the load.
 - `[host] grace-secs`, if set, must be at most `3600`.
 - `retry-budget-secs`, if set at the top level or on a remote provider, must be at most `3600`
   seconds. `0` is legal and disables retries.

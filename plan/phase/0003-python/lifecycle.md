@@ -313,6 +313,21 @@ session.
   parent, and the program's handles settle with the closing error, as a Rust owner's
   `RootHandle` and `RequestHandle` do.
 
+**Agents at their model-request limit** (`0003-50`)
+
+- *Idle at its limit, holding nothing* -- a child whose limit ended what it held, or the primary
+  agent whose round its limit stopped. Outcome: as an idle agent; a child is released and its
+  kernel ends with the interpreter at terminating, and the report lists none of its requests,
+  since it holds none. Invoked: not a boundary request. Effects: what its rounds did stands.
+- *Stopped at its limit with Python still running* -- a task its code left running, which the
+  stop did not end. Outcome: as an execution running (**Executions**, above): it runs until the
+  drain ends, then its kernel is interrupted and the container stop ends what is left. Invoked
+  and effects: as for that execution and its calls.
+- *A reset or a raise in flight at the close* -- the owner's, through `Session` or a root's
+  handle, or a host program's `outrig.Session`. Outcome: refused, since admission has closed:
+  the Rust owner's call returns the closed error and a host program's await raises
+  `SessionClosing`; the count and the limit are as they were. Invoked: no. Effects: none.
+
 **The host program** (`0003-29`)
 
 - *Alive, with the session open.* Outcome: the program's session exit runs this sequence and

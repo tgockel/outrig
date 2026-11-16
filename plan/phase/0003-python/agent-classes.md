@@ -493,6 +493,14 @@ cancel does the same. Cancelling a
 request never interrupts the child's execution: it is cancelling work, not interrupting
 (`execution-and-rounds.md`'s four cancellations), and the child learns of it at its reply.
 
+**A child at its model-request limit holds nothing, so the rule above never warns it.** The
+runner checks the limit before it compares summaries, as it checks the spent budget: what the
+child holds ends `limit`, and so does what arrives while it stays there, with no round. A round
+the limit stopped part way ended, and sets its baseline; a warning round that reaches the limit
+ends `limit` what it would have cancelled. A reset or a raise wakes the runner, which decides from
+what the child holds then, the warning available again. Built by `0003-50`; `model-policy.md`,
+"A child at its limit, and `0003-37`", has the reasoning.
+
 ## Release
 
 ```python
@@ -592,7 +600,7 @@ there being no round above it.
   `plan/next/wait-for-request-capacity.md`.
 - **Model requests, counted.** `model-request-limit` (`0003-50`) bounds the model requests the
   child's runner issues, one per logical call. At it, the child settles what it holds `limit`, stays
-  resident and addressable with its history, and waits for the owner's or the parent's reset;
+  resident and addressable with its history, and waits for the owner's reset;
   `model-policy.md` has the rule and how it composes with `0003-37`.
 - **Spend.** A child's model usage is attributed to the child's round. A round that answers
   several requests is attributed to the round and not divided among them, because a division

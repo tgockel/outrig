@@ -706,10 +706,11 @@ mod tests {
         });
         let mut config = Config::default();
         config.workspace = Workspace::new(&configured, "/workspace");
-        config
-            .workspace
-            .mounts
-            .push(MountConfig::new(&configured, "/also", MountAccess::ReadWrite));
+        config.workspace.mounts.push(MountConfig::new(
+            &configured,
+            "/also",
+            MountAccess::ReadWrite,
+        ));
         let context = Context {
             config,
             repo_root: repo.clone(),

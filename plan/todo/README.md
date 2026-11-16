@@ -102,12 +102,6 @@ was built from the phase's exit criteria instead and silently omitted discovery,
 observability -- the exit criteria describe the first milestone, the deliverables describe the
 phase.
 
-**Application agents**
-
-| Task      | What it settles                                     |
-| --------- | ----------------------------------------------------|
-| `0003-50` | An agent has a model-request limit                  |
-
 **External channels**
 
 | Task      | What it settles                                     |

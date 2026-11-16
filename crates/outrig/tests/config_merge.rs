@@ -2016,6 +2016,42 @@ subagent-width-max = 4
             .expect("no ceiling");
     }
 
+    /// A model-request limit, or a warning, of 0 bounds nothing, and is refused naming the key.
+    #[test]
+    fn a_model_request_limit_or_warning_of_zero_is_refused() {
+        for (top, agent, path) in [
+            (
+                "model-request-limit = 0\n",
+                "",
+                "top-level model-request-limit",
+            ),
+            (
+                "",
+                "model-request-limit = 0\n",
+                "agents.coding.model-request-limit",
+            ),
+            (
+                "model-request-warnings = [5, 0]\n",
+                "",
+                "top-level model-request-warnings[1]",
+            ),
+            (
+                "",
+                "model-request-warnings = [0]\n",
+                "agents.coding.model-request-warnings[0]",
+            ),
+        ] {
+            let cfg = parse(&format!(
+                "default-model = \"fast\"\n{top}{PROVIDER_AND_FAST_MODEL}\n[agents.coding]\n{agent}"
+            ));
+            let err = expect_validation_err(&cfg, None);
+            assert_eq!(err.to_string(), format!("{path} must be at least 1; got 0"));
+        }
+        parse("model-request-limit = 1\nmodel-request-warnings = [1]\n")
+            .validate(None)
+            .expect("1 is a limit, and a warning");
+    }
+
     #[test]
     fn child_limits_repo_override_global() {
         let global = parse(

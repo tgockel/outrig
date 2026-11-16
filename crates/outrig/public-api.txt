@@ -581,6 +581,8 @@ pub outrig::config::Agent::image: core::option::Option<alloc::string::String>
 pub outrig::config::Agent::max_tokens: core::option::Option<u32>
 pub outrig::config::Agent::model: core::option::Option<alloc::string::String>
 pub outrig::config::Agent::model_concurrency_max: core::option::Option<u32>
+pub outrig::config::Agent::model_request_limit: core::option::Option<u32>
+pub outrig::config::Agent::model_request_warnings: core::option::Option<alloc::vec::Vec<u32>>
 pub outrig::config::Agent::preamble: core::option::Option<alloc::string::String>
 pub outrig::config::Agent::repo_instructions: core::option::Option<outrig::config::RepoInstructions>
 pub outrig::config::Agent::requests_max: core::option::Option<u32>
@@ -636,6 +638,8 @@ pub outrig::config::Config::host: outrig::config::HostConfig
 pub outrig::config::Config::images: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ImageConfig>
 pub outrig::config::Config::mcp_call_timeout_secs: core::option::Option<u64>
 pub outrig::config::Config::model_concurrency_max: core::option::Option<u32>
+pub outrig::config::Config::model_request_limit: core::option::Option<u32>
+pub outrig::config::Config::model_request_warnings: core::option::Option<alloc::vec::Vec<u32>>
 pub outrig::config::Config::models: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::Model>
 pub outrig::config::Config::network: outrig::config::NetworkConfig
 pub outrig::config::Config::providers: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::LlmProvider>
@@ -1557,6 +1561,21 @@ pub outrig::harness::event::Payload::ModelInstructions::max_tokens: core::option
 pub outrig::harness::event::Payload::ModelInstructions::model: alloc::string::String
 pub outrig::harness::event::Payload::ModelInstructions::preamble: alloc::string::String
 pub outrig::harness::event::Payload::ModelInstructions::tools: alloc::vec::Vec<outrig::harness::event::ToolDefinition>
+#[non_exhaustive] pub outrig::harness::event::Payload::ModelLimitReached
+pub outrig::harness::event::Payload::ModelLimitReached::limit: u32
+pub outrig::harness::event::Payload::ModelLimitReached::requests: alloc::vec::Vec<outrig::harness::event::AgentRequestId>
+pub outrig::harness::event::Payload::ModelLimitReached::round: core::option::Option<u32>
+pub outrig::harness::event::Payload::ModelLimitReached::spent: u32
+#[non_exhaustive] pub outrig::harness::event::Payload::ModelLimitReset
+pub outrig::harness::event::Payload::ModelLimitReset::limit_after: core::option::Option<u32>
+pub outrig::harness::event::Payload::ModelLimitReset::limit_before: core::option::Option<u32>
+pub outrig::harness::event::Payload::ModelLimitReset::spent_after: u32
+pub outrig::harness::event::Payload::ModelLimitReset::spent_before: u32
+#[non_exhaustive] pub outrig::harness::event::Payload::ModelLimitWarned
+pub outrig::harness::event::Payload::ModelLimitWarned::limit: u32
+pub outrig::harness::event::Payload::ModelLimitWarned::remaining: u32
+pub outrig::harness::event::Payload::ModelLimitWarned::spent: u32
+pub outrig::harness::event::Payload::ModelLimitWarned::threshold: u32
 #[non_exhaustive] pub outrig::harness::event::Payload::ModelRetry
 pub outrig::harness::event::Payload::ModelRetry::attempt: u32
 pub outrig::harness::event::Payload::ModelRetry::attempt_id: outrig::harness::event::AttemptId
@@ -1570,7 +1589,7 @@ pub outrig::harness::event::Payload::ModelRoundCompleted::calls: alloc::vec::Vec
 pub outrig::harness::event::Payload::ModelRoundCompleted::descendants: alloc::vec::Vec<outrig::harness::event::AttemptId>
 pub outrig::harness::event::Payload::ModelRoundCompleted::input_tokens_max: core::option::Option<u64>
 pub outrig::harness::event::Payload::ModelRoundCompleted::round: u32
-pub outrig::harness::event::Payload::ModelRoundCompleted::stopped: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::ModelRoundCompleted::stopped: core::option::Option<outrig::harness::RoundStop>
 pub outrig::harness::event::Payload::ModelRoundCompleted::total: core::option::Option<outrig::harness::event::Usage>
 pub outrig::harness::event::Payload::ModelRoundCompleted::usage: core::option::Option<outrig::harness::event::Usage>
 #[non_exhaustive] pub outrig::harness::event::Payload::ModelRoundDropped
@@ -1732,6 +1751,7 @@ pub outrig::harness::event::RequestEnd::Budget
 pub outrig::harness::event::RequestEnd::Cancelled
 pub outrig::harness::event::RequestEnd::Closed
 pub outrig::harness::event::RequestEnd::Failed
+pub outrig::harness::event::RequestEnd::Limit
 pub outrig::harness::event::RequestEnd::Rejected
 pub outrig::harness::event::RequestEnd::Released
 pub outrig::harness::event::RequestEnd::Terminated
@@ -1972,6 +1992,10 @@ pub outrig::harness::AgentState::Failed::round: core::option::Option<u32>
 #[non_exhaustive] pub outrig::harness::AgentState::Idle
 pub outrig::harness::AgentState::Idle::round: u32
 pub outrig::harness::AgentState::Launching
+#[non_exhaustive] pub outrig::harness::AgentState::LimitReached
+pub outrig::harness::AgentState::LimitReached::limit: u32
+pub outrig::harness::AgentState::LimitReached::round: core::option::Option<u32>
+pub outrig::harness::AgentState::LimitReached::spent: u32
 #[non_exhaustive] pub outrig::harness::AgentState::Refused
 pub outrig::harness::AgentState::Refused::attempt: core::option::Option<outrig::harness::event::AttemptId>
 pub outrig::harness::AgentState::Refused::round: u32
@@ -2049,6 +2073,21 @@ pub outrig::harness::RosterState::Wedged
 #[non_exhaustive] pub enum outrig::harness::RoundOutcome
 pub outrig::harness::RoundOutcome::Ended(outrig::harness::RoundEnd)
 pub outrig::harness::RoundOutcome::NothingNew
+#[non_exhaustive] pub enum outrig::harness::RoundStop
+#[non_exhaustive] pub outrig::harness::RoundStop::Accepted
+pub outrig::harness::RoundStop::Accepted::submission: u64
+#[non_exhaustive] pub outrig::harness::RoundStop::ModelRequestLimit
+pub outrig::harness::RoundStop::ModelRequestLimit::limit: u32
+pub outrig::harness::RoundStop::ModelRequestLimit::spent: u32
+#[non_exhaustive] pub outrig::harness::RoundStop::NoRoom
+pub outrig::harness::RoundStop::NoRoom::reason: alloc::string::String
+pub outrig::harness::RoundStop::Released
+#[non_exhaustive] pub outrig::harness::RoundStop::TokenBudget
+pub outrig::harness::RoundStop::TokenBudget::budget: u64
+#[non_exhaustive] pub outrig::harness::RoundStop::ToolCallMax
+pub outrig::harness::RoundStop::ToolCallMax::max: usize
+impl core::fmt::Display for outrig::harness::RoundStop
+pub fn outrig::harness::RoundStop::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub enum outrig::harness::ServiceErrorCategory
 pub outrig::harness::ServiceErrorCategory::Cancelled
 pub outrig::harness::ServiceErrorCategory::Failed
@@ -2067,6 +2106,7 @@ pub outrig::harness::SessionError::Closed(outrig::harness::Closed)
 pub outrig::harness::SessionError::Construct
 pub outrig::harness::SessionError::Construct::class: alloc::string::String
 pub outrig::harness::SessionError::Construct::error: alloc::boxed::Box<outrig::harness::RootError>
+pub outrig::harness::SessionError::NoAgent(alloc::string::String)
 pub outrig::harness::SessionError::NoPrimary
 pub outrig::harness::SessionError::Primary
 pub outrig::harness::SessionError::Resolve(outrig::harness::Failure)
@@ -2152,6 +2192,8 @@ impl outrig::harness::ConstructSpec
 pub fn outrig::harness::ConstructSpec::alias(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::harness::ConstructSpec::arg(self, impl core::convert::Into<alloc::string::String>, outrig::harness::Argument) -> Self
 pub fn outrig::harness::ConstructSpec::class(&self) -> &str
+pub fn outrig::harness::ConstructSpec::model_request_limit(self, core::num::nonzero::NonZeroU32) -> Self
+pub fn outrig::harness::ConstructSpec::model_request_warnings(self, impl core::iter::traits::collect::IntoIterator<Item = core::num::nonzero::NonZeroU32>) -> Self
 pub fn outrig::harness::ConstructSpec::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 #[non_exhaustive] pub struct outrig::harness::ContainerSpec
 pub outrig::harness::ContainerSpec::left_out: alloc::vec::Vec<alloc::string::String>
@@ -2209,6 +2251,11 @@ pub outrig::harness::MethodDescription::result: core::option::Option<serde_json:
 impl outrig::harness::MethodDescription
 pub fn outrig::harness::MethodDescription::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, serde_json::value::Value) -> Self
 pub fn outrig::harness::MethodDescription::with_result(self, serde_json::value::Value) -> Self
+#[non_exhaustive] pub struct outrig::harness::ModelRequests
+pub outrig::harness::ModelRequests::limit: core::option::Option<u32>
+pub outrig::harness::ModelRequests::spent: u32
+pub outrig::harness::ModelRequests::warned: alloc::vec::Vec<u32>
+pub outrig::harness::ModelRequests::warnings: alloc::vec::Vec<u32>
 #[non_exhaustive] pub struct outrig::harness::OpenWait
 pub outrig::harness::OpenWait::agent: outrig::harness::event::Subject
 pub outrig::harness::OpenWait::execid: outrig::harness::event::ExecId
@@ -2255,10 +2302,13 @@ pub fn outrig::harness::RootHandle::agent(&self) -> core::option::Option<&str>
 pub async fn outrig::harness::RootHandle::changed(&self, u64) -> outrig::harness::Status
 pub fn outrig::harness::RootHandle::channels(&self) -> &[outrig::harness::RequestChannel]
 pub fn outrig::harness::RootHandle::id(&self) -> core::option::Option<outrig::harness::event::AgentInstanceId>
+pub fn outrig::harness::RootHandle::model_requests(&self) -> core::option::Option<outrig::harness::ModelRequests>
 pub async fn outrig::harness::RootHandle::next_stop(&self, u64) -> outrig::harness::Status
+pub fn outrig::harness::RootHandle::raise_model_request_limit(&self, core::num::nonzero::NonZeroU32) -> core::result::Result<outrig::harness::ModelRequests, outrig::harness::RootError>
 pub async fn outrig::harness::RootHandle::ready(&self) -> core::result::Result<(), outrig::harness::RootError>
 pub async fn outrig::harness::RootHandle::release(&self)
 pub fn outrig::harness::RootHandle::request(&self, &str, serde_json::value::Value) -> core::result::Result<outrig::harness::RequestHandle, outrig::harness::RootError>
+pub fn outrig::harness::RootHandle::reset_model_requests(&self, core::option::Option<core::num::nonzero::NonZeroU32>) -> core::result::Result<outrig::harness::ModelRequests, outrig::harness::RootError>
 pub fn outrig::harness::RootHandle::rounds(&self) -> alloc::vec::Vec<outrig::harness::RoundFacts>
 pub fn outrig::harness::RootHandle::status(&self) -> outrig::harness::Status
 impl core::fmt::Debug for outrig::harness::RootHandle
@@ -2270,13 +2320,13 @@ pub outrig::harness::Roster::seq: u64
 pub outrig::harness::RoundEnd::reasoning: core::option::Option<alloc::string::String>
 pub outrig::harness::RoundEnd::reply: alloc::string::String
 pub outrig::harness::RoundEnd::still_running: outrig::harness::StillRunning
-pub outrig::harness::RoundEnd::stopped: core::option::Option<alloc::string::String>
+pub outrig::harness::RoundEnd::stopped: core::option::Option<outrig::harness::RoundStop>
 #[non_exhaustive] pub struct outrig::harness::RoundFacts
 pub outrig::harness::RoundFacts::reasoning: core::option::Option<alloc::string::String>
 pub outrig::harness::RoundFacts::reply: alloc::string::String
 pub outrig::harness::RoundFacts::round: u32
 pub outrig::harness::RoundFacts::sends: alloc::vec::Vec<outrig::harness::RoundSend>
-pub outrig::harness::RoundFacts::stopped: core::option::Option<alloc::string::String>
+pub outrig::harness::RoundFacts::stopped: core::option::Option<outrig::harness::RoundStop>
 impl outrig::harness::RoundFacts
 pub fn outrig::harness::RoundFacts::any_send(&self) -> bool
 #[non_exhaustive] pub struct outrig::harness::RoundSend
@@ -2329,7 +2379,10 @@ pub fn outrig::harness::Session::container_name(&self) -> &str
 pub fn outrig::harness::Session::id(&self) -> &str
 pub fn outrig::harness::Session::interrupter(&self) -> core::option::Option<impl core::ops::function::Fn() -> core::option::Option<alloc::string::String> + core::marker::Send + core::marker::Sync + 'static>
 pub fn outrig::harness::Session::model(&self) -> core::option::Option<&str>
+pub fn outrig::harness::Session::model_requests(&self, &str) -> core::option::Option<outrig::harness::ModelRequests>
 pub fn outrig::harness::Session::python_version(&self) -> &str
+pub fn outrig::harness::Session::raise_model_request_limit(&self, &str, core::num::nonzero::NonZeroU32) -> core::result::Result<outrig::harness::ModelRequests, outrig::harness::SessionError>
+pub fn outrig::harness::Session::reset_model_requests(&self, &str, core::option::Option<core::num::nonzero::NonZeroU32>) -> core::result::Result<outrig::harness::ModelRequests, outrig::harness::SessionError>
 pub fn outrig::harness::Session::root(&self, outrig::harness::event::AgentInstanceId) -> core::option::Option<outrig::harness::RootHandle>
 pub fn outrig::harness::Session::roster(&self) -> outrig::harness::Roster
 pub async fn outrig::harness::Session::round(&mut self) -> core::result::Result<outrig::harness::RoundOutcome, outrig::harness::SessionError>

@@ -40,8 +40,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::budget::Budget;
 use super::history::Adjacent;
+use super::request_limit::{Reached, RequestLimit};
 use crate::events::Events;
-use crate::harness::event::{AttemptId, CallId, ModelAttempt, Payload, Usage, UsageRefusal};
+use crate::harness::event::{
+    AgentRequestId, AttemptId, CallId, ModelAttempt, Payload, Usage, UsageRefusal,
+};
 
 /// What a provider reported, or `None` when it reported nothing. rig leaves a
 /// counter it was not given as `None`; the event's counters are plain numbers,
@@ -369,6 +372,8 @@ pub(crate) struct CallSlot {
     /// For a child: its parent's slot, and the round of its parent's it was
     /// launched in, whose tree its spend is added to.
     parent: Option<Arc<(CallSlot, Option<u32>)>>,
+    /// The agent's count of model requests, against its limit.
+    limit: RequestLimit,
 }
 
 #[derive(Default)]
@@ -411,6 +416,9 @@ struct InFlight {
     /// Whether the current candidate's next request is sent once, an unusable
     /// reply to it not retried.
     once: bool,
+    /// Whether a provider has answered the call, which counts it once against
+    /// the agent's limit.
+    counted: bool,
 }
 
 /// A candidate's refusal of a request whose conversation put one role after
@@ -463,11 +471,39 @@ impl CallSlot {
             state: Arc::default(),
             events,
             parent: parent.map(Arc::new),
+            limit: RequestLimit::default(),
         }
+    }
+
+    /// The slot, its agent's model requests counted against `limit`.
+    pub(crate) fn limited(mut self, limit: RequestLimit) -> Self {
+        self.limit = limit;
+        self
     }
 
     pub(crate) fn ledger(&self) -> &Ledger {
         &self.ledger
+    }
+
+    /// The agent's count of model requests, against its limit.
+    pub(crate) fn limit(&self) -> &RequestLimit {
+        &self.limit
+    }
+
+    /// The agent's count and limit, when its count has reached its limit, with whether this is
+    /// its arrival there: which is recorded once, as `model.limit.reached`, naming `round`, the
+    /// latest it opened, and `requests`, those the limit ends.
+    pub(crate) fn reached(&self, round: Option<u32>, requests: &[u64]) -> Option<Reached> {
+        let reached = self.limit.reached()?;
+        if reached.first {
+            self.events.emit(Payload::ModelLimitReached {
+                spent: reached.spent,
+                limit: reached.limit,
+                round,
+                requests: requests.iter().copied().map(AgentRequestId::new).collect(),
+            });
+        }
+        Some(reached)
     }
 
     /// Where the agent's model events go.
@@ -561,6 +597,7 @@ impl CallSlot {
             refusal: None,
             filtered: None,
             once: false,
+            counted: false,
         });
         call
     }
@@ -665,6 +702,10 @@ impl CallSlot {
         }
     }
 
+    /// Record `attempt` of `call`. One a provider `answered` -- a `2xx`, whether
+    /// rig could use it or not -- counts its call against the agent's limit,
+    /// the first time one does.
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
         call: CallId,
@@ -673,6 +714,7 @@ impl CallSlot {
         error: Option<String>,
         usage: Option<Usage>,
         finish_reason: Option<String>,
+        answered: bool,
     ) {
         // A failure the provider ended for what the request or the reply held.
         let filtered = finish_reason
@@ -691,17 +733,25 @@ impl CallSlot {
             },
             self.events(),
         );
-        {
+        let first_answer = {
             let mut state = self.state();
+            let mut first_answer = false;
             if let Some(in_flight) = &mut state.call
                 && in_flight.call == call
             {
                 in_flight.last = Some(attempt);
                 in_flight.recorded = Some((attempt, error));
                 in_flight.filtered = filtered;
+                first_answer = answered && !in_flight.counted;
+                in_flight.counted |= answered;
             }
             state.round.push(attempt);
             state.attempts.push(attempt);
+            first_answer
+        };
+        // After the attempt's own record, outside the slot's lock.
+        if first_answer && let Some(warned) = self.limit.answered() {
+            self.events.emit(warned);
         }
         // Up the tree, outside this slot's lock: each round above this agent's
         // that it was launched under counts what it spent.
@@ -737,6 +787,7 @@ impl Pending {
             Some(error),
             None,
             None,
+            false,
         );
         (self.call, self.attempt)
     }
@@ -785,6 +836,7 @@ impl Drop for Pending {
                 Some("cancelled".to_string()),
                 None,
                 None,
+                false,
             );
         }
     }
@@ -841,6 +893,7 @@ impl Settling {
             error,
             usage,
             finish_reason,
+            true,
         );
         // `answered` gives its request's place back as it drops, after this
         // record.
@@ -860,6 +913,8 @@ impl Drop for Settling {
                 Some((call.call, answered.attempt, Arc::clone(&call.settings)))
             })
         };
+        // A `2xx` the provider sent, though nothing read it: the call was
+        // answered.
         if let Some((call, attempt, settings)) = answered {
             self.slot.record(
                 call,
@@ -868,6 +923,7 @@ impl Drop for Settling {
                 Some("cancelled".to_string()),
                 None,
                 None,
+                true,
             );
         }
     }

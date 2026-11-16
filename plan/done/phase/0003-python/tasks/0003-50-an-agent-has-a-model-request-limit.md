@@ -289,3 +289,151 @@ Each is a mock-driven test unless it says otherwise.
   `orientation.rs`; `crates/outrig/src/harness/session.rs`, `event.rs`;
   `crates/outrig/src/config/mod.rs`, `validate.rs`;
   `crates/outrig/src/python/outrig/_interpreter.py`, `outrig/_agents.py`.
+
+## Decisions
+
+Forks 1, 2, 4 and 5 were taken as recommended, and fork 3 as recommended; the maintainer chose
+the Python owner's half of the reset (below).
+
+- **Fork 1: `harness::RoundStop`, in place of the text.** `ToolCallMax { max }`,
+  `TokenBudget { budget }`, `NoRoom { reason }` (the unfit text, which names each model and why),
+  `ModelRequestLimit { spent, limit }`, and the two a child's quiet round ends on, which the text
+  carried too: `Accepted { submission }` and `Released`. `#[non_exhaustive]`, each struct variant
+  too. `Display` is the text each carried before, so `run-new` prints what it printed. It is
+  `RoundEnd::stopped`, `RoundFacts::stopped`, `Finished::stopped` and the child's `Quiet`, and
+  `model.round.completed`'s `stopped` serializes it with serde's tag: an object with `kind` in
+  snake case beside its fields. The renderer shows the kind and its fields; a log written before
+  reads as its text.
+- **Fork 2: every call a provider answered counts; nothing is refunded.** The count is committed
+  in `CallSlot::record`, once per `call_id`, on the first attempt recorded as a `2xx` --
+  `Settling::settle` (a completion, an unusable reply re-rolled, a content refusal) and
+  `Settling`'s drop (a `2xx` nothing read) -- and never at `begin_call`, so retries, moves and an
+  outage add nothing. An instance's orienting round counts; the orientation says nothing of it,
+  since the warning says what remains.
+- **Fork 3: one keyword, `model_requests`**, an int for the limit (the session's thresholds kept)
+  or a `(limit, [warnings])` pair, on `runtime.spawn` and `outrig.Agent(...)`, validated at the
+  call. A root's own constructor refuses it -- its limit is its owner's, `ConstructSpec::
+  model_request_limit` and `model_request_warnings` -- as it refuses a `model=` that differs. The
+  launch line carries `model_requests: {limit, warnings}`, each `null` for the session's.
+- **Fork 4: `AgentLimitReached`, no subclass.** `Status.child` reads `limit-reached` to tell it
+  from a `requests-max` refusal. The text names the child, its limit and its count: `child 'l'
+  (c1): model-request-limit (4) reached: 4 of 4 model requests made; no model request is made
+  until the count is reset or the limit raised`. The host sends the stop's own text; the kernel
+  -- or a host program -- puts the child before it as its `str()` names it, so a name holding a
+  quote reads as Python writes it everywhere. The same text is `ready()`'s when the orienting
+  round cannot open, and the event's (`agent.instance.ready.error`) is the stop's text alone, the
+  subject naming the child.
+- **Fork 5: `run-new` lifts nothing.** It prints the stop, and does not start the round it starts
+  after every other ended one: at the limit a round opens on nothing and the message stays
+  unread, so it would loop. The next typed line asks again, and is answered with the stop.
+- **Only the owner lifts a limit; the parent's Python reset is dropped (after review).** The
+  first build had a parent's code reset its child -- `child.reset_model_requests()`, as a
+  kernel-to-host `agent.model_requests` line -- and the host checked that the asker had launched
+  the child. Review showed that check forgeable: every agent's code runs in one interpreter
+  process and writes one pipe, and can reach the interpreter's own `_send`, so a line can claim
+  any agent -- the parent, or `owner` -- and a child could lift its own limit and record an
+  owner's reset. Nothing on the interpreter's side can tell who wrote a line, so the reset is now
+  the owner's alone, as `work.md` has it ("an agent cannot raise its own ceiling"): the registry
+  answers `agent.model_requests` only on the owner's connection, and a line from the interpreter
+  of that kind is ignored. `ResetBy` and the event's `by` went with it. A forged line from agent
+  code, claiming the owner, the parent and the child, changes nothing
+  (`a_child_at_its_limit_ends_what_it_is_sent_until_its_owner_resets_it`). The pre-existing trust
+  in a line's claimed agent -- a launch's depth is read from it -- is
+  `plan/next/the-interpreter-is-trusted-to-name-its-agent.md`.
+- **The Python owner resets too (the maintainer's choice), through `outrig.Session`.** A host
+  program's sessions honor the configuration's limit, and without a reset a root that reached it
+  would be stuck there. `await session.reset_model_requests(agent, limit=None)` and
+  `await session.raise_model_request_limit(agent, limit)` post `agent.model_requests` over the
+  program's own connection. They are the session's -- the owner's object -- rather than the
+  instance's, so `help(outrig.Agent)` stays within its bound and the reference generator needs no
+  docstring the bound has no room for. The Python owner's reads stay out, the other half of
+  `model-policy.md`'s open question.
+- **The reset's spellings.** `Session::model_requests(agent)`, `reset_model_requests(agent,
+  Option<NonZeroU32>)`, `raise_model_request_limit(agent, NonZeroU32)`, and the same three on
+  `RootHandle`; the two on a host program's `outrig.Session`. A raise may lower the limit; one at
+  or below the count leaves the agent at it. Refused, changing nothing, once admission has closed
+  -- `SessionError::Closed`, `RootError::Closed`, `SessionClosing` -- and for an id the session
+  does not hold or released, the new `SessionError::NoAgent`. The primary's reset is between
+  rounds, since `round()` holds the session mutably; a child's or a root's can come mid-round,
+  and the hook reads it at the next call. A child's count is made as its id is reserved, so a
+  change the owner makes while it launches -- the roster lists it from then -- is to the count it
+  runs with (`a_change_made_while_a_child_launches_holds`).
+- **The `model_requests` field `0003-58` carries is `harness::ModelRequests`, serialized**:
+  `{"spent": u32, "limit": u32 | null, "warnings": [u32, ...], "warned": [u32, ...]}`, the
+  thresholds highest first without repeats, `warned` those warned at or passed since the count or
+  the limit last changed. `the_owner_reads_and_resets_a_root` asserts it.
+- **The warning's text:** `[outrig] N model requests remain of your limit of L. When none remain,
+  your round ends before its next model request, and you make none until the limit is reset or
+  raised. Finish what is open and leave the rest in a state you can take up again.` (`1 model
+  request remains` at one). **The notice's:** `[outrig] Your model-request count was reset: N
+  model requests remain of your limit of L.` -- `, and your limit set to L` when a reset gave a new
+  one -- or `[outrig] Your model-request limit was raised to L: N model requests remain of it.`
+  (`lowered`, `kept`), then, when the limit cut a round short since the last change, ` Your limit
+  ended your last round before its next model request; nothing it left running was stopped.` The
+  cut is what the hook's stop marks: reaching the limit as a round ends on its own, or a change
+  before the round's next call, cuts nothing, and the notice says nothing of it. An agent with no
+  limit is told nothing.
+- **When a warning is queued, and what it is not.** At the commit, not as the request begins: the
+  count is what the warning is about. A request that leaves none remaining queues nothing -- no
+  request follows to carry it -- though the thresholds it passed are marked. A reset or raise drops
+  anything not yet told -- a queued warning, or what an opening holds for a round that failed
+  before its code ran -- since its notice says what holds now, and re-arms each threshold below
+  the count then remaining. The word of a cut is not dropped: a change's notice carries it as the
+  notice is delivered, not as it is made, while the model has not kept an input that said it. So
+  two changes before the model's next input do not erase it, and a change while a round runs on
+  an opening that said it does not say it again -- unless that round loses its opening before
+  its code runs, when the next opening says it.
+- **Where the model reads them, once.** A tool result takes what is queued for good: the result,
+  once made, is kept. A round's opening holds what it carried until the round keeps its opening --
+  it ended, or failed after its code ran -- so the reopen of one that failed before its code ran
+  carries them again, and nothing is lost or said twice. The notices follow the opening's sentence
+  and its omitted-turn count, before a child's detail.
+- **`model.limit.warned`, `model.limit.reached`, `model.limit.reset`**, in place of
+  `model-policy.md`'s first `agent.model_requests.*`: no event name holds an underscore, and the
+  renderer's sweep pins them to `[a-z.]`. `reached` is once per arrival at the limit, its `round`
+  the latest round the agent opened, and for a child it lists the requests open as the runner's
+  check fired; a request that arrives later ends `limit` with only its `agent.request.settled`.
+  `reset` names the count and limit before and after.
+- **The state.** `AgentState::LimitReached { spent, limit, round }`, `round` the latest the agent
+  opened, `None` when it opened none. The runner says it, and `Life::LimitReached` (the parent's
+  `limit-reached`), before ending anything, so each end reads the child at its limit. With nothing
+  held it waits without `idle()`. A reset or raise wakes it, and `idle()` takes it from the limit
+  to `Idle { round }` -- or to `Launching` for one that opened no round, which is what it was, as
+  `0003-48` defines launching. The primary has no stop state (`0003-49`); its read is the count.
+- **The answer to `agent.model_requests` runs on a task of its own,** as `agent.spawn`'s and
+  `agent.release`'s do: the host hands the registry a line with its table's lock held, which both
+  answering the kernel and reading the session's admission take. The first build answered inline
+  and hung.
+- **Either key on a `[models.<name>]` row fails the load** (`config::lenient`'s `misplaced`),
+  where an unknown key is otherwise dropped with a warning: dropped, the agents it was meant for
+  would run unlimited, with a warning the only sign. It is checked for every key a batch drops,
+  not only the one the error named, since an unknown key before it would otherwise take it along
+  (review); the error names the key and says where it belongs.
+- **The acceptance's child is held to 4, not 2.** A request child's round makes at least two
+  model requests -- the call that replies, then its closing turn -- so a limit of 2 is spent in the
+  first round. `a_child_at_its_limit_ends_what_it_is_sent_until_its_parent_resets_it` keeps the
+  shape: two requests answered in two rounds, the third ended `limit`.
+- **The close rows** are `lifecycle.md`'s **Agents at their model-request limit**; the agent with
+  Python still running is one whose task outlived the stop, since the hook stops only before a
+  model call, once every tool call of the turn has returned.
+- **`/simplify` changed the first build**, from four reviews: one path opens a round for the
+  primary and a child (`Agent::run_round`); `RoundStop`'s variants are built as literals;
+  `CallSlot::reached` records the arrival at the limit for both, with one lock per decision
+  (`RequestLimit::reached` returns the count, the limit and whether this is the arrival); the
+  warning's event and the reset's are built where the count changes; a refused change is a typed
+  `NotChanged`, mapped once each into `SessionError`, `RootError` and the owner's answer; the
+  kernel's refusals share one table; the tool takes the count in its constructor, so no build of
+  it drops the notices; the tests share `children_tests`' `seen` and `data_of`, `stop_tests`'
+  `reached` and `answered`, and `instance_tests`' `fizzing`. Not adopted: carrying the warnings
+  on the `Announcer`, whose rule -- tell again after any failed round -- would repeat a warning a
+  failed round's kept tool result already carried, where the limit's is once; a new
+  `RoundOutcome` for a round the limit refused, which the design specifies as `Ended`, and
+  refusing every limit key in any wrong table, which changes what loads for keys already shipped
+  -- both in `plan/next/`, with the host's table lock held across child lines.
+- **`help()` stays within its bound.** `help(runtime)` and `help(outrig.Agent)` were within a
+  few characters of 8 KiB, and both are tested whole: `runtime.spawn`'s docstring was tightened
+  to carry `model_requests` in one sentence, and `outrig.Agent`'s carries it in one;
+  `outrig.Agent.__init__` got a one-line docstring in place of `object`'s, and
+  `__outrig_attach__` none, as `__outrig_instructions__` has none. `doc/reference/python.md` is
+  rendered from these docstrings (`scripts/python-api-reference.py`), which now wraps a
+  signature past the page's width after its parenthesis, as the constructor's now is.

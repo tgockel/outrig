@@ -387,6 +387,8 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(cfg.model_concurrency_max, Some(4));
         assert_eq!(cfg.requests_max, Some(128));
         assert_eq!(cfg.token_budget, Some(20_000_000));
+        assert_eq!(cfg.model_request_limit, Some(200));
+        assert_eq!(cfg.model_request_warnings, Some(vec![20, 1]));
         assert_eq!(cfg.retry_budget_secs, Some(300));
         assert_eq!(cfg.mcp_call_timeout_secs, Some(900));
 
@@ -480,6 +482,8 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(coding.model_concurrency_max, Some(2));
         assert_eq!(coding.requests_max, Some(64));
         assert_eq!(coding.token_budget, Some(5_000_000));
+        assert_eq!(coding.model_request_limit, Some(50));
+        assert_eq!(coding.model_request_warnings, Some(vec![5]));
         assert_eq!(cfg.agents["review"].model.as_deref(), Some("smart"));
 
         assert_eq!(cfg.workspace.host_path(), Path::new("."));

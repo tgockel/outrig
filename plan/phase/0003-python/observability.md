@@ -175,7 +175,7 @@ as zero, here and in every event that carries usage: zero is a count the provide
 retires a workaround -- today the failover chain's state is recovered by prefix-matching the
 *error string* it was rendered into.
 
-`0003-50` adds the `agent.model_requests.*` family beside these, and `0003-59` adds
+`0003-50` adds the `model.limit.*` family beside these, and `0003-59` adds
 `model.selection.moved` and `model.selection.restored` (`model-policy.md`).
 
 Every model event -- a round's usage and its per-call list, a retry, a failover hop -- carries two

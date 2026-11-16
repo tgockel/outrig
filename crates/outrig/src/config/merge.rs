@@ -101,6 +101,10 @@ pub fn merge(global: Config, repo: Config) -> Config {
         model_concurrency_max: repo.model_concurrency_max.or(global.model_concurrency_max),
         requests_max: repo.requests_max.or(global.requests_max),
         token_budget: repo.token_budget.or(global.token_budget),
+        model_request_limit: repo.model_request_limit.or(global.model_request_limit),
+        model_request_warnings: repo
+            .model_request_warnings
+            .or(global.model_request_warnings),
         retry_budget_secs: repo.retry_budget_secs.or(global.retry_budget_secs),
         mcp_call_timeout_secs: repo.mcp_call_timeout_secs.or(global.mcp_call_timeout_secs),
         network,

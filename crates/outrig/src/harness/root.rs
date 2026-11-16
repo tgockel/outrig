@@ -19,6 +19,7 @@
 //! from its events, and never by asking the interpreter.
 
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
@@ -27,9 +28,10 @@ use serde_json::{Value, json};
 use tokio::sync::{oneshot, watch};
 
 use super::event::{AgentInstanceId, AgentRequestId};
-use super::stop::{AgentState, RoundFacts, Snapshot, Status};
+use super::stop::{AgentState, ModelRequests, RoundFacts, Snapshot, Status};
 use crate::agent::children::{Children, channel_texts};
 use crate::agent::orientation::ChannelText;
+use crate::agent::request_limit::{Change, LimitConfig};
 
 /// How long [`RequestHandle::cancel`] waits for the root's kernel to say how
 /// the request ended, as a program's cancel does.
@@ -48,6 +50,8 @@ pub struct ConstructSpec {
     pub(crate) model: String,
     pub(crate) args: Vec<(String, Argument)>,
     pub(crate) aliases: Vec<String>,
+    pub(crate) model_request_limit: Option<NonZeroU32>,
+    pub(crate) model_request_warnings: Option<Vec<NonZeroU32>>,
 }
 
 impl ConstructSpec {
@@ -60,7 +64,30 @@ impl ConstructSpec {
             model: model.into(),
             args: Vec::new(),
             aliases: Vec::new(),
+            model_request_limit: None,
+            model_request_warnings: None,
         }
+    }
+
+    /// Hold the root to `limit` model requests, in place of the configuration's
+    /// `model-request-limit`: at it, its round ends before its next request,
+    /// and what it holds ends [`RootError::Limit`], until
+    /// [`RootHandle::reset_model_requests`] or
+    /// [`RootHandle::raise_model_request_limit`].
+    pub fn model_request_limit(mut self, limit: NonZeroU32) -> Self {
+        self.model_request_limit = Some(limit);
+        self
+    }
+
+    /// Warn the root's model as the model requests remaining of its limit first
+    /// fall to each of `warnings`, in place of the configuration's
+    /// `model-request-warnings`.
+    pub fn model_request_warnings(
+        mut self,
+        warnings: impl IntoIterator<Item = NonZeroU32>,
+    ) -> Self {
+        self.model_request_warnings = Some(warnings.into_iter().collect());
+        self
     }
 
     /// Call the constructor with `argument` as its keyword argument `name`.
@@ -399,6 +426,10 @@ impl Owner {
         let line = json!({
             "t": "agent.spawn", "id": number, "name": name, "kind": "request",
             "model": spec.model, "instance": {"id": number}, "construct": spec.record(),
+            "model_requests": LimitConfig::launch_line(
+                spec.model_request_limit,
+                spec.model_request_warnings.as_deref(),
+            ),
         });
         let answer = self.asked(number, line).await;
         let child = answer["child"].as_str().map(str::to_string);
@@ -732,6 +763,44 @@ impl RootHandle {
     pub async fn next_stop(&self, seq: u64) -> Status {
         self.waited(|snapshot| snapshot.seq > seq && snapshot.state.at_rest())
             .await
+    }
+
+    /// The count of the root's model requests, its limit and its warning thresholds; `None` for
+    /// a root that was not launched, or once the session has ended. Read from the root's own
+    /// count, never from events.
+    pub fn model_requests(&self) -> Option<ModelRequests> {
+        let owner = self.0.owner.upgrade()?;
+        owner.children.model_requests(self.0.child.as_deref()?)
+    }
+
+    /// Set the root's count of model requests to zero, keeping its limit or replacing it with
+    /// `limit`: a root at its limit goes on, its next round opening on what it holds then, and
+    /// its model is told of the reset once. Refused, changing nothing, for a root that was not
+    /// launched or was released ([`RootError::Released`]) and once the session's admission has
+    /// closed ([`RootError::Closed`]). The count and the limit after.
+    pub fn reset_model_requests(
+        &self,
+        limit: Option<NonZeroU32>,
+    ) -> Result<ModelRequests, RootError> {
+        self.change_model_requests(Change::Reset(limit))
+    }
+
+    /// Replace the root's model-request limit with `limit`, keeping its count: as
+    /// [`RootHandle::reset_model_requests`] does, otherwise.
+    pub fn raise_model_request_limit(&self, limit: NonZeroU32) -> Result<ModelRequests, RootError> {
+        self.change_model_requests(Change::Raise(limit))
+    }
+
+    fn change_model_requests(&self, change: Change) -> Result<ModelRequests, RootError> {
+        let (Some(owner), Some(child)) = (self.0.owner.upgrade(), self.0.child.as_deref()) else {
+            return Err(RootError::Released(
+                "the root was not launched, or its session has ended".into(),
+            ));
+        };
+        owner
+            .children
+            .change_model_requests(child, change)
+            .map_err(|refused| RootError::of(refused.kind(), refused.to_string()))
     }
 
     /// The facts of the root's latest rounds that ended with a reply, the oldest first: at most

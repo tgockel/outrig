@@ -8,7 +8,10 @@
 //! nothing read here, and the interpreter is never asked.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::time::SystemTime;
+
+use serde::Serialize;
 
 use super::event::AttemptId;
 
@@ -83,6 +86,21 @@ pub enum AgentState {
         /// The last request the failed call sent, when a model call failed.
         attempt: Option<AttemptId>,
     },
+    /// The agent's model-request limit stopped it: its count of the model requests a provider
+    /// answered reached its limit, so its round ended before its next request, and no round
+    /// opens until its owner -- or, for a child an agent launched, that agent -- resets the
+    /// count or raises the limit. What it held ended `limit`, and so does anything sent to it
+    /// meanwhile. Nothing is released and nothing failed: it keeps its kernel, its names and its
+    /// history, and a reset or a raise lets it go on from them.
+    #[non_exhaustive]
+    LimitReached {
+        /// Its count of model requests.
+        spent: u32,
+        /// Its limit.
+        limit: u32,
+        /// The latest round it opened, or `None` when it opened none.
+        round: Option<u32>,
+    },
     /// The agent was released: by its owner, or by the session's close.
     Released,
     /// The agent was released before its first round opened.
@@ -127,9 +145,9 @@ pub struct RoundFacts {
     pub round: u32,
     /// The model's closing text: what it said last, less its tool calls.
     pub reply: String,
-    /// Why the round was cut short -- the tool-call cap, the token budget -- or `None` when the
-    /// model ended it.
-    pub stopped: Option<String>,
+    /// Why the round was cut short -- the tool-call cap, the token budget, the model-request
+    /// limit -- or `None` when the model ended it.
+    pub stopped: Option<RoundStop>,
     /// The final message's reasoning, when it held no text.
     pub reasoning: Option<String>,
     /// The deliberate sends the round made on each external channel, in order. Always empty
@@ -152,6 +170,102 @@ pub struct RoundSend {
     pub channel: String,
     /// Each item it sent there, by its id, in order.
     pub items: Vec<String>,
+}
+
+/// Why OutRig ended a round before the model did: what [`RoundEnd::stopped`],
+/// [`RoundFacts::stopped`] and the `model.round.completed` event's `stopped` carry. Its
+/// `Display` is the sentence a terminal prints; the event records it as an object whose `kind`
+/// is the variant's name in snake case, beside its fields.
+///
+/// [`RoundEnd::stopped`]: super::RoundEnd::stopped
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RoundStop {
+    /// The round ran its `tool-call-max` tool calls.
+    #[non_exhaustive]
+    ToolCallMax {
+        /// The cap.
+        max: usize,
+    },
+    /// The session's `token-budget` is spent: no model call is made from here on in the session.
+    #[non_exhaustive]
+    TokenBudget {
+        /// The budget, in tokens.
+        budget: u64,
+    },
+    /// No model the call could go to had room in its window for the call's latest turn.
+    #[non_exhaustive]
+    NoRoom {
+        /// Each model tried, and why it had no room.
+        reason: String,
+    },
+    /// The agent's model-request limit was reached: no model request is made until the count
+    /// is reset or the limit raised.
+    #[non_exhaustive]
+    ModelRequestLimit {
+        /// The agent's count of model requests.
+        spent: u32,
+        /// Its limit.
+        limit: u32,
+    },
+    /// A work child's submission was accepted and nothing else waits, so the call that would
+    /// only speak after the work was not sent.
+    #[non_exhaustive]
+    Accepted {
+        /// The submission.
+        submission: u64,
+    },
+    /// The child was released.
+    Released,
+}
+
+impl fmt::Display for RoundStop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ToolCallMax { max } => write!(f, "tool-call iteration max ({max}) reached"),
+            Self::TokenBudget { budget } => write!(
+                f,
+                "token-budget ({budget} tokens) is spent: no model call is made from here on in \
+                 this session"
+            ),
+            Self::NoRoom { reason } => f.write_str(reason),
+            Self::ModelRequestLimit { spent, limit } => write!(
+                f,
+                "model-request-limit ({limit}) reached: {spent} of {limit} model requests made; no \
+                 model request is made until the count is reset or the limit raised"
+            ),
+            Self::Accepted { submission } => {
+                write!(
+                    f,
+                    "submission {submission} was accepted and nothing else waits"
+                )
+            }
+            Self::Released => f.write_str("the child was released"),
+        }
+    }
+}
+
+/// An agent's count of model requests, against its limit: what the owner reads
+/// ([`Session::model_requests`](super::Session::model_requests),
+/// [`RootHandle::model_requests`](super::RootHandle::model_requests)), and the
+/// `model_requests` field of the agent's continuation metadata, which it serializes as.
+///
+/// A model request is a logical one: a call the agent's model was asked to answer, counted once,
+/// when a provider first answers it, however many retries or moves to another model it took. A
+/// call no provider answered is not counted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct ModelRequests {
+    /// The model requests counted since the agent started, or since its count was last reset.
+    pub spent: u32,
+    /// Its limit, or `None` for none.
+    pub limit: Option<u32>,
+    /// The counts remaining at which the model is warned, highest first.
+    pub warnings: Vec<u32>,
+    /// Those of `warnings` it has been warned at, or passed, since its count or limit last
+    /// changed, highest first.
+    pub warned: Vec<u32>,
 }
 
 /// What the registry keeps of one child for its readers: its state, numbered, the latest state

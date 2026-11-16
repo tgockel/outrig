@@ -19,6 +19,33 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **An agent has a model-request limit.** `model-request-limit`, at the top level or in
+  `[agents.<name>]`, holds each agent of a `run-new` session -- the main agent, and every child,
+  each from zero -- to that many model requests: a request is counted once, as a provider first
+  answers it, however many retries or moves to another of an alias's models it took, and one no
+  provider answered is never counted, so an outage spends nothing. At the limit an agent's round
+  ends before its next request with `RoundStop::ModelRequestLimit { spent, limit }`, completed and
+  not failed, its names, history and running Python intact. The main agent opens no round until
+  the limit is lifted, `Session::round` answering with that stop and what waits staying unread. A
+  child ends what it holds, and what is sent to it, with the end `limit`
+  (`RequestEnd::Limit`; `outrig.AgentLimitReached` naming the child, its limit and its count), its
+  `status` reads `limit-reached`, it stays resident, counted by `children-max`, and no warning
+  round is spent on it; an orienting round that cannot open makes `ready()` raise it.
+  `model-request-warnings` lists counts remaining at which the model is warned, once each, in
+  the next tool result it reads -- after any delivery announcement -- or its next round's
+  opening. The owner reads each agent's `ModelRequests { spent, limit, warnings, warned }` with
+  `Session::model_requests(agent)` and `RootHandle::model_requests()`, and lifts the limit with
+  `reset_model_requests(limit)` or `raise_model_request_limit(limit)` on either, as a host
+  program does with `outrig.Session.reset_model_requests(agent)` and
+  `raise_model_request_limit(agent, limit)`. Only the owner can: a line from the interpreter can
+  claim any agent, so no agent's code -- a parent's included -- lifts a limit. The model is told
+  of each change once. A child's own limit is `runtime.spawn(..., model_requests=n)`, or
+  `(n, warnings)`, and the same keyword on an agent class's constructor;
+  `ConstructSpec::model_request_limit` and `model_request_warnings` give a root its own. The stop
+  read gains `AgentState::LimitReached { spent, limit, round }`, which the roster shows; new
+  events `model.limit.warned`, `model.limit.reached` and `model.limit.reset`; a reset after the
+  close is refused, `SessionError::NoAgent` for an id the session does not hold. Either key on a
+  `[models.<name>]` row fails the load. `outrig run` ignores both and says so.
 - **The owner reads a root's stop.** `RootHandle::status()` returns a `Status`: an `AgentState`
   -- `Launching` until its first round opens, `Running { round }`, and at rest `Unavailable {
   class, since, next_attempt, round, attempt }` while a model call that may clear is retried,
@@ -863,6 +890,12 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Changed
 
+- **A round's stop is a `RoundStop`, not a text.** `RoundEnd::stopped`, `RoundFacts::stopped` and
+  `model.round.completed`'s `stopped` carry `harness::RoundStop` -- `ToolCallMax { max }`,
+  `TokenBudget { budget }`, `NoRoom { reason }`, `ModelRequestLimit { spent, limit }`,
+  `Accepted { submission }` or `Released` -- whose `Display` is the text they carried before, and
+  which the event records as an object with its `kind`, so an owner reads why a round stopped
+  without parsing it.
 - **The interpreter program is a file of the `outrig` package.** A session's `python3` ran it
   from a `-c` argument, which Linux caps at 128 KiB and which it had grown to within 5% of. It is
   now `outrig/_interpreter.py` in the package every session mounts at `/outrig/lib`, run by its

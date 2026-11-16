@@ -32,7 +32,9 @@
 //! - **Its agent class instances**, root children of the session (`agent::children`): `agent.*`
 //!   lines, as a kernel sends them -- `agent.spawn`, answered with the `instance` id the child's
 //!   kernel gave it; `agent.release`, with `how`, which the engine records as it releases, and
-//!   answers at once, releasing nothing, once admission has closed; and
+//!   answers at once, releasing nothing, once admission has closed; `agent.model_requests`
+//!   (`child`, `reset`, `limit`), which resets the child's model-request count or raises its
+//!   limit and answers `model_requests` with the `error` that refused it, or none; and
 //!   `agent.instance.handle.collected` -- and three notices about one of its requests, which the
 //!   program numbers `ask`: `ask` (`agent`, `channel`, `body`), the request; `withdraw`
 //!   (`agent`), its cancel; and `verdict` (`agent`, `reply`, `problems`), what the program found

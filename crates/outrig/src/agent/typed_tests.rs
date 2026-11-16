@@ -387,10 +387,8 @@ async fn a_typed_calls_round_ends_when_its_submission_is_accepted() {
         let rounds = kind(&events, "model.round.completed", Some(subject));
         assert_eq!(rounds.len(), 1, "{subject}");
         let stopped = data(rounds[0])["stopped"].clone();
-        assert!(
-            stopped
-                .as_str()
-                .is_some_and(|why| why.contains("was accepted")),
+        assert_eq!(
+            stopped["kind"], "accepted",
             "{subject} stopped on {stopped}"
         );
         assert!(

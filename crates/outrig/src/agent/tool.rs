@@ -25,6 +25,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::channel::Announcer;
+use super::request_limit::RequestLimit;
 use crate::harness::ClosedBy;
 use crate::harness::event::{Payload, SessionState};
 use crate::harness::lifecycle::Lifecycle;
@@ -124,6 +125,9 @@ pub(crate) struct SubmitPython {
     lifecycle: Option<Arc<Lifecycle>>,
     /// What the model has been told of what waits on the agent's channels.
     announcer: Announcer,
+    /// The agent's count of model requests, whose warnings and notices a
+    /// result carries.
+    limit: RequestLimit,
 }
 
 impl SubmitPython {
@@ -132,6 +136,7 @@ impl SubmitPython {
         result_max_bytes: usize,
         announcer: Announcer,
         lifecycle: Option<Arc<Lifecycle>>,
+        limit: RequestLimit,
     ) -> Self {
         Self {
             interpreter,
@@ -140,6 +145,7 @@ impl SubmitPython {
             interrupts: Interrupts::default(),
             lifecycle,
             announcer,
+            limit,
         }
     }
 
@@ -150,9 +156,11 @@ impl SubmitPython {
 
     /// A line for each live object a host program injected since the model
     /// was last told, then one saying what waits on the agent's channels, if
-    /// anything arrived since the model was last told, or nothing. Never an
-    /// error: the result matters more, and an announcement missed here is made
-    /// by a later call or the next round.
+    /// anything arrived since the model was last told, then each warning or
+    /// notice of the agent's model requests not yet told: what it delivers,
+    /// then how to go on. Nothing when there is none of these. Never an error:
+    /// the result matters more, and an announcement missed here is made by a
+    /// later call or the next round.
     async fn announcement(&self) -> String {
         let mut text: String = self
             .announcer
@@ -164,6 +172,10 @@ impl SubmitPython {
             Ok(Some(waiting)) => text.push_str(&format!("[{waiting}]\n")),
             Ok(None) => {}
             Err(e) => tracing::debug!("not announcing what waits: {e}"),
+        }
+        for notice in self.limit.take_notices() {
+            text.push_str(&notice);
+            text.push('\n');
         }
         text
     }

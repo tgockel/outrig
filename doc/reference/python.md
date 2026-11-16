@@ -237,6 +237,30 @@ a call an agent makes of a binding is refused, admission closed, and so is an ex
 What is already running is left to finish, or to the exit to stop. After the exit, it
 returns at once.
 
+#### `outrig.Session.reset_model_requests`
+
+```python
+async def reset_model_requests(self, agent, limit=None): ...
+```
+
+Set the model-request count of `agent`, an `outrig.Agent` this program constructed in
+the session, to zero, keeping its limit, or replacing it with `limit`, an int of at least
+1. An agent at its limit goes on: what is sent to it from now on opens its rounds again,
+on what it kept. Its model is told once. What warrants a reset is this program's to
+decide; only the session's owner can lift a limit, never an agent's code. Raises
+`outrig.AgentReleased` for an agent released, and `outrig.SessionClosing` once the session
+is closing.
+
+#### `outrig.Session.raise_model_request_limit`
+
+```python
+async def raise_model_request_limit(self, agent, limit): ...
+```
+
+Replace the model-request limit of `agent` with `limit`, an int of at least 1, keeping
+its count: otherwise as `reset_model_requests`. A limit at or below the count leaves the
+agent at its limit.
+
 #### `outrig.Session.inject`
 
 ```python
@@ -578,7 +602,8 @@ class adds to its child's instructions by returning `outrig.Section`s from
 
 ```python
 class Agent:
-    def __init__(self, *, model=None, session=None, facilities=None, **inputs): ...
+    def __init__(self, *, model=None, model_requests=None, session=None, facilities=None,
+                 **inputs): ...
 ```
 
 The base of an agent class: each instance is one long-lived child agent, and each method
@@ -610,7 +635,7 @@ and returns at once; a request made before the child exists waits for it. The ch
 round is its own, to get ready in: `await reviewer.ready()` returns once it has ended, and
 raises what the launch met instead. `await reviewer.release()` ends the child and every request
 still open on it; `async with Reviewer() as reviewer:` waits for `ready()` on entry and releases
-on leaving.
+on leaving. `model_requests=n`, or `(n, warnings)`, is the child's own model-request limit.
 
 In the child, the instance is `self`: the same object, not a copy, so `self._task` there is what
 `__init__` stored, and an ordinary method runs in whichever agent calls it. A request method
@@ -824,8 +849,9 @@ What a handle's request is doing, read without waiting.
 `state` is `queued` or `running` for a submission, `waiting` or `received` for a request on a
 channel, and `accepted` or `failed` once it has ended; `reason` says why a failed one failed --
 `rejected`, `failed`, `cancelled`, `released`, `budget`, `closed`, `terminated`, or `limit`
-for a typed call whose child a limit refused -- and is `None` otherwise. `child` is its
-child's state: `running`, `idle`, `wedged` or `released`. Fixed once the request has ended.
+for a typed call whose child a limit refused, or a request its child's model-request limit
+ended -- and is `None` otherwise. `child` is its child's state: `running`, `idle`,
+`limit-reached`, `wedged` or `released`. Fixed once the request has ended.
 
 ### `outrig.Section`
 
@@ -917,7 +943,9 @@ class AgentLimitReached(AgentError): ...
 ```
 
 A limit the session holds every agent to refused at once, rather than waiting: the depth
-agents may nest to, the children a session holds, or the requests one child holds.
+agents may nest to, the children a session holds, or the requests one child holds. Or the
+child's model-request limit: at it, the child ends what it holds with this, and what is sent
+to it, until the session's owner resets its count or raises its limit.
 
 ### `outrig.BudgetExhausted`
 

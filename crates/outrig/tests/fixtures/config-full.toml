@@ -15,6 +15,8 @@ children-max       = 32
 model-concurrency-max = 4
 requests-max       = 128
 token-budget       = 20000000
+model-request-limit = 200
+model-request-warnings = [20, 1]
 retry-budget-secs  = 300
 mcp-call-timeout-secs = 900
 
@@ -88,6 +90,8 @@ children-max       = 16
 model-concurrency-max = 2
 requests-max       = 64
 token-budget       = 5000000
+model-request-limit = 50
+model-request-warnings = [5]
 
 [agents.review]
 model    = "smart"

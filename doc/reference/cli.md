@@ -405,6 +405,13 @@ round that yielded with nothing left running closes on no such line. A turn that
 model's reasoning, which usually means it was cut off at its output ceiling, is reported as that,
 with the reasoning, rather than as silence.
 
+**A model-request limit stops the agent until it is lifted.** With `model-request-limit` set (see
+[Top level](config.md#top-level)), the round that reaches it ends before its next model request,
+closing on `(round ended: model-request-limit (N) reached: N of N model requests made; ...)`.
+What you type from then on waits unread: each line is answered with the same line, and no round
+opens, since `run-new` has no command that resets the count or raises the limit. End the session,
+or start another with a higher limit.
+
 **What the agent's Python can import.** The standard library, and modules in the workspace, which
 come after the standard library on `sys.path`. `pip install`, run from the agent's code, adds
 pure-Python packages: `pip` there is the interpreter's own, not the image's, and it installs into
@@ -451,7 +458,8 @@ runtime.complete(value)`; a request child, launched with `requests={"fizz": outr
 Thing)}`, answers what is sent on its channels. Each submission and request returns a handle at
 once, and awaiting it gives a value of the declared type or raises an `outrig.AgentError` saying
 why there is none; `help(runtime.spawn)` has the rest. `children-max`, `model-concurrency-max`,
-`requests-max`, and `token-budget` bound them (see [Top level](config.md#top-level)). A child's
+`requests-max`, `token-budget`, and `model-request-limit` bound them (see
+[Top level](config.md#top-level)). A child's
 code and model calls are in the event log, under the child's own subject, and are not printed
 here. [Python Runtime -> Child agents](../concepts/python-runtime.md#child-agents) describes
 them, with `@outrig.agent` and `outrig.Agent`, which declare the same work as typed Python.

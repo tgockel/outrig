@@ -8,8 +8,10 @@
 //! Some mistakes are never skipped: a TOML syntax error, a dotted name that
 //! wants quoting (that gets its hint), anything under `[network]` or an
 //! `images.<n>.security` / `sidecars.<n>.security` table, where a skipped
-//! entry would loosen the sandbox, and anything under `[bindings]`, where it
-//! would have the host build an object other than the one the file declares.
+//! entry would loosen the sandbox, anything under `[bindings]`, where it
+//! would have the host build an object other than the one the file declares,
+//! and a model-request limit on a `[models.<name>]` row, where a skipped one
+//! would leave the agents it was meant for unlimited.
 //!
 //! The types keep `deny_unknown_fields`, so the leniency is a loop around
 //! them: deserialize the parsed document, and on failure leave out the entry
@@ -198,6 +200,16 @@ pub(super) fn parse(text: &str, file: Option<&Path>, skip_bad_values: bool) -> R
                 let keep = fields.contains(&k)
                     || (tagged && k == "style")
                     || (names_entry && follows_dot_in_header(text, start));
+                // Whichever unknown key the error named: the batch drops every one.
+                if (k == name || !keep) && misplaced(&path, k) {
+                    let at = dotted(&child(&path, Seg::Key(k.to_string())));
+                    let line = newlines.partition_point(|&i| i < start) + 1;
+                    let refused = <toml::de::Error as serde::de::Error>::custom(format!(
+                        "line {line}: `{at}` limits an agent's model requests, so it belongs at \
+                         the top level or in [agents.<name>], not on a model"
+                    ));
+                    return Err(failed(refused).into());
+                }
                 if (k == name || !keep) && dropped.insert(start) {
                     let path = child(&path, Seg::Key(k.to_string()));
                     warnings.push(warning(&path, start, ConfigWarningKind::UnknownKey));
@@ -627,6 +639,15 @@ fn is_strict(path: &[Seg]) -> bool {
     }
 }
 
+/// Whether `key`, unknown in the table at `path`, is refused rather than
+/// skipped: a limit on an agent's model requests set on a `[models.<name>]`
+/// row instead of at the top level or in `[agents.<name>]`. Skipped, it would
+/// leave every agent unlimited, with a warning the only sign.
+fn misplaced(path: &[Seg], key: &str) -> bool {
+    matches!(path, [Seg::Key(top), _] if top == "models")
+        && matches!(key, "model-request-limit" | "model-request-warnings")
+}
+
 /// serde's `message`, except where it would quote a secret or blame a missing
 /// field this load already dropped. Every `ApiKeyError` an `api-key` can fail
 /// to parse with starts `api-key `, and is the one error that quotes its value.
@@ -744,6 +765,21 @@ mod tests {
                 matches!(parse(text, None, true), Err(OutrigError::Config(_))),
                 "{text}"
             );
+        }
+        // A model-request limit on a model row, where it would bound nothing: alone, or after
+        // another unknown key, which the error names first and whose batch would drop it too.
+        for key in ["model-request-limit = 5", "model-request-warnings = [1]"] {
+            for before in ["", "a = 1\n"] {
+                let text = format!("[models.fast]\nprovider = \"openai\"\n{before}{key}\n");
+                let Err(OutrigError::Config(err)) = parse(&text, None, true) else {
+                    panic!("{text} loaded");
+                };
+                let named = key.split(' ').next().expect("a key");
+                assert!(
+                    err.to_string().contains(&format!("`models.fast.{named}`")),
+                    "{err}"
+                );
+            }
         }
         assert!(matches!(
             parse("[models.opus-4.7]\nprovider = \"a\"\n", None, true),

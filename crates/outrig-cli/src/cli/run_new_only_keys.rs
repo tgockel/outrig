@@ -58,6 +58,16 @@ pub(crate) fn warnings<'a>(
         ),
         ("requests-max", cfg.requests_max.is_some(), agent.is_some_and(|a| a.requests_max.is_some())),
         ("token-budget", cfg.token_budget.is_some(), agent.is_some_and(|a| a.token_budget.is_some())),
+        (
+            "model-request-limit",
+            cfg.model_request_limit.is_some(),
+            agent.is_some_and(|a| a.model_request_limit.is_some()),
+        ),
+        (
+            "model-request-warnings",
+            cfg.model_request_warnings.is_some(),
+            agent.is_some_and(|a| a.model_request_warnings.is_some()),
+        ),
     ];
     for (key, top, own) in limits {
         if top || own {
@@ -179,6 +189,34 @@ requests-max = 4
         assert_eq!(
             warnings(&cfg, None, ["fast"]),
             [ignored("token-budget")]
+        );
+    }
+
+    /// An agent's model-request limit and warnings are `run-new`'s, set at
+    /// the top level or by the session's agent.
+    #[test]
+    fn the_model_request_limit_is_named() {
+        let cfg = config(
+            r#"
+model-request-warnings = [5, 1]
+
+[models.fast]
+provider = "openai"
+
+[agents.coding]
+model-request-limit = 40
+"#,
+        );
+        assert_eq!(
+            warnings(&cfg, Some("coding"), ["fast"]),
+            [
+                ignored("model-request-limit"),
+                ignored("model-request-warnings")
+            ]
+        );
+        assert_eq!(
+            warnings(&cfg, None, ["fast"]),
+            [ignored("model-request-warnings")]
         );
     }
 

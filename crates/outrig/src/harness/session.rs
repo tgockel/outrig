@@ -1,6 +1,7 @@
 //! The session an owner holds: its rounds, its user channel, its interrupter,
 //! and how it stops.
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
@@ -17,11 +18,13 @@ use super::root::{ConstructSpec, Owner, RootError, RootHandle};
 use super::roster::Roster;
 use super::services::Services;
 use super::skills::{Catalog, SkillBrief};
+use super::stop::{ModelRequests, RoundStop};
 use super::{Closed, ClosedBy, Failure, SessionError, UserChannel};
 use crate::Outrig;
-use crate::agent::children::{self, Children};
-use crate::agent::ledger::Ledger;
+use crate::agent::children::{self, Children, NotChanged};
+use crate::agent::ledger::{CallSlot, Ledger};
 use crate::agent::orientation::Holdings;
+use crate::agent::request_limit::{Change, RequestLimit};
 use crate::agent::window::Windows;
 use crate::agent::{Agent, AgentError, ResolvedAgent};
 use crate::config::{Config, Secrets};
@@ -197,7 +200,8 @@ impl Session {
                 skills: &catalog.briefs(),
                 catalog: Some(catalog),
             },
-            self.ledger.clone(),
+            CallSlot::new(self.ledger.clone(), self.interpreter.events().clone(), None)
+                .limited(RequestLimit::new(self.children.limit_config())),
             Arc::clone(&self.lifecycle),
         )
         .await?;
@@ -446,6 +450,58 @@ impl Session {
     /// interpreter died first, `terminated`; the report, read last, is the last word.
     pub fn roster(&self) -> Roster {
         self.children.roster()
+    }
+
+    /// The count of agent `agent`'s model requests, its limit and its warning
+    /// thresholds -- the primary agent's, `primary`, or any child's, by the id
+    /// its events and [`Session::roster`] name -- or `None` for an id the
+    /// session does not hold. Read from the agent's own count, under the lock
+    /// it changes under, never from events.
+    pub fn model_requests(&self, agent: &str) -> Option<ModelRequests> {
+        self.children.model_requests(agent)
+    }
+
+    /// Set agent `agent`'s count of model requests to zero, keeping its limit,
+    /// or replacing it with `limit`. An agent at its limit goes on: a child
+    /// opens its next round on what arrives, and the primary's next
+    /// [`Session::round`] tells it what waits. Its model is told of the reset
+    /// once, in the next result it reads or its next round's opening. What
+    /// warrants a reset is the owner's to decide; OutRig resets on nothing.
+    ///
+    /// Refused, changing nothing, once admission has closed
+    /// ([`SessionError::Closed`]), and for an id the session does not hold or
+    /// an agent it released ([`SessionError::NoAgent`]). The count and the
+    /// limit after.
+    pub fn reset_model_requests(
+        &self,
+        agent: &str,
+        limit: Option<NonZeroU32>,
+    ) -> Result<ModelRequests, SessionError> {
+        self.change_model_requests(agent, Change::Reset(limit))
+    }
+
+    /// Replace agent `agent`'s model-request limit with `limit`, keeping its
+    /// count: as [`Session::reset_model_requests`] does, otherwise. A limit at
+    /// or below the count leaves the agent at its limit.
+    pub fn raise_model_request_limit(
+        &self,
+        agent: &str,
+        limit: NonZeroU32,
+    ) -> Result<ModelRequests, SessionError> {
+        self.change_model_requests(agent, Change::Raise(limit))
+    }
+
+    fn change_model_requests(
+        &self,
+        agent: &str,
+        change: Change,
+    ) -> Result<ModelRequests, SessionError> {
+        self.children
+            .change_model_requests(agent, change)
+            .map_err(|refused| match refused {
+                NotChanged::Closed(by) => Closed::from(by).into(),
+                other => SessionError::NoAgent(other.to_string()),
+            })
     }
 
     /// The root [`SessionBuilder::construct`] constructed as the session
@@ -794,9 +850,10 @@ pub struct RoundEnd {
     /// The model's closing text: commentary, where a message the agent means
     /// the user to have is one it sends.
     pub reply: String,
-    /// Why a limit stopped the round, when one did: the tool-call cap, or a
-    /// turn too large for the model's window. `None` when the model yielded.
-    pub stopped: Option<String>,
+    /// Why a limit stopped the round, when one did: the tool-call cap, a turn
+    /// too large for the model's window, the token budget, or the agent's
+    /// model-request limit. `None` when the model yielded.
+    pub stopped: Option<RoundStop>,
     /// The reasoning in the round's final message, when it held no text: a
     /// turn the model spent thinking, likely cut off at its output ceiling.
     pub reasoning: Option<String>,

@@ -160,13 +160,14 @@ only through that code.
 
 ### Spawning a child
 
-`await runtime.spawn(name, prompt=..., model=None, inputs=None, requests=None)` launches one and
-returns its `Child`. `prompt` is the first part of the child's instructions; `model` names a
-configured model or alias, else the child runs on its parent's; `inputs`, a dict, is bound in the
-child's namespace as variables. Inputs must be data -- `None`, str, int, bool, float, lists and
-str-keyed dicts of these, or dataclass instances -- and the child gets a copy. An object a binding
-holds cannot be an input: the child reaches the bindings it sees by name, and an agent class takes
-one in its constructor's `facilities=` dict.
+`await runtime.spawn(name, prompt=..., model=None, inputs=None, requests=None,
+model_requests=None)` launches one and returns its `Child`. `prompt` is the first part of the
+child's instructions; `model` names a configured model or alias, else the child runs on its
+parent's; `inputs`, a dict, is bound in the child's namespace as variables; `model_requests` is
+its own model-request limit (see [Limits](#limits)). Inputs must be data -- `None`, str, int,
+bool, float, lists and str-keyed dicts of these, or dataclass instances -- and the child gets a
+copy. An object a binding holds cannot be an input: the child reaches the bindings it sees by
+name, and an agent class takes one in its constructor's `facilities=` dict.
 
 There are two kinds of child:
 
@@ -188,7 +189,8 @@ there is none:
 - `RequestCancelled` -- the sender cancelled it with `handle.cancel()`, or the engine did, as
   below.
 - `AgentReleased` -- the child, or an agent above it, was released first.
-- `AgentLimitReached` -- a limit refused the work at once (see [Limits](#limits)).
+- `AgentLimitReached` -- a limit refused the work at once, or the child is at its model-request
+  limit (see [Limits](#limits)).
 - `BudgetExhausted` -- the session's `token-budget` was spent.
 - `SessionClosing` -- the session closed to new work.
 
@@ -228,6 +230,8 @@ round opened on:
   it, and `agent.request.cancelled` records the engine's `reason`.
 
 So a request sent to a child is either being worked on or cancelled, and its sender is told which.
+A child at its model-request limit is neither: what it holds ends `AgentLimitReached` before the
+comparison, so it holds nothing, and no warning round is spent on it.
 One round is the exception: one the provider would not answer for what it carried -- a reply it
 ended with `content_filter` or `refusal`, sent once more without the turn's results and refused
 again. Sent again, it would be refused the same way, so the engine opens no round, the warning
@@ -257,7 +261,7 @@ spend of every child made inside it on `skill.invocation.finished`. The
 
 ### Limits
 
-Five settings bound a session's agents, each at the top level of the configuration or under
+Six settings bound a session's agents, each at the top level of the configuration or under
 `[agents.<name>]` (see [Config -> Top level](../reference/config.md#top-level)):
 
 - `children-max` (default 64) -- children resident at once: launching, working, idle, or wedged.
@@ -268,6 +272,14 @@ Five settings bound a session's agents, each at the top level of the configurati
   past it raises `AgentLimitReached` at once.
 - `token-budget` (unset by default) -- tokens every model call of the session spends in all, the
   main agent's included. Once spent, no model call is made, and open work ends `BudgetExhausted`.
+- `model-request-limit` (unset by default) -- model requests each agent makes, its own count from
+  zero, a request counted once a provider answers it, however many retries it took. At it, the
+  agent's round ends before its next request, and a child ends what it holds, and what is sent to
+  it, `AgentLimitReached`: its `status` reads `limit-reached`. It stays resident, with its names
+  and history, until the session's owner resets its count or raises its limit; no agent's code
+  can, its parent's included. `model-request-warnings`, counts remaining, warn its model once
+  each as it nears the limit. `runtime.spawn(..., model_requests=n)`, or `(n, warnings)`, and the
+  same on an agent class's constructor, give one child its own.
 - `subagent-depth-max` (default 3) -- how deep agents nest. The main agent is at depth 1, and an
   agent at the limit cannot spawn.
 

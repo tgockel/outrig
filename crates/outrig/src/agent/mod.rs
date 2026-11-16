@@ -32,6 +32,7 @@ mod history;
 mod instructions;
 pub(crate) mod ledger;
 pub(crate) mod orientation;
+pub(crate) mod request_limit;
 mod resolve;
 mod retry;
 pub(crate) mod round;
@@ -48,9 +49,9 @@ use rig::tool::tool_definition;
 
 use crate::config::{Config, Secrets};
 use crate::error::OutrigError;
-use crate::harness::Closed;
 use crate::harness::event::{self, Payload};
 use crate::harness::lifecycle::Lifecycle;
+use crate::harness::{Closed, RoundStop};
 use crate::python::host::{Interpreter, InterpreterError, Tasks};
 
 pub use self::channel::UserChannel;
@@ -60,7 +61,7 @@ use self::channel::Announcer;
 #[cfg(test)]
 pub(crate) use self::history::rig_json;
 use self::history::{History, Window};
-use self::ledger::{CallSlot, Ledger};
+use self::ledger::CallSlot;
 use self::resolve::LlmResolveError;
 pub(crate) use self::resolve::{ResolvedAgent, find_agent};
 use self::round::{Finished, Quiet};
@@ -112,7 +113,7 @@ pub(crate) struct Agent {
 impl Agent {
     /// The session's model calls and attempts.
     #[cfg(test)]
-    pub(crate) fn ledger(&self) -> &Ledger {
+    pub(crate) fn ledger(&self) -> &ledger::Ledger {
         self.agent.model.slot().ledger()
     }
 
@@ -148,26 +149,49 @@ impl Agent {
     }
 
     /// Run one round of a child's, opening on what `opening` makes of how
-    /// many earlier turns its calls are not sent. The runner decides when.
+    /// many earlier turns its calls are not sent and what the model is to be
+    /// told of its model requests. The runner decides when.
     pub(crate) async fn opened(
         &self,
-        opening: impl Fn(usize) -> String,
+        opening: impl Fn(usize, &[String]) -> String,
     ) -> Result<Finished, AgentError> {
+        self.run_round(opening, self.quiet.as_ref()).await
+    }
+
+    /// Open a round on what `opening` makes of how many earlier turns its
+    /// calls are not sent and of what the model is to be told of its model
+    /// requests, and run it, ending early once `quiet` says so. What the
+    /// opening told of the model requests is said once the round keeps its
+    /// opening: it ended, or failed after its code ran. One that failed before
+    /// keeps nothing of it, and the next opening tells it again.
+    async fn run_round(
+        &self,
+        opening: impl Fn(usize, &[String]) -> String,
+        quiet: Option<&Quiet>,
+    ) -> Result<Finished, AgentError> {
+        let limit = self.slot().limit();
+        let notices = limit.for_opening();
         let opening = self
             .history
-            .open_round(&self.agent.model.head_budget(), opening);
+            .open_round(&self.agent.model.head_budget(), |omitted| {
+                opening(omitted, &notices)
+            });
         self.history.events().emit(Payload::RoundStarted {
             round: self.history.round(),
         });
-        round::round(
+        let ended = round::round(
             &self.agent,
             opening,
             &self.history,
             self.tool_call_max,
             &self.interrupts,
-            self.quiet.as_ref(),
+            quiet,
         )
-        .await
+        .await;
+        if ended.as_ref().err().is_none_or(AgentError::ran_python) {
+            limit.opening_read();
+        }
+        ended
     }
 
     /// Drive one round, if anything was sent on the user channel since the
@@ -175,48 +199,64 @@ impl Agent {
     /// model, when nothing was. See [`crate::harness::Session::round`]. With
     /// it, the tasks the agent's code left running when it ended, or `None`
     /// when the interpreter could not say.
+    ///
+    /// At the agent's model-request limit no round opens: the limit's stop is
+    /// the outcome, nothing is sent, and what waits is announced again once
+    /// the limit is lifted.
     pub(crate) async fn round(&mut self) -> Result<Option<(Finished, Option<Tasks>)>, AgentError> {
         let Some(announcement) = self.announcer.opening().await? else {
             return Ok(None);
         };
+        // Before the session moves to a round running, since none opens.
+        let latest = Some(self.history.round()).filter(|round| *round > 0);
+        if let Some(reached) = self.slot().reached(latest, &[]) {
+            let stopped = Finished {
+                reply: String::new(),
+                stopped: Some(RoundStop::ModelRequestLimit {
+                    spent: reached.spent,
+                    limit: reached.limit,
+                }),
+                reasoning: None,
+            };
+            return Ok(Some((stopped, self.tasks().await)));
+        }
         // Refused here, with nothing opened, once the session has closed.
         let running = self
             .lifecycle
             .open_round()
             .map_err(|by| AgentError::Closed(by.into()))?;
-        let opening = self
-            .history
-            .open_round(&self.agent.model.head_budget(), |omitted| {
-                orientation::opening(&announcement, omitted)
-            });
-        self.history.events().emit(Payload::RoundStarted {
-            round: self.history.round(),
-        });
-        let finished = round::round(
-            &self.agent,
-            opening,
-            &self.history,
-            self.tool_call_max,
-            &self.interrupts,
-            None,
-        )
-        .await?;
+        let finished = self
+            .run_round(
+                |omitted, notices| {
+                    orientation::told(orientation::opening(&announcement, omitted), notices)
+                },
+                None,
+            )
+            .await?;
+        if matches!(finished.stopped, Some(RoundStop::ModelRequestLimit { .. })) {
+            self.slot().reached(Some(self.history.round()), &[]);
+        }
         // Only now: a round that failed or was dropped may have left the
         // model unaware of what it announced, and the next one says it again.
         self.announcer.keep();
         // The model has yielded; what its code left running has not.
         drop(running);
-        let tasks = tokio::time::timeout(TASKS_TIMEOUT, self.interpreter.tasks())
+        Ok(Some((finished, self.tasks().await)))
+    }
+
+    /// The tasks the agent's code left running, or `None` when the
+    /// interpreter could not say.
+    async fn tasks(&self) -> Option<Tasks> {
+        tokio::time::timeout(TASKS_TIMEOUT, self.interpreter.tasks())
             .await
             .ok()
-            .and_then(Result::ok);
-        Ok(Some((finished, tasks)))
+            .and_then(Result::ok)
     }
 
     /// An agent over `interpreter`, in the container named `container_name`
     /// whose workspace is `workspace`, told of the bindings and skills in
-    /// `holdings`, recording its spend in `ledger` and moving `lifecycle`
-    /// through each round. Its system prompt ends with the repository's
+    /// `holdings`, naming its calls and counting its model requests in `slot`,
+    /// and moving `lifecycle` through each round. Its system prompt ends with the repository's
     /// instructions, read through `interpreter`, when `resolved` asks for them
     /// and `workspace` holds them.
     pub(crate) async fn build(
@@ -225,7 +265,7 @@ impl Agent {
         container_name: &str,
         workspace: Option<&Path>,
         holdings: orientation::Holdings<'_>,
-        ledger: Ledger,
+        slot: CallSlot,
         lifecycle: Arc<Lifecycle>,
     ) -> Result<Self, AgentError> {
         let window = Window::DEFAULT;
@@ -239,7 +279,6 @@ impl Agent {
             instructions.as_ref(),
             window,
         );
-        let slot = CallSlot::new(ledger, interpreter.events().clone(), None);
         let user = UserChannel::new(interpreter.clone(), catalog);
         Self::assemble(
             resolved,
@@ -303,6 +342,7 @@ impl Agent {
             resolved.tool_result_max_bytes,
             announcer.clone(),
             user.is_some().then(|| Arc::clone(&lifecycle)),
+            slot.limit().clone(),
         );
         let interrupts = tool.interrupts();
         let definition = tool_definition(&tool);
@@ -509,3 +549,7 @@ mod stop_tests;
 #[cfg(test)]
 #[path = "roster_tests.rs"]
 mod roster_tests;
+
+#[cfg(test)]
+#[path = "limit_tests.rs"]
+mod limit_tests;

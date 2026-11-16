@@ -190,18 +190,31 @@ def defined(tree):
     }
 
 
-def declaration(node):
-    """`node` as a stub declares it: a function's decorators and `def` line; a class's decorators,
-    `class` line, fields and constructor; or an assignment."""
+def declaration(node, indent=0):
+    """`node` as a stub declares it, to be shown `indent` columns in: a function's decorators and
+    `def` line, wrapped after the parenthesis where it would pass the page's width; a class's
+    decorators, `class` line, fields and constructor; or an assignment."""
     if isinstance(node, (ast.Assign, ast.AnnAssign)):
         return ast.unparse(node)
     lines = [f"@{ast.unparse(d)}" for d in node.decorator_list]
     if isinstance(node, FUNCTIONS):
         kind = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
         returns = f" -> {ast.unparse(node.returns)}" if node.returns else ""
-        return "\n".join(lines + [f"{kind} {node.name}({ast.unparse(node.args)}){returns}: ..."])
+        opening = f"{kind} {node.name}("
+        signature = f"{opening}{ast.unparse(node.args)}){returns}: ..."
+        if indent + len(signature) > MAX_WIDTH:
+            # The close stays with the last parameter: a no-break space, which `textwrap` does not
+            # break at, holds `: ...` to it until the wrap is done.
+            signature = textwrap.fill(
+                signature.removesuffix(" ...") + "\N{NO-BREAK SPACE}...",
+                MAX_WIDTH - indent,
+                subsequent_indent=" " * len(opening),
+                break_long_words=False,
+                break_on_hyphens=False,
+            ).replace("\N{NO-BREAK SPACE}", " ")
+        return "\n".join(lines + [signature])
     body = [
-        textwrap.indent(declaration(m), "    ")
+        textwrap.indent(declaration(m, indent + 4), "    ")
         for m in node.body
         if isinstance(m, ast.AnnAssign)
         or getattr(m, "name", "") == "__init__" and node.name not in HIDDEN_CONSTRUCTORS

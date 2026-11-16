@@ -39,12 +39,13 @@ use super::ledger::{CallSlot, Refusal};
 use super::retry::{BudgetSpent, prompt_failure_text};
 use super::tool::Interrupts;
 use crate::config::RoleAlternation;
+use crate::harness::RoundStop;
 use crate::harness::event::{AttemptId, CallId, CallUsage, Payload, Usage};
 
 /// Why a child has nothing left for its round to do, when it has none: asked
 /// before each model call, and the round ends there, as the tool-call cap
 /// ends it, when it answers.
-pub(crate) type Quiet = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+pub(crate) type Quiet = Arc<dyn Fn() -> Option<RoundStop> + Send + Sync>;
 
 /// How a round ended.
 pub(crate) struct Finished {
@@ -52,7 +53,7 @@ pub(crate) struct Finished {
     pub(crate) reply: String,
     /// Why the round was cut short, when it was. `None` means the model
     /// finished on its own.
-    pub(crate) stopped: Option<String>,
+    pub(crate) stopped: Option<RoundStop>,
     /// The final message's reasoning, when it held no text: a round the model
     /// ended after thinking is not reported as one that said nothing. (One
     /// cut off at its output ceiling while thinking fails instead: rig takes
@@ -65,8 +66,9 @@ pub(crate) struct Finished {
 /// message ([`History::open_round`]): rig's first message is the store's
 /// opening.
 ///
-/// A round cut short -- the tool-call cap, or rig's own turn budget -- keeps
-/// what it managed, so the next prompt can carry on from it. Any other failure
+/// A round cut short -- the tool-call cap, rig's own turn budget, the token
+/// budget, the agent's model-request limit -- keeps what it managed, so the
+/// next prompt can carry on from it. Any other failure
 /// is an error. It leaves the store as it was when the round had run no
 /// Python; otherwise the store keeps the tool calls that completed, since what
 /// they did stands and nothing is rolled back. A round whose future is dropped
@@ -252,10 +254,12 @@ fn stopped_short(err: PromptError, hook: &RoundHook) -> Result<Finished, AgentEr
                 ..
             },
             _,
-        ) => (cap_reason(max_turns), chat_history),
+        ) => (RoundStop::ToolCallMax { max: max_turns }, chat_history),
         // As for an unfit call, every turn the call answers is in the store.
         (refused, _) if budget_spent(&refused) => (
-            budget_reason(hook.slot.ledger().budget().unwrap_or_default()),
+            RoundStop::TokenBudget {
+                budget: hook.slot.ledger().budget().unwrap_or_default(),
+            },
             Vec::new(),
         ),
         (other, _) => {
@@ -280,7 +284,7 @@ fn stopped_short(err: PromptError, hook: &RoundHook) -> Result<Finished, AgentEr
             // Nothing is left to flush: every turn the call answers is in the
             // store, and the round's opening, if no turn has begun with it,
             // becomes a turn of its own as the round finishes.
-            (reason, Vec::new())
+            (RoundStop::NoRoom { reason }, Vec::new())
         }
     };
     hook.flush(&chat_history);
@@ -326,19 +330,6 @@ fn may_clear(err: &PromptError) -> bool {
     }
 }
 
-fn cap_reason(max: usize) -> String {
-    format!("tool-call iteration max ({max}) reached")
-}
-
-/// Why a round stopped once the session's token budget was spent: before a
-/// model call, or as the call's request was refused.
-pub(crate) fn budget_reason(budget: u64) -> String {
-    format!(
-        "token-budget ({budget} tokens) is spent: no model call is made from here on in this \
-         session"
-    )
-}
-
 /// What a round's attempts used: its own, and those of the children working
 /// under it, each counted once.
 struct Spent {
@@ -376,7 +367,7 @@ struct RoundHook {
     /// Why this hook stopped the loop, once it has. Recorded here rather than
     /// recovered from the cancellation rig reports, because rig raises
     /// `PromptCancelled` for its own internal faults too.
-    stopped: Arc<Mutex<Option<String>>>,
+    stopped: Arc<Mutex<Option<RoundStop>>>,
     max: usize,
     journal: Arc<Mutex<Journal>>,
     interrupts: Interrupts,
@@ -607,15 +598,16 @@ impl RoundHook {
         journal.ran
     }
 
-    /// Stop the loop for `reason`, and say so to rig: the reason, for the
-    /// action that carries it.
-    fn stop(&self, reason: String) -> String {
-        *self.stopped.lock().unwrap_or_else(PoisonError::into_inner) = Some(reason.clone());
-        reason
+    /// Stop the loop for `reason`, and say so to rig: the reason, as text,
+    /// for the action that carries it.
+    fn stop(&self, reason: RoundStop) -> String {
+        let text = reason.to_string();
+        *self.stopped.lock().unwrap_or_else(PoisonError::into_inner) = Some(reason);
+        text
     }
 
-    /// Why this hook stopped the loop, if it did: the tool-call cap.
-    fn stop_reason(&self) -> Option<String> {
+    /// Why this hook stopped the loop, if it did.
+    fn stop_reason(&self) -> Option<RoundStop> {
         self.stopped
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -699,10 +691,17 @@ impl AgentHook for RoundHook {
         // it has spent.
         if self.slot.ledger().budget_spent() {
             let budget = self.slot.ledger().budget().unwrap_or_default();
-            return CompletionCallAction::Stop(self.stop(budget_reason(budget)));
+            return CompletionCallAction::Stop(self.stop(RoundStop::TokenBudget { budget }));
+        }
+        // After the budget, which ends every agent's calls, and before the
+        // cap, which ends one round: the limit ends this agent's until it is
+        // lifted. Here, so no request is sent past it and the last turn's
+        // results are all kept.
+        if let Some(limit) = self.slot.limit().stop() {
+            return CompletionCallAction::Stop(self.stop(limit));
         }
         if self.calls.load(Ordering::SeqCst) > self.max {
-            return CompletionCallAction::Stop(self.stop(cap_reason(self.max)));
+            return CompletionCallAction::Stop(self.stop(RoundStop::ToolCallMax { max: self.max }));
         }
         // After the budget and the cap, which say more of why. Here rather
         // than at the tool's result, so the turn's other calls run, and the

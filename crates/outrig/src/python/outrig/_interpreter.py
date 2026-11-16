@@ -4024,30 +4024,33 @@ class Runtime:
             )
         raise AttributeError(f"'runtime' has no attribute {name!r}")
 
-    async def spawn(self, name, *, prompt, model=None, inputs=None, requests=None):
+    async def spawn(self, name, *, prompt, model=None, inputs=None, requests=None,
+                    model_requests=None):
         """Launch a child agent, and return its `Child` once it exists.
 
         The child is a kernel of its own in this interpreter -- its own names, the bindings you
-        see, no user channel -- and the host runs its rounds, each model call one of the
-        session's. `prompt` is the first part of its instructions. `model` names a configured
-        model or alias; without it, the child runs on yours. `inputs`, a dict of names to values,
-        is bound in its namespace as variables, copies, before it starts: each must be data.
+        see, no user channel -- and the host runs its rounds. `prompt` is the first part of its
+        instructions. `model` names a configured model or alias; without it, the child runs on
+        yours. `inputs`, a dict of names to values, is bound in its namespace as variables,
+        copies, before it starts: each must be data. `model_requests=n`, or `(n, warnings)`,
+        sets its own model-request limit.
 
         Without `requests`, it is a work child: give it work with `child.submit(inputs,
         result=T)`, and it completes each with `runtime.complete`. With `requests`, a dict of
         channel names to `outrig.Request(request_type, reply_type, doc=...)` or a bare
         `(request_type, reply_type)`, it is a request child, answering requests on those
-        channels: `child.channels[name].request(body)` sends one. Either way you get a handle
-        to await.
+        channels: `child.channels[name].request(body)` sends one and returns a handle to await.
 
-        A spawn past the session's `children-max`, or from an agent at `subagent-depth-max`,
-        raises `outrig.AgentLimitReached` at once rather than waiting; an unknown model raises
-        `ValueError`, naming the configured ones, and so does a prompt that with the rest of the
-        spawn comes to more than 1 MiB.
+        Past `children-max`, or from an agent at `subagent-depth-max`, it raises
+        `outrig.AgentLimitReached` at once; an unknown model raises `ValueError`, naming the
+        configured ones, and so does a spawn of more than 1 MiB.
         """
-        return await self._spawn(name, prompt, model, inputs, requests)
+        return await self._spawn(name, prompt, model, inputs, requests,
+                                 model_requests=_agents.model_requests_line(model_requests,
+                                                                            "spawn"))
 
-    async def _spawn(self, name, prompt, model, inputs, requests, instance=None, call=None):
+    async def _spawn(self, name, prompt, model, inputs, requests, instance=None, call=None,
+                     model_requests=None):
         # `instance`, an agent class instance's `_Instance`, names its class to the host, which
         # gives the child its orienting round, and brings the record its requests are held on.
         # `call`, a typed call's `_Call`, tells the host to brief the child as that call.
@@ -4101,7 +4104,8 @@ class Runtime:
                 "contributions": [] if instance is None else instance.contributions,
                 "invocations": [] if _skills is None else _skills._current(),
                 "instance": None if instance is None else {**instance.said,
-                                                           "aliases": list(instance.aliases)}}
+                                                           "aliases": list(instance.aliases)},
+                "model_requests": model_requests}
         if call is not None:
             d = call.declaration
             line["call"] = {"signature": d.signature,
@@ -4128,12 +4132,7 @@ class Runtime:
         error = answer.get("error")
         if error is not None:
             text = error.get("message", "the host refused the spawn")
-            raise {
-                "limit": _agents.AgentLimitReached,
-                "closed": _agents.SessionClosing,
-                "released": _agents.AgentReleased,
-                "model": ValueError,
-            }.get(error.get("kind"), RuntimeError)(text)
+            raise _refusal(error, text)
         return Child(_children[answer["child"]])
 
     async def release(self, children):
@@ -4437,6 +4436,18 @@ _launching = {}  # each typed call (`outrig.agent`) not yet ended, by its id, th
 _works_lock = threading.Lock()
 # What a typed call's status reads when its launch -- its spawn, or its submission -- was refused.
 _REFUSED = {"AgentLimitReached": "limit", "SessionClosing": "closed", "AgentReleased": "released"}
+# What the host's refusal of a spawn raises, by the host's name for it: `outrig`'s error of that
+# name.
+_REFUSALS = {"limit": "AgentLimitReached", "closed": "SessionClosing", "released": "AgentReleased"}
+
+
+def _refusal(error, text):
+    """The exception the host's refusal `error` raises, saying `text`: `ValueError` for an unknown
+    model, and `RuntimeError` for a refusal of no kind it names."""
+    kind = error.get("kind")
+    if kind == "model":
+        return ValueError(text)
+    return getattr(_agents, _REFUSALS[kind])(text) if kind in _REFUSALS else RuntimeError(text)
 # Each child agent's record, by its agent id, for as long as anything holds it: its parent's `Child`,
 # a request made of it, its kernel. The host says what each is doing for as long as its parent can
 # ask, its release included.
@@ -5112,8 +5123,8 @@ class Child:
     spawn called it. A work child (`kind` "work") takes submissions: `submit(inputs, result=T)`
     gives it one and returns its handle. A request child ("request") answers requests on its
     channels: `channels[name].request(body)` sends one and returns its handle. `status` is what the
-    host last said of it: `running`, `idle`, `wedged` or `released`. Release it with
-    `await runtime.release([child])`.
+    host last said of it: `running`, `idle`, `limit-reached`, `wedged` or `released`. Release it
+    with `await runtime.release([child])`.
     """
 
     __slots__ = ("_child", "channels")
@@ -5445,9 +5456,10 @@ class _Instance(_Attached):
     the kernel that made it. The release runs on that loop too, once, however it began.
     """
 
-    def __init__(self, agent, inputs, model, session, facilities):
+    def __init__(self, agent, inputs, model, session, facilities, model_requests):
         cls = type(agent)
         self.attaching(agent, inputs, model, session, facilities)
+        self.model_requests_line = model_requests
         self.record = _Child(None, f"{cls.__name__[:48]}-{self.id}", "request", self.kernel,
                              self.channels, _requests_max)
         self.record.holding = True
@@ -5467,7 +5479,8 @@ class _Instance(_Attached):
         """Spawn the child, then send it what was held for it; or end that as the launch did."""
         try:
             self.child = await self.kernel.runtime._spawn(
-                self.record.name, self.prompt, self.model, self.inputs, self.requests, self)
+                self.record.name, self.prompt, self.model, self.inputs, self.requests, self,
+                model_requests=self.model_requests_line)
         except Exception as e:
             # A child the host opened, then could not make, never came to exist: what was held
             # for it was never told of.
@@ -5628,9 +5641,14 @@ class _Adopted(_Attached):
     launch; its readiness, its requests and its release are the owner's, through the host, and
     each raises `TypeError` here, as a request method called on `self` does in any child."""
 
-    def __init__(self, agent, inputs, model, session, facilities):
+    def __init__(self, agent, inputs, model, session, facilities, model_requests):
         self.attaching(agent, inputs, model, session, facilities)
         self.record = self.kernel.child
+        if model_requests is not None:
+            raise TypeError(
+                f"{type(agent).__qualname__} is constructed as a root, whose model-request limit "
+                "is the one its session's owner gives it, so it takes no model_requests="
+            )
         if self.record is None or not self.record.constructing:
             raise RuntimeError(f"{type(agent).__qualname__} is attached as a root only in the "
                                "kernel its session's owner opened to construct it")
@@ -5669,12 +5687,12 @@ class _Adopted(_Attached):
         }
 
 
-def _attach(agent, inputs, model, session, facilities):
+def _attach(agent, inputs, model, session, facilities, model_requests):
     """Attach `agent`, an agent class instance whose construction has finished: adopted by its
     own kernel when it is the root its session's owner asked for, and launched as the calling
     kernel's child otherwise. What `outrig.Agent`'s metaclass calls."""
     attached = _Adopted if _agents._SITE.get() == "root" else _Instance
-    return attached(agent, inputs, model, session, facilities)
+    return attached(agent, inputs, model, session, facilities, model_requests)
 
 
 class _ProgressOut(Endpoint):
@@ -7543,10 +7561,12 @@ def _assign(kernel, assign_id, _message):
 
 
 # What a request the host ends ends with: the child's rounds left it as it was after a warning, the
-# token budget was spent first, or the child's model failed for good.
+# token budget was spent first, the child reached its model-request limit, or the child's model
+# failed for good.
 _HOST_ENDS = {
     "cancelled": "RequestCancelled",
     "budget": "BudgetExhausted",
+    "limit": "AgentLimitReached",
     "failed": "AgentRequestFailed",
 }
 
@@ -7563,6 +7583,9 @@ def _settle_work(kernel, work_id, message):
         work.tell()
         return
     text = message.get("message") or f"{work} ended {outcome}"
+    if outcome == "limit":
+        # The host's text is the limit's: the sender's names the child as the sender knows it.
+        text = f"{work.child}: {text}"
     error = getattr(_agents, _HOST_ENDS[outcome])(text)
     cause = message.get("cause")
     if cause:
@@ -7579,9 +7602,15 @@ def _oriented(kernel, instance_id, message):
     """The orienting round of agent class instance `instance_id`'s child has ended, or, as its
     `error` says, the child cannot have it -- its budget spent, or its model failing for good."""
     instance, error = _instances.get(instance_id), message.get("error")
-    if instance is not None:
-        instance.settle(None if error is None
-                        else getattr(_agents, _HOST_ENDS[error["kind"]])(error["message"]))
+    if instance is None:
+        return
+    if error is None:
+        instance.settle(None)
+        return
+    text = error["message"]
+    if error["kind"] == "limit":
+        text = f"{instance.record}: {text}"
+    instance.settle(getattr(_agents, _HOST_ENDS[error["kind"]])(text))
 
 
 def _asked_work(ask):
@@ -7657,7 +7686,7 @@ def _child_state(kernel, _, message):
     """What the host now says a child of `kernel`'s is doing."""
     child = _children.get(message.get("child"))
     state = message.get("state")
-    if child is not None and state in ("running", "idle", "wedged", "released"):
+    if child is not None and state in ("running", "idle", "limit-reached", "wedged", "released"):
         child.state = state
 
 

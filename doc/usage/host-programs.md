@@ -205,6 +205,13 @@ asyncio.run(main())
   collected. Construct agents inside the session's block: leaving the session releases each one
   still alive, ends its open requests with `outrig.SessionClosing`, and lists them in
   `shutdown_report.requests`.
+- **Lifting its model-request limit.** An agent constructed with `model_requests=n`, or held to
+  the configuration's `model-request-limit`, that reaches it ends what it holds, and each request
+  sent to it, with `outrig.AgentLimitReached`, and stays: `await
+  session.reset_model_requests(agent)` zeroes its count, or `await
+  session.raise_model_request_limit(agent, n)` raises its limit, and it goes on from what it
+  kept. What warrants either is your program's to decide, as the session's owner; no agent's code
+  can lift a limit.
 
 The session's events record such an agent under a subject of its own, `agent/c1` and on, its
 parent `owner`, the program (see [the event log](../reference/events.md)). The calls an agent's
@@ -273,7 +280,8 @@ A program's sessions are built from the configuration `outrig run-new` loaded, a
 applies. The image `default-image` names, its `[images.<name>]` block, `[network]`, the factory
 bindings, `[events]`, the models and providers an agent class's `model=` or `default-model`
 names, and the top-level limits -- `children-max`, `model-concurrency-max`, `requests-max`,
-`token-budget`, `subagent-depth-max`, `tool-call-max`, `tool-result-max` -- all do. The
+`token-budget`, `model-request-limit`, `model-request-warnings`, `subagent-depth-max`,
+`tool-call-max`, `tool-result-max` -- all do. The
 configured workspace and its mounts are not mounted: a program passes `mounts=`. No
 `[agents.<name>]` table, `default-agent` or `preamble` applies to an agent class, whose
 docstring is its instructions. No MCP server or sidecar starts, as for `outrig run-new`, and a

@@ -1228,6 +1228,63 @@ asyncio.run(main())
     );
 }
 
+/// A program's instance held to its own model-request limit ends what it is sent at the limit,
+/// with `AgentLimitReached`, and the program, the session's owner, lifts it through its session:
+/// a reset lets it answer again, and a raise is recorded too. The instance has no way to.
+#[tokio::test]
+async fn the_program_lifts_its_instances_model_request_limit() {
+    let script = format!(
+        r#"
+import asyncio, json
+import outrig
+{ASKER}
+async def main():
+    out = []
+    async with outrig.Session() as session:
+        # Two model requests to orient, one to answer `x`: the round ends there.
+        agent = Asker(model_requests=3)
+        await agent.ready()
+        out.append(await agent.ask("x"))
+        try:
+            await agent.ask("y")
+        except outrig.AgentLimitReached:
+            out.append("limit")
+        out.append(hasattr(agent, "reset_model_requests"))
+        await session.reset_model_requests(agent)
+        out.append(await agent.ask("z"))
+        await session.raise_model_request_limit(agent, 10)
+        out.append("raised")
+        await agent.release()
+        try:
+            await session.reset_model_requests(agent)
+        except outrig.AgentReleased:
+            out.append("released")
+    print(json.dumps(out), flush=True)
+
+asyncio.run(main())
+"#
+    );
+    let run = owned_with("OUTRIG_TEST_OWNED_LIMIT", "", &script, |bed| {
+        vec![("ROLE asker", serving_in(bed, ASKS))]
+    })
+    .await;
+    let (ran, records, _) = run.finish().await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    assert_eq!(
+        ran.json(),
+        [json!([
+            "done x", "limit", false, "done z", "raised", "released"
+        ])],
+        "{}",
+        ran.stderr
+    );
+    let resets: Vec<Value> = of_kind(&records, "model.limit.reset")
+        .into_iter()
+        .map(|data| data["limit_after"].clone())
+        .collect();
+    assert_eq!(resets, [json!(3), json!(10)]);
+}
+
 /// A root child's model calls take the session's places: with `model-concurrency-max = 1`, two
 /// instances launched together never have two calls open at once.
 #[tokio::test]

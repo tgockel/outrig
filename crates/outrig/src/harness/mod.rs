@@ -95,7 +95,7 @@ pub use self::services::{
 };
 pub use self::session::{Closer, RoundEnd, RoundOutcome, Session, StillRunning, Tasks};
 pub use self::skills::{DirectorySource, SkillFile, SkillSource};
-pub use self::stop::{AgentState, RoundFacts, RoundSend, Status};
+pub use self::stop::{AgentState, ModelRequests, RoundFacts, RoundSend, RoundStop, Status};
 pub use crate::agent::UserChannel;
 pub use crate::config::{EnvSecrets, Secrets};
 pub use crate::owner::{HostProgram, LeftOpen, ProgramExit, RunningProgram, SessionEnd};

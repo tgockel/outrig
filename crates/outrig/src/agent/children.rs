@@ -42,6 +42,7 @@ use super::channel::{Announcer, Injected};
 use super::history::Window;
 use super::ledger::{CallSlot, Ledger};
 use super::orientation::{self, ChannelText, ChildBrief, Given, View};
+use super::request_limit::{Change, LimitConfig, RequestLimit, count_of};
 use super::resolve::{self, LlmResolveError};
 use super::round::Quiet;
 use super::window::Windows;
@@ -58,7 +59,7 @@ use crate::harness::lifecycle::Lifecycle;
 use crate::harness::roster::{AgentKind, AgentRow, Outstanding, Parent, Roster, RosterState};
 use crate::harness::services::ServiceBrief;
 use crate::harness::skills::SkillBrief;
-use crate::harness::stop::{AgentState, RoundFacts, Snapshot};
+use crate::harness::stop::{AgentState, ModelRequests, RoundFacts, RoundStop, Snapshot};
 use crate::harness::{ClosedBy, RequestOutcome};
 use crate::python::host::{
     Channels, ChildLines, Counts, ImportFailure, Interpreter, InterpreterError, OWNER,
@@ -239,6 +240,8 @@ enum Life {
     Launching,
     Running,
     Idle,
+    /// At its model-request limit: no round opens until it is lifted.
+    LimitReached,
     Wedged,
     Released,
 }
@@ -248,6 +251,7 @@ impl Life {
         match self {
             Life::Launching | Life::Idle => "idle",
             Life::Running => "running",
+            Life::LimitReached => "limit-reached",
             Life::Wedged => "wedged",
             Life::Released => "released",
         }
@@ -313,6 +317,29 @@ struct Refused {
     failure: Option<ImportFailure>,
 }
 
+/// Why an agent's model-request count was not changed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum NotChanged {
+    /// The session's admission has closed.
+    #[error("the session is closing -- {0} -- so no model-request count changes")]
+    Closed(ClosedBy),
+    /// The session holds no live agent of that id: none was launched under it, or it was
+    /// released.
+    #[error("the session holds no live agent {0:?}, so its model-request count is spent")]
+    NoAgent(String),
+}
+
+impl NotChanged {
+    /// How the engine names it to the program that asked: as a closing session, or a released
+    /// agent.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Closed(_) => "closed",
+            Self::NoAgent(_) => "released",
+        }
+    }
+}
+
 impl Refused {
     fn new(kind: &'static str, message: impl Into<String>) -> Self {
         Self {
@@ -332,6 +359,13 @@ impl Children {
     /// child at once.
     pub(crate) fn requests_max(&self) -> u32 {
         self.0.settings.limits.requests_max
+    }
+
+    /// The session's `model-request-limit` and `model-request-warnings`: what
+    /// each agent counts its model requests against, unless its launch names
+    /// its own.
+    pub(crate) fn limit_config(&self) -> &LimitConfig {
+        &self.0.settings.limits.model_requests
     }
 
     /// What the session has learned of its models' windows.
@@ -442,6 +476,27 @@ impl Children {
         told
     }
 
+    /// The count of `agent`'s model requests, its limit and its thresholds:
+    /// the primary agent's, a root's, or any child's the session holds.
+    pub(crate) fn model_requests(&self, agent: &str) -> Option<ModelRequests> {
+        let limit = {
+            let state = self.0.state();
+            let node = state.agents.get(agent).filter(|_| agent != OWNER)?;
+            node.slot.limit().clone()
+        };
+        Some(limit.read())
+    }
+
+    /// Change `agent`'s model-request count as `change` says, for the
+    /// session's owner: see [`Inner::change_model_requests`].
+    pub(crate) fn change_model_requests(
+        &self,
+        agent: &str,
+        change: Change,
+    ) -> Result<ModelRequests, NotChanged> {
+        self.0.change_model_requests(agent, change)
+    }
+
     /// The program has seen the last of the session, once every launch and
     /// release it asked for has answered it: it is told nothing more.
     pub(crate) async fn detach_owner(&self) {
@@ -472,6 +527,18 @@ impl Children {
             })),
             "agent.spawn" | "agent.release" | "agent.instance.handle.collected" => {
                 inner.line(OWNER, line);
+            }
+            // The owner's alone, so only the owner's connection carries it: a line from the
+            // interpreter can claim any agent, and an agent's code never lifts a limit
+            // (`plan/phase/0003-python/work.md`, "Limits belong outside generated code").
+            "agent.model_requests" => {
+                let task = tokio::spawn({
+                    let inner = Arc::clone(inner);
+                    async move { inner.model_requests_asked(&line) }
+                });
+                let mut tasks = lock(&inner.owner_tasks);
+                tasks.retain(|task| !task.is_finished());
+                tasks.push(task);
             }
             kind => tracing::warn!("ignored a {kind} line from the program"),
         }
@@ -874,7 +941,13 @@ impl Inner {
         parent: &str,
         line: &Value,
     ) -> Result<(String, Option<u64>, Option<Value>), Refused> {
-        let limits = self.settings.limits;
+        let limits = &self.settings.limits;
+        // Made now, so a change the owner makes while the child launches -- it is in the roster
+        // from here on -- is to the count it runs with.
+        let model_requests =
+            LimitConfig::of_launch(&line["model_requests"], &limits.model_requests)
+                .map(|config| RequestLimit::new(&config))
+                .map_err(|why| Refused::new("other", why))?;
         let kind = match line["kind"].as_str() {
             Some("request") => ChildKind::Request,
             _ => ChildKind::Work,
@@ -956,7 +1029,7 @@ impl Inner {
                     parent: Some(parent.to_string()),
                     depth,
                     model: model.clone(),
-                    slot: CallSlot::default(),
+                    slot: CallSlot::default().limited(model_requests.clone()),
                     children: Vec::new(),
                     child: Some(ChildNode {
                         kind,
@@ -981,7 +1054,17 @@ impl Inner {
             (id, model, depth, lineage)
         };
         match self
-            .make(&id, &name, kind, &model, depth, lineage, parent, line)
+            .make(
+                &id,
+                &name,
+                kind,
+                &model,
+                depth,
+                lineage,
+                parent,
+                line,
+                &model_requests,
+            )
             .await
         {
             Ok((instance, channels)) => Ok((id, instance, channels)),
@@ -1036,6 +1119,7 @@ impl Inner {
         lineage: (CallSlot, Option<u32>),
         parent: &str,
         line: &Value,
+        model_requests: &RequestLimit,
     ) -> Result<(Option<u64>, Option<Value>), Refused> {
         let settings = &self.settings;
         let construct = line
@@ -1220,7 +1304,8 @@ impl Inner {
             &inputs,
             &brief,
         );
-        let slot = CallSlot::new(self.ledger.clone(), events, Some(lineage));
+        let slot = CallSlot::new(self.ledger.clone(), events, Some(lineage))
+            .limited(model_requests.clone());
         let weak = Arc::downgrade(self);
         let child = id.to_string();
         let quiet: Quiet =
@@ -1759,7 +1844,7 @@ impl Inner {
     /// records is that it was done. A request child is quiet only once
     /// released: what it holds open is what its channels' requests come to,
     /// and it answers them as it chooses.
-    fn quiet(&self, child: &str, kind: ChildKind) -> Option<String> {
+    fn quiet(&self, child: &str, kind: ChildKind) -> Option<RoundStop> {
         let state = self.state();
         if kind == ChildKind::Work && state.summary(child, kind).is_empty() {
             // The latest, so an older acceptance does not vouch for a
@@ -1767,14 +1852,10 @@ impl Inner {
             if let Some((id, record)) = state.requests.iter().rev().find(|(_, r)| r.child == child)
                 && record.state == Req::Ended(RequestEnd::Accepted)
             {
-                return Some(format!(
-                    "submission {id} was accepted and nothing else waits"
-                ));
+                return Some(RoundStop::Accepted { submission: *id });
             }
         }
-        state
-            .released(child)
-            .then(|| "the child was released".to_string())
+        state.released(child).then_some(RoundStop::Released)
     }
 
     /// Whether `child` was released: its runner has no round to open.
@@ -1910,6 +1991,82 @@ impl Inner {
         }
     }
 
+    /// `child`'s runner found its model-request count at its `limit`, `spent`,
+    /// the latest round it opened `round`: say so to its readers and to its
+    /// parent, before what it holds is ended for it, so a request ended
+    /// `limit` reads the child `limit-reached`.
+    pub(crate) fn limit_reached(&self, child: &str, spent: u32, limit: u32, round: Option<u32>) {
+        {
+            let mut state = self.state();
+            let Some(node) = state.child_mut(child) else {
+                return;
+            };
+            if matches!(node.life, Life::Released | Life::Wedged) {
+                return;
+            }
+            node.life = Life::LimitReached;
+            state.say(child, |_| {
+                Some(AgentState::LimitReached {
+                    spent,
+                    limit,
+                    round,
+                })
+            });
+        }
+        self.tell_life(child);
+    }
+
+    /// Change `agent`'s model-request count as `change` says, for the session's owner, the one
+    /// who may: never on a line from the interpreter, whose agent any agent's code can claim.
+    /// Refused, changing nothing, once admission has closed and for an agent the session does not
+    /// hold or has released. A child at its limit is woken, and goes on from what it holds. The
+    /// count and limit after.
+    pub(crate) fn change_model_requests(
+        &self,
+        agent: &str,
+        change: Change,
+    ) -> Result<ModelRequests, NotChanged> {
+        let closing = self.lifecycle.closed();
+        let (limit, wake) = {
+            let state = self.state();
+            if let Some(by) = state.closed.clone().or(closing) {
+                return Err(NotChanged::Closed(by));
+            }
+            let node = state
+                .agents
+                .get(agent)
+                .filter(|_| agent != OWNER && !state.released(agent))
+                .ok_or_else(|| NotChanged::NoAgent(agent.to_string()))?;
+            let wake = node.child.as_ref().map(|c| Arc::clone(&c.wake));
+            (node.slot.limit().clone(), wake)
+        };
+        let (changed, after) = limit.change(change);
+        self.events_of(agent).emit(changed);
+        if let Some(wake) = wake {
+            wake.notify_one();
+        }
+        Ok(after)
+    }
+
+    /// The program that owns the session asked to reset a child's model-request count or raise
+    /// its limit: answered with why not, when it was refused.
+    fn model_requests_asked(&self, line: &Value) {
+        let child = line["child"].as_str().unwrap_or_default();
+        let change = match (line["reset"].as_bool(), count_of(&line["limit"])) {
+            (Some(true), limit) => Some(Change::Reset(limit)),
+            (_, Some(limit)) => Some(Change::Raise(limit)),
+            _ => None,
+        };
+        let error = match change.map(|change| self.change_model_requests(child, change)) {
+            Some(Ok(_)) => Value::Null,
+            Some(Err(refused)) => json!({"kind": refused.kind(), "message": refused.to_string()}),
+            None => json!({"kind": "other", "message": "a raise names a limit of at least 1"}),
+        };
+        self.to_owner(
+            json!({"t": "model_requests", "agent": OWNER, "id": line["id"], "error": error}),
+        );
+    }
+
     /// `child`'s runner put it in `state`: a round failed, or the provider
     /// refused it, or its model can answer nothing more.
     pub(crate) fn stopped(&self, child: &str, state: AgentState) {
@@ -1939,17 +2096,22 @@ impl Inner {
         let Some(node) = state.child_mut(child) else {
             return;
         };
-        if node.life != Life::Running {
+        if !matches!(node.life, Life::Running | Life::LimitReached) {
             return;
         }
         node.life = Life::Idle;
-        // From a round, or a failure the runner was to try again: a refusal and
-        // a model that can answer nothing more stay what the child is at rest
-        // on, since nothing has changed either.
+        // From a round, a failure the runner was to try again, or a limit
+        // lifted: a refusal and a model that can answer nothing more stay what
+        // the child is at rest on, since nothing has changed either. A limit
+        // lifted from a child that never opened a round leaves it as it was
+        // before the limit stopped it, launching.
         state.say(child, |now| match *now {
-            AgentState::Running { round } | AgentState::Unavailable { round, .. } => {
-                Some(AgentState::Idle { round })
-            }
+            AgentState::Running { round }
+            | AgentState::Unavailable { round, .. }
+            | AgentState::LimitReached {
+                round: Some(round), ..
+            } => Some(AgentState::Idle { round }),
+            AgentState::LimitReached { round: None, .. } => Some(AgentState::Launching),
             _ => None,
         });
         drop(state);
@@ -2285,6 +2447,7 @@ fn outcome(name: &str) -> RequestEnd {
         "cancelled" => RequestEnd::Cancelled,
         "released" => RequestEnd::Released,
         "budget" => RequestEnd::Budget,
+        "limit" => RequestEnd::Limit,
         "closed" => RequestEnd::Closed,
         _ => RequestEnd::Terminated,
     }

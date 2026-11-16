@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
-use super::children_tests::{Tree, Watch, data, kind};
+use super::children_tests::{Tree, Watch, data_of};
 use super::instance_tests::ready_then;
 use super::mock_http::{Responder, Style, failure, scripted, submit, text_reply};
 use super::root_tests::{REVIEWS, agent_of, not_ready, owned_watched, reviewer};
@@ -48,7 +48,11 @@ pub(super) async fn ready_root_with(
 }
 
 /// The root's status once `wanted` holds of its state, read change by change from `seq`.
-async fn reached(root: &RootHandle, seq: u64, wanted: impl Fn(&AgentState) -> bool) -> Status {
+pub(super) async fn reached(
+    root: &RootHandle,
+    seq: u64,
+    wanted: impl Fn(&AgentState) -> bool,
+) -> Status {
     within(async {
         let mut seq = seq;
         loop {
@@ -70,30 +74,22 @@ async fn open(request: &RequestHandle) -> bool {
 }
 
 /// The reply `request` was answered with, as JSON.
-async fn answered(request: &RequestHandle) -> Value {
+pub(super) async fn answered(request: &RequestHandle) -> Value {
     let reply = within(request.outcome()).await.expect("answered");
     serde_json::from_str(&reply).expect("a JSON reply")
-}
-
-/// The data of `subject`'s events of `what`.
-fn of(events: &[Arc<Event>], what: &str, subject: &str) -> Vec<Value> {
-    kind(events, what, Some(subject))
-        .into_iter()
-        .map(data)
-        .collect()
 }
 
 /// The `model.attempt` of `attempt`, once checked to be the last request a failed round `round`
 /// of `subject`'s sent, as its `model.round.failed` says.
 fn agrees(events: &[Arc<Event>], subject: &str, round: u32, attempt: Option<AttemptId>) -> Value {
     let attempt = json!(attempt.expect("a request decided it").get());
-    let failed = of(events, "model.round.failed", subject);
+    let failed = data_of(events, "model.round.failed", subject);
     assert!(
         failed.iter().any(|ended| ended["round"] == round
             && ended["attempts"].as_array().and_then(|sent| sent.last()) == Some(&attempt)),
         "{attempt} as the last request of round {round}: {failed:?}"
     );
-    of(events, "model.attempt", subject)
+    data_of(events, "model.attempt", subject)
         .into_iter()
         .find(|sent| sent["attempt_id"] == attempt)
         .expect("the request's model.attempt")
@@ -290,7 +286,7 @@ async fn idle(watch: Watch) {
     let subject = format!("agent/{}", agent_of(&root));
     let (_, events, _) = tree.end().await;
     if watch == Watch::Gathered {
-        let completed = of(&events, "model.round.completed", &subject);
+        let completed = data_of(&events, "model.round.completed", &subject);
         assert_eq!(completed.last().expect("a round")["round"], 2);
     }
 }
@@ -327,7 +323,7 @@ async fn cancelled_by_the_host(watch: Watch) {
     let subject = format!("agent/{}", agent_of(&root));
     let (_, events, _) = tree.end().await;
     if watch == Watch::Gathered {
-        let completed = of(&events, "model.round.completed", &subject);
+        let completed = data_of(&events, "model.round.completed", &subject);
         assert_eq!(completed.last().expect("a round")["round"], round);
     }
 }

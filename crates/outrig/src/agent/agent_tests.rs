@@ -2210,7 +2210,7 @@ fn manifests(agent: &Session) -> Arc<Mutex<Vec<Manifest>>> {
 }
 
 /// How many times `needle` appears in the messages `request` carried.
-fn count(request: &RecordedRequest, needle: &str) -> usize {
+pub(super) fn count(request: &RecordedRequest, needle: &str) -> usize {
     messages(request)
         .iter()
         .map(|message| message.to_string())
@@ -3146,6 +3146,7 @@ fn tool_over(interpreter: crate::python::host::Interpreter) -> SubmitPython {
         1024,
         Announcer::new(interpreter),
         Some(crate::harness::lifecycle::Lifecycle::starting(Events::off())),
+        Default::default(),
     )
 }
 

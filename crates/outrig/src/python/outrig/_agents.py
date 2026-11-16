@@ -68,7 +68,8 @@ SECTIONS_MAX = 32 * 1024
 # What only the interpreter has, bound as it loads the package: `_call(declaration, arguments)`
 # makes a typed call from the calling kernel and returns its handle, and `_submitted_source(code)`
 # is the source of the submission that compiled `code`, or `None` for code none did; on the host
-# both stay `None`. `_launch(agent, inputs, model, session, facilities)` attaches an agent class
+# both stay `None`. `_launch(agent, inputs, model, session, facilities, model_requests)` attaches
+# an agent class
 # instance once its construction has finished, launching its child, and returns what the runtime
 # keeps of the instance: the interpreter's from the calling kernel, or, bound by `outrig._host`, a
 # program's on the host. `_resolve(kind, name)` is what the calling execution's kernel holds for a
@@ -171,7 +172,9 @@ class RequestSettled(AgentError):
 
 class AgentLimitReached(AgentError):
     """A limit the session holds every agent to refused at once, rather than waiting: the depth
-    agents may nest to, the children a session holds, or the requests one child holds."""
+    agents may nest to, the children a session holds, or the requests one child holds. Or the
+    child's model-request limit: at it, the child ends what it holds with this, and what is sent
+    to it, until the session's owner resets its count or raises its limit."""
 
 
 class BudgetExhausted(AgentError):
@@ -214,8 +217,9 @@ class Status:
     `state` is `queued` or `running` for a submission, `waiting` or `received` for a request on a
     channel, and `accepted` or `failed` once it has ended; `reason` says why a failed one failed --
     `rejected`, `failed`, `cancelled`, `released`, `budget`, `closed`, `terminated`, or `limit`
-    for a typed call whose child a limit refused -- and is `None` otherwise. `child` is its
-    child's state: `running`, `idle`, `wedged` or `released`. Fixed once the request has ended.
+    for a typed call whose child a limit refused, or a request its child's model-request limit
+    ended -- and is `None` otherwise. `child` is its child's state: `running`, `idle`,
+    `limit-reached`, `wedged` or `released`. Fixed once the request has ended.
     """
 
     state: str
@@ -976,7 +980,7 @@ class Agent(metaclass=_Attaching):
     round is its own, to get ready in: `await reviewer.ready()` returns once it has ended, and
     raises what the launch met instead. `await reviewer.release()` ends the child and every request
     still open on it; `async with Reviewer() as reviewer:` waits for `ready()` on entry and releases
-    on leaving.
+    on leaving. `model_requests=n`, or `(n, warnings)`, is the child's own model-request limit.
 
     In the child, the instance is `self`: the same object, not a copy, so `self._task` there is what
     `__init__` stored, and an ordinary method runs in whichever agent calls it. A request method
@@ -1032,7 +1036,9 @@ class Agent(metaclass=_Attaching):
         super().__init_subclass__(**kwargs)
         _declare_class(cls)
 
-    def __init__(self, *, model=None, session=None, facilities=None, **inputs):
+    def __init__(self, *, model=None, model_requests=None, session=None, facilities=None,
+                 **inputs):
+        """See `help(outrig.Agent)`."""
         name = f"{type(self).__module__}.{type(self).__qualname__}"
         # A root its session's owner constructs is given work by its channels and its task; a
         # child's one way to be given work is a request.
@@ -1045,6 +1051,7 @@ class Agent(metaclass=_Attaching):
         if facilities is not None and type(facilities) is not dict:
             raise TypeError(f"facilities is a dict of names to facilities, not "
                             f"{schema._type_qualname(type(facilities))}")
+        limited = model_requests_line(model_requests, f"{type(self).__qualname__}()")
         if _launch is None:
             raise RuntimeError(f"an instance of {name} runs in an agent's kernel, where OutRig "
                                "runs agent code, or in a program `outrig run-new` runs, and this "
@@ -1052,7 +1059,7 @@ class Agent(metaclass=_Attaching):
         # The agent's own mapping, a copy, from here on; and what the metaclass attaches the
         # instance with, once its construction has finished.
         self._outrig_facilities = None if facilities is None else dict(facilities)
-        self._outrig_given = (inputs, model, session, self._outrig_facilities)
+        self._outrig_given = (inputs, model, session, self._outrig_facilities, limited)
 
     @property
     def facilities(self):
@@ -1066,8 +1073,9 @@ class Agent(metaclass=_Attaching):
         return self.__dict__.get("_outrig_facilities")
 
     def __outrig_attach__(self):
-        """The hook a subclass defines to finish what `__init__` cannot, run before the child
-        launches: see `help(outrig.Agent)`. This one does nothing."""
+        # No docstring: `help(outrig.Agent)` has no room for one, and says what this hook is. This
+        # one does nothing.
+        pass
 
     def __outrig_instructions__(self):
         # No docstring: `help(outrig.Agent)` has no room for one, and says what this is.
@@ -1100,6 +1108,41 @@ class Agent(metaclass=_Attaching):
 
     async def __aexit__(self, *exc_info):
         await _runs(self).release("async_with")
+
+
+# The largest count a model-request limit or warning may be: what the engine counts in.
+MODEL_REQUESTS_MAX = 2**32 - 1
+
+
+def model_request_count(value, what, optional=False):
+    """`value`, checked as a count of model requests: an int of at least 1, or `None` when
+    `optional`."""
+    if value is None and optional:
+        return None
+    if type(value) is not int or not 1 <= value <= MODEL_REQUESTS_MAX:
+        raise (ValueError if type(value) is int else TypeError)(
+            f"{what} is a count of model requests, an int of at least 1, not {value!r}"
+        )
+    return value
+
+
+def model_requests_line(value, what):
+    """What `model_requests=`, given to `what`, says to the engine: `None` for the session's
+    limit and warnings; an int, the limit, with the session's warnings; or a `(limit, warnings)`
+    pair, `warnings` a list of the counts remaining at which the child's model is warned."""
+    if value is None:
+        return None
+    if type(value) is int:
+        return {"limit": model_request_count(value, f"{what}: model_requests"), "warnings": None}
+    if type(value) is tuple and len(value) == 2 and isinstance(value[1], (list, tuple)):
+        limit, warnings = value
+        return {
+            "limit": model_request_count(limit, f"{what}: model_requests' limit"),
+            "warnings": [model_request_count(w, f"{what}: a model_requests warning")
+                         for w in warnings],
+        }
+    raise TypeError(f"{what}: model_requests is an int, the limit, or a (limit, warnings) pair, "
+                    f"not {value!r}")
 
 
 def _runs(agent):
