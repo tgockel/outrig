@@ -309,6 +309,24 @@ answers neither way -- one whose server has stopped accepting, or that this user
 cannot connect to -- is also refused, since the risk of cutting off a running
 instance outweighs an error message.
 
+Concurrent starts for the same path are serialized with an advisory lock on
+`<path>.lock`. A start waits up to five seconds for that lock, then refuses with
+a startup-lock timeout rather than guessing whether the holder is serving yet.
+Locking errors (including unsupported filesystems) also refuse startup. Session-ending
+signals interrupt the wait and begin teardown. A new lock is initialized privately,
+including owner read/write permissions regardless of umask, then published with an
+atomic no-replace rename. If the filesystem cannot provide that operation, startup
+refuses. A crash before publication can leave a private `.outrig-mcp-lock-*` file,
+but not an inaccessible lock at the persistent name. Existing locks are never chmodded:
+they must be empty, singly linked regular files owned by this user with mode `0600`,
+or startup refuses without modifying them.
+
+The lock covers startup only; it is released before serving. The owner-only lock file is
+left in place, even after shutdown or a failed start: do not delete or replace it
+while starts may be using it. This coordination requires all starters to use a
+version with startup locking; it cannot protect against older versions or other
+programs that ignore the lock.
+
 Point `--listen` at a directory only you can write. In a shared one without the
 sticky bit, another user can replace the socket's directory entry; outrig refuses
 the path instead of following the replacement, but it cannot stop the entry from

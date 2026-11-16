@@ -464,8 +464,9 @@ async fn serve_unix_http_transport(
     monitor: SessionMonitor,
     signals: &mut Signals,
 ) -> Result<i32> {
-    prepare_unix_socket(path)?;
-    let listener = bind_unix_listener(path)?;
+    let listener = signals
+        .race(start_unix_listener(path, Duration::from_secs(5)))
+        .await?;
     eprintln!("[outrig] listen: unix:{}", path.display());
     let shutdown = http_shutdown(ct.clone());
     let server = axum::serve(listener, router).with_graceful_shutdown(shutdown);
@@ -711,6 +712,141 @@ fn listen_exposure_warning(listen: &ListenAddr) -> Option<String> {
 #[cfg(unix)]
 const UNIX_SOCKET_MODE: u32 = 0o600;
 
+/// Serialize probing, stale removal, binding, claiming, listening, and mode repair.
+/// Release before serving: subsequent starts can then probe the live listener.
+#[cfg(unix)]
+async fn start_unix_listener(path: &Path, lock_timeout: Duration) -> Result<OwnedUnixListener> {
+    let _lock = lock_unix_startup(path, lock_timeout).await?;
+    prepare_unix_socket(path)?;
+    bind_unix_listener(path)
+}
+
+/// Cooperating starts must always lock the same inode, so leave this sibling
+/// file in place even on failure. Never fall back to running without a lock.
+/// Like the socket itself, it belongs in a directory only the user can write.
+#[cfg(unix)]
+async fn lock_unix_startup(
+    path: &Path,
+    timeout: Duration,
+) -> Result<nix::fcntl::Flock<std::fs::File>> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    use nix::errno::Errno;
+    use nix::fcntl::{Flock, FlockArg};
+
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    let lock_path = PathBuf::from(name);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut file = open_unix_startup_lock(&lock_path)?;
+    let meta = file.metadata().path_ctx("stat", &lock_path)?;
+    if !meta.is_file() {
+        return Err(OutrigError::Configuration(format!(
+            "unix listen startup lock is not a regular file: {}",
+            lock_path.display()
+        ))
+        .into());
+    }
+    // An existing pathname is not ours to chmod. In particular, a hard link
+    // may name an unrelated file. Accept only the shape we publish, without
+    // changing it; the directory must still be writable only by this user.
+    if meta.uid() != nix::unistd::geteuid().as_raw()
+        || meta.mode() & 0o7777 != 0o600
+        || meta.nlink() != 1
+        || meta.len() != 0
+    {
+        return Err(OutrigError::Configuration(format!(
+            "unix listen startup lock {} must be an empty, singly linked file owned by \
+             this user with mode 0600; outrig will not modify it",
+            lock_path.display()
+        ))
+        .into());
+    }
+
+    loop {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => return Ok(lock),
+            Err((unlocked, Errno::EWOULDBLOCK)) => file = unlocked,
+            Err((_, e)) => return errno_ctx(Err(e), "lock", &lock_path),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(OutrigError::Configuration(format!(
+                "timed out waiting for unix listen startup lock: {}\n  \
+                 another process may still be starting; wait for it, or use another --listen path",
+                lock_path.display()
+            ))
+            .into());
+        }
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(10)),
+        )
+        .await;
+    }
+}
+
+/// Open an established lock, or publish a fully initialized private inode.
+/// Neither the final name nor an existing inode ever receives a chmod.
+#[cfg(unix)]
+fn open_unix_startup_lock(lock_path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    use nix::errno::Errno;
+    use nix::fcntl::{AT_FDCWD, OFlag, RenameFlags, renameat2};
+
+    loop {
+        // std opens close-on-exec. NOFOLLOW refuses a substituted symlink;
+        // NONBLOCK lets us reject a FIFO rather than hanging while opening it.
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits())
+            .open(lock_path)
+        {
+            Ok(file) => return Ok(file),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).path_ctx("open", lock_path).map_err(Into::into),
+        }
+        let parent = lock_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let candidate = prepare_unix_startup_lock(parent)?;
+        // No overwrite and no hard-link interval: observers see either no
+        // final name or the complete, singly linked lock. Fail closed if the
+        // filesystem cannot provide atomic no-replace publication.
+        match renameat2(
+            AT_FDCWD,
+            candidate.path(),
+            AT_FDCWD,
+            lock_path,
+            RenameFlags::RENAME_NOREPLACE,
+        ) {
+            Ok(()) => return Ok(candidate.into_file()),
+            Err(Errno::EEXIST) => continue,
+            Err(e) => return errno_ctx(Err(e), "publish startup lock", lock_path),
+        }
+    }
+}
+
+/// Complete all initialization before the persistent pathname can exist.
+#[cfg(unix)]
+fn prepare_unix_startup_lock(parent: &Path) -> Result<tempfile::NamedTempFile> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let candidate = tempfile::Builder::new()
+        .prefix(".outrig-mcp-lock-")
+        .tempfile_in(parent)
+        .path_ctx("create startup lock in", parent)?;
+    // umask can remove all owner bits. Only this creation descriptor is
+    // safe to repair, and a crash here leaves at most a private temp file,
+    // never an unopenable persistent lock that prevents future starts.
+    candidate
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .path_ctx("chmod", candidate.path())?;
+    Ok(candidate)
+}
+
 /// Clear the listen path, refusing rather than displacing a listener that is
 /// still serving it.
 ///
@@ -772,10 +908,10 @@ fn prepare_unix_socket(path: &Path) -> Result<()> {
 /// socket a nonblocking `connect(2)` resolves in the same call, so this
 /// returns an answer without ever waiting.
 ///
-/// This is a check, not a lock. Two `outrig mcp` processes racing for the same
-/// path can both find it free, and one then binds a name the other is about to
-/// remove. It closes the case the report describes -- a second instance
-/// launched against a path an established one is already serving.
+/// The caller must hold the startup lock through binding and listening.
+/// A bound socket not yet listening also answers `ECONNREFUSED`; without
+/// serialization, a concurrent start could clear that name or remove a fresh
+/// listener while both starts are clearing the same stale entry (#928).
 #[cfg(unix)]
 fn clear_stale_unix_socket(path: &Path) -> Result<()> {
     use nix::errno::Errno;
@@ -861,9 +997,8 @@ fn bind_unix_listener(path: &Path) -> Result<OwnedUnixListener> {
 
     errno_ctx(bind(sock.as_raw_fd(), &addr), "bind", path)?;
     // The name exists from here on, so own its removal before anything else
-    // can fail. Nothing has had a chance to replace the entry yet: our socket
-    // is bound to it and is not refusing connections, so no other `outrig
-    // mcp` would clear it.
+    // can fail. The caller holds the startup lock, so another cooperating
+    // start cannot clear this entry while it is bound but not yet listening.
     let cleanup = UnixSocketCleanup::claim(path)?;
     errno_ctx(listen(&sock, Backlog::MAXCONN), "listen", path)?;
     restore_socket_mode(path)?;
@@ -1186,7 +1321,10 @@ fn render_banner(banner: StartupBanner<'_>) -> String {
     let _ = writeln!(
         buf,
         "{}",
-        crate::builtin_image::banner_image_config_row(banner.container_name, banner.builtin_default)
+        crate::builtin_image::banner_image_config_row(
+            banner.container_name,
+            banner.builtin_default
+        )
     );
     let _ = writeln!(buf, "[outrig] image:             {}", banner.image_tag);
     let container_action = if banner.attached {
@@ -1652,6 +1790,380 @@ named  = { sidecar = "serve" }
         assert!(listen_exposure_warning(&unix).is_none());
     }
 
+    /// A's bind/listen gap must not look stale to B (#928). On a single-thread
+    /// runtime the timed wait also proves contention does not block the executor.
+    #[tokio::test]
+    async fn unix_startup_preserves_a_bound_but_not_listening_socket() {
+        use nix::sys::socket::{
+            AddressFamily, Backlog, SockFlag, SockType, UnixAddr, bind, listen, socket,
+        };
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+        let lock = lock_unix_startup(&path, Duration::ZERO)
+            .await
+            .expect("A locks");
+        let sock = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("socket");
+        bind(sock.as_raw_fd(), &UnixAddr::new(&path).expect("addr")).expect("bind");
+        let inode = std::fs::symlink_metadata(&path).expect("stat").ino();
+        let err = start_unix_listener(&path, Duration::from_millis(20))
+            .await
+            .err()
+            .expect("B must wait rather than clear A");
+        assert!(
+            err.to_string()
+                .contains("timed out waiting for unix listen startup lock"),
+            "{err}"
+        );
+        assert_eq!(std::fs::symlink_metadata(&path).expect("stat").ino(), inode);
+
+        // A different socket does not wait for this one's startup.
+        let other = start_unix_listener(&dir.path().join("other.sock"), Duration::ZERO)
+            .await
+            .expect("independent path");
+        drop(other);
+        listen(&sock, Backlog::MAXCONN).expect("listen");
+        drop(lock);
+        let err = start_unix_listener(&path, Duration::ZERO)
+            .await
+            .err()
+            .expect("B must now see a live listener");
+        assert!(
+            err.to_string()
+                .contains("already served by a running process"),
+            "{err}"
+        );
+        assert_eq!(std::fs::symlink_metadata(&path).expect("stat").ino(), inode);
+        let _client = std::os::unix::net::UnixStream::connect(&path).expect("A remains reachable");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_unix_starts_have_one_reachable_winner() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        for stale in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("outrig.sock");
+            if stale {
+                drop(std::os::unix::net::UnixListener::bind(&path).expect("stale socket"));
+            }
+            let barrier = Arc::new(tokio::sync::Barrier::new(8));
+            let mut starts = tokio::task::JoinSet::new();
+            for _ in 0..8 {
+                let (path, barrier) = (path.clone(), barrier.clone());
+                starts.spawn(async move {
+                    barrier.wait().await;
+                    start_unix_listener(&path, Duration::from_secs(5)).await
+                });
+            }
+            let mut winners = Vec::new();
+            while let Some(result) = starts.join_next().await {
+                match result.expect("startup task") {
+                    Ok(listener) => winners.push(listener),
+                    Err(err) => assert!(
+                        err.to_string()
+                            .contains("already served by a running process"),
+                        "{err}"
+                    ),
+                }
+            }
+            assert_eq!(winners.len(), 1);
+            let _client =
+                std::os::unix::net::UnixStream::connect(&path).expect("connect to winner");
+            tokio::time::timeout(Duration::from_secs(1), winners[0].listener.accept())
+                .await
+                .expect("reachable")
+                .expect("accept");
+            let lock_path = dir.path().join("outrig.sock.lock");
+            let lock_inode = std::fs::metadata(&lock_path).expect("lock remains").ino();
+            drop(winners);
+            assert!(!path.exists(), "winner removes its own socket");
+            // The persistent lock is reusable, including after refused starts.
+            let next = start_unix_listener(&path, Duration::ZERO)
+                .await
+                .expect("restart");
+            assert_eq!(
+                std::fs::metadata(&lock_path).expect("lock remains").ino(),
+                lock_inode
+            );
+            drop(next);
+        }
+    }
+
+    #[tokio::test]
+    async fn unix_startup_lock_refuses_symlinks_and_non_regular_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+        let lock_path = dir.path().join("outrig.sock.lock");
+        let target = dir.path().join("target");
+        std::fs::write(&target, "untouched").expect("target");
+        std::os::unix::fs::symlink(&target, &lock_path).expect("symlink");
+        assert!(start_unix_listener(&path, Duration::ZERO).await.is_err());
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "untouched");
+        std::fs::remove_file(&lock_path).expect("unlink");
+        nix::unistd::mkfifo(
+            &lock_path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("fifo");
+        let err = start_unix_listener(&path, Duration::ZERO)
+            .await
+            .err()
+            .expect("refuse fifo");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        assert!(!path.exists());
+    }
+
+    /// Run tests that change umask or raise signals alone in a fresh process;
+    /// both are process-wide and must not affect the rest of the unit suite.
+    fn isolated_unix_startup_test(name: &str) -> bool {
+        const CHILD: &str = "OUTRIG_TEST_UNIX_STARTUP_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                &format!("cli::mcp::tests::{name}"),
+                "--nocapture",
+            ])
+            .env(CHILD, name)
+            .output()
+            .expect("isolated test");
+        assert!(
+            output.status.success(),
+            "isolated test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    #[test]
+    fn unix_startup_restarts_after_a_restrictive_umask() {
+        if isolated_unix_startup_test("unix_startup_restarts_after_a_restrictive_umask") {
+            return;
+        }
+        use nix::sys::stat::{Mode, umask};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                for mask in [0o200, 0o400, 0o600, 0o777] {
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let path = dir.path().join("outrig.sock");
+                    let lock_path = dir.path().join("outrig.sock.lock");
+                    let previous = umask(Mode::from_bits_truncate(mask));
+                    let first = start_unix_listener(&path, Duration::from_secs(1)).await;
+                    umask(previous);
+                    let first = first.expect("first start under restrictive umask");
+                    let inode = std::fs::metadata(&lock_path).expect("lock").ino();
+                    assert_eq!(
+                        std::fs::metadata(&lock_path)
+                            .expect("lock")
+                            .permissions()
+                            .mode()
+                            & 0o777,
+                        0o600
+                    );
+                    drop(first);
+                    // Reopen the persistent inode, both after changing the umask
+                    // and with the original restrictive mask still in effect.
+                    for restart_mask in [0o022, mask] {
+                        let previous = umask(Mode::from_bits_truncate(restart_mask));
+                        let next = start_unix_listener(&path, Duration::from_secs(1)).await;
+                        umask(previous);
+                        let next = next.expect("restart");
+                        assert_eq!(std::fs::metadata(&lock_path).expect("lock").ino(), inode);
+                        let _client =
+                            std::os::unix::net::UnixStream::connect(&path).expect("reachable");
+                        next.listener.accept().await.expect("accept");
+                        drop(next);
+                    }
+                }
+            });
+    }
+
+    #[test]
+    fn unix_startup_ignores_an_unpublished_lock_left_by_a_crash() {
+        if isolated_unix_startup_test("unix_startup_ignores_an_unpublished_lock_left_by_a_crash") {
+            return;
+        }
+        use nix::sys::stat::{Mode, umask};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let path = dir.path().join("outrig.sock");
+                let lock_path = dir.path().join("outrig.sock.lock");
+                let previous = umask(Mode::from_bits_truncate(0o777));
+                // The state left if a creator dies before repairing its private
+                // file: no destructor removes it, and it has no owner bits.
+                let (orphan, orphan_path) = tempfile::Builder::new()
+                    .prefix(".outrig-mcp-lock-")
+                    .tempfile_in(dir.path())
+                    .expect("private file")
+                    .keep()
+                    .expect("leave private file behind");
+                assert_eq!(
+                    orphan.metadata().expect("orphan").permissions().mode() & 0o777,
+                    0
+                );
+                assert!(!lock_path.exists(), "an unfinished lock is not published");
+                // The production initializer also leaves the final name
+                // absent after permission repair. A crash on either side of
+                // that repair cannot publish an inaccessible lock.
+                let prepared = prepare_unix_startup_lock(dir.path()).expect("prepared candidate");
+                assert_eq!(
+                    prepared.as_file().metadata().expect("prepared").mode() & 0o777,
+                    0o600
+                );
+                assert!(!lock_path.exists());
+                let (_prepared_file, _prepared_path) =
+                    prepared.keep().expect("abandon prepared file");
+                let first = start_unix_listener(&path, Duration::from_secs(1)).await;
+                umask(previous);
+                drop(first.expect("the abandoned private inode cannot block startup"));
+                let meta = std::fs::metadata(&lock_path).expect("published lock");
+                assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+                assert_eq!(meta.nlink(), 1);
+                assert_ne!(meta.ino(), orphan.metadata().expect("orphan").ino());
+                assert_eq!(
+                    std::fs::metadata(&orphan_path)
+                        .expect("orphan unchanged")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0
+                );
+                drop(
+                    start_unix_listener(&path, Duration::ZERO)
+                        .await
+                        .expect("restart"),
+                );
+            });
+    }
+
+    #[tokio::test]
+    async fn unix_startup_refuses_existing_lock_collisions_without_modifying_them() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        for (hard_link, mode, contents) in [
+            (true, 0o755, "unrelated executable"),
+            (true, 0o600, ""),
+            (false, 0o755, ""),
+            (false, 0o600, "unrelated data"),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("outrig.sock");
+            let lock_path = dir.path().join("outrig.sock.lock");
+            let target = if hard_link {
+                dir.path().join("victim")
+            } else {
+                lock_path.clone()
+            };
+            std::fs::write(&target, contents).expect("victim");
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).expect("mode");
+            if hard_link {
+                std::fs::hard_link(&target, &lock_path).expect("hard link");
+            }
+            std::fs::write(&path, "socket path must not be prepared").expect("sentinel");
+            let before = std::fs::metadata(&target).expect("before");
+            let err = start_unix_listener(&path, Duration::ZERO)
+                .await
+                .err()
+                .expect("collision refused");
+            assert!(
+                err.to_string().contains("outrig will not modify it"),
+                "{err}"
+            );
+            let after = std::fs::metadata(&target).expect("after");
+            assert_eq!(
+                after.mode(),
+                before.mode(),
+                "collision must not chmod the victim"
+            );
+            assert_eq!(after.ino(), before.ino());
+            assert_eq!(after.nlink(), before.nlink());
+            assert_eq!(std::fs::read_to_string(&target).expect("victim"), contents);
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("sentinel"),
+                "socket path must not be prepared"
+            );
+        }
+    }
+
+    #[test]
+    fn unix_startup_contention_is_interrupted_by_signals() {
+        if isolated_unix_startup_test("unix_startup_contention_is_interrupted_by_signals") {
+            return;
+        }
+        use crate::cli::signals::EndSignal;
+        use crate::error::CliError;
+        use nix::sys::signal::{Signal, raise};
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                for (raised, expected) in [
+                    (Signal::SIGINT, EndSignal::Interrupt),
+                    (Signal::SIGTERM, EndSignal::Terminate),
+                ] {
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let path = dir.path().join("outrig.sock");
+                    let held = lock_unix_startup(&path, Duration::ZERO)
+                        .await
+                        .expect("holder");
+                    let mut signals = Signals::install().expect("signals");
+                    let send = async {
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        raise(raised).expect("raise");
+                    };
+                    let serving = serve_unix_http_transport(
+                        axum::Router::new(),
+                        &path,
+                        CancellationToken::new(),
+                        SessionMonitor::None,
+                        &mut signals,
+                    );
+                    let (result, ()) =
+                        tokio::join!(tokio::time::timeout(Duration::from_secs(1), serving), send,);
+                    let err = result
+                        .expect("signal cancels startup promptly")
+                        .expect_err("interrupted");
+                    assert!(
+                        matches!(err, CliError::Interrupted(sig) if sig == expected),
+                        "{err}"
+                    );
+                    assert_eq!(err.exit_code(), expected.exit_code());
+                    assert!(!path.exists(), "cancelled startup did not bind");
+                    drop(held);
+                    drop(
+                        start_unix_listener(&path, Duration::ZERO)
+                            .await
+                            .expect("lock remains reusable"),
+                    );
+                }
+            });
+    }
+
     /// A path whose socket nothing answers on is the ordinary case -- a prior
     /// `outrig mcp` that was killed -- and the new listener takes the name.
     #[tokio::test]
@@ -1731,7 +2243,10 @@ named  = { sidecar = "serve" }
             err.to_string().contains("outrig will not replace it"),
             "an unanswered probe must refuse rather than clear: {err}"
         );
-        assert!(path.exists(), "the live listener's socket must still be there");
+        assert!(
+            path.exists(),
+            "the live listener's socket must still be there"
+        );
     }
 
     /// The fault from #374: a second `outrig mcp --listen unix:<same path>`
@@ -1851,8 +2366,15 @@ named  = { sidecar = "serve" }
             "error should name what happened: {err}"
         );
 
-        let mode = std::fs::metadata(&victim).expect("stat").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o755, "the victim's mode must be untouched, is {mode:o}");
+        let mode = std::fs::metadata(&victim)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "the victim's mode must be untouched, is {mode:o}"
+        );
     }
 
     /// The listener owns the name it bound: dropping it takes the socket file
@@ -1919,7 +2441,9 @@ named  = { sidecar = "serve" }
         );
 
         // Hold a request open so the shutdown has something to drain.
-        let mut client = tokio::net::UnixStream::connect(&path).await.expect("connect");
+        let mut client = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("connect");
         client
             .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .await
@@ -1942,15 +2466,25 @@ named  = { sidecar = "serve" }
 
         release.notify_one();
         let mut response = Vec::new();
-        client.read_to_end(&mut response).await.expect("read response");
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
         assert!(
             String::from_utf8_lossy(&response).contains("done"),
             "the drained request still completes"
         );
         first.await.expect("join").expect("first server");
 
-        assert!(path.exists(), "the second server's socket must survive the first");
+        assert!(
+            path.exists(),
+            "the second server's socket must survive the first"
+        );
         let _client = std::os::unix::net::UnixStream::connect(&path).expect("connect to second");
-        second.listener.accept().await.expect("the second server is reachable");
+        second
+            .listener
+            .accept()
+            .await
+            .expect("the second server is reachable");
     }
 }

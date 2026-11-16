@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Concurrent `mcp --listen unix:<path>` starts now serialize socket startup with a
+  persistent `<path>.lock` advisory lock. A start can no longer mistake another
+  start's bound-but-not-listening socket for a stale entry, or clear its fresh
+  socket while both replace a stale one. Contention waits asynchronously for up
+  to five seconds and is interrupted by session-ending signals; timeout or
+  unsupported locking refuses startup. New lock files receive owner read/write
+  permissions before atomic publication, so restrictive umasks and crashes during
+  initialization do not prevent restarts. Existing lock-file collisions are
+  refused without changing their permissions. (#928)
+
 - **A sidecar's repo-declared mounts are checked again right before the sidecar's container is
   created.** The guards pin each repo-declared mount to the canonical path they validated (#604),
   and re-resolve the pinned paths just before the primary container starts -- but a sidecar binds
