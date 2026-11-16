@@ -2079,18 +2079,21 @@ async fn hash_git_context(
     hasher: &mut blake3::Hasher,
     stamps: &mut Stamps,
 ) -> Result<()> {
-    hash_git_tree(ctx, Path::new(""), hasher, stamps).await
+    hash_git_tree(ctx, Path::new(""), hasher, stamps, &mut HashMap::new()).await
 }
 
 /// [`hash_git_context`] for `ctx/dir`, a directory git lists from its own
 /// repository: the context itself, or a nested repository in it. Paths are
 /// keyed relative to `ctx/dir`, but symlinks resolve against `ctx`, as buildah
-/// resolves every `COPY` source.
+/// resolves every `COPY` source. `links` spans the entire context: sorted
+/// listings and recursive walks give each admitted file a deterministic first
+/// path, even when its partner is owned by a different repository.
 async fn hash_git_tree(
     ctx: &Path,
     dir: &Path,
     hasher: &mut blake3::Hasher,
     stamps: &mut Stamps,
+    links: &mut HardLinks,
 ) -> Result<()> {
     let tree = ctx.join(dir);
     // What the rules admit, tracked or not, and what is tracked although a
@@ -2126,7 +2129,7 @@ async fn hash_git_tree(
         let root = tokio::fs::symlink_metadata(&tree)
             .await
             .path_ctx("stat", &tree)?;
-        let digest = hash_whole_tree(ctx, dir, stamps).await?;
+        let digest = hash_whole_tree(ctx, dir, stamps, links).await?;
         update_record(hasher, b"", root.mode(), &digest);
         return Ok(());
     }
@@ -2161,6 +2164,9 @@ async fn hash_git_tree(
     for (rel, mode, entry) in entries {
         let digest = match entry {
             ContextEntry::Leaf(digest) => digest,
+            ContextEntry::File(digest, identity) => identity
+                .and_then(|id| earlier_link(links, &dir.join(OsStr::from_bytes(&rel)), id))
+                .map_or(digest, |first| hard_link_digest(&first)),
             ContextEntry::Dir => {
                 let sub_dir = dir.join(OsStr::from_bytes(&rel));
                 // A nested repository or initialized submodule is hashed by
@@ -2171,10 +2177,10 @@ async fn hash_git_tree(
                 // recursing would never end.
                 if is_worktree_root(&ctx.join(&sub_dir)).await? {
                     let mut sub = blake3::Hasher::new();
-                    Box::pin(hash_git_tree(ctx, &sub_dir, &mut sub, stamps)).await?;
+                    Box::pin(hash_git_tree(ctx, &sub_dir, &mut sub, stamps, links)).await?;
                     sub.finalize()
                 } else {
-                    hash_whole_tree(ctx, &sub_dir, stamps).await?
+                    hash_whole_tree(ctx, &sub_dir, stamps, links).await?
                 }
             }
         };
@@ -2303,28 +2309,40 @@ async fn ls_files(tree: &Path, flags: &[&str]) -> Result<Vec<Vec<u8>>> {
 /// `ctx/dir` whole, ignored files and all, by [`TreeHasher::dir`]. From the
 /// context's own root (an empty `dir`) the walk is [`TreeHasher::whole`].
 /// `ctx/dir` and everything the walk meets are recorded in `stamps`.
-async fn hash_whole_tree(ctx: &Path, dir: &Path, stamps: &mut Stamps) -> Result<blake3::Hash> {
+async fn hash_whole_tree(
+    ctx: &Path,
+    dir: &Path,
+    stamps: &mut Stamps,
+    links: &mut HardLinks,
+) -> Result<blake3::Hash> {
     let (root, dir) = (ctx.to_path_buf(), dir.to_path_buf());
-    let (digest, walked) = tokio::task::spawn_blocking(move || {
+    let first_links = std::mem::take(links);
+    let (digest, walked, first_links) = tokio::task::spawn_blocking(move || {
         let mut tree = if dir.as_os_str().is_empty() {
             TreeHasher::whole(&root)
         } else {
             TreeHasher::new(&root)
         };
+        tree.hard_links = Some(first_links);
         let top = root.join(&dir);
         let meta = std::fs::symlink_metadata(&top).path_ctx("stat", &top)?;
         tree.stamps.record(&top, &meta);
-        Ok::<_, OutrigError>((tree.dir(&dir)?, tree.stamps))
+        Ok::<_, OutrigError>((tree.dir(&dir)?, tree.stamps, tree.hard_links.unwrap()))
     })
     .await
     .expect("context hashing task panicked")?;
     stamps.extend(walked);
+    *links = first_links;
     Ok(digest)
 }
 
 /// What one listed path contributes to [`hash_git_context`].
 enum ContextEntry {
-    /// Anything but a directory, hashed in the blocking pass.
+    /// A regular file's content and, if multiply linked, its device and inode.
+    /// Topology is applied only when the caller admits the entry, not during
+    /// speculative hashing or symlink resolution.
+    File(blake3::Hash, Option<(u64, u64)>),
+    /// Anything but a regular file or directory, hashed in the blocking pass.
     Leaf(blake3::Hash),
     /// A directory git lists as one entry: a submodule or nested repository.
     Dir,
@@ -2349,13 +2367,11 @@ struct TreeHasher<'a> {
     done: HashMap<PathBuf, (u32, blake3::Hash)>,
     /// Referents being hashed now.
     active: HashSet<PathBuf>,
-    /// Set for a walk of the whole context: the first path each file with more
-    /// than one link was met at, by device and inode. buildah keeps a `COPY
-    /// .`'s hard links, so a later link to a file is keyed as such, not by
-    /// bytes a pair of copies would share. Only the one walk, in name order,
-    /// makes "first" mean something; a referent hashed from the middle of
-    /// another walk would not.
-    whole: Option<HashMap<(u64, u64), PathBuf>>,
+    /// First admitted path per multiply linked regular file. Shared across
+    /// git recursion and whole-subtree walks; never used for symlink referents.
+    hard_links: Option<HardLinks>,
+    /// Whole-context walks meet referents in place, so need not follow links.
+    follow_links: bool,
     /// Every path met, as [`Self::entry`] met it.
     stamps: Stamps,
 }
@@ -2366,7 +2382,8 @@ impl<'a> TreeHasher<'a> {
             ctx,
             done: HashMap::new(),
             active: HashSet::new(),
-            whole: None,
+            hard_links: None,
+            follow_links: true,
             stamps: Stamps::default(),
         }
     }
@@ -2375,7 +2392,8 @@ impl<'a> TreeHasher<'a> {
     /// is met once, in name order.
     fn whole(ctx: &'a Path) -> Self {
         Self {
-            whole: Some(HashMap::new()),
+            hard_links: Some(HashMap::new()),
+            follow_links: false,
             ..Self::new(ctx)
         }
     }
@@ -2393,6 +2411,11 @@ impl<'a> TreeHasher<'a> {
         };
         let entry = if meta.is_dir() {
             ContextEntry::Dir
+        } else if meta.is_file() {
+            ContextEntry::File(
+                self.entry(rel, &meta)?,
+                (meta.nlink() > 1).then(|| (meta.dev(), meta.ino())),
+            )
         } else {
             ContextEntry::Leaf(self.entry(rel, &meta)?)
         };
@@ -2420,22 +2443,15 @@ impl<'a> TreeHasher<'a> {
         }
     }
 
-    /// Where a whole-context walk first met the regular file `meta` describes,
+    /// Where the context walk first met the regular file `meta` describes,
     /// when `rel` is a later link to it. A file whose other links are outside
     /// the context, or that has none, has no earlier one: nothing `COPY` sees
     /// tells it from a plain file.
     fn earlier_link(&mut self, rel: &Path, meta: &std::fs::Metadata) -> Option<PathBuf> {
-        let first_links = self.whole.as_mut()?;
         if meta.nlink() < 2 {
             return None;
         }
-        match first_links.entry((meta.dev(), meta.ino())) {
-            Entry::Occupied(first) => Some(first.get().clone()),
-            Entry::Vacant(slot) => {
-                slot.insert(rel.to_path_buf());
-                None
-            }
-        }
+        earlier_link(self.hard_links.as_mut()?, rel, (meta.dev(), meta.ino()))
     }
 
     /// Each entry of the directory `ctx/rel`, by name, mode, and digest.
@@ -2469,7 +2485,7 @@ impl<'a> TreeHasher<'a> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(target.as_os_str().as_bytes());
         hasher.update(b"\0");
-        if self.whole.is_none()
+        if self.follow_links
             && let Some(referent) = resolve_in_context(self.ctx, rel, &mut self.stamps)
             && let Some((mode, digest)) = self.referent(referent)?
         {
@@ -2491,11 +2507,29 @@ impl<'a> TreeHasher<'a> {
         if !self.active.insert(rel.clone()) {
             return Ok(None);
         }
+        // A referent is not another entry in COPY .; it must neither consume
+        // a first-link slot nor be keyed as a later link to itself.
+        let links = self.hard_links.take();
         let digest = self.entry(&rel, &meta);
+        self.hard_links = links;
         self.active.remove(&rel);
         let done = (meta.mode(), digest?);
         self.done.insert(rel, done);
         Ok(Some(done))
+    }
+}
+
+/// Inodes are used only to recognize a pair, never hashed: independent
+/// checkouts with the same topology must have the same key.
+type HardLinks = HashMap<(u64, u64), PathBuf>;
+
+fn earlier_link(links: &mut HardLinks, rel: &Path, identity: (u64, u64)) -> Option<PathBuf> {
+    match links.entry(identity) {
+        Entry::Occupied(first) => Some(first.get().clone()),
+        Entry::Vacant(slot) => {
+            slot.insert(rel.to_path_buf());
+            None
+        }
     }
 }
 
@@ -2597,7 +2631,7 @@ async fn hash_non_git_context(
     let root = tokio::fs::symlink_metadata(ctx)
         .await
         .path_ctx("stat", ctx)?;
-    let digest = hash_whole_tree(ctx, Path::new(""), stamps).await?;
+    let digest = hash_whole_tree(ctx, Path::new(""), stamps, &mut HashMap::new()).await?;
     update_record(hasher, b"", root.mode(), &digest);
     Ok(())
 }

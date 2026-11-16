@@ -416,8 +416,11 @@ does not exclude, committed or not, by path, permission bits, and content, and e
 does not exclude, empty ones included, by path and permission bits. If `.gitignore` matches the
 context directory, or every file in it, committed or not, then every file counts: the rules say
 nothing about which of them the build uses. Outside a git repo, every file and directory in it
-counts the same way, and so does which of its files are hard links to one another; it is walked in
-process rather than listed by git. So `[images.outrig-standard]` builds to
+counts the same way; it is walked in process rather than listed by git. In either kind of context,
+which regular files are hard links to one another also counts, including pairs split across nested
+repositories or subtrees walked whole. Only paths admitted to the key count: a partner outside the
+context or excluded by git does not change it, and raw inode numbers never enter the key.
+So `[images.outrig-standard]` builds to
 `outrig-standard:<hash>`, which podman shows as `localhost/outrig-standard`.
 
 Repo-local build images carry an `org.outrig.mcp` label too. On a cache miss, outrig builds a
