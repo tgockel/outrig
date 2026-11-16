@@ -844,7 +844,7 @@ async fn a_request_arriving_during_a_round_is_announced_on_the_next_result() {
 }
 
 /// Python that waits until `test()` holds, failing rather than hanging.
-const UNTIL: &str = r#"
+pub(super) const UNTIL: &str = r#"
 import os, time
 async def until(test):
     deadline = time.monotonic() + 20
@@ -2576,16 +2576,19 @@ const ANSWER_ONE: &str =
 /// a round's first call runs `source`, and the call after its result ends the
 /// round.
 pub(super) fn serving(source: &str) -> Responder {
-    let source = source.to_string();
+    serving_each(vec![source.to_string()])
+}
+
+/// [`serving`], each round running the next of `sources`, the last again once
+/// they run out.
+pub(super) fn serving_each(sources: Vec<String>) -> Responder {
     let next = Arc::new(AtomicUsize::new(0));
     Arc::new(move |request: &RecordedRequest| {
         let canned = if after_result(request) {
             text_reply("ended")
         } else {
-            submit(
-                &format!("s{}", next.fetch_add(1, Ordering::SeqCst)),
-                &py(&source),
-            )
+            let n = next.fetch_add(1, Ordering::SeqCst);
+            submit(&format!("s{n}"), &py(&sources[n.min(sources.len() - 1)]))
         };
         Box::pin(async move { canned })
     })

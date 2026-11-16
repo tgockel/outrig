@@ -106,7 +106,6 @@ phase.
 
 | Task      | What it settles                                     |
 | --------- | ----------------------------------------------------|
-| `0003-49` | The owner reads the roster                          |
 | `0003-50` | An agent has a model-request limit                  |
 
 **External channels**

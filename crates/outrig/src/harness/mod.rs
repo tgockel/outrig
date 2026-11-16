@@ -35,6 +35,9 @@
 //! - **Reading a root.** A [`RootHandle`] says what the root its owner constructed is doing --
 //!   a round open, or why it is at rest -- and what each round said, read from the session's
 //!   own record of its agents rather than from its events ([`RootHandle::status`]).
+//! - **Reading the roster.** [`Session::roster`] lists the session's agents at one moment --
+//!   each with what it is, what launched it, what it is doing and the requests made of it that
+//!   have not ended -- from the same record, so it agrees with the [`ShutdownReport`] at the end.
 //! - **Stopping.** [`Session::close_admission`] refuses new work at once, and
 //!   [`Session::shutdown`] stops what is left and returns a
 //!   [`ShutdownReport`]: whether everything is proven stopped, and how each
@@ -63,6 +66,7 @@ pub mod event;
 pub(crate) mod lifecycle;
 mod report;
 mod root;
+pub(crate) mod roster;
 pub(crate) mod services;
 mod session;
 pub(crate) mod skills;
@@ -84,6 +88,7 @@ pub use self::root::{
     Argument, ConstructSpec, Facility, Problem, RequestChannel, RequestHandle, RootError,
     RootHandle,
 };
+pub use self::roster::{AgentKind, AgentRow, Outstanding, Parent, Roster, RosterState};
 pub use self::services::{
     CallContext, MethodDescription, Service, ServiceDescription, ServiceError,
     ServiceErrorCategory, ServiceFuture, ServicePolicy,

@@ -55,6 +55,7 @@ use crate::harness::event::{
     RequestEnd, Subject, Usage,
 };
 use crate::harness::lifecycle::Lifecycle;
+use crate::harness::roster::{AgentKind, AgentRow, Outstanding, Parent, Roster, RosterState};
 use crate::harness::services::ServiceBrief;
 use crate::harness::skills::SkillBrief;
 use crate::harness::stop::{AgentState, RoundFacts, Snapshot};
@@ -141,7 +142,8 @@ struct State {
     launched: u64,
     /// What closed the session's admission, once something has.
     closed: Option<ClosedBy>,
-    /// Each request open when admission closed.
+    /// Each request open when admission closed, and each heard of after it, which the
+    /// interpreter made before it heard of the close and ends with the rest.
     at_close: Vec<u64>,
     /// Who waits for each answer to an `assign`, by its id.
     assigning: HashMap<u64, oneshot::Sender<Option<u64>>>,
@@ -153,6 +155,11 @@ struct State {
     /// How many times a child's state has changed, which numbers each change
     /// ([`ChildNode::say`]).
     seq: u64,
+    /// Each end the interpreter told of, once admission closed, for a request it had not yet
+    /// told of: its close ends a request it has registered and not yet announced, and the two
+    /// lines can arrive in either order. Kept, by the request's id, until the request is heard
+    /// of ([`State::record`]); one never heard of stays, for as long as the session does.
+    early: HashMap<u64, Value>,
 }
 
 #[derive(Default)]
@@ -179,6 +186,11 @@ struct Node {
 }
 
 struct ChildNode {
+    kind: ChildKind,
+    /// The name its launch gave it.
+    name: String,
+    /// The class it is an agent class instance of, as `module.qualname`, when it is one.
+    class: Option<String>,
     life: Life,
     /// Whether it counts against `children-max`: from its launch until its
     /// kernel is gone.
@@ -213,6 +225,9 @@ impl ChildNode {
             };
             *seq += 1;
             snapshot.seq = *seq;
+            if next.at_rest() {
+                snapshot.last_stop = Some(next.clone());
+            }
             snapshot.state = next;
             true
         });
@@ -365,6 +380,18 @@ impl Children {
         Self(inner)
     }
 
+    /// The session's agents as they are now, read in one hold of the state's lock: see
+    /// [`Roster`].
+    pub(crate) fn roster(&self) -> Roster {
+        self.0.state().roster()
+    }
+
+    /// How many children count against `children-max` now.
+    #[cfg(test)]
+    pub(crate) fn resident(&self) -> usize {
+        self.0.state().resident()
+    }
+
     /// What child `child` is doing, as its owner reads it, from now on;
     /// `None` for an agent that is no child.
     pub(crate) fn status_of(&self, child: &str) -> Option<watch::Receiver<Snapshot>> {
@@ -450,9 +477,9 @@ impl Children {
         }
     }
 
-    /// Each request open when admission closed, and how it ended: what the
-    /// close or an answer ended it with, or `terminated` for one nothing
-    /// ended -- the interpreter died first.
+    /// Each request open when admission closed -- or heard of after it, made before the
+    /// interpreter heard of the close -- and how it ended: what the close or an answer ended it
+    /// with, or `terminated` for one nothing ended -- the interpreter died first.
     pub(crate) fn report(&self) -> Vec<RequestOutcome> {
         let state = lock(&self.0.state);
         state
@@ -535,6 +562,34 @@ impl State {
         true
     }
 
+    /// Record request `id`, just made: a round its child is running now is one it spans, and
+    /// the child is woken to it. One made before the interpreter heard of the close, and heard
+    /// of here after it, is the close's to end, as every request open at it is, and the report's
+    /// to list; the end, if the interpreter told of it first, is returned, to be heard now.
+    fn record(&mut self, id: u64, mut record: Record) -> Option<Value> {
+        if let Some(node) = self.child_mut(&record.child) {
+            record.rounds.extend(node.round);
+            if let Some(channel) = &record.channel {
+                *node.delivered.entry(channel.clone()).or_default() += 1;
+            }
+            node.wake.notify_one();
+        }
+        if self.closed.is_some() {
+            self.at_close.push(id);
+        }
+        self.requests.insert(id, record);
+        self.early.remove(&id)
+    }
+
+    /// The interpreter told of request `id`'s end, `line`, before the request: once admission
+    /// has closed, whose close ends what the interpreter has not yet told of, it is kept to be
+    /// heard when the request is ([`State::record`]). Before, there is no such end to keep.
+    fn ended_early(&mut self, id: u64, line: &Value) {
+        if self.closed.is_some() {
+            self.early.insert(id, line.clone());
+        }
+    }
+
     /// Move what `child`'s readers see: see [`ChildNode::say`].
     fn say(&mut self, child: &str, to: impl FnOnce(&AgentState) -> Option<AgentState>) {
         if let Some(node) = self.agents.get(child).and_then(|node| node.child.as_ref()) {
@@ -609,6 +664,104 @@ impl State {
         }
         summary
     }
+
+    /// Every agent of the tree, in its order, as [`Roster`] lists them. What each child holds is
+    /// every request made of it that has not ended, not its [`summary`](State::summary), which
+    /// keeps a work child's one submission.
+    fn roster(&self) -> Roster {
+        let mut outstanding: HashMap<&str, Outstanding> = HashMap::new();
+        for record in self.requests.values() {
+            if let Req::Ended(_) = record.state {
+                continue;
+            }
+            let held = outstanding.entry(&record.child).or_default();
+            match record.state {
+                Req::Unread => held.unread += 1,
+                Req::Queued => held.queued += 1,
+                Req::Received(_) => held.taken += 1,
+                Req::Ended(_) => {}
+            }
+        }
+        // The tree's roots, and each child whose parent's node is gone -- a root whose
+        // construction failed after it launched the child, which outlives it while its kernel
+        // ends -- after them, in launch order: `c1`, `c2`, ... sort by length, then by text.
+        let mut roots: Vec<&String> = self
+            .agents
+            .iter()
+            .filter(|(_, node)| {
+                node.parent
+                    .as_ref()
+                    .is_none_or(|parent| !self.agents.contains_key(parent))
+            })
+            .map(|(id, _)| id)
+            .collect();
+        roots.sort_unstable_by_key(|id| (self.agents[*id].parent.is_some(), id.len(), *id));
+        let mut agents = Vec::with_capacity(self.agents.len());
+        // Each agent before the agents it launched, and those in the order it launched them.
+        let mut next: Vec<&String> = roots.into_iter().rev().collect();
+        while let Some(id) = next.pop() {
+            let Some(node) = self.agents.get(id) else {
+                continue;
+            };
+            next.extend(node.children.iter().rev());
+            agents.extend(row(id, node, &outstanding));
+        }
+        Roster {
+            seq: self.seq,
+            agents,
+        }
+    }
+}
+
+/// Agent `id`'s row of the roster, `outstanding` what each child holds: `None` for the program
+/// that owns the session, which is no agent, and for a child whose kernel is gone.
+fn row(id: &str, node: &Node, outstanding: &HashMap<&str, Outstanding>) -> Option<AgentRow> {
+    let (kind, name, state, last_stop, held) = match &node.child {
+        None if id == OWNER => return None,
+        None => (AgentKind::Primary, None, None, None, None),
+        Some(child) if !child.resident => return None,
+        Some(child) => {
+            let snapshot = child.status.borrow();
+            let kind = match (node.parent.as_deref(), child.kind) {
+                (Some(OWNER), _) => AgentKind::Root {
+                    class: child.class.clone().unwrap_or_default(),
+                },
+                (_, ChildKind::Request) => AgentKind::Request {
+                    class: child.class.clone(),
+                },
+                (_, ChildKind::Work) => AgentKind::Work,
+            };
+            // A release -- its parent's, its owner's, the close's -- has begun, and the kernel it
+            // ends is still there: the stop read's `released` is said once the row is gone.
+            let state = match (child.life, &snapshot.state) {
+                (Life::Wedged, _) => RosterState::Wedged,
+                (_, AgentState::Released | AgentState::Cancelled) => RosterState::Releasing,
+                (_, state) => RosterState::Agent(state.clone()),
+            };
+            let held = outstanding.get(id).copied().unwrap_or_default();
+            (
+                kind,
+                Some(child.name.clone()).filter(|name| !name.is_empty()),
+                Some(state),
+                snapshot.last_stop.clone(),
+                Some(held),
+            )
+        }
+    };
+    Some(AgentRow {
+        id: id.to_string(),
+        kind,
+        name,
+        parent: node.parent.as_deref().map(|parent| match parent {
+            OWNER => Parent::Owner,
+            agent => Parent::Agent(agent.to_string()),
+        }),
+        depth: node.depth,
+        state,
+        last_stop,
+        model: node.model.clone(),
+        outstanding: held,
+    })
 }
 
 impl Inner {
@@ -806,6 +959,9 @@ impl Inner {
                     slot: CallSlot::default(),
                     children: Vec::new(),
                     child: Some(ChildNode {
+                        kind,
+                        name: name.clone(),
+                        class: class_of(line),
                         life: Life::Launching,
                         resident: true,
                         runner: None,
@@ -840,6 +996,8 @@ impl Inner {
                     if let Some(child) = state.child_mut(&id) {
                         child.life = Life::Released;
                     }
+                    // Given up before its first round, as a release while launching is.
+                    state.say(&id, |_| Some(AgentState::Cancelled));
                     let launched: Vec<String> = state
                         .agents
                         .get(&id)
@@ -1116,6 +1274,10 @@ impl Inner {
                     owned.started = true;
                     owned.instance = instance;
                 }
+                // A root constructed in its kernel is the class the kernel declared.
+                if constructed.is_some() {
+                    child.class = class_of(line).or(child.class.take());
+                }
                 if let Some(instance) = instance {
                     // Once nothing can refuse the launch, and before the runner can say the
                     // child is ready.
@@ -1243,14 +1405,7 @@ impl Inner {
             result_type: text(&line["result"]["type"]),
             schema: text(&line["result"]["schema"]),
         });
-        let mut state = self.state();
-        // A round running now is one it spans.
-        let rounds = state
-            .child(&child)
-            .and_then(|node| node.round)
-            .into_iter()
-            .collect();
-        state.requests.insert(
+        let early = self.state().record(
             id,
             Record {
                 child: child.clone(),
@@ -1261,17 +1416,10 @@ impl Inner {
                     Req::Unread
                 },
                 attempts: 0,
-                rounds,
+                rounds: Vec::new(),
                 submission,
             },
         );
-        if let Some(node) = state.child_mut(&child) {
-            if let Some(channel) = &channel {
-                *node.delivered.entry(channel.clone()).or_default() += 1;
-            }
-            node.wake.notify_one();
-        }
-        drop(state);
         self.events_of(&child).emit(Payload::AgentRequestSent {
             request: AgentRequestId::new(id),
             channel,
@@ -1279,6 +1427,10 @@ impl Inner {
             body: line["body"].as_str().unwrap_or_default().to_string(),
             attempts_max: line["attempts"].as_u64().unwrap_or_default() as u32,
         });
+        // Its end came first: heard now, after the request it ends.
+        if let Some(ended) = early {
+            self.ended(&ended);
+        }
     }
 
     /// A typed call `caller`'s code made -- `@outrig.agent`'s -- whose child
@@ -1526,6 +1678,7 @@ impl Inner {
         let (child, attempts, rounds) = {
             let mut state = self.state();
             let Some(record) = state.requests.get_mut(&id) else {
+                state.ended_early(id, line);
                 return;
             };
             // Told again, for a settle sent again: it ended once.
@@ -2180,6 +2333,19 @@ fn given(facilities: &Value) -> Option<Vec<Given>> {
     )
 }
 
+/// The class the child a spawn line launches is an instance of, as `module.qualname`: its
+/// instance's, as its kernel declared it, or, for a root its owner constructs and its kernel has
+/// not yet declared, the class the construction names. `None` for a child no instance's.
+fn class_of(line: &Value) -> Option<String> {
+    let instance = &line["instance"];
+    match (instance["module"].as_str(), instance["qualname"].as_str()) {
+        (Some(module), Some(qualname)) => Some(format!("{module}.{qualname}")),
+        _ => line["construct"]["class"]
+            .as_str()
+            .map(|class| class.replacen(':', ".", 1)),
+    }
+}
+
 fn text(value: &Value) -> String {
     value.as_str().unwrap_or_default().to_string()
 }
@@ -2191,42 +2357,17 @@ pub(crate) type Registry = Weak<Inner>;
 mod tests {
     use super::*;
 
-    /// A registry holding one child `c1`, in `life`, with one request open on it.
+    /// A registry holding one child `c1` of the primary's, in `life`, with one request open on
+    /// it.
     fn state_of(life: Life) -> State {
         let mut state = State::default();
-        state.agents.insert(
-            "c1".to_string(),
-            Node {
-                parent: Some("primary".to_string()),
-                depth: 2,
-                model: "sonnet".to_string(),
-                slot: CallSlot::default(),
-                children: Vec::new(),
-                child: Some(ChildNode {
-                    life,
-                    resident: true,
-                    runner: None,
-                    abort: None,
-                    wake: Arc::new(Notify::new()),
-                    delivered: BTreeMap::new(),
-                    round: None,
-                    instance: None,
-                    status: watch::Sender::new(Snapshot::launching(0)),
-                }),
-                invocations: Vec::new(),
-            },
-        );
-        state.requests.insert(
-            1,
-            Record {
-                child: "c1".to_string(),
-                channel: Some("fizz".to_string()),
-                state: Req::Unread,
-                attempts: 0,
-                rounds: Vec::new(),
-                submission: None,
-            },
-        );
+        place(&mut state, "primary", None, 1, None);
+        let c1 = ChildNode {
+            life,
+            ..child(ChildKind::Request, "c", None)
+        };
+        place(&mut state, "c1", Some("primary"), 2, Some(c1));
+        ask(&mut state, 1, "c1", Req::Unread);
         state
     }
 
@@ -2248,5 +2389,334 @@ mod tests {
         let child = state.child("c1").expect("the child");
         assert_eq!((child.life, child.round), (Life::Running, Some(3)));
         assert_eq!(state.requests[&1].rounds, [3]);
+    }
+
+    /// Agent `id` under `parent`, at `depth`, on `fast`, a child when `child` is one.
+    fn place(
+        state: &mut State,
+        id: &str,
+        parent: Option<&str>,
+        depth: u32,
+        child: Option<ChildNode>,
+    ) {
+        state.agents.insert(
+            id.to_string(),
+            Node {
+                parent: parent.map(str::to_string),
+                depth,
+                model: "fast".to_string(),
+                slot: CallSlot::default(),
+                children: Vec::new(),
+                child,
+                invocations: Vec::new(),
+            },
+        );
+        if let Some(node) = parent.and_then(|parent| state.agents.get_mut(parent)) {
+            node.children.push(id.to_string());
+        }
+    }
+
+    /// A child of `kind` named `name`, an instance of `class` when there is one, idle.
+    fn child(kind: ChildKind, name: &str, class: Option<&str>) -> ChildNode {
+        ChildNode {
+            kind,
+            name: name.to_string(),
+            class: class.map(str::to_string),
+            life: Life::Idle,
+            resident: true,
+            runner: None,
+            abort: None,
+            wake: Arc::new(Notify::new()),
+            delivered: BTreeMap::new(),
+            round: None,
+            instance: None,
+            status: watch::Sender::new(Snapshot::launching(0)),
+        }
+    }
+
+    /// Request `id` made of `child`, as `req` leaves it, recorded.
+    fn ask(state: &mut State, id: u64, child: &str, req: Req) {
+        state.record(id, asked(child, req));
+    }
+
+    /// A request made of `child`, as `req` leaves it.
+    fn asked(child: &str, req: Req) -> Record {
+        let channel = (req != Req::Queued).then(|| "ask".to_string());
+        Record {
+            child: child.to_string(),
+            channel,
+            state: req,
+            attempts: 0,
+            rounds: Vec::new(),
+            submission: None,
+        }
+    }
+
+    fn row<'a>(roster: &'a Roster, id: &str) -> &'a AgentRow {
+        roster
+            .agents
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap_or_else(|| panic!("{id} is not listed: {roster:?}"))
+    }
+
+    /// The program that owns the session is no agent; its root, and what the root launched, are
+    /// listed in the tree's order, each with what it holds: every request not ended, a work
+    /// child's waiting submissions included, where its summary keeps the one it works on. A child
+    /// whose kernel is gone is not listed, and a child it launched whose kernel is not gone is.
+    #[test]
+    fn the_roster_lists_the_tree_and_what_each_child_holds() {
+        let mut state = State::default();
+        place(&mut state, OWNER, None, 0, None);
+        place(
+            &mut state,
+            "c1",
+            Some(OWNER),
+            1,
+            Some(child(
+                ChildKind::Request,
+                "Reviewer",
+                Some("app.agents.Reviewer"),
+            )),
+        );
+        place(
+            &mut state,
+            "c2",
+            Some("c1"),
+            2,
+            Some(child(ChildKind::Work, "w", None)),
+        );
+        place(
+            &mut state,
+            "c3",
+            Some("c1"),
+            2,
+            Some(child(ChildKind::Request, "k", None)),
+        );
+        let mut gone = child(ChildKind::Request, "f", Some("app.agents.Fizzer"));
+        gone.resident = false;
+        place(&mut state, "c4", Some("c1"), 2, Some(gone));
+        place(
+            &mut state,
+            "c5",
+            Some("c4"),
+            3,
+            Some(child(ChildKind::Request, "i", Some("x.I"))),
+        );
+        for (id, req) in [
+            (1, Req::Received(Instant::now())),
+            (2, Req::Queued),
+            (3, Req::Queued),
+            (4, Req::Ended(RequestEnd::Accepted)),
+        ] {
+            ask(&mut state, id, "c2", req);
+        }
+        for (id, req) in [
+            (5, Req::Unread),
+            (6, Req::Received(Instant::now())),
+            (7, Req::Ended(RequestEnd::Cancelled)),
+        ] {
+            ask(&mut state, id, "c3", req);
+        }
+        state.seq = 9;
+        let roster = state.roster();
+        assert_eq!(roster.seq, 9);
+        let ids: Vec<&str> = roster.agents.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["c1", "c2", "c3", "c5"]);
+        let root = row(&roster, "c1");
+        assert_eq!(
+            (&root.kind, &root.parent, root.depth, root.name.as_deref()),
+            (
+                &AgentKind::Root {
+                    class: "app.agents.Reviewer".to_string()
+                },
+                &Some(Parent::Owner),
+                1,
+                Some("Reviewer")
+            )
+        );
+        assert_eq!(root.outstanding, Some(Outstanding::default()));
+        assert_eq!(root.state, Some(RosterState::Agent(AgentState::Launching)));
+        assert_eq!((&root.last_stop, root.model.as_str()), (&None, "fast"));
+        let work = row(&roster, "c2");
+        assert_eq!(work.kind, AgentKind::Work);
+        assert_eq!(work.parent, Some(Parent::Agent("c1".to_string())));
+        let held = work.outstanding.expect("a child's");
+        assert_eq!((held.unread, held.queued, held.taken), (0, 2, 1));
+        assert_eq!(
+            state.summary("c2", ChildKind::Work).held(),
+            BTreeSet::from([1])
+        );
+        let request = row(&roster, "c3");
+        assert_eq!(request.kind, AgentKind::Request { class: None });
+        let held = request.outstanding.expect("a child's");
+        assert_eq!((held.unread, held.queued, held.taken), (1, 0, 1));
+        assert_eq!(
+            row(&roster, "c5").kind,
+            AgentKind::Request {
+                class: Some("x.I".to_string())
+            }
+        );
+    }
+
+    /// The primary agent is listed with no state, no stop and nothing outstanding: its owner
+    /// drives its rounds.
+    #[test]
+    fn the_primary_is_listed_with_no_state() {
+        let mut state = State::default();
+        place(&mut state, "primary", None, 1, None);
+        place(
+            &mut state,
+            "c1",
+            Some("primary"),
+            2,
+            Some(child(ChildKind::Work, "w", None)),
+        );
+        let roster = state.roster();
+        let primary = &roster.agents[0];
+        assert_eq!(
+            (
+                primary.id.as_str(),
+                &primary.kind,
+                &primary.parent,
+                primary.depth
+            ),
+            ("primary", &AgentKind::Primary, &None, 1)
+        );
+        assert_eq!(
+            (
+                &primary.name,
+                &primary.state,
+                &primary.last_stop,
+                &primary.outstanding
+            ),
+            (&None, &None, &None, &None)
+        );
+        assert_eq!(
+            roster.agents[1].parent,
+            Some(Parent::Agent("primary".to_string()))
+        );
+        assert!(State::default().roster().agents.is_empty());
+    }
+
+    /// A child's last stop is the latest state at rest it came to, kept while a round runs.
+    #[test]
+    fn a_childs_last_stop_outlasts_its_next_round() {
+        let mut state = state_of(Life::Idle);
+        state.say("c1", |_| Some(AgentState::Idle { round: 1 }));
+        state.say("c1", |_| Some(AgentState::Running { round: 2 }));
+        let roster = state.roster();
+        let row = row(&roster, "c1");
+        assert_eq!(
+            row.state,
+            Some(RosterState::Agent(AgentState::Running { round: 2 }))
+        );
+        assert_eq!(row.last_stop, Some(AgentState::Idle { round: 1 }));
+        assert_eq!(roster.seq, 2);
+    }
+
+    /// A released child reads `releasing` while its kernel is there, `wedged` once its kernel
+    /// did not end, and is dropped once the kernel is gone. The close's release reads the same;
+    /// an interpreter that died leaves each child `terminated`.
+    #[test]
+    fn a_released_child_is_listed_until_its_kernel_is_gone() {
+        let mut state = state_of(Life::Idle);
+        state.say("c1", |_| Some(AgentState::Idle { round: 1 }));
+        state.mark_released(&["c1".to_string()]);
+        let releasing = state.roster();
+        assert_eq!(row(&releasing, "c1").state, Some(RosterState::Releasing));
+        assert_eq!(row(&releasing, "c1").last_stop, Some(AgentState::Released));
+        state.child_mut("c1").expect("the child").life = Life::Wedged;
+        assert_eq!(row(&state.roster(), "c1").state, Some(RosterState::Wedged));
+        state.child_mut("c1").expect("the child").resident = false;
+        assert!(state.roster().agents.iter().all(|row| row.id != "c1"));
+
+        let mut closed = state_of(Life::Running);
+        closed.say("c1", |_| Some(AgentState::Released));
+        assert_eq!(
+            row(&closed.roster(), "c1").state,
+            Some(RosterState::Releasing)
+        );
+        let mut died = state_of(Life::Running);
+        died.say("c1", |_| Some(AgentState::Terminated));
+        assert_eq!(
+            row(&died.roster(), "c1").state,
+            Some(RosterState::Agent(AgentState::Terminated))
+        );
+    }
+
+    /// A request heard of after the close was made before the interpreter heard of it, and is
+    /// the close's to end: the report lists it, so a roster taken after the close lists nothing
+    /// outstanding the report does not. One heard of before the close is listed by the close.
+    #[test]
+    fn a_request_heard_of_after_the_close_is_the_reports() {
+        let mut state = state_of(Life::Running);
+        state.closed = Some(ClosedBy::Owner);
+        ask(&mut state, 2, "c1", Req::Unread);
+        assert_eq!(state.at_close, [2]);
+        let held = row(&state.roster(), "c1").outstanding.expect("a child's");
+        assert_eq!(
+            held.unread, 2,
+            "request 1, which the close's own list holds, and 2"
+        );
+    }
+
+    /// An end the interpreter told of before the request it ends, once admission closed, is
+    /// kept, and handed back as the request is recorded, to be heard after it; one told before
+    /// the close, when no such end can come, is not kept.
+    #[test]
+    fn an_end_told_before_its_request_is_heard_after_it() {
+        let mut state = state_of(Life::Running);
+        let end = json!({"t": "agent.ended", "request": 2, "outcome": "closed"});
+        state.ended_early(2, &end);
+        assert_eq!(state.record(2, asked("c1", Req::Unread)), None);
+        state.closed = Some(ClosedBy::Owner);
+        let end = json!({"t": "agent.ended", "request": 3, "outcome": "closed"});
+        state.ended_early(3, &end);
+        assert_eq!(state.record(3, asked("c1", Req::Unread)), Some(end));
+        assert!(state.early.is_empty());
+    }
+
+    /// A child whose parent's node is gone -- a root whose construction failed after launching
+    /// it, the child wedged as the failure released it -- still counts against `children-max`,
+    /// and is listed after the tree, in launch order, with what it launched below it.
+    #[test]
+    fn a_child_whose_parent_is_gone_is_listed_after_the_tree() {
+        let mut state = State::default();
+        place(&mut state, OWNER, None, 0, None);
+        place(
+            &mut state,
+            "c12",
+            Some(OWNER),
+            1,
+            Some(child(ChildKind::Request, "R", None)),
+        );
+        for (id, parent) in [("c10", "c9"), ("c2", "c1")] {
+            let wedged = ChildNode {
+                life: Life::Wedged,
+                ..child(ChildKind::Request, id, None)
+            };
+            place(&mut state, id, Some(parent), 2, Some(wedged));
+        }
+        place(
+            &mut state,
+            "c3",
+            Some("c2"),
+            3,
+            Some(child(ChildKind::Work, "w", None)),
+        );
+        let roster = state.roster();
+        assert_eq!(
+            roster
+                .agents
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["c12", "c2", "c3", "c10"]
+        );
+        assert_eq!(roster.agents.len(), state.resident());
+        let orphan = row(&roster, "c2");
+        assert_eq!(orphan.parent, Some(Parent::Agent("c1".to_string())));
+        assert_eq!(orphan.state, Some(RosterState::Wedged));
     }
 }

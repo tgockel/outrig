@@ -14,6 +14,7 @@ use super::report::{
     self, EventDelivery, ExecutionOutcome, ExecutionStatus, ShutdownReport, Stopped,
 };
 use super::root::{ConstructSpec, Owner, RootError, RootHandle};
+use super::roster::Roster;
 use super::services::Services;
 use super::skills::{Catalog, SkillBrief};
 use super::{Closed, ClosedBy, Failure, SessionError, UserChannel};
@@ -431,6 +432,20 @@ impl Session {
     /// it is launched and not released.
     pub fn root(&self, id: AgentInstanceId) -> Option<RootHandle> {
         self.owner.get()?.root(id)
+    }
+
+    /// The session's agents at this moment: for each, its id, what it is, its name, what
+    /// launched it and how deep, what it is doing, the latest state at rest it came to, its
+    /// model, and the requests made of it that have not ended (see [`Roster`]).
+    ///
+    /// Read in one hold of the lock the session's record of its agents is changed under, so it
+    /// lags any change by that one lock at most and never mixes two moments; it waits on
+    /// nothing -- not the interpreter, not a kernel busy in code that never yields -- and no event
+    /// subscription, or the lack of one, changes it. Taken once admission has closed, what it
+    /// lists outstanding is in the [`ShutdownReport`]'s `requests`, each ended `closed` or, if the
+    /// interpreter died first, `terminated`; the report, read last, is the last word.
+    pub fn roster(&self) -> Roster {
+        self.children.roster()
     }
 
     /// The root [`SessionBuilder::construct`] constructed as the session

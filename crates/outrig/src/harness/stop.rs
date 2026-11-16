@@ -154,12 +154,14 @@ pub struct RoundSend {
     pub items: Vec<String>,
 }
 
-/// What the registry keeps of one child for its readers: its state, numbered, and its latest
-/// rounds' facts.
+/// What the registry keeps of one child for its readers: its state, numbered, the latest state
+/// at rest it came to, and its latest rounds' facts.
 #[derive(Debug, Clone)]
 pub(crate) struct Snapshot {
     pub(crate) seq: u64,
     pub(crate) state: AgentState,
+    /// The latest state at rest the child came to, `state` included when it is one.
+    pub(crate) last_stop: Option<AgentState>,
     pub(crate) rounds: VecDeque<RoundFacts>,
 }
 
@@ -169,6 +171,7 @@ impl Snapshot {
         Self {
             seq,
             state: AgentState::Launching,
+            last_stop: None,
             rounds: VecDeque::new(),
         }
     }

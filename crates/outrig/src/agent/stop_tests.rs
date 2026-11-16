@@ -27,14 +27,19 @@ async fn ready_root(
     watch: Watch,
     rounds: Responder,
 ) -> (Tree, tempfile::TempDir, RootHandle) {
-    let (tree, app) = owned_watched(
-        var,
-        "",
-        vec![("ROLE reviewer", ready_then(rounds))],
-        watch,
-        |builder| builder,
-    )
-    .await;
+    ready_root_with(var, watch, Vec::new(), rounds).await
+}
+
+/// [`ready_root`], the model calls of the children the root launches answered by `children`.
+pub(super) async fn ready_root_with(
+    var: &str,
+    watch: Watch,
+    children: Vec<(&'static str, Responder)>,
+    rounds: Responder,
+) -> (Tree, tempfile::TempDir, RootHandle) {
+    let mut routes = children;
+    routes.push(("ROLE reviewer", ready_then(rounds)));
+    let (tree, app) = owned_watched(var, "", routes, watch, |builder| builder).await;
     let root = within(tree.session.construct(reviewer()))
         .await
         .expect("constructed");

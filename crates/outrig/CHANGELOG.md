@@ -36,6 +36,22 @@ without touching each other, from one ensured image. [The container facade besid
   turn's results -- is no longer opened again five times and then taken for a broken model: no
   round opens until a request it holds arrives or ends -- taking one in the refused round is no
   change -- and its requests stay open.
+- **The owner reads the session's roster.** `Session::roster()` returns a `Roster`: `seq`, the
+  session's count of changes to its agents' states at the read, and an `AgentRow` per agent in
+  the tree's order -- `id`, `kind` (`Primary`, `Root { class }`, `Request { class }` or `Work`),
+  `name`, `parent` (`Parent::Owner` or `Parent::Agent(id)`), `depth`, `model` as named, and, for a
+  child, `state` (a `RosterState`: the stop read's `AgentState`, `Releasing` between a release and
+  its kernel's end, or `Wedged`), `last_stop`, the latest state at rest, and `outstanding` --
+  `unread`, `queued` and `taken`, every request made of it that has not ended, a work child's
+  waiting submissions included. A child is listed from its launch until its kernel is gone, as
+  `children-max` counts it -- one a failed constructor launched and that outlives its root comes
+  after the tree -- and the primary agent, whose rounds its owner drives, has no state. The
+  roster is read in one hold of the registry's lock, awaits nothing, and adds no event. The
+  shutdown report's `requests` now also lists a request the host heard of only after admission
+  closed, which the close ends `closed`, so a roster taken after the close lists nothing
+  outstanding that the report does not; one whose end the interpreter's close told of before the
+  request itself now ends as it said, where it stayed open and the report called it
+  `terminated`.
 - **An agent class contributes sections to its child's instructions.** `outrig.Section(title,
   text)`, a frozen dataclass, is what the optional `__outrig_instructions__(self)` of an
   `outrig.Agent` subclass returns an iterable of. OutRig calls it once, in the constructor call --

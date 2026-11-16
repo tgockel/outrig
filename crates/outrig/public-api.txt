@@ -1956,6 +1956,13 @@ pub outrig::harness::event::Usage::total_tokens: u64
 impl core::iter::traits::accum::Sum for outrig::harness::event::Usage
 pub fn outrig::harness::event::Usage::sum<I: core::iter::traits::iterator::Iterator<Item = outrig::harness::event::Usage>>(I) -> outrig::harness::event::Usage
 pub const outrig::harness::event::DEFAULT_CAPACITY: usize
+#[non_exhaustive] pub enum outrig::harness::AgentKind
+pub outrig::harness::AgentKind::Primary
+#[non_exhaustive] pub outrig::harness::AgentKind::Request
+pub outrig::harness::AgentKind::Request::class: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub outrig::harness::AgentKind::Root
+pub outrig::harness::AgentKind::Root::class: alloc::string::String
+pub outrig::harness::AgentKind::Work
 #[non_exhaustive] pub enum outrig::harness::AgentState
 pub outrig::harness::AgentState::Cancelled
 #[non_exhaustive] pub outrig::harness::AgentState::Failed
@@ -2011,6 +2018,9 @@ pub outrig::harness::Facility::Service(alloc::string::String)
 impl outrig::harness::Facility
 pub fn outrig::harness::Facility::binding(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::harness::Facility::service(impl core::convert::Into<alloc::string::String>) -> Self
+#[non_exhaustive] pub enum outrig::harness::Parent
+pub outrig::harness::Parent::Agent(alloc::string::String)
+pub outrig::harness::Parent::Owner
 #[non_exhaustive] pub enum outrig::harness::Progress
 pub outrig::harness::Progress::Finished(outrig::harness::Step)
 pub outrig::harness::Progress::Started(outrig::harness::Step)
@@ -2032,6 +2042,10 @@ pub outrig::harness::RootError::Rejected::message: alloc::string::String
 pub outrig::harness::RootError::Rejected::problems: alloc::vec::Vec<outrig::harness::Problem>
 pub outrig::harness::RootError::Released(alloc::string::String)
 pub outrig::harness::RootError::Terminated(alloc::string::String)
+#[non_exhaustive] pub enum outrig::harness::RosterState
+pub outrig::harness::RosterState::Agent(outrig::harness::AgentState)
+pub outrig::harness::RosterState::Releasing
+pub outrig::harness::RosterState::Wedged
 #[non_exhaustive] pub enum outrig::harness::RoundOutcome
 pub outrig::harness::RoundOutcome::Ended(outrig::harness::RoundEnd)
 pub outrig::harness::RoundOutcome::NothingNew
@@ -2076,6 +2090,16 @@ pub outrig::harness::Tasks::Listed::names: alloc::vec::Vec<alloc::string::String
 pub outrig::harness::Verdict::Clean
 pub outrig::harness::Verdict::NotProvenStopped
 pub outrig::harness::Verdict::StoppedWithUnknown
+#[non_exhaustive] pub struct outrig::harness::AgentRow
+pub outrig::harness::AgentRow::depth: u32
+pub outrig::harness::AgentRow::id: alloc::string::String
+pub outrig::harness::AgentRow::kind: outrig::harness::AgentKind
+pub outrig::harness::AgentRow::last_stop: core::option::Option<outrig::harness::AgentState>
+pub outrig::harness::AgentRow::model: alloc::string::String
+pub outrig::harness::AgentRow::name: core::option::Option<alloc::string::String>
+pub outrig::harness::AgentRow::outstanding: core::option::Option<outrig::harness::Outstanding>
+pub outrig::harness::AgentRow::parent: core::option::Option<outrig::harness::Parent>
+pub outrig::harness::AgentRow::state: core::option::Option<outrig::harness::RosterState>
 #[non_exhaustive] pub struct outrig::harness::ApplicationIdentity
 pub outrig::harness::ApplicationIdentity::digest: alloc::string::String
 pub outrig::harness::ApplicationIdentity::label: core::option::Option<alloc::string::String>
@@ -2194,6 +2218,10 @@ pub outrig::harness::OpenWait::return_when: outrig::harness::event::ReturnWhen
 pub outrig::harness::OpenWait::since: std::time::Instant
 pub outrig::harness::OpenWait::timeout: core::option::Option<core::time::Duration>
 pub outrig::harness::OpenWait::wait: u64
+#[non_exhaustive] pub struct outrig::harness::Outstanding
+pub outrig::harness::Outstanding::queued: usize
+pub outrig::harness::Outstanding::taken: usize
+pub outrig::harness::Outstanding::unread: usize
 #[non_exhaustive] pub struct outrig::harness::Problem
 pub outrig::harness::Problem::message: alloc::string::String
 pub outrig::harness::Problem::path: alloc::string::String
@@ -2235,6 +2263,9 @@ pub fn outrig::harness::RootHandle::rounds(&self) -> alloc::vec::Vec<outrig::har
 pub fn outrig::harness::RootHandle::status(&self) -> outrig::harness::Status
 impl core::fmt::Debug for outrig::harness::RootHandle
 pub fn outrig::harness::RootHandle::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::Roster
+pub outrig::harness::Roster::agents: alloc::vec::Vec<outrig::harness::AgentRow>
+pub outrig::harness::Roster::seq: u64
 #[non_exhaustive] pub struct outrig::harness::RoundEnd
 pub outrig::harness::RoundEnd::reasoning: core::option::Option<alloc::string::String>
 pub outrig::harness::RoundEnd::reply: alloc::string::String
@@ -2300,6 +2331,7 @@ pub fn outrig::harness::Session::interrupter(&self) -> core::option::Option<impl
 pub fn outrig::harness::Session::model(&self) -> core::option::Option<&str>
 pub fn outrig::harness::Session::python_version(&self) -> &str
 pub fn outrig::harness::Session::root(&self, outrig::harness::event::AgentInstanceId) -> core::option::Option<outrig::harness::RootHandle>
+pub fn outrig::harness::Session::roster(&self) -> outrig::harness::Roster
 pub async fn outrig::harness::Session::round(&mut self) -> core::result::Result<outrig::harness::RoundOutcome, outrig::harness::SessionError>
 pub async fn outrig::harness::Session::shutdown(self, core::time::Duration) -> outrig::harness::ShutdownReport
 pub async fn outrig::harness::Session::start(outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<outrig::harness::Session, outrig::harness::SessionError>

@@ -505,3 +505,7 @@ mod root_tests;
 #[cfg(test)]
 #[path = "stop_tests.rs"]
 mod stop_tests;
+
+#[cfg(test)]
+#[path = "roster_tests.rs"]
+mod roster_tests;

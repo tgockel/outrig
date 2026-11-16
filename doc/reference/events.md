@@ -489,8 +489,8 @@ The `model.round.*` events say what each round did, for diagnosis. An owner acti
 root it constructed is at rest -- idle, waiting to try a failed call again and until when,
 refused, failed for good, released -- reads it from the root's handle (`RootHandle::status` in
 `outrig::harness`), which the session keeps whether or not anything subscribes, so a dropped
-event changes nothing it reads. The wait between a child's failed rounds is in that read and has
-no event of its own.
+event changes nothing it reads; `Session::roster` reads every agent of the session from the same
+record. The wait between a child's failed rounds is in that read and has no event of its own.
 
 - `model.retry` -- a model call that failed and will be made again, after a wait.
   - `model`: the `[models.<name>]` row being retried.

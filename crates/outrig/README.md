@@ -250,6 +250,33 @@ match stop.state {
 # }
 ```
 
+`Session::roster()` lists every agent of the session at one moment, from the same record, read in
+one hold of its lock: it lags any change by that lock at most and waits on nothing. Each row gives
+the agent's id; its `kind` -- the primary, a root with its class, a request child with its class
+when it is an instance's, or a work child; its name; its `parent`, the owner or an agent's id, and
+its depth; its model as named; and, for a child, its `state` -- the stop read's `AgentState`, or
+`Releasing` between its release and its kernel's end, or `Wedged` once its kernel did not end --
+its `last_stop`, and the requests made of it that have not ended, `unread`, `queued` and `taken`.
+A child is listed from its launch until its kernel is gone, which is what `children-max` counts.
+The primary agent's rounds are its owner's to drive, so its row has no state. Taken once
+admission has closed, what the roster lists outstanding is in the shutdown report's `requests`:
+
+```rust,no_run
+# fn example(session: &outrig::harness::Session) {
+use outrig::harness::{AgentState, RosterState};
+
+for row in session.roster().agents {
+    match &row.state {
+        Some(RosterState::Agent(AgentState::Unavailable { next_attempt, .. })) => {
+            println!("{}: trying again at {next_attempt:?}", row.id)
+        }
+        Some(state) => println!("{}: {state:?}, holding {:?}", row.id, row.outstanding),
+        None => println!("{}: the primary agent", row.id),
+    }
+}
+# }
+```
+
 The application supplies what the root is told of its task and OutRig composes the instructions:
 the class's docstring, then the `outrig.Section(title, text)`s its optional
 `__outrig_instructions__(self)` returns, which Python calls once as the constructor call finishes
