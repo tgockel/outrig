@@ -20,6 +20,7 @@ use std::sync::Arc;
 use clap::{ArgAction, Parser};
 use rig::completion::Message;
 
+use crate::cli::eprint_best_effort;
 use crate::builtin_tool;
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{
@@ -406,7 +407,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         mcp_plan,
     };
 
-    eprintln!("[outrig] entering REPL");
+    eprint_best_effort(format_args!("[outrig] entering REPL\n"));
     // When a watcher is armed, external death of the primary ends the REPL
     // with an error instead of leaving the agent talking to dead tools.
     let primary_died = async {
@@ -509,7 +510,7 @@ async fn run_repl(session: ReplSession<'_>) -> Result<i32> {
             // reach the user as pure silence.
             result.map(|end| {
                 if end.is_silent() {
-                    eprintln!("{}", end.silent_report());
+                    eprint_best_effort(format_args!("{}\n", end.silent_report()));
                     // A turn with reasoning is in the history for "continue" to
                     // pick up from, but the reasoning itself may not reach the
                     // model: providers commonly leave an earlier turn's
@@ -524,10 +525,10 @@ async fn run_repl(session: ReplSession<'_>) -> Result<i32> {
                         "but say what you need again rather than referring back, as the \
                          model may not see this turn"
                     };
-                    eprintln!(
+                    eprint_best_effort(format_args!(
                         "[outrig] send another prompt (e.g. \"continue\") to keep going, \
-                         or \"/reset\" to start over -- {caveat}."
-                    );
+                         or \"/reset\" to start over -- {caveat}.\n"
+                    ));
                     // Whitespace is exact-non-empty, so returning it would
                     // put a stray blank line on stdout directly under the
                     // report that just said the turn produced nothing. A turn
@@ -1093,7 +1094,7 @@ struct StartupBanner<'a> {
 }
 
 fn print_banner(banner: StartupBanner<'_>) {
-    eprint!("{}", render_banner(banner));
+    eprint_best_effort(format_args!("{}", render_banner(banner)));
 }
 
 /// Split from `print_banner` so the lines it claims can be asserted on. Every

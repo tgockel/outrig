@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `run` and `mcp` no longer panic when stderr rejects a workspace note, startup
+  banner, warning, or final error (for example, a broken pipe or `/dev/full`).
+  Failed diagnostics are dropped without changing the command's exit status. (#907)
+
 - **`discard` now preserves sessions when Podman cannot determine their running state.**
   Engine-query failures abort before removal instead of deleting the record, logs, and launcher
   of a potentially running session. (#877)

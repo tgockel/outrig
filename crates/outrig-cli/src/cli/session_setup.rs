@@ -26,11 +26,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::cli::eprint_best_effort;
 use crate::builtin_image;
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::signals::{self, Signals};
@@ -68,28 +68,19 @@ pub(crate) struct ProgressSpan {
 impl ProgressSpan {
     pub(crate) fn start(label: impl Into<String>) -> Self {
         let label = label.into();
-        progress_line(format_args!("[outrig] {label}"));
+        eprint_best_effort(format_args!("[outrig] {label}\n"));
         Self {
             started: Instant::now(),
         }
     }
 
     pub(crate) fn done(self, message: impl AsRef<str>) {
-        progress_line(format_args!(
-            "[outrig] {} ({})",
+        eprint_best_effort(format_args!(
+            "[outrig] {} ({})\n",
             message.as_ref(),
             format_elapsed(self.started.elapsed())
         ));
     }
-}
-
-/// One progress line on stderr, dropped if stderr cannot take it. `eprintln!`
-/// panics on a failed write, and a reader that closes its end of the pipe
-/// mid-startup would then end the command partway -- before a `show-merged`
-/// table is printed or the session is finalized -- over lines it chose not to
-/// read.
-fn progress_line(line: std::fmt::Arguments<'_>) {
-    let _ = writeln!(std::io::stderr(), "{line}");
 }
 
 pub(crate) fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
@@ -416,12 +407,12 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         // the working directory by default, whether or not `--config`
         // supplied the settings.
         if declared || own_config {
-            eprintln!("[outrig] workspace: {}", workspace.display());
+            eprint_best_effort(format_args!("[outrig] workspace: {}\n", workspace.display()));
         } else {
-            eprintln!(
-                "[outrig] no repo config found; using current directory as workspace ({})",
+            eprint_best_effort(format_args!(
+                "[outrig] no repo config found; using current directory as workspace ({})\n",
                 workspace.display()
-            );
+            ));
         }
     }
     let network_mode = args.network_mode_override.unwrap_or(cfg.network.mode());
@@ -494,13 +485,13 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         let injection = builtin_image::inject(cfg);
         used_builtin_default = injection.applied;
         if injection.applied && announce {
-            eprintln!(
+            eprint_best_effort(format_args!(
                 "[outrig] no --image, agent image, or default-image configured; \
-                 using outrig's built-in default"
-            );
+                 using outrig's built-in default\n"
+            ));
         }
         for note in &injection.notes {
-            eprintln!("[outrig] {note}");
+            eprint_best_effort(format_args!("[outrig] {note}\n"));
         }
         injection.resolved
     };
@@ -1066,9 +1057,9 @@ async fn setup_sidecars(
 
         if !args.start_sidecars || sc.start != SidecarStart::Auto {
             if args.start_sidecars && plan.servers_in(&name).next().is_some() {
-                eprintln!(
-                    "[outrig] sidecar {name} is start = \"manual\"; skipping its MCP servers"
-                );
+                eprint_best_effort(format_args!(
+                    "[outrig] sidecar {name} is start = \"manual\"; skipping its MCP servers\n"
+                ));
             }
             continue;
         }
@@ -1421,11 +1412,11 @@ fn warn_or_bail(plan: &SessionMcpPlan, sc: &SidecarPlan, e: crate::error::CliErr
     }
     let server_count = plan.servers_in(&sc.name).count();
     let server_word = plural(server_count, "server", "servers");
-    eprintln!(
+    eprint_best_effort(format_args!(
         "[outrig] warning: sidecar {}: {e}; skipping the sidecar and its \
-         {server_count} MCP {server_word}",
+         {server_count} MCP {server_word}\n",
         sc.name
-    );
+    ));
     Ok(())
 }
 
@@ -1851,10 +1842,10 @@ pub async fn connect_mcp_clients(
                     return Err(e.into());
                 }
                 let sc = sidecar_name.expect("warn on-failure implies a sidecar placement");
-                eprintln!(
+                eprint_best_effort(format_args!(
                     "[outrig] warning: sidecar {sc}: MCP server {mcp_name} failed to \
-                     start: {e}; skipping the sidecar and its servers"
-                );
+                     start: {e}; skipping the sidecar and its servers\n"
+                ));
                 let mut kept = Vec::with_capacity(connected.len());
                 for (tag, arc) in connected.drain(..) {
                     if tag.as_deref() == Some(sc.as_str()) {

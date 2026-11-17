@@ -31,6 +31,7 @@ use rmcp::transport::streamable_http_server::{
 use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
 
+use crate::cli::eprint_best_effort;
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{
     self, SessionContainers, SessionRuntime, SessionSetup, SessionSetupArgs,
@@ -376,7 +377,7 @@ async fn serve_stdio_transport(
             ct.clone(),
         ))
         .await?;
-    eprintln!("[outrig] mcp server ready");
+    eprint_best_effort(format_args!("[outrig] mcp server ready\n"));
 
     let mut waiter = tokio::spawn(service.waiting());
     let mut monitor = Box::pin(monitor_session(monitor));
@@ -436,9 +437,9 @@ async fn serve_http_transport(
             let listener = tokio::net::TcpListener::bind(addr).await?;
             let bound = ListenAddr::Tcp(listener.local_addr()?);
             if let Some(warning) = listen_exposure_warning(&bound) {
-                eprintln!("{warning}");
+                eprint_best_effort(format_args!("{warning}\n"));
             }
-            eprintln!("[outrig] listen: {}", listen_endpoint(&bound));
+            eprint_best_effort(format_args!("[outrig] listen: {}\n", listen_endpoint(&bound)));
             let router =
                 streamable_http_router(proxy, &bound, ct.child_token(), session_manager.clone());
             let shutdown = http_shutdown(ct.clone());
@@ -467,7 +468,7 @@ async fn serve_unix_http_transport(
     let listener = signals
         .race(start_unix_listener(path, Duration::from_secs(5)))
         .await?;
-    eprintln!("[outrig] listen: unix:{}", path.display());
+    eprint_best_effort(format_args!("[outrig] listen: unix:{}\n", path.display()));
     let shutdown = http_shutdown(ct.clone());
     let server = axum::serve(listener, router).with_graceful_shutdown(shutdown);
     wait_for_http_shutdown(server, ct, monitor, signals).await
@@ -592,7 +593,7 @@ async fn wait_for_http_shutdown<F>(
 where
     F: IntoFuture<Output = std::io::Result<()>>,
 {
-    eprintln!("[outrig] mcp server ready");
+    eprint_best_effort(format_args!("[outrig] mcp server ready\n"));
     let mut server = Box::pin(server.into_future());
     let mut monitor = Box::pin(monitor_session(monitor));
 
@@ -1310,7 +1311,7 @@ struct StartupBanner<'a> {
 }
 
 fn print_banner(banner: StartupBanner<'_>) {
-    eprint!("{}", render_banner(banner));
+    eprint_best_effort(format_args!("{}", render_banner(banner)));
 }
 
 /// Split from `print_banner` for the same reason as `run`'s: the built-in

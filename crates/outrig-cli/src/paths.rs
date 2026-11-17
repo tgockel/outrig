@@ -5,6 +5,7 @@ use std::io::{ErrorKind, Write as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
+use crate::cli::eprint_best_effort;
 use directories::{BaseDirs, ProjectDirs};
 use nix::libc;
 use tempfile::NamedTempFile;
@@ -351,7 +352,7 @@ impl RepoConfig {
 /// aside. stderr because `outrig mcp` speaks JSON-RPC on stdout.
 pub(crate) fn report_config_warnings(cfg: &Config) {
     for warning in cfg.warnings() {
-        eprintln!("[outrig] warning: {warning}");
+        eprint_best_effort(format_args!("[outrig] warning: {warning}\n"));
     }
 }
 
@@ -690,7 +691,7 @@ fn global_config_link_warning(global: &Path) -> Option<String> {
 /// line on stderr, which `outrig mcp` leaves free of JSON-RPC.
 pub(crate) fn warn_if_global_config_is_hard_linked(global: Option<&Path>) {
     if let Some(warning) = global.and_then(global_config_link_warning) {
-        eprintln!("[outrig] warning: {warning}");
+        eprint_best_effort(format_args!("[outrig] warning: {warning}\n"));
     }
 }
 

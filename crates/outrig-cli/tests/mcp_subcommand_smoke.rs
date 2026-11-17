@@ -1010,6 +1010,74 @@ async fn mcp_show_merged_survives_stderr_closing_mid_startup() {
     );
 }
 
+/// Unlike the mid-startup test, the reader is gone before spawn, so the
+/// workspace note itself must tolerate EPIPE (#907). `/dev/full` covers ENOSPC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_show_merged_survives_stderr_failing_from_startup() {
+    let image = ensure_fixture_image().await;
+    for repo_config in [false, true] {
+        for full in [false, true] {
+            if full && !cfg!(target_os = "linux") {
+                continue;
+            }
+            let repo = tempfile::tempdir().expect("repo");
+            if repo_config {
+                let dir = repo.path().join(".agents/outrig");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("config.toml"), "").unwrap();
+            }
+            let sessions = tempfile::tempdir().expect("sessions");
+            let global = common::EmptyGlobalConfig::new();
+            let stderr: Stdio = if full {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/full")
+                    .unwrap()
+                    .into()
+            } else {
+                let (reader, writer) = std::io::pipe().unwrap();
+                drop(reader);
+                writer.into()
+            };
+            let child = Command::new(env!("CARGO_BIN_EXE_outrig"))
+                .arg("--global-config")
+                .arg(global.path())
+                .arg("--session-root")
+                .arg(sessions.path())
+                .args(["mcp", "show-merged", "--image", image.as_str()])
+                .current_dir(repo.path())
+                .env_remove("RUST_LOG")
+                .env_remove("RUST_BACKTRACE")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(stderr)
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn show-merged");
+            let output = timeout(E2E_TIMEOUT, child.wait_with_output())
+                .await
+                .expect("show-merged must exit")
+                .expect("wait for show-merged");
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "[mcp]\n");
+            let listed = SessionStore::new(sessions.path().to_path_buf())
+                .list()
+                .expect("list sessions")
+                .sessions;
+            assert_eq!(listed.len(), 1, "{listed:?}");
+            let session = &listed[0];
+            assert!(session.ended_at.is_some(), "{session:?}");
+            assert_eq!(session.exit_code, Some(0), "{session:?}");
+            assert!(
+                !podman_names(&format!("name={}", session.container_name))
+                    .await
+                    .contains(&session.container_name),
+                "container left behind"
+            );
+        }
+    }
+}
+
 /// Run `outrig mcp <args> --env no_such_server:DEBUG=1` with stdin closed and
 /// assert it fails with the undeclared-server error. Returns the session
 /// records left under `session_root`.

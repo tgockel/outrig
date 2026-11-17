@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::Directive;
 
+use crate::cli::eprint_best_effort;
 use crate::cli::build::{self, BuildArgs};
 use crate::cli::clean::{self, CleanArgs};
 use crate::cli::design_prompt::{self, DesignArgs, DesignCommand};
@@ -164,7 +165,7 @@ pub fn run() -> ExitCode {
                 // A signal announced itself as it landed, and the terminal it
                 // would be reported to may be gone.
                 if !matches!(e, CliError::Interrupted(_)) {
-                    eprintln!("error: {e}");
+                    eprint_best_effort(format_args!("error: {e}\n"));
                 }
                 ExitCode::from(e.exit_code().clamp(0, 255) as u8)
             }

@@ -24,6 +24,18 @@ use std::path::{Path, PathBuf};
 use crate::error::{OutrigError, Result};
 use crate::session::{DanglingLink, Session, SessionId, SessionStore, SkippedSession};
 
+/// Write a diagnostic to stderr, dropping write errors rather than panicking.
+/// A closed reader or a full device must not abort startup, skip teardown, or
+/// replace a command's exit status over output the user cannot receive.
+///
+/// Include any newline in `args`. Like an ordinary stderr write, this can
+/// block on a full pipe with a live reader; it does not impose a timeout.
+/// Writers that can overlap a REPL prompt must use `crate::notice` instead.
+pub(crate) fn eprint_best_effort(args: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let _ = std::io::stderr().write_fmt(args);
+}
+
 /// What a `<session>` argument names: a readable session, a `--session-dir`
 /// link whose directory is gone, or an entry whose record cannot be read.
 pub enum Found {
