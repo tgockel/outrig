@@ -1560,7 +1560,7 @@ fn sidecar_container_name(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> String
 /// binds later than that -- an automatic one after its own image work, which
 /// is a cold build's worth of minutes, and one from `/sidecar add` whenever
 /// the session asks for it. A source directory replaced in between is caught
-/// here rather than mounted unchecked (#732).
+/// here rather than mounted unchecked (#732, #903).
 fn recheck_sidecar_mounts(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> Result<()> {
     Ok(recheck_pinned_mounts(pinned_mounts_for_sidecar(
         ctx.pinned_mounts,
@@ -2262,6 +2262,153 @@ lint = { command = ["mcp-lint"], sidecar = "lint" }
         let text = err.to_string();
         assert!(text.contains("sidecar \"tools\" mount"), "{text}");
         assert!(text.contains(&other.display().to_string()), "{text}");
+    }
+
+    /// Pin a workspace as setup does, then simulate a replacement after the
+    /// primary's successful recheck. No sidecar-specific mount is involved:
+    /// the workspace pin alone must protect both sidecar creation paths (#903).
+    fn replaced_sidecar_workspace(
+        root: &Path,
+        declared: bool,
+        access: &str,
+    ) -> (PathBuf, PathBuf, Config, Vec<PinnedMount>) {
+        let repo = root.join("repo");
+        let file = crate::paths::repo_config_path(&repo);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let workspace = if declared { root.join("ws") } else { repo.clone() };
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace_config = if declared {
+            format!("[workspace]\nhost-path = {:?}\n", workspace)
+        } else {
+            String::new()
+        };
+        std::fs::write(
+            &file,
+            format!(
+                "{workspace_config}\n[images.x]\ndockerfile = \"D\"\ncontext = \".\"\n\n\
+                 [images.x.mcp]\nfs = {{ command = [\"mcp-fs\"], sidecar = \"tools\" }}\n\n\
+                 [sidecars.tools]\nimage = \"img\"\nworkspace = {access:?}\n"
+            ),
+        )
+        .unwrap();
+        let mut cfg = Config::load_unvalidated(&repo, None).unwrap();
+        let mut pinned = pin_repo_declared_mounts(&mut cfg, &repo, None).unwrap();
+        if !declared {
+            pinned.push(pin_default_workspace(&workspace, &repo, None).unwrap());
+        }
+        assert_eq!(pinned.len(), 1, "only the workspace is pinned");
+        recheck_pinned_mounts(&pinned).expect("the primary's check passes");
+
+        let conf = root.join("conf");
+        std::fs::create_dir_all(&conf).unwrap();
+        std::fs::write(conf.join("config.toml"), "# operator config\n").unwrap();
+        std::fs::rename(&workspace, root.join("workspace.moved")).unwrap();
+        std::os::unix::fs::symlink(&conf, &workspace).unwrap();
+        (repo, workspace, cfg, pinned)
+    }
+
+    /// `start_one_sidecar` is shared by automatic exec sidecars and
+    /// `launch_declared_sidecar` (the `/sidecar add` path). A workspace swap
+    /// must fail here before either caller can hand the bind to Podman.
+    #[tokio::test]
+    async fn a_sidecar_whose_workspace_was_replaced_is_refused_before_run() {
+        for declared in [false, true] {
+            for access in ["ro", "rw"] {
+                let tmp = tempfile::tempdir().unwrap();
+                let root = std::fs::canonicalize(tmp.path()).unwrap();
+                let (repo, workspace, cfg, pinned) =
+                    replaced_sidecar_workspace(&root, declared, access);
+                let plan = sidecar::plan_from_config(&cfg, &cfg.images["x"]);
+                let sc = &plan.sidecars["tools"];
+                let ctx = SidecarStartCtx {
+                    cfg: &cfg,
+                    repo_root: &repo,
+                    pinned_mounts: &pinned,
+                    sid: "test",
+                    instance_salt: "salt",
+                    host_workspace: &workspace,
+                    container_workspace: Path::new("/workspace"),
+                    transcript: None,
+                };
+                let mut abandoned = Vec::new();
+                let err = start_one_sidecar(&ctx, &ImageTag::new("img"), sc, false, &mut abandoned)
+                    .await
+                    .expect_err("a replaced workspace refuses the sidecar");
+                let text = err.to_string();
+                assert!(text.contains("refusing workspace"), "{text}");
+                assert!(text.contains(&root.join("conf").display().to_string()), "{text}");
+                assert!(abandoned.is_empty(), "no container was created: {text}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_entrypoint_sidecar_whose_workspace_was_replaced_is_refused_before_create() {
+        for declared in [false, true] {
+            for access in ["ro", "rw"] {
+                let tmp = tempfile::tempdir().unwrap();
+                let root = std::fs::canonicalize(tmp.path()).unwrap();
+                let (repo, workspace, cfg, pinned) =
+                    replaced_sidecar_workspace(&root, declared, access);
+                let plan = sidecar::plan_from_config(&cfg, &cfg.images["x"]);
+                let sid = SessionId::from("test".to_string());
+                let cli_env = CliEnvEntries::parse(&[]).unwrap();
+                let args = SidecarPhaseArgs {
+                    cfg: &cfg,
+                    repo_root: &repo,
+                    pinned_mounts: &pinned,
+                    instance_salt: "salt",
+                    image_cfg_name: "x",
+                    image_cfg: &cfg.images["x"],
+                    sid: &sid,
+                    host_workspace: &workspace,
+                    container_workspace: Path::new("/workspace"),
+                    session_dir: &root.join("session"),
+                    intercept_dns: false,
+                    start_sidecars: true,
+                    cli_env: &cli_env,
+                    transcript: None,
+                };
+                let err = create_one_entrypoint_sidecar(
+                    &args,
+                    &ImageTag::new("img"),
+                    &plan.sidecars["tools"],
+                    "fs",
+                    &McpServerSpec::entrypoint_in_sidecar("tools"),
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("a replaced workspace refuses the sidecar");
+                let text = err.to_string();
+                assert!(text.contains("refusing workspace"), "{text}");
+                assert!(text.contains(&root.join("conf").display().to_string()), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_sidecar_without_a_workspace_view_ignores_a_replaced_workspace() {
+        for declared in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(tmp.path()).unwrap();
+            let (repo, workspace, cfg, pinned) =
+                replaced_sidecar_workspace(&root, declared, "none");
+            let plan = sidecar::plan_from_config(&cfg, &cfg.images["x"]);
+            let sc = &plan.sidecars["tools"];
+            let ctx = SidecarStartCtx {
+                cfg: &cfg,
+                repo_root: &repo,
+                pinned_mounts: &pinned,
+                sid: "test",
+                instance_salt: "salt",
+                host_workspace: &workspace,
+                container_workspace: Path::new("/workspace"),
+                transcript: None,
+            };
+            recheck_sidecar_mounts(&ctx, sc).expect("this sidecar does not bind the workspace");
+            assert!(sidecar_launch_base(&ctx, sc).workspace.is_none());
+        }
     }
 
     /// A plan of `[images.x]` over `config`, as `setup_sidecars`

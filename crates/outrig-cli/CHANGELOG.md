@@ -38,16 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   initialization do not prevent restarts. Existing lock-file collisions are
   refused without changing their permissions. (#928)
 
-- **A sidecar's repo-declared mounts are checked again right before the sidecar's container is
-  created.** The guards pin each repo-declared mount to the canonical path they validated (#604),
-  and re-resolve the pinned paths just before the primary container starts -- but a sidecar binds
-  later than that: an automatic one after its own image work, which is a cold build's worth of
-  minutes, and a `/sidecar add` one whenever the session asks. A concurrent session's agent with
-  the repo could replace a pinned source directory with a link to the operator's home (or to a
-  directory covering the global config) in that window and have the sidecar bind it. Each sidecar
-  now rechecks what it is about to bind -- the mounts its own block declared, plus the workspace
-  when it has a view onto it -- and a source replaced since the check refuses the sidecar instead
-  of mounting it. (#732)
+- **A sidecar's repo-declared mounts and workspace view are checked again right before its
+  container is created.** The guards pin each repo-declared mount to the canonical path they
+  validated (#604), and re-resolve the pinned paths just before the primary container starts --
+  but a sidecar binds later than that: an automatic one after its own image work, which is a
+  cold build's worth of minutes, and a `/sidecar add` one whenever the session asks. A
+  concurrent session's agent with the repo could replace a pinned source directory with a link
+  to the operator's home (or to a directory covering the global config) in that window and have
+  the sidecar bind it. Each sidecar now rechecks what it is about to bind -- the mounts its own
+  block declared, plus the workspace when it has a view onto it -- and a source replaced since
+  the check refuses the sidecar instead of mounting it. (#732, #903)
 
 - **An MCP server that crashes at startup with an empty stderr log is no longer reported as a
   server that said nothing.** Fixed in `outrig` (#727). `mcp server "probe" ... stderr
