@@ -292,6 +292,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every symlink hop in the global config path is protected.** Default workspaces and
+  repo-declared read-write mounts cannot cover an intermediate link in a chain or a dangling
+  link's target directories. Path resolution follows links one component at a time and refuses
+  symlink loops instead of silently accepting an incomplete reach check. (#608, #649)
+
 - **`outrig run-new`'s status line says what is unread, and that a round failed.** The count of
   the user's messages the agent has not read read `2 waiting for the agent`, which named neither
   messages nor reading and, beside `ready`, read as a contradiction; it now reads `2 messages

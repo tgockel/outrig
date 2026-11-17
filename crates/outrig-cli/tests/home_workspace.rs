@@ -498,3 +498,43 @@ async fn the_home_refusal_comes_before_the_global_config_one() {
     assert!(stderr.contains("it is your home directory"), "{stderr}");
     assert!(!stderr.contains("covers the global config"), "{stderr}");
 }
+
+/// The kernel follows both links on the next config read, so the directory
+/// holding the second link must not be handed to any default workspace (#649).
+#[tokio::test]
+async fn the_second_link_in_a_global_config_chain_is_refused_for_every_command() {
+    let fx = Fixture::new();
+    let proj = fx.home().join("proj");
+    fs::create_dir_all(&proj).unwrap();
+    std::os::unix::fs::symlink(fx.tmp.path().join("cfg"), proj.join("hop")).unwrap();
+    std::os::unix::fs::symlink(proj.join("hop"), fx.home().join("link")).unwrap();
+    let global = fx.home().join("link/global.toml");
+
+    for cmd in ["run", "mcp", "run-new"] {
+        let (ok, stderr) = fx.run_with_global(&proj, &global, &[cmd]).await;
+        assert_refused(&fx, ok, &stderr, &proj);
+        assert!(
+            stderr.contains(&format!("global config path ({})", global.display())),
+            "{stderr}"
+        );
+    }
+}
+
+/// A missing default config can be planted through a dangling symlink. MCP
+/// needs no model from that absent config, so it reaches the mount guard.
+#[tokio::test]
+async fn a_dangling_default_global_config_target_is_refused() {
+    let fx = Fixture::new();
+    let later = fx.home().join("later");
+    fs::create_dir_all(&later).unwrap();
+    std::os::unix::fs::symlink("later/missing/dir", fx.home().join(".outrig")).unwrap();
+    let (ok, stderr) = fx.run_default_global(&later, &["mcp"]).await;
+    assert_refused(&fx, ok, &stderr, &later);
+    assert!(
+        stderr.contains(&format!(
+            "covers the global config ({})",
+            later.join("missing/dir/config.toml").display()
+        )),
+        "{stderr}"
+    );
+}
