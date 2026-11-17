@@ -328,6 +328,31 @@ session.
   the Rust owner's call returns the closed error and a host program's await raises
   `SessionClosing`; the count and the limit are as they were. Invoked: no. Effects: none.
 
+**External channels** (`0003-51`)
+
+- *An item unread in the window* -- pushed by the owner, its holder's code not yet having received
+  it, or the channel held by no agent. Outcome: left where it is, never consumed: the report's
+  `channels` lists it unread by the owner's item id, and the backend is never told of it.
+  Invoked: no. Effects: the backend still holds it, and delivers it again as it chooses.
+- *An item received, its notice not acknowledged* -- the backend's `consumed` refused or not yet
+  answered. Outcome: told again through the drain, a growing pause between tries; one still not
+  acknowledged when the drain ends is listed `unacknowledged`. Invoked: yes, perhaps more than
+  once, which the backend takes as idempotent per item. Effects: the backend may or may not have
+  recorded the position.
+- *A send not yet handed to the backend* -- waiting for one of its channel's eight calls, or made
+  after the close. Outcome: `refused`, and the holder's `send` raises `SessionClosing`; it is
+  listed in the report's `sends`. Invoked: no. Effects: none.
+- *A send the backend holds.* Outcome: it drains: the backend's answer, if it comes within the
+  channel's call timeout and the drain -- `accepted`, `not_accepted`, or `uncertain` -- and
+  `uncertain` when either runs out first, its call dropped. Listed in the report's `sends`; an
+  `uncertain` one makes the verdict `stopped_with_unknown`. Invoked: yes. Effects: an
+  `uncertain` item may have been taken, which only the backend can say.
+- *A push during or after the close.* Outcome: refused `closed`, the session closing; nothing is
+  queued. Invoked: no. Effects: none.
+
+A backend has no process of its own to stop: it is the embedder's object, dropped with the
+session.
+
 **The host program** (`0003-29`)
 
 - *Alive, with the session open.* Outcome: the program's session exit runs this sequence and

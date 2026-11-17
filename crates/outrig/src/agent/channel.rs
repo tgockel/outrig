@@ -24,6 +24,7 @@
 //! no round, and is made again if the round that made it failed
 //! ([`Injected`]).
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -89,10 +90,30 @@ struct Told {
     announced: AtomicU64,
     /// By the last round that ended well.
     kept: AtomicU64,
+    /// The same, of the messages alone, by channel: a child's channels carry
+    /// requests too, whose deliveries are no news of a message, and what one
+    /// channel delivered is no news of what waits on another.
+    messages: std::sync::Mutex<Messages>,
     /// Live objects, by the round in flight, or the last one.
     injections: AtomicUsize,
     /// Live objects, by the last round that ended well.
     injections_kept: AtomicUsize,
+}
+
+/// How many messages each of a child's channels delivered that the model has
+/// been told of.
+#[derive(Default)]
+struct Messages {
+    /// By the round in flight, or the last one.
+    announced: BTreeMap<String, u64>,
+    /// By the last round that ended well.
+    kept: BTreeMap<String, u64>,
+}
+
+impl Told {
+    fn messages(&self) -> std::sync::MutexGuard<'_, Messages> {
+        self.messages.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl Announcer {
@@ -131,16 +152,48 @@ impl Announcer {
         injected[from..].iter().map(orientation::injected).collect()
     }
 
-    /// A child's round opens, telling the model what waits: only what arrives
-    /// from here on is news within it. A live object a failed round told of is
-    /// told of again.
-    pub(crate) fn opened(&self) {
+    /// A child's round opens, telling the model what waits as `channels`
+    /// counted it, the counts the opening's words were read from: only what
+    /// arrives from there on is news within it. A live object a failed round
+    /// told of is told of again.
+    pub(crate) fn opened_at(&self, channels: &Channels) {
         let kept = self.told.injections_kept.load(Ordering::SeqCst);
         self.told.injections.store(kept, Ordering::SeqCst);
-        if let Source::Requests(counts) = &self.source {
-            let delivered = counts().values().map(|counts| counts.delivered).sum();
-            self.told.announced.store(delivered, Ordering::SeqCst);
+        if let Source::Requests(_) = &self.source {
+            self.told
+                .announced
+                .store(delivered(channels), Ordering::SeqCst);
+            self.told.messages().announced = messages(channels).collect();
         }
+    }
+
+    /// Whether `channels`, a child's counts as its announcer reads them, hold a
+    /// message the model has not been told of, by a round that ended well or
+    /// one that was refused: a channel that delivered a message past what it
+    /// was told, and holds one unread. A channel is read in order, so what it
+    /// holds unread then includes the message last delivered. What opens a
+    /// round for a message, which owes no reply and so never enters the rule
+    /// for requests; a request is no news of one.
+    pub(crate) fn unannounced(&self, channels: &Channels) -> bool {
+        let told = self.told.messages();
+        channels.iter().any(|(channel, counts)| {
+            !counts.requests
+                && counts.pending > 0
+                && counts.delivered > told.kept.get(channel).copied().unwrap_or(0)
+        })
+    }
+
+    /// A child's round the provider refused for what it carried, opened on
+    /// `opening`, the counts its opening's words were read from: what the
+    /// opening told is kept, so it opens no round again -- the same opening
+    /// would be refused the same way. What only a result told of is not: the
+    /// model never took that result, so a message it told of opens the next
+    /// round. A live object it told of is told of again.
+    pub(crate) fn settle(&self, opening: &Channels) {
+        self.told
+            .kept
+            .fetch_max(delivered(opening), Ordering::SeqCst);
+        raise(&mut self.told.messages().kept, messages(opening));
     }
 
     /// What a round opens on: what waits, if anything arrived since a round
@@ -159,57 +212,77 @@ impl Announcer {
         self.news(&self.told.announced).await
     }
 
-    /// The round in flight ended well, so what it announced was read.
+    /// The round in flight ended well, so what it announced, of every channel
+    /// and of the messages alone, was read.
     pub(crate) fn keep(&self) {
-        let announced = self.told.announced.load(Ordering::SeqCst);
-        self.told.kept.fetch_max(announced, Ordering::SeqCst);
-        let injections = self.told.injections.load(Ordering::SeqCst);
-        self.told
-            .injections_kept
-            .fetch_max(injections, Ordering::SeqCst);
+        let told = &self.told;
+        told.kept
+            .fetch_max(told.announced.load(Ordering::SeqCst), Ordering::SeqCst);
+        {
+            let mut messages = told.messages();
+            let announced = messages.announced.clone();
+            raise(&mut messages.kept, announced);
+        }
+        told.injections_kept
+            .fetch_max(told.injections.load(Ordering::SeqCst), Ordering::SeqCst);
     }
 
     /// What waits unread, if anything was delivered past `seen`, counted as
     /// announced.
     async fn news(&self, seen: &AtomicU64) -> Result<Option<String>, AgentError> {
-        let (channels, noun) = match &self.source {
-            Source::Interpreter(interpreter) => (
+        let channels = match &self.source {
+            Source::Interpreter(interpreter) => {
                 tokio::time::timeout(PENDING_TIMEOUT, interpreter.pending())
                     .await
-                    .map_err(|_| AgentError::Unanswered(PENDING_TIMEOUT))??,
-                Noun::Message,
-            ),
-            Source::Requests(counts) => (counts(), Noun::Request),
+                    .map_err(|_| AgentError::Unanswered(PENDING_TIMEOUT))??
+            }
+            Source::Requests(counts) => counts(),
         };
-        let delivered = channels.values().map(|counts| counts.delivered).sum();
+        let delivered = delivered(&channels);
         if delivered <= seen.load(Ordering::SeqCst) {
             return Ok(None);
         }
         self.told.announced.fetch_max(delivered, Ordering::SeqCst);
-        Ok(announcement(&channels, noun))
+        raise(&mut self.told.messages().announced, messages(&channels));
+        Ok(announcement(&channels))
     }
 }
 
-/// What waits on a channel: a message, or a request.
-#[derive(Clone, Copy)]
-pub(crate) enum Noun {
-    Message,
-    Request,
+/// Every item ever delivered to `channels`.
+fn delivered(channels: &Channels) -> u64 {
+    channels.values().map(|counts| counts.delivered).sum()
+}
+
+/// Every message ever delivered to each of `channels` that carries messages
+/// rather than requests.
+fn messages(channels: &Channels) -> impl Iterator<Item = (String, u64)> + '_ {
+    channels
+        .iter()
+        .filter(|(_, counts)| !counts.requests)
+        .map(|(channel, counts)| (channel.clone(), counts.delivered))
+}
+
+/// Each count of `told` raised to the channel's in `to`, where higher.
+fn raise(told: &mut BTreeMap<String, u64>, to: impl IntoIterator<Item = (String, u64)>) {
+    for (channel, count) in to {
+        let at = told.entry(channel).or_default();
+        *at = (*at).max(count);
+    }
 }
 
 /// What waits, by channel and count: `2 messages are waiting on
-/// runtime.channels["user"]`, or requests on a child's. `None` when nothing
-/// does.
-pub(crate) fn announcement(channels: &Channels, noun: Noun) -> Option<String> {
+/// runtime.channels["user"]`, or requests on a child's request channels.
+/// `None` when nothing does.
+pub(crate) fn announcement(channels: &Channels) -> Option<String> {
     let waiting: Vec<String> = channels
         .iter()
         .filter(|(_, counts)| counts.pending > 0)
         .map(|(channel, counts)| {
-            let words = match (noun, counts.pending) {
-                (Noun::Message, 1) => "message is",
-                (Noun::Message, _) => "messages are",
-                (Noun::Request, 1) => "request is",
-                (Noun::Request, _) => "requests are",
+            let words = match (counts.requests, counts.pending) {
+                (false, 1) => "message is",
+                (false, _) => "messages are",
+                (true, 1) => "request is",
+                (true, _) => "requests are",
             };
             format!(
                 "{} {words} waiting on runtime.channels[{channel:?}]",
@@ -346,5 +419,100 @@ impl UserChannel {
             .try_lock()
             .map(|mut sent| sent.recv_waiting())
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{Announcer, Injected};
+    use crate::python::host::{Channels, Counts};
+
+    fn counts(channels: &[(&str, usize, u64, bool)]) -> Channels {
+        channels
+            .iter()
+            .map(|&(name, pending, delivered, requests)| {
+                (
+                    name.to_string(),
+                    Counts {
+                        pending,
+                        delivered,
+                        requests,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// A message announced and left unread is no news again because a request arrived and was
+    /// answered after the round's last result: news of a message is counted in messages.
+    #[test]
+    fn a_request_is_no_news_of_a_message() {
+        let now = Arc::new(Mutex::new(counts(&[("inbox", 1, 1, false)])));
+        let read = Arc::clone(&now);
+        let announcer = Announcer::of_requests(
+            Arc::new(move || read.lock().unwrap().clone()),
+            Injected::default(),
+        );
+        let opening = now.lock().unwrap().clone();
+        assert!(announcer.unannounced(&opening));
+        announcer.opened_at(&opening);
+        announcer.keep();
+        assert!(!announcer.unannounced(&opening), "announced, and kept");
+        let answered = counts(&[("inbox", 1, 1, false), ("fizz", 0, 1, true)]);
+        assert!(
+            !announcer.unannounced(&answered),
+            "a request taken and answered is no news of the message"
+        );
+        let arrived = counts(&[("inbox", 2, 2, false), ("fizz", 0, 1, true)]);
+        assert!(announcer.unannounced(&arrived), "a second message is");
+    }
+
+    /// A message announced and left unread on one channel is no news again because another
+    /// channel delivered a message the agent's code then read: news is counted per channel.
+    #[test]
+    fn one_channels_message_is_no_news_of_anothers() {
+        let opening = counts(&[("a", 0, 0, false), ("b", 1, 1, false)]);
+        let announcer = Announcer::of_requests(Arc::new(Channels::default), Injected::default());
+        assert!(announcer.unannounced(&opening));
+        announcer.opened_at(&opening);
+        announcer.keep();
+        let read = counts(&[("a", 0, 1, false), ("b", 1, 1, false)]);
+        assert!(
+            !announcer.unannounced(&read),
+            "a's message was read, and b's was told of"
+        );
+        let waiting = counts(&[("a", 1, 1, false), ("b", 1, 1, false)]);
+        assert!(announcer.unannounced(&waiting), "a's message waits unread");
+    }
+
+    /// A refused round keeps what its opening told and no more: a message only a result told
+    /// of, the call carrying that result refused, is news; the round it opens, refused too,
+    /// keeps it, so no round opens on it again.
+    #[tokio::test]
+    async fn a_refused_round_keeps_only_its_opening() {
+        let opening = counts(&[("inbox", 1, 1, false)]);
+        let now = Arc::new(Mutex::new(opening.clone()));
+        let read = Arc::clone(&now);
+        let announcer = Announcer::of_requests(
+            Arc::new(move || read.lock().unwrap().clone()),
+            Injected::default(),
+        );
+        announcer.opened_at(&opening);
+        let arrived = counts(&[("inbox", 1, 2, false)]);
+        *now.lock().unwrap() = arrived.clone();
+        assert!(announcer.arrived().await.expect("counted").is_some());
+        announcer.settle(&opening);
+        assert!(
+            announcer.unannounced(&arrived),
+            "told only in a result the model never took"
+        );
+        announcer.opened_at(&arrived);
+        announcer.settle(&arrived);
+        assert!(
+            !announcer.unannounced(&arrived),
+            "told in a refused opening"
+        );
     }
 }

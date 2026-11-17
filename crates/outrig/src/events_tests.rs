@@ -11,8 +11,8 @@ use super::*;
 use crate::agent::rig_json;
 use crate::harness::event::*;
 use crate::harness::{
-    BindingStop, ClosedBy, ExecutionOutcome, ExecutionStatus, HostedCall, RequestOutcome,
-    ServiceCall, ServiceErrorCategory, Stopped, Verdict,
+    BindingStop, ChannelClose, ClosedBy, ExecutionOutcome, ExecutionStatus, HostedCall,
+    RequestOutcome, SendAtClose, ServiceCall, ServiceErrorCategory, Stopped, Verdict,
 };
 
 const SOURCE: &str = "/outrig/session/20260921T103000-a1b2";
@@ -265,6 +265,18 @@ fn each_event_has_exactly_its_data_fields() {
                     channel: Some(text("fizz")),
                     outcome: RequestEnd::Closed,
                 }],
+                channels: vec![ChannelClose {
+                    channel: text("inbox"),
+                    holder: Some(text("c2")),
+                    unread: vec![text("m-2")],
+                    sends: vec![SendAtClose {
+                        item: MessageId::new(9),
+                        agent: text("c2"),
+                        outcome: ItemOutcome::Uncertain,
+                        reason: Some(text("the session ended first")),
+                    }],
+                    unacknowledged: vec![text("m-1")],
+                }],
                 verdict: Verdict::StoppedWithUnknown,
             },
             "session.report",
@@ -276,6 +288,7 @@ fn each_event_has_exactly_its_data_fields() {
                 "services",
                 "bindings",
                 "requests",
+                "channels",
                 "verdict",
             ],
         ),
@@ -533,9 +546,10 @@ fn each_event_has_exactly_its_data_fields() {
                 skill: text("review-diff"),
                 source: text("project"),
                 message: MessageId::new(5),
+                channel: text("user"),
             },
             "skill.directive.received",
-            &["skill", "source", "message"],
+            &["skill", "source", "message", "channel"],
         ),
         (
             Payload::SkillInvocationStarted {
@@ -1153,10 +1167,51 @@ fn each_event_has_exactly_its_data_fields() {
                 channel: text("user"),
                 from: text("user"),
                 to: text("agent/primary"),
+                sender: Some(text("user")),
                 body: text("hi"),
             },
             "message.sent",
-            &["message", "channel", "from", "to", "body"],
+            &["message", "channel", "from", "to", "sender", "body"],
+        ),
+        (
+            Payload::ChannelAttached {
+                channel: text("inbox"),
+                kind: text("plain"),
+                receives: text("str"),
+                sends: text("app.messages:Note"),
+                bound: 256,
+                wake: text("announce"),
+            },
+            "channel.attached",
+            &["channel", "kind", "receives", "sends", "bound", "wake"],
+        ),
+        (
+            Payload::ChannelConsumed {
+                channel: text("inbox"),
+                item: text("m-1"),
+                delivery: MessageId::new(3),
+            },
+            "channel.consumed",
+            &["channel", "item", "delivery"],
+        ),
+        (
+            Payload::ChannelClosed {
+                channel: text("inbox"),
+                reason: text("peer gone"),
+            },
+            "channel.closed",
+            &["channel", "reason"],
+        ),
+        (
+            Payload::ChannelItemOutcome {
+                channel: text("inbox"),
+                item: MessageId::new(4),
+                outcome: ItemOutcome::NotAccepted,
+                reason: Some(text("no room")),
+                reference: None,
+            },
+            "channel.item.outcome",
+            &["channel", "item", "outcome", "reason", "reference"],
         ),
         (
             Payload::MessageRefused {
@@ -1300,6 +1355,18 @@ fn each_event_has_exactly_its_data_fields() {
                 "exited": null,
             },
             "requests": [{"request": 7, "child": "c1", "channel": "fizz", "outcome": "closed"}],
+            "channels": [{
+                "channel": "inbox",
+                "holder": "c2",
+                "unread": ["m-2"],
+                "sends": [{
+                    "item": 9,
+                    "agent": "c2",
+                    "outcome": "uncertain",
+                    "reason": "the session ended first",
+                }],
+                "unacknowledged": ["m-1"],
+            }],
             "verdict": "stopped_with_unknown",
         })
     );

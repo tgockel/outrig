@@ -36,6 +36,10 @@ value or with an `outrig.AgentError`: see `help(outrig.AgentError)` and `help(ou
 its own: see `help(outrig.agent)`. A subclass of `outrig.Agent` declares a long-lived child
 instead, whose methods marked `@outrig.agent` are its request channels: see `help(outrig.Agent)`.
 
+A channel the session's owner declares ends in the owner's own messaging rather than at an agent:
+its `send` raises an `outrig.ChannelError` when the message was not taken, or may not have been,
+and its `receive` when the channel was closed: see `help(outrig.ChannelError)`.
+
 Each service the session's owner serves from Rust is an `outrig.Service`, its methods calls to
 the host by value; a call that returns no result raises `outrig.ServiceError`: see
 `help(outrig.Service)`.
@@ -1140,3 +1144,9 @@ describes; a program on the host has no use for them. What a program meets if it
 - `outrig.Service` -- the class of a service's object, which only a kernel holds.
 - `outrig.ServiceError` -- what a call of a service's method raises, which only a kernel makes.
 - `outrig.ServiceMethod` -- what a service's object lists of its methods, which only a kernel holds.
+- `outrig.ChannelError` -- the base of what an external channel raises, which only a kernel holds.
+- `outrig.ChannelClosed` -- what an external channel raises once closed, which only a kernel holds.
+- `outrig.SendRefused` -- what an external channel's `send` raises, which only a kernel holds.
+- `outrig.SendNotAccepted` -- what an external channel's `send` raises, which only a kernel holds.
+- `outrig.SendUncertain` -- what an external channel's `send` raises, which only a kernel holds.
+- `outrig.UnreadableDelivery` -- what an external channel's `receive` may raise, only in a kernel.

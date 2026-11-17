@@ -2488,7 +2488,9 @@ def _load_outrig(directory):
     outrig._agents._call = _call
     outrig._agents._launch = _attach
     outrig._agents._submitted_source = _submitted_source
-    outrig._agents._kind_of = lambda name: getattr(_SESSION.get(name), "kind", "binding")
+    outrig._agents._kind_of = lambda name: (
+        "channel" if name in _CHANNELS else getattr(_SESSION.get(name), "kind", "binding")
+    )
     outrig._services._call = _service_call
     outrig.skills._install(
         _ask_host, _notify, _compiled_cause, lambda: next(_ids), _refuse_closing,
@@ -3636,7 +3638,14 @@ def _union_members(t):
 
 
 class _Refused(Exception):
-    """A message the host sent that its endpoint does not take. Nothing was queued."""
+    """A message the host sent that its endpoint does not take. Nothing was queued. `code` and
+    `problems` say why to an external channel's owner: `full`, `contract` with what is wrong, or
+    `closed`."""
+
+    def __init__(self, message, code=None, problems=()):
+        super().__init__(message)
+        self.code = code
+        self.problems = tuple(problems)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3647,7 +3656,8 @@ class Delivery:
     `id` names too -- `body` is the message itself, `sender` who sent it -- `"user"` on the user
     channel, an agent's id between agents -- and `received_at` when it arrived, in UTC. `skill`
     names the skill a `/name` the user typed resolved to, which asks you to run it, and is
-    `None` on every other message.
+    `None` on every other message. On a channel of the session's owner, `correlation` is the id
+    of what the message answers or follows, as its far end said, or `None`.
     """
 
     id: int
@@ -3655,6 +3665,7 @@ class Delivery:
     sender: str
     received_at: datetime.datetime
     skill: object = dataclasses.field(default=None, kw_only=True)
+    correlation: object = dataclasses.field(default=None, kw_only=True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3728,6 +3739,11 @@ class Endpoint:
     The channel's contract -- what may travel each way -- was fixed when it was made, and reads as
     `receives` and `sends`. Messages arrive in the order they were sent.
     """
+
+    # How many messages it holds unread, and whether what waits is counted in what the model is
+    # told of: an external channel's are its definition's.
+    _bound = QUEUE_MAX
+    _counted = True
 
     def __init__(self, agent, name, *, receives, sends):
         self._receives, self._receiving = _contract(receives, f"channel {name!r} cannot receive")
@@ -3846,6 +3862,20 @@ class Endpoint:
         other end receives one. Sending does not end anything -- not the round, and not the code
         that sends.
         """
+        line = self._encoded(message, {"t": "send", "agent": self._agent, "channel": self._name})
+        await self._when(self._senders, self._take_room)
+        try:
+            _write_line(line)
+        except BaseException:
+            # Not sent, so it takes no room -- on the reserve if it has to be, since room that is
+            # never given back is lost to the channel for good.
+            _with_room(self._received)
+            raise
+
+    def _encoded(self, message, line, encode=_encode):
+        """`line`, the protocol line sending `message` from here, its `body` the message's JSON
+        form, encoded with `encode`. Raises `TypeError` for a message the channel does not send,
+        and `ValueError` for one past `MESSAGE_MAX` as sent."""
         # As JSON: a dataclass crosses as its fields' values, under their keys, never as itself.
         body, problems = self._sending._encoding(message)
         if problems:
@@ -3862,20 +3892,13 @@ class Endpoint:
             )
         # Encoded here rather than on the reserve: running out of memory while building the
         # agent's own message is the agent's to see.
-        line = _encode({"t": "send", "agent": self._agent, "channel": self._name, "body": body})
-        if len(line) > MESSAGE_MAX:
+        encoded = encode({**line, "body": body})
+        if len(encoded) > MESSAGE_MAX:
             raise ValueError(
-                f"this message is {len(line)} bytes as sent, past the {MESSAGE_MAX} a channel "
+                f"this message is {len(encoded)} bytes as sent, past the {MESSAGE_MAX} a channel "
                 f"carries; send less, or send it in parts"
             )
-        await self._when(self._senders, self._take_room)
-        try:
-            _write_line(line)
-        except BaseException:
-            # Not sent, so it takes no room -- on the reserve if it has to be, since room that is
-            # never given back is lost to the channel for good.
-            _with_room(self._received)
-            raise
+        return encoded
 
     def _received(self):
         """The other end received a message this endpoint sent, which makes room for another.
@@ -3909,12 +3932,20 @@ class Endpoint:
                 f"channel {self._name!r} receives {_describe_all(self._receives)}, not "
                 f"{_type_name(type(body))}"
             )
-        delivery = Delivery(
+        return self._enqueue(message, Delivery(
             message, copy, sender, datetime.datetime.now(datetime.timezone.utc), skill=skill
-        )
+        ))
+
+    def _enqueue(self, message, delivery):
+        """Queue `delivery`, posted as `message`, and return how many messages then wait; or
+        raise `_Refused`, `full`, having queued nothing, when the queue holds its bound. The append
+        is the last step that can fail, so a retry after running out of memory never queues a
+        message twice; waking the receivers comes after, and cannot undo it."""
         with self._lock:
-            if len(self._queue) >= QUEUE_MAX:
-                raise _Refused(f"channel {self._name!r} already holds {QUEUE_MAX} unread messages")
+            if len(self._queue) >= self._bound:
+                raise _Refused(
+                    f"channel {self._name!r} already holds {self._bound} unread messages", "full"
+                )
             count, delivered = len(self._queue) + 1, self._delivered + 1
             wake = iter(self._receivers.copy())
             # Beside the id it was posted under, which a take is reported by.
@@ -3924,6 +3955,392 @@ class Endpoint:
         # Every receiver, since each re-checks and one may have been cancelled in the meantime.
         _wake_all(wake, self._name)
         return count
+
+
+# ---------------------------------------------------------------------------- external channels
+#
+# A channel the session's owner declares (`0003-51`) ends in the owner's own messaging -- its
+# backend, on the host -- rather than at the user or an agent. Each is declared once, before any
+# kernel opens (`_declare_channels`), and its endpoint exists from then on, unheld: what the owner
+# pushes waits in its queue, the window, until a kernel holds it and its code receives. One kernel
+# holds a channel at a time -- the primary takes every one no dict names; any other kernel the
+# ones its facilities name -- and only that kernel's loop may use it. Receiving tells the host,
+# whose backend records the position; sending waits for the host's answer: the backend took it,
+# did not, may have, or it was refused before anything was sent.
+
+# Each channel the session declares, by its name, once it has been declared.
+_CHANNELS = types.MappingProxyType({})
+# Guards which kernel claims each channel.
+_channels_lock = threading.Lock()
+# What a channel's wake policy may be: whether an arrival ends a `runtime.wait`, is only
+# announced, or neither.
+_WAKES = ("wake", "announce", "silent")
+# What a take or a send's room gives back when the channel was closed.
+_CLOSED = object()
+
+
+class _External(Endpoint):
+    """An external channel's endpoint: `await receive()`, `await send(message)` and `pending()`,
+    used only from the loop of the kernel holding it."""
+
+    def __init__(self, name, receives, sends, bound, wake, description):
+        super().__init__(None, name, receives=receives, sends=sends)
+        self._bound = bound
+        self._wake = wake
+        self._counted = wake != "silent"
+        self._description = description
+        # The agent whose kernel claimed it, and that kernel once built; `None` while unheld.
+        self._claimant = None
+        self._kernel = None
+        # Counts its holders: room a send took is given back only to the holder that took it,
+        # since another's answers arrive on a loop that has stopped, or not at all.
+        self._generation = 0
+        # Why the far end closed it, once it has, and whether a wait has said so.
+        self._closed = None
+        self._reported = False
+
+    def _here(self):
+        """The kernel holding this channel, whose loop the caller must be running on."""
+        kernel = self._kernel
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if kernel is None or kernel.ended or loop is not kernel.loop:
+            holder = "no agent" if self._claimant is None else f"agent {self._claimant!r}"
+            raise RuntimeError(
+                f"channel {self._name!r} is held by {holder}, and only its code can use it"
+            )
+        return kernel
+
+    def _closed_error(self):
+        return _agents.ChannelClosed(
+            f"channel {self._name!r} was closed by its far end: {self._closed}", self._closed
+        )
+
+    async def receive(self):
+        """Take the next message, waiting until there is one, as a `Delivery`.
+
+        `.body` is the message itself, built into the channel's type here. Receiving removes it --
+        no later receive sees it again -- and tells the channel's far end it was taken. Once the
+        far end has closed the channel, what was waiting is still taken, and then this raises
+        `outrig.ChannelClosed` rather than waiting.
+        """
+        self._here()
+        taken = await self._when(self._receivers, self._take_or_closed)
+        if taken is _CLOSED:
+            raise self._closed_error()
+        message, arrived = taken
+        # Taken already: the host is told, whatever building it comes to.
+        _notify({"t": "channel.consumed", "agent": self._claimant, "channel": self._name,
+                 "delivery": message})
+        try:
+            body = self._receiving.decode(arrived.body)
+        except Exception as e:
+            raise _agents.UnreadableDelivery(
+                f"message {message} on channel {self._name!r} could not be built as "
+                f"{_describe_all(self._receives)}: {e}",
+                message,
+                arrived.body,
+            ) from e
+        return dataclasses.replace(arrived, body=body)
+
+    def _take_or_closed(self):
+        if self._queue:
+            return self._queue.popleft()
+        return _CLOSED if self._closed is not None else None
+
+    def _watch(self, waiter):
+        """Whether a message waiting here should end a `runtime.wait`: only on a `wake` channel.
+        A closed channel raises `outrig.ChannelClosed`, once. `waiter` is woken by what arrives,
+        or by the close, until `_unwatch`."""
+        with self._lock:
+            if self._closed is not None and not self._reported:
+                self._reported = True
+                raise self._closed_error()
+            if self._queue and self._wake == "wake":
+                return True
+            self._receivers.append(waiter)
+            return False
+
+    async def send(self, message):
+        """Send `message` to the channel's far end, and return once it has taken it: accepted,
+        not yet read.
+
+        Raises `outrig.SendNotAccepted` when the far end said it did not take it, so sending it
+        again is safe; `outrig.SendUncertain`, carrying the id OutRig gave it, when it may have,
+        so sending it again may deliver it twice; `outrig.SendRefused` when it was refused before
+        anything was sent; `outrig.ChannelClosed` once the far end closed the channel; and
+        `outrig.SessionClosing` once the session has closed. At most `SEND_WINDOW` messages wait
+        for an answer at once; a send past that waits for one. Sending ends nothing -- not the
+        round, and not the code that sends.
+        """
+        kernel = self._here()
+        if self._closed is not None:
+            raise self._closed_error()
+        _refuse_closing()
+        line = {"t": "channel.send", "agent": kernel.agent, "id": next(_ids), "channel": self._name}
+        encoded = self._encoded(message, line, _encode_strict)
+        room = await self._when(self._senders, self._room_or_closed)
+        if room is _CLOSED:
+            raise self._closed_error()
+        generation = room
+        try:
+            _refuse_closing()
+            future = kernel.ask(line, encoded)
+        except BaseException:
+            _with_room(self._returned, generation)
+            raise
+        # Room is made once the host answers, whether or not this send still waits for it.
+        future.add_done_callback(lambda _: self._returned(generation))
+        answer = await asyncio.shield(future)
+        outcome, reason, item = answer.get("outcome"), answer.get("reason") or "", answer.get("item")
+        if outcome == "accepted":
+            return None
+        where = f"channel {self._name!r}"
+        if outcome == "not_accepted":
+            raise _agents.SendNotAccepted(
+                f"{where}'s far end did not take message {item}, so sending it again is safe: "
+                f"{reason}", reason)
+        if outcome == "uncertain":
+            raise _agents.SendUncertain(
+                f"{where}'s far end may have taken message {item}, or not; sending it again may "
+                f"deliver it twice: {reason}", item, reason)
+        if outcome == "closed":
+            raise _agents.ChannelClosed(f"{where} was closed by its far end: {reason}", reason)
+        if outcome == "closing":
+            raise _agents.SessionClosing(f"the session is closing -- {reason} -- so nothing was "
+                                         f"sent")
+        raise _agents.SendRefused(f"{where} refused the message, and nothing was sent: {reason}",
+                                  reason)
+
+    def _room_or_closed(self):
+        """Room for one more send, as the holder it was taken by; or `_CLOSED`. Under the
+        lock."""
+        if self._closed is not None:
+            return _CLOSED
+        return self._generation if self._take_room() else None
+
+    def _returned(self, generation):
+        """The room a send took as holder `generation` is given back: unless the channel has
+        changed holders since, which gave every holder's room back at once."""
+        with self._lock:
+            if generation != self._generation:
+                return
+            wake = iter(self._senders.copy())
+            if self._unreceived:
+                self._unreceived -= 1
+        _wake_all(wake, self._name)
+
+    def _released(self):
+        """Its holder is gone: what that holder's sends held of the window is given back, and an
+        answer to one, if it ever comes, gives back nothing more."""
+        with self._lock:
+            self._generation += 1
+            self._unreceived = 0
+
+    def _deliver(self, body, sender, message, skill=None, correlation=None):
+        """Queue `body` from `sender`, pushed as `message`, naming `skill` and `correlation` when
+        given, and return how many messages then wait. Reader thread only.
+
+        Its body is checked against the channel's type as JSON, building nothing, since building
+        runs the type's own code and this is the reader thread; `receive` builds it. Raises
+        `_Refused` -- `contract`, `full` or `closed` -- having queued nothing. The append is the
+        last step that can fail, as `Endpoint._deliver`'s is.
+        """
+        if self._closed is not None:
+            raise _Refused(f"channel {self._name!r} was closed: {self._closed}", "closed")
+        problems = self._receiving._checking(body)
+        if problems:
+            raise _Refused(
+                f"channel {self._name!r} receives {_describe_all(self._receives)}:\n"
+                f"{problems.listing()}",
+                "contract",
+                [str(problem) for problem in problems.found],
+            )
+        # Queued as it arrived, its body still JSON, which `receive` builds.
+        return self._enqueue(message, Delivery(
+            message, body, sender, datetime.datetime.now(datetime.timezone.utc), skill=skill,
+            correlation=correlation,
+        ))
+
+    def _close(self, reason):
+        """The far end closed the channel, saying `reason`: every waiting receive, send and
+        wait is woken to find it closed. Reader thread only. Said once; a later close changes
+        nothing."""
+        with self._lock:
+            if self._closed is not None:
+                return
+            self._closed = reason
+            wake = iter(self._receivers.copy() + self._senders.copy())
+        _wake_all(wake, self._name)
+
+    def _said(self):
+        """What the host is told of this channel as a kernel takes it."""
+        return {"t": "channel.attached", "agent": self._claimant, "channel": self._name}
+
+
+def _external_contract(said, where):
+    """The type one direction of a declared channel admits, as the host said it: `text`, `json`,
+    `nothing`, or `{"typed": "module:Name"}`, the name imported from the application's code."""
+    if said == "text":
+        return str
+    if said == "json":
+        return _schema._JSON
+    if said == "nothing":
+        return ()
+    if type(said) is dict and type(said.get("typed")) is str:
+        return _class_named(said["typed"])
+    raise ValueError(f"{where} has no contract the host could have said: {said!r}")
+
+
+def _declare_channels(message):
+    """Take the session's channels, which the host declares once, before any kernel opens: each
+    made on a thread of its own, since a typed contract imports the application's code, which the
+    reader never runs. Reader thread only."""
+    entries = message.get("channels")
+    if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+        raise ValueError("channels without a list of channels")
+    reply = {"t": "declared", "agent": message.get("agent"), "id": message.get("id")}
+    threading.Thread(
+        target=_declaring_channels, args=(reply, entries), name="channels", daemon=True
+    ).start()
+
+
+def _declaring_channels(reply, entries):
+    """Make each channel in `entries`, all or none, and answer with `reply`: declared, or why
+    not -- with the end of its traceback when importing a type raised."""
+    global _CHANNELS
+    try:
+        # Each channel, and the JSON Schema of each of its typed directions, which its holder's
+        # instructions show.
+        made, schemas = {}, {}
+        for entry in entries:
+            name = entry.get("name")
+            where = f"channel {name!r}"
+            bound, wake = entry.get("bound"), entry.get("wake")
+            if (
+                type(name) is not str
+                or name in made
+                or type(bound) is not int
+                or not 0 < bound <= QUEUE_MAX
+                or wake not in _WAKES
+            ):
+                raise ValueError(f"{where} is not a channel the host could have declared")
+            made[name] = _External(
+                name,
+                _external_contract(entry.get("receives"), f"{where}'s receiving contract"),
+                _external_contract(entry.get("sends"), f"{where}'s sending contract"),
+                bound,
+                wake,
+                entry.get("description") or "",
+            )
+            endpoint = made[name]
+            schemas[name] = {
+                direction: schema.text()
+                for direction, schema in (("receives", endpoint._receiving),
+                                          ("sends", endpoint._sending))
+                if type(entry.get(direction)) is dict
+            }
+        if not _CHANNELS:
+            _CHANNELS = types.MappingProxyType(made)
+        _notify({**reply, "schemas": schemas})
+    except _NotConstructed as e:
+        # A type that does not import, or names nothing: said as a construction's would be.
+        _notify({**reply, "error": e.said})
+    except BaseException as e:
+        _notify({**reply, "error": {"code": "invalid-contract", "message": _said_of(e),
+                                    "traceback": _traceback_text(e)[-_serve.TEXT_MAX:]}})
+
+
+def _claim(agent, names, taken=()):
+    """Claim the channels `names` for `agent`'s kernel, all or none, and return them by name:
+    refused, naming the holder, for one another kernel holds, and for one whose name is in
+    `taken`, a channel of the agent's own."""
+    with _channels_lock:
+        for name in names:
+            endpoint = _CHANNELS.get(name)
+            if endpoint is None:
+                raise LookupError(f"the session declares no channel {name!r}")
+            if endpoint._claimant is not None and endpoint._claimant != agent:
+                raise ValueError(
+                    f"channel {name!r} is held by agent {endpoint._claimant!r}, and a channel has "
+                    f"one holder"
+                )
+            if name in taken:
+                raise ValueError(f"channel {name!r} has the name of one of the agent's own "
+                                 f"channels")
+        for name in names:
+            _CHANNELS[name]._claimant = agent
+    return {name: _CHANNELS[name] for name in names}
+
+
+def _unclaim(endpoints):
+    """Give up `endpoints`, which a kernel claimed: unheld from now on, what waits on each still
+    there for the next kernel to take one."""
+    with _channels_lock:
+        for endpoint in endpoints:
+            endpoint._claimant = endpoint._kernel = None
+            endpoint._released()
+
+
+def _unheld():
+    """The name of every declared channel no kernel holds, in the order they were declared."""
+    with _channels_lock:
+        return [name for name, endpoint in _CHANNELS.items() if endpoint._claimant is None]
+
+
+def _named_channels(facilities):
+    """The names of the channels the references in `facilities`, a mapping, name, in order."""
+    if not facilities:
+        return []
+    names = []
+    for value in list(facilities.values()):
+        if type(value) is _agents.Facility:
+            kind, target = _agents._identity(value)
+            if kind == "channel" and target not in names:
+                names.append(target)
+    return names
+
+
+def _channel_msg(message):
+    """Queue what the session's owner pushed on one of its channels, and say how many then wait,
+    or why it was refused. Always answered, since the host waits for the answer; nothing after the
+    queueing reaches `_handle`'s retry, as in `_msg`."""
+    reply = {"t": "posted", "agent": message.get("agent"), "id": message.get("id")}
+    channel, sender, skill = message.get("channel"), message.get("sender"), message.get("skill")
+    correlation = message.get("correlation")
+    endpoint = _CHANNELS.get(channel) if type(channel) is str else None
+    try:
+        if endpoint is None:
+            raise _Refused(f"the session declares no channel {channel!r}", "unknown")
+        if type(sender) is not str or any(
+            value is not None and type(value) is not str for value in (skill, correlation)
+        ):
+            raise _Refused(
+                "a message names its sender, and any skill or correlation, with a str", "contract"
+            )
+        pending = endpoint._deliver(
+            message.get("body"), sender, message.get("id"), skill, correlation
+        )
+    except _Refused as e:
+        _send({**reply, "error": {"code": e.code, "message": str(e), "problems": e.problems}})
+        return
+    try:
+        _send({**reply, "pending": pending})
+    except BaseException as e:
+        try:
+            _diag(f"message {reply['id']!r} was queued, but saying so failed: {e!r}")
+        except BaseException:
+            pass
+
+
+def _channel_close(message):
+    """The session's owner closed one of its channels: its far end's peer is gone."""
+    endpoint = _CHANNELS.get(message.get("channel"))
+    if endpoint is None:
+        raise ValueError(f"no channel {message.get('channel')!r} to close")
+    endpoint._close(str(message.get("reason") or ""))
 
 
 # What `return_when` may be: asyncio's own constants, which in CPython are strings.
@@ -5781,12 +6198,17 @@ class RequestEndpoint(Endpoint):
 class Kernel:
     """One agent's execution environment: its namespace, its loop, its slot, its backlog."""
 
-    def __init__(self, agent, child=None, facilities=None):
+    def __init__(self, agent, child=None, facilities=None, externals=None):
         self.agent = agent
         # A child's record, which its parent shares; `None` for an agent that is no child.
         self.child = child
         # The mapping this kernel's view follows, the agent's own; `None` for the session's view.
         self.facilities = facilities
+        # The session's channels this kernel holds, by name, which it claimed as it was built
+        # (`_claim`).
+        self.externals = externals or {}
+        for endpoint in self.externals.values():
+            endpoint._kernel = self
         # Set once the host has ended this kernel: it takes no more work, and is going.
         self.ended = False
         # What this kernel's code waits on the host to answer, by the id it asked under.
@@ -5858,6 +6280,8 @@ class Kernel:
         else:
             self.channels = {"progress": _ProgressOut(agent, child)}
             runtime = WorkRuntime
+        # The session's channels it holds, beside its own, whose names `_claim` kept apart.
+        self.channels.update(self.externals)
         if self.facilities is not None:
             runtime = _GIVEN_RUNTIMES[runtime]
         # Also `outrig.runtime`, from any code an execution of this kernel runs, whatever the
@@ -5880,6 +6304,13 @@ class Kernel:
         the instance's facilities, and its namespace the inputs and classes, `self` and the
         aliases. On the kernel's own thread, before anything else runs in it."""
         record = self.child
+        # Claimed first, so a channel another kernel holds refuses the construction with nothing
+        # of the record changed.
+        self.externals = _claim(
+            self.agent, _named_channels(instance.facilities), taken=instance.channels
+        )
+        for endpoint in self.externals.values():
+            endpoint._kernel = self
         record.channels, record.instance = instance.channels, instance.id
         self.facilities = instance.facilities
         self._equip()
@@ -5903,6 +6334,13 @@ class Kernel:
     def announce(self, instance=None):
         """Say the kernel is ready: a root child's, with its instance's id."""
         _send({"t": "ready", "agent": self.agent, "version": _VERSION, "instance": instance})
+
+    def attached(self):
+        """Tell the host which of the session's channels this kernel holds, before it says the
+        kernel is ready or its instance constructed, so the host knows each channel's holder
+        before anything runs in it."""
+        for endpoint in self.externals.values():
+            _notify(endpoint._said())
 
     def offer_session(self):
         """Give each of the session's bindings and services not yet offered here what this kernel
@@ -5985,12 +6423,14 @@ class Kernel:
 
     def briefs(self):
         """What `runtime.bindings` says in this kernel: the session's bindings, or its mapping's
-        entries as they stand, each classified and described now."""
+        entries as they stand, each classified and described now -- but a channel's, which
+        `runtime.channels` holds."""
         if self.facilities is None:
             return _SESSION
         return types.MappingProxyType({
             d["name"]: Binding(d["name"], d["description"], d["type"], d["kind"])
             for d in _manifest(self.facilities)
+            if d["kind"] != "channel"
         })
 
     def stub(self, binding):
@@ -6088,13 +6528,14 @@ class Kernel:
                 return
         _diag(f"agent {self.agent!r}: its event loop was closed")
 
-    def ask(self, line):
-        """Send `line`, which the host answers under its `id`, and return the future of this
-        kernel's loop the answer settles. Called on that loop."""
+    def ask(self, line, encoded=None):
+        """Send `line` -- already `encoded`, when it is given -- which the host answers under its
+        `id`, and return the future of this kernel's loop the answer settles. Called on that
+        loop."""
         future = self.loop.create_future()
         self.asks[line["id"]] = future
         try:
-            _write_line(_encode(line))
+            _write_line(_encode(line) if encoded is None else encoded)
         except BaseException:
             self.asks.pop(line["id"], None)
             raise
@@ -6110,6 +6551,13 @@ class Kernel:
         if self.ended:
             return
         self.ended = True
+        # The session's channels it held are unheld from now on, what waits on each kept for the
+        # next kernel to take it.
+        # A detach of one the host never heard it take, it ignores.
+        if self.externals:
+            _unclaim(self.externals.values())
+            for name in self.externals:
+                _notify({"t": "channel.detached", "agent": self.agent, "channel": name})
         child = self.child
         # An agent class instance's child whose spawn is unanswered leaves what was asked of it
         # to that answer.
@@ -7013,10 +7461,34 @@ def _resolve_service(kernel, name):
     return kernel.service(name)
 
 
-# Each kind of reference, by its name. A plain object needs none: it is itself.
+def _channel_brief(key, name):
+    endpoint = _CHANNELS.get(name)
+    if endpoint is None:
+        raise LookupError(f"facility {key!r} names channel {name!r}, which the session does not "
+                          f"declare")
+    return "channel", endpoint._description
+
+
+def _resolve_channel(kernel, name):
+    endpoint = _CHANNELS.get(name)
+    if endpoint is None:
+        raise LookupError(f"the session declares no channel {name!r}")
+    if endpoint._kernel is not kernel:
+        holder = endpoint._claimant
+        raise LookupError(
+            f"channel {name!r} is held by "
+            f"{'no agent' if holder is None else f'agent {holder!r}'}, not this one: a channel "
+            f"has one holder, which reaches it as runtime.channels[{name!r}]"
+        )
+    return endpoint
+
+
+# Each kind of reference, by its name. A plain object needs none: it is itself. A channel stays
+# with its holder, so a child made without a mapping of its own never inherits one.
 _KINDS = {
     "binding": _Kind(_resolve_binding, _binding_brief, True),
     "service": _Kind(_resolve_service, _service_brief, True),
+    "channel": _Kind(_resolve_channel, _channel_brief, False),
 }
 # What a facility's key, or an alias, may not be, beyond what an input's may not: the package,
 # and the instance.
@@ -7036,6 +7508,8 @@ def _classified(key, value):
         return _agents._reference("binding", object.__getattribute__(value, "_pool").binding)
     if issubclass(kind, _services_mod.Service):
         return _agents._reference("service", _services_mod._state(value)[0])
+    if kind is _External:
+        return _agents._reference("channel", value._name)
     if _rpyc is not None and issubclass(kind, _rpyc.core.netref.BaseNetref):
         raise TypeError(
             f"facility {key!r} is a proxy of an object a binding returned, which belongs to one "
@@ -7191,7 +7665,20 @@ def _open(agent, main, child=None):
         record = spec["record"] or _Child(agent, spec["name"], spec["kind"], spec["parent"],
                                           spec["channels"], requests_max)
         record.id, record.requests_max = agent, requests_max
-    kernel = Kernel(agent, child=record, facilities=None if spec is None else spec.get("facilities"))
+    facilities = None if spec is None else spec.get("facilities")
+    # The session's channels it holds, claimed before anything of the kernel is made, so a
+    # channel another kernel holds refuses the launch with nothing to undo: the primary takes
+    # every one no dict names, and any other kernel those its facilities name.
+    if record is None:
+        externals = _claim(agent, _unheld(), taken=("user",))
+    else:
+        own = record.channels if record.kind == "request" else ("progress",)
+        externals = _claim(agent, _named_channels(facilities), taken=own)
+    try:
+        kernel = Kernel(agent, child=record, facilities=facilities, externals=externals)
+    except BaseException:
+        _unclaim(externals.values())
+        raise
     if record is not None:
         record.kernel = kernel
         kernel.bind(spec["inputs"], spec["classes"], spec.get("boot", {}))
@@ -7202,6 +7689,7 @@ def _open(agent, main, child=None):
         try:
             kernel.thread.start()
         except BaseException:
+            _unclaim(externals.values())
             sys.modules.pop(kernel.module.__name__, None)
             kernel.loop.close()
             raise
@@ -7211,6 +7699,7 @@ def _open(agent, main, child=None):
     if main:
         _primary = kernel
         _onto_main.put(kernel)
+    kernel.attached()
     kernel.announce(getattr(record, "instance", None))
 
 
@@ -7306,8 +7795,11 @@ def _constructing(kernel, request_id, message):
         answer.pop("declaration", None)
         answer["error"] = failed.said
         line = _with_room(_encode, answer)
-    # Answered once: the session's close may have answered it already.
+    # Answered once: the session's close may have answered it already. The channels it took are
+    # said first, so the host knows their holder before the root's rounds begin.
     if _constructions.pop(kernel.agent, None) is not None:
+        if "declaration" in answer:
+            kernel.attached()
         _write_line(line)
 
 
@@ -7337,7 +7829,12 @@ def _constructed(kernel, message):
     adopted = agent._outrig
     adopted.alias({name: arguments[name] for name in aliases})
     declaration = adopted.declaration()
-    kernel.adopt(adopted)
+    try:
+        kernel.adopt(adopted)
+    except (LookupError, ValueError) as e:
+        # A channel its facilities name that another kernel holds, or that takes the name of one
+        # of its own: the launch fails, naming the holder, as a child's does.
+        raise _NotConstructed("invalid-argument", str(e)) from None
     return declaration
 
 
@@ -7387,6 +7884,9 @@ def _argument(name, argument):
             raise _NotConstructed("invalid-argument", f"argument {name!r} names {declared}, "
                                   f"which no data decodes into: {e}") from None
     if "facility" in argument:
+        if type(argument["facility"]) is dict and argument["facility"].get("kind") == "channel":
+            raise _NotConstructed("invalid-argument", f"argument {name!r} names a channel, which "
+                                  f"reaches the root only in a dict of its facilities")
         return _referenced(name, argument["facility"])
     if "facilities" in argument and type(argument["facilities"]) is dict:
         return {key: _referenced(f"{name}[{key!r}]", ref)
@@ -7704,7 +8204,11 @@ def _observe():
 def _pending(kernel, request_id, _):
     """Say how many messages wait on each of the agent's channels, and how many have ever been
     delivered to it, reading none of them."""
-    channels = {name: endpoint._counts() for name, endpoint in kernel.channels.items()}
+    channels = {
+        name: endpoint._counts()
+        for name, endpoint in kernel.channels.items()
+        if endpoint._counted
+    }
     _send({"t": "pending", "agent": kernel.agent, "id": request_id, "channels": channels})
 
 
@@ -7838,6 +8342,7 @@ _ROUTES = {
     ),
     "spawned": _answer_ask,
     "released": _answer_ask,
+    "channel.sent": _answer_ask,
     "assign": _assign,
     "settle": _settle_work,
     "oriented": _oriented,
@@ -7892,6 +8397,15 @@ def _route(line):
         return
     if kind == "service.described":
         _declare_services([message["service"]])
+        return
+    if kind == "channels":
+        _declare_channels(message)
+        return
+    if kind == "channel.msg":
+        _channel_msg(message)
+        return
+    if kind == "channel.close":
+        _channel_close(message)
         return
     if kind in _OWNER_ROUTES:
         # The program on the host's, about its requests: no kernel of its own to address.

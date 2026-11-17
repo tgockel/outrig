@@ -295,6 +295,11 @@ pub(crate) struct Counts {
     pub(crate) pending: usize,
     /// Every message ever delivered to it, read or not.
     pub(crate) delivered: u64,
+    /// Whether what it carries are requests, which owe a reply, rather than
+    /// messages: a child's request channels'. The host knows; the interpreter
+    /// counts only the agent's messages.
+    #[serde(skip)]
+    pub(crate) requests: bool,
 }
 
 /// Each of the agent's channels, by name.
@@ -464,6 +469,8 @@ struct Table {
     skills: Option<SkillLines>,
     /// Where the lines about services go, once the session serves any.
     services: Option<ServiceLines>,
+    /// Where the lines about the session's channels go, once it declares any.
+    channels: Option<ChannelLines>,
     /// The writer's queue, held weakly, for the close's own line to the
     /// interpreter when no relay carries it.
     lines: Option<Lines>,
@@ -482,6 +489,11 @@ pub(crate) type SkillLines = Arc<dyn Fn(Value) + Send + Sync>;
 /// service's method, a notice that its caller was interrupted -- each naming
 /// a kernel the host opened.
 pub(crate) type ServiceLines = Arc<dyn Fn(Value) + Send + Sync>;
+
+/// What hears the lines the interpreter sends about the session's channels -- a kernel taking
+/// one, an item its holder received, a send to the channel's backend -- on the reader task, so
+/// what it records is recorded before any later line is read.
+pub(crate) type ChannelLines = Arc<dyn Fn(Value) + Send + Sync>;
 
 /// What the host holds for one kernel.
 struct KernelState {
@@ -568,6 +580,22 @@ enum Query {
     Imported(mpsc::UnboundedSender<Imported>),
     /// A root constructed in its kernel: what its child is made of, or why it was not.
     Constructed(oneshot::Sender<Result<Value, ImportFailure>>),
+    /// The session's channels declared, with each typed direction's schema text, or why they
+    /// could not be.
+    Declared(oneshot::Sender<Result<Value, ImportFailure>>),
+    /// An item the session's owner pushed on one of its channels: how many then waited, or why
+    /// it was refused.
+    Posted(oneshot::Sender<Result<usize, PostRefusal>>),
+}
+
+/// Why the interpreter refused an item the session's owner pushed on a channel, nothing queued:
+/// `code` is `full`, `contract`, `closed` or `unknown`, and `problems` what the contract found.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct PostRefusal {
+    pub(crate) code: Option<String>,
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) problems: Vec<String>,
 }
 
 /// One protocol line from the interpreter, which names the agent it concerns.
@@ -699,6 +727,19 @@ enum Reply {
     /// A kernel the host asked to end has ended: its loop has stopped and its
     /// thread is done.
     Ended {},
+    /// The session's channels declared under `id`, with the schema text of each typed
+    /// direction, by channel; or why not.
+    Declared {
+        id: ExecId,
+        schemas: Option<Value>,
+        error: Option<ImportFailure>,
+    },
+    /// The answer to an item pushed on a channel under `id`, which carries one of the two.
+    Posted {
+        id: ExecId,
+        pending: Option<usize>,
+        error: Option<PostRefusal>,
+    },
     #[serde(other)]
     Other,
 }
@@ -773,6 +814,20 @@ impl ImportFailure {
             true => message.clone(),
             false => format!("{message}\n{traceback}"),
         })
+    }
+
+    /// The start's error for `module`, which failed so: its code, its message and the end of
+    /// its traceback.
+    pub(crate) fn into_import(self, module: String) -> InterpreterError {
+        let Self {
+            code,
+            message,
+            traceback,
+        } = self;
+        InterpreterError::Import {
+            module,
+            reason: format!("({code}): {message}\n{}", traceback.trim_end()),
+        }
     }
 }
 
@@ -1081,6 +1136,61 @@ impl Interpreter {
         lock(&self.table).services = Some(lines);
     }
 
+    /// An id from the interpreter's one counter, which no request, message or execution shares:
+    /// an item an agent sends on an external channel is given one.
+    pub(crate) fn mint(&self) -> ExecId {
+        lock(&self.table).next_id()
+    }
+
+    /// Hand each line the interpreter sends about the session's channels to `lines`, from now
+    /// on.
+    pub(crate) fn attach_channels(&self, lines: ChannelLines) {
+        lock(&self.table).channels = Some(lines);
+    }
+
+    /// Declare the session's channels, `entries`, before any kernel opens, and wait for the
+    /// interpreter to have made each, within `bound`: a typed contract imports the application's
+    /// code, which the interpreter does on a thread of its own. The JSON Schema text of each
+    /// typed direction, by channel and direction; or `Err` with why one could not be made.
+    pub(crate) async fn declare_channels(
+        &self,
+        entries: Value,
+        bound: Duration,
+    ) -> Result<Value, InterpreterError> {
+        let receiver = self.request(
+            json!({"t": "channels", "channels": entries}),
+            Query::Declared,
+            |_, _| {},
+        )?;
+        let declared = match tokio::time::timeout(bound, answer(&self.table, receiver)).await {
+            Ok(answered) => answered?,
+            Err(_) => {
+                return Err(InterpreterError::Import {
+                    module: "the session's channels".to_string(),
+                    reason: format!("were not declared within {bound:?}"),
+                });
+            }
+        };
+        declared.map_err(|failure| failure.into_import("the session's channels".to_string()))
+    }
+
+    /// Queue `line`, an item pushed on one of the session's channels, under an id of its own,
+    /// which `before` is given under the lock the line is sent under, before it is sent: the
+    /// item's delivery id, recorded before the holder's taking it can be heard. The future says
+    /// how many items then waited, or why the interpreter refused it.
+    pub(crate) fn post_item(
+        &self,
+        line: Value,
+        before: &mut dyn FnMut(ExecId),
+    ) -> Result<
+        impl Future<Output = Result<Result<usize, PostRefusal>, InterpreterError>> + Send + use<>,
+        InterpreterError,
+    > {
+        let receiver = self.request(line, Query::Posted, |_, id| before(id))?;
+        let table = Arc::clone(&self.table);
+        Ok(async move { answer(&table, receiver).await })
+    }
+
     /// Tell the interpreter the session's skills, before anything runs, as
     /// [`Interpreter::declare_bindings`] tells it the bindings.
     pub(crate) fn declare_skills(&self, message: &Value) {
@@ -1259,7 +1369,8 @@ impl Interpreter {
                 message: id.message(),
                 channel: channel.to_string(),
                 from: USER_END.to_string(),
-                to: self.events.agent().to_string(),
+                to: self.events.end(),
+                sender: Some(USER_END.to_string()),
                 body: body.to_string(),
             });
             if let Some((skill, source)) = directive {
@@ -1267,6 +1378,7 @@ impl Interpreter {
                     skill: skill.to_string(),
                     source: source.to_string(),
                     message: id.message(),
+                    channel: channel.to_string(),
                 });
             }
         })?;
@@ -1386,16 +1498,7 @@ impl Interpreter {
                 };
                 answered(&imported);
                 if let Some(failure) = imported.error {
-                    let ImportFailure {
-                        code,
-                        message,
-                        traceback,
-                    } = failure;
-                    let reason = format!("({code}): {message}\n{}", traceback.trim_end());
-                    return Err(InterpreterError::Import {
-                        module: imported.module,
-                        reason,
-                    });
+                    return Err(failure.into_import(imported.module));
                 }
             }
             Ok(())
@@ -1481,7 +1584,7 @@ impl Interpreter {
         self.events.emit(Payload::MessageReceived {
             message: message.message(),
             channel: channel.to_string(),
-            from: self.events.agent().to_string(),
+            from: self.events.end(),
             to: USER_END.to_string(),
         });
         if table.open().is_ok() {
@@ -2412,6 +2515,19 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
         }
         return;
     }
+    // A line about the session's channels is the session's: a kernel taking one, its holder's
+    // receipt of an item, a send. Its own statement, so the table is not locked while the hook
+    // runs. With no hook, nothing declared a channel, so no kernel has one to speak of.
+    if let Some(kind) = value["t"].as_str()
+        && kind.starts_with("channel.")
+    {
+        let channels = lock(table).channels.clone();
+        match channels {
+            Some(channels) => channels(value),
+            None => tracing::warn!("ignored a {kind} line: the session declares no channel"),
+        }
+        return;
+    }
     // A line about services is the session's, and names the kernel whose
     // agent made the call: one the host did not open is answered at once, as
     // is any when nothing serves them, since the thread that sent it waits for
@@ -2586,6 +2702,27 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
             }
             _ => tracing::warn!("ignored construction {id}, which nothing asked for"),
         },
+        Reply::Declared { id, schemas, error } => match lock(table).queries.remove(&id) {
+            Some(Query::Declared(waiter)) => {
+                let _ = waiter.send(error.map_or_else(|| Ok(schemas.unwrap_or_default()), Err));
+            }
+            _ => tracing::warn!("ignored channels declared under {id}, which nothing asked for"),
+        },
+        Reply::Posted { id, pending, error } => match lock(table).queries.remove(&id) {
+            Some(Query::Posted(waiter)) => {
+                let answer = match (pending, error) {
+                    (_, Some(error)) => Err(error),
+                    (Some(pending), None) => Ok(pending),
+                    (None, None) => Err(PostRefusal {
+                        code: None,
+                        message: "the interpreter answered without saying".to_string(),
+                        problems: Vec::new(),
+                    }),
+                };
+                let _ = waiter.send(answer);
+            }
+            _ => tracing::warn!("ignored the answer to item {id}, which nothing pushed"),
+        },
         Reply::File { id, file, error } => match lock(table).queries.remove(&id) {
             Some(Query::File(waiter)) => {
                 let _ = waiter.send(error.map_or(Ok(file), Err));
@@ -2601,6 +2738,7 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
                 channel: channel.clone(),
                 from: from.clone(),
                 to: USER_END.to_string(),
+                sender: None,
                 body: body.clone(),
             });
             // Only the primary agent has a user on the other end.

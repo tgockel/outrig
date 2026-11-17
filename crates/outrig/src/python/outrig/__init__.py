@@ -22,6 +22,10 @@ value or with an `outrig.AgentError`: see `help(outrig.AgentError)` and `help(ou
 its own: see `help(outrig.agent)`. A subclass of `outrig.Agent` declares a long-lived child
 instead, whose methods marked `@outrig.agent` are its request channels: see `help(outrig.Agent)`.
 
+A channel the session's owner declares ends in the owner's own messaging rather than at an agent:
+its `send` raises an `outrig.ChannelError` when the message was not taken, or may not have been,
+and its `receive` when the channel was closed: see `help(outrig.ChannelError)`.
+
 Each service the session's owner serves from Rust is an `outrig.Service`, its methods calls to
 the host by value; a call that returns no result raises `outrig.ServiceError`: see
 `help(outrig.Service)`.
@@ -38,14 +42,20 @@ from ._agents import (
     AgentReleased,
     AgentRequestFailed,
     BudgetExhausted,
+    ChannelClosed,
+    ChannelError,
     CompletionRejected,
     Facility,
     Request,
     RequestCancelled,
     RequestSettled,
     Section,
+    SendNotAccepted,
+    SendRefused,
+    SendUncertain,
     SessionClosing,
     Status,
+    UnreadableDelivery,
     agent,
     facility,
 )
@@ -60,17 +70,23 @@ __all__ = [
     "AgentReleased",
     "AgentRequestFailed",
     "BudgetExhausted",
+    "ChannelClosed",
+    "ChannelError",
     "CompletionRejected",
     "Facility",
     "Request",
     "RequestCancelled",
     "RequestSettled",
     "Section",
+    "SendNotAccepted",
+    "SendRefused",
+    "SendUncertain",
     "Service",
     "ServiceError",
     "ServiceMethod",
     "SessionClosing",
     "Status",
+    "UnreadableDelivery",
     "agent",
     "facility",
 ]

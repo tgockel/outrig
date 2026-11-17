@@ -883,3 +883,69 @@ fn a_generated_message_and_an_input_cross() {
          True 2 {'a': 1} 3\n"
     );
 }
+
+/// A check builds nothing: a dataclass's `__post_init__` does not run, the problems are those a
+/// decode finds -- a missing field named by its path -- and a union two classes would both
+/// take passes, left to the decode that builds it. What an external channel's reader thread
+/// runs on a typed body (`0003-51`).
+#[test]
+fn a_check_finds_a_decodes_problems_and_builds_nothing() {
+    let out = run(r#"
+        built = []
+        @dataclass
+        class Point:
+            x: int
+            y: int
+            def __post_init__(self):
+                built.append(self)
+        @dataclass
+        class Pair:
+            x: int
+            y: int
+        point = declare(Point)
+        print(list(map(str, point._checking({'x': 1, 'y': 2}).found)), built)
+        print(list(map(str, point._checking({'x': 1}).found)), built)
+        print(list(map(str, declare(list[Point])._checking([{'x': 1, 'y': 'a'}]).found)))
+        either = declare(Point | Pair)
+        print(list(map(str, either._checking({'x': 1, 'y': 2}).found)), built)
+        print(problems({'x': 1, 'y': 2}, either))
+        "#);
+    assert_eq!(
+        out,
+        "[] []\n\
+         ['$.y: missing required key'] []\n\
+         ['$[0].y: expected an integer, not a string']\n\
+         [] []\n\
+         $: is ambiguous: it decodes as each of Point, Pair\n"
+    );
+}
+
+/// Untyped JSON takes any JSON value and copies it, refusing only what is not JSON: a
+/// non-finite number, a key that is not a string, a value of another type, nesting past the
+/// host parser's 128. Its schema is `{}`, and it is named `JSON`.
+#[test]
+fn untyped_json_takes_any_json_value_and_copies_it() {
+    let out = run(r#"
+        any_json = schema._contract((schema._JSON,), 'a channel cannot take')
+        value = {'a': [1, 2.5, None, True, {'b': 'c'}]}
+        copied = any_json.decode(value)
+        print(copied == value, copied is not value, copied['a'] is not value['a'])
+        print(any_json.encode('text'), any_json.json_schema(), schema._describe(schema._JSON))
+        for bad in (float('nan'), {1: 2}, (1, 2), [object()]):
+            print(any_json._encoding(bad)[1].listing())
+        deep = []
+        for _ in range(130):
+            deep = [deep]
+        print(problems(deep, any_json).split(': ', 1)[1])
+        "#);
+    assert_eq!(
+        out,
+        "True True True\n\
+         text {} JSON\n  \
+         $: expected a finite number, not nan\n  \
+         $: expected string keys, not int\n  \
+         $: expected JSON, not tuple\n  \
+         $[0]: expected JSON, not object\n\
+         nests past 128 levels\n"
+    );
+}

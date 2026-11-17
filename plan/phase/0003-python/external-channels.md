@@ -611,7 +611,11 @@ by `0003-47` from OutRig's rules, the class docstring, the application's contrib
 facility and channel manifest ("What the agent is told"; `task-agents.md`), and they say nothing
 about any particular message. The owner pushes the initial input through the channel handle as it
 pushes anything else, before or after the holder's kernel exists; the window exists from session
-start and holds it either way ("Who holds a channel").
+start and holds it either way ("Who holds a channel"). A holder the builder constructs inside the
+start exists before the owner holds any handle, so the definition carries initial items too --
+`ChannelDefinition::deliver`, decided in `0003-51`'s planning -- each queued through the same push
+as the start declares the window, before any agent is built: the envelope, the announcement and
+the consumption are a later item's, and only the moment it is pushed differs.
 
 OR-A1-5 requires one documented order for the docstring, the contributions and the first
 delivery, and this page documents it with `0003-47`: the instructions come first and whole --

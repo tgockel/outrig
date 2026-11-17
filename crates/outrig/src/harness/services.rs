@@ -329,25 +329,38 @@ pub(crate) fn check_names(
     served: &[(String, Arc<dyn Service>)],
 ) -> crate::error::Result<()> {
     for (index, (name, _)) in served.iter().enumerate() {
-        let refused = |why: String| {
-            crate::error::OutrigError::Configuration(format!(
+        let earlier = served[..index].iter().map(|(earlier, _)| earlier.as_str());
+        if let Some(why) = name_taken(name, "serve", declared, earlier) {
+            return Err(crate::error::OutrigError::Configuration(format!(
                 "the service `{name}` given through `serve` {why}: a service's name is a global in \
                  every kernel, so it names one service"
-            ))
-        };
-        crate::config::check_binding_name(name, None).map_err(|e| {
-            refused(format!(
-                "cannot take that name, as a binding could not: {e}"
-            ))
-        })?;
-        if declared.iter().any(|binding| binding.name == *name) {
-            return Err(refused("is a binding's name already".into()));
-        }
-        if served[..index].iter().any(|(earlier, _)| earlier == name) {
-            return Err(refused("was given through `serve` already".into()));
+            )));
         }
     }
     Ok(())
+}
+
+/// Why `name`, given through the builder's `method`, cannot be had, if it cannot: a name a
+/// binding could not take -- not a Python identifier, a keyword, `runtime`, `asyncio`, `outrig`
+/// -- one a binding `declared`, or one among the `earlier` names `method` was given.
+pub(crate) fn name_taken<'a>(
+    name: &str,
+    method: &str,
+    declared: &[super::bindings::Declared],
+    mut earlier: impl Iterator<Item = &'a str>,
+) -> Option<String> {
+    if let Err(e) = crate::config::check_binding_name(name, None) {
+        return Some(format!(
+            "cannot take that name, as a binding could not: {e}"
+        ));
+    }
+    if declared.iter().any(|binding| binding.name == name) {
+        return Some("is a binding's name already".into());
+    }
+    if earlier.any(|earlier| earlier == name) {
+        return Some(format!("was given through `{method}` already"));
+    }
+    None
 }
 
 /// The longest a preview in an event is, in characters, as a child's inputs'.

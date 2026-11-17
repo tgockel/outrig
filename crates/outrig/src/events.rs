@@ -64,18 +64,20 @@ static EVENT_LABELS: Labels = Labels {
 /// with no subscriber holds.
 ///
 /// A handle speaks for one agent, the primary unless [`Events::for_agent`]
-/// made it: an event that names no agent of its own is that agent's.
+/// made it: an event that names no agent of its own is that agent's. One
+/// [`Events::for_session`] made speaks for none, and such an event is the
+/// session's, with no subject.
 #[derive(Clone)]
 pub(crate) struct Events {
     stream: Option<Arc<Stream>>,
-    agent: Subject,
+    agent: Option<Subject>,
 }
 
 impl Default for Events {
     fn default() -> Self {
         Self {
             stream: None,
-            agent: Subject::PRIMARY,
+            agent: Some(Subject::PRIMARY),
         }
     }
 }
@@ -120,13 +122,26 @@ impl Events {
     pub(crate) fn for_agent(&self, agent: &str) -> Self {
         Self {
             stream: self.stream.clone(),
-            agent: Subject::agent(agent),
+            agent: Some(Subject::agent(agent)),
         }
     }
 
-    /// The agent this handle speaks for.
-    pub(crate) fn agent(&self) -> &Subject {
-        &self.agent
+    /// A handle on the same stream that speaks for no agent: for what happens
+    /// in a session while no agent is there to own it, such as an item pushed
+    /// on a channel nobody holds yet, in a session with no primary.
+    pub(crate) fn for_session(&self) -> Self {
+        Self {
+            stream: self.stream.clone(),
+            agent: None,
+        }
+    }
+
+    /// How a message's end names the agent this handle speaks for: its
+    /// subject, or `none` for a handle that speaks for the session.
+    pub(crate) fn end(&self) -> String {
+        self.agent
+            .as_ref()
+            .map_or_else(|| "none".to_string(), Subject::to_string)
     }
 
     /// Whether events go anywhere. Fixed when the stream is built, so a caller
@@ -140,7 +155,7 @@ impl Events {
     /// dropped, there being nobody left to hand it to.
     pub(crate) fn emit(&self, payload: Payload) {
         if let Some(stream) = &self.stream {
-            stream.publish(payload, &self.agent, false);
+            stream.publish(payload, self.agent.as_ref(), false);
         }
     }
 
@@ -148,7 +163,7 @@ impl Events {
     /// someone subscribes: for one that copies what it carries.
     pub(crate) fn emit_with(&self, build: impl FnOnce() -> Payload) {
         if let Some(stream) = &self.stream {
-            stream.publish(build(), &self.agent, false);
+            stream.publish(build(), self.agent.as_ref(), false);
         }
     }
 
@@ -158,7 +173,7 @@ impl Events {
     pub(crate) async fn close_after(&self, last: Payload) -> std::result::Result<(), LogLoss> {
         match &self.stream {
             Some(stream) => {
-                stream.publish(last, &self.agent, true);
+                stream.publish(last, self.agent.as_ref(), true);
                 stream.finish().await
             }
             None => Ok(()),
@@ -200,7 +215,7 @@ impl Events {
 impl Stream {
     /// Number `payload`, `emitter`'s unless it names its own agent, and hand
     /// it to every queue; with `last`, end the stream behind it.
-    fn publish(&self, payload: Payload, emitter: &Subject, last: bool) {
+    fn publish(&self, payload: Payload, emitter: Option<&Subject>, last: bool) {
         // Built before the lock every emitter shares, and given its place
         // under it.
         let subject = payload.subject(emitter);
@@ -421,7 +436,7 @@ impl StreamBuilder {
                 subscribers,
                 file: Mutex::new(file),
             })),
-            agent: Subject::PRIMARY,
+            agent: Some(Subject::PRIMARY),
         }
     }
 }

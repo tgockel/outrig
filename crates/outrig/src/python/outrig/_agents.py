@@ -43,14 +43,20 @@ __all__ = [
     "AgentReleased",
     "AgentRequestFailed",
     "BudgetExhausted",
+    "ChannelClosed",
+    "ChannelError",
     "CompletionRejected",
     "Facility",
     "Request",
     "RequestCancelled",
     "RequestSettled",
     "Section",
+    "SendNotAccepted",
+    "SendRefused",
+    "SendUncertain",
     "SessionClosing",
     "Status",
+    "UnreadableDelivery",
     "agent",
     "facility",
 ]
@@ -184,6 +190,53 @@ class BudgetExhausted(AgentError):
 
 class SessionClosing(AgentError):
     """The session closed to new work before the child answered, or before this could start."""
+
+
+class ChannelError(Exception):
+    """The base of what an external channel's `send` and `receive` raise: a channel whose far
+    end is the session owner's own messaging, not an agent's. `reason` says why, in the far end's
+    words where it gave any."""
+
+    def __init__(self, message, reason=None):
+        super().__init__(message)
+        self.reason = reason
+
+
+class ChannelClosed(ChannelError):
+    """The channel's far end closed it -- its peer is gone -- saying why in `reason`. A `send`
+    raises this; a `receive` takes what was already waiting, then raises it rather than waiting;
+    `runtime.wait` raises it once."""
+
+
+class SendRefused(ChannelError):
+    """The message was refused before anything was sent, so nothing was: `reason` says why."""
+
+
+class SendNotAccepted(ChannelError):
+    """The channel's far end said it did not take the message, so sending it again is safe:
+    `reason` is what it said."""
+
+
+class SendUncertain(ChannelError):
+    """Whether the message was taken is not known: it may have been. `item` is the id OutRig gave
+    it, which the far end knows it by; sending it again may deliver it twice. `reason` says what
+    went wrong."""
+
+    def __init__(self, message, item, reason):
+        super().__init__(message, reason)
+        self.item = item
+
+
+class UnreadableDelivery(ChannelError):
+    """A message taken from a channel whose body checked against the channel's type when it
+    arrived, and then could not be built as it: the type's own code raised. The message is taken,
+    and no later receive sees it. `delivery` is its id, `body` the JSON it arrived as, and
+    `__cause__` why."""
+
+    def __init__(self, message, delivery, body):
+        super().__init__(message)
+        self.delivery = delivery
+        self.body = body
 
 
 class Request:

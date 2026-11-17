@@ -70,6 +70,17 @@
 //! round in flight is given until its next model call to end, and is dropped
 //! only if a model call keeps it past `RELEASE_WAIT`.
 //!
+//! An agent class instance's child -- a root among them -- may also hold
+//! external channels, whose messages owe no reply. A message its model has
+//! not been told of, waiting unread on one that announces its arrivals, opens
+//! a round as a change of what it holds does: its opening says what waits, by
+//! channel and count, and the round that announced it -- at its opening, or in
+//! a result -- is the only one it earns, read or not. A round the provider
+//! refused keeps only what its opening announced: a result it refused the
+//! call carrying was never taken, so a message only that result told of opens
+//! the next round. Nothing warns about a message or cancels it, and it never
+//! makes a round the warning or the one after it.
+//!
 //! An agent class instance's child has one round before the rule applies: its
 //! orienting round, which opens as it launches, to get ready in. Its opening
 //! line announces what already waits, by channel and count, after its lead;
@@ -85,8 +96,8 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use super::children::{Registry, Summary};
-use super::orientation;
 use super::{Agent, AgentError};
+use super::{channel, orientation};
 use crate::harness::RoundStop;
 use crate::harness::event::{AttemptId, ChildKind};
 use crate::harness::stop::{AgentState, RoundFacts};
@@ -266,20 +277,29 @@ pub(crate) async fn run(
             continue;
         }
         let live = children.summary(&id, kind);
-        if orienting.is_none() && live.is_empty() {
+        // What waits, read once: whether a message is news, and, if a round
+        // opens, what its opening says, which the announcer counts as told.
+        let counts = children.counts(&id);
+        // A message on an external channel it holds that its model has not
+        // been told of: it opens a round, as a request does, and owes no reply,
+        // so it never makes one the warning or the round after it. Only an
+        // agent class instance's child -- a root among them -- has rounds that
+        // are not its submissions'.
+        let news = kind == ChildKind::Request && agent.announcer().unannounced(&counts);
+        if orienting.is_none() && live.is_empty() && !news {
             children.idle(&id);
             drop(children);
             wake.notified().await;
             continue;
         }
-        if resting.as_ref() == Some(&live.held()) {
+        if resting.as_ref() == Some(&live.held()) && !news {
             drop(children);
             wake.notified().await;
             continue;
         }
         resting = None;
         // Unchanged since the last round opened on it, and holding something.
-        let unchanged = orienting.is_none() && live == baseline;
+        let unchanged = orienting.is_none() && live == baseline && !news;
         if !unchanged {
             warned = false;
         } else if warned {
@@ -315,14 +335,11 @@ pub(crate) async fn run(
         let mut opened_on = None;
         // Whether this round is the warning: a submission given now is new.
         let mut warning = unchanged;
+        let unread = || channel::announcement(&counts).unwrap_or_default();
         let (lead, detail) = match kind {
-            _ if orienting.is_some() => (
-                orientation::orienting(task, &children.unread_text(&id)),
-                String::new(),
-            ),
+            _ if orienting.is_some() => (orientation::orienting(task, &unread()), String::new()),
             ChildKind::Request => {
-                let outstanding =
-                    orientation::requests(&children.unread_text(&id), &children.taken(&id));
+                let outstanding = orientation::requests(&unread(), &children.taken(&id));
                 if warning {
                     orientation::requests_warning(&outstanding, &children.unread_on(&id))
                 } else {
@@ -369,7 +386,7 @@ pub(crate) async fn run(
         drop(children);
         let mut failures = 0;
         let ended = loop {
-            agent.announcer().opened();
+            agent.announcer().opened_at(&counts);
             let ended = agent
                 .opened(|omitted, notices| {
                     orientation::child_opening(&lead, &detail, omitted, notices)
@@ -408,7 +425,7 @@ pub(crate) async fn run(
             reply: finished.reply.clone(),
             stopped: finished.stopped.clone(),
             reasoning: finished.reasoning.clone(),
-            sends: Vec::new(),
+            sends: children.sends_in(&id, opened),
         });
         children.round_ended(&id, facts);
         // A release ended the round, or let it end, so what it held is no
@@ -438,6 +455,10 @@ pub(crate) async fn run(
             // that changes; what an orienting round ran, or did not, it has
             // ended all the same.
             Err(AgentError::Refused(failed)) => {
+                // What its opening told of opens no round again: the same
+                // opening would be refused the same way. What only a result
+                // told of the model never took, so it may open the next.
+                agent.announcer().settle(&counts);
                 let attempt = agent.slot().last_recorded().map(|(attempt, _)| attempt);
                 children.stopped(
                     &id,

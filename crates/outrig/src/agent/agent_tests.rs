@@ -57,6 +57,7 @@ const NOTHING_HELD: Holdings<'static> = Holdings {
     services: &[],
     skills: &[],
     catalog: None,
+    channels: &[],
 };
 
 /// Run `f` with the api-key variable `var` set.
@@ -1037,6 +1038,7 @@ fn the_orientation_names_each_binding_and_says_a_call_blocks_the_loop() {
             services: &[],
             skills: &[],
             catalog: None,
+            channels: &[],
         },
         Some("You write Python."),
         None,
@@ -1177,6 +1179,7 @@ fn the_orientation_lists_skills_within_its_bounds_and_counts_the_rest() {
                 services: &[],
                 skills,
                 catalog: None,
+                channels: &[],
             },
             None,
             None,

@@ -61,6 +61,7 @@ mod application;
 mod approval;
 pub(crate) mod bindings;
 mod builder;
+pub(crate) mod channels;
 mod error;
 pub mod event;
 pub(crate) mod lifecycle;
@@ -79,10 +80,15 @@ pub use self::approval::{Approval, ApprovalRequest, Approver};
 pub use self::bindings::BindingSpec;
 pub(crate) use self::builder::chosen_repo_root;
 pub use self::builder::{ContainerSpec, Progress, SessionBuilder, Step, container_spec};
+pub use self::channels::{
+    BackendFuture, CHANNEL_BOUND_MAX, Channel, ChannelBackend, ChannelDefinition, ChannelKind,
+    Consumed, Contract, DEFAULT_CALL_TIMEOUT, DeliverError, Delivered, Inbound, ItemKind, Outbound,
+    Position, SendAnswer, Wake,
+};
 pub use self::error::{Closed, ClosedBy, Failure, SessionError};
 pub use self::report::{
-    BindingStop, EventDelivery, ExecutionOutcome, ExecutionStatus, HostedCall, LogLoss,
-    RequestOutcome, ServiceCall, ShutdownReport, Stopped, Verdict,
+    BindingStop, ChannelClose, EventDelivery, ExecutionOutcome, ExecutionStatus, HostedCall,
+    LogLoss, RequestOutcome, SendAtClose, ServiceCall, ShutdownReport, Stopped, Verdict,
 };
 pub use self::root::{
     Argument, ConstructSpec, Facility, Problem, RequestChannel, RequestHandle, RootError,

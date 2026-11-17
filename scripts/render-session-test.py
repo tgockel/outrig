@@ -483,7 +483,11 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             },
             a,
         ),
-        ("skill.directive.received", {"skill": "s", "source": "project", "message": 1}, a),
+        (
+            "skill.directive.received",
+            {"skill": "s", "source": "project", "message": 1, "channel": "user"},
+            a,
+        ),
         (
             "skill.invocation.started",
             {
@@ -539,7 +543,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
         ),
         (
             "message.sent",
-            {"message": 1, "channel": "user", "from": "user", "to": a, "body": "b"},
+            {"message": 1, "channel": "user", "from": "user", "to": a, "sender": "user", "body": "b"},
             a,
         ),
         ("round.started", {"round": 1}, a),
@@ -562,9 +566,47 @@ def every_event() -> list[tuple[str, dict, str | None]]:
         ("message.received", {"message": 1, "channel": "user", "from": "user", "to": a}, a),
         (
             "message.sent",
-            {"message": 4, "channel": "user", "from": a, "to": "user", "body": "b"},
+            {"message": 4, "channel": "user", "from": a, "to": "user", "sender": None, "body": "b"},
             a,
         ),
+        (
+            "channel.attached",
+            {
+                "channel": "inbox",
+                "kind": "plain",
+                "receives": "str",
+                "sends": "app.messages:Note",
+                "bound": 256,
+                "wake": "announce",
+            },
+            a,
+        ),
+        (
+            "message.sent",
+            {
+                "message": 6,
+                "channel": "inbox",
+                "from": "backend",
+                "to": a,
+                "sender": "alice",
+                "body": '"hi"',
+            },
+            a,
+        ),
+        ("message.received", {"message": 6, "channel": "inbox", "from": "backend", "to": a}, a),
+        ("channel.consumed", {"channel": "inbox", "item": "m-1", "delivery": 6}, a),
+        (
+            "channel.item.outcome",
+            {
+                "channel": "inbox",
+                "item": 7,
+                "outcome": "not_accepted",
+                "reason": "no room",
+                "reference": None,
+            },
+            a,
+        ),
+        ("channel.closed", {"channel": "inbox", "reason": "peer gone"}, a),
         (
             "message.refused",
             {"message": 4, "channel": "user", "from": a, "to": "user", "reason": "r"},
@@ -1060,6 +1102,17 @@ def every_event() -> list[tuple[str, dict, str | None]]:
                     {"request": 9, "child": "c1", "channel": "fizz", "outcome": "closed"},
                     {"request": 10, "child": "c1", "channel": None, "outcome": "terminated"},
                 ],
+                "channels": [
+                    {
+                        "channel": "inbox",
+                        "holder": "c2",
+                        "unread": ["m-2"],
+                        "sends": [
+                            {"item": 9, "agent": "c2", "outcome": "uncertain", "reason": "r"},
+                        ],
+                        "unacknowledged": ["m-1"],
+                    },
+                ],
                 "verdict": "not_proven_stopped",
             },
             None,
@@ -1373,6 +1426,32 @@ class RenderSession(unittest.TestCase):
         self.assertIn("Owner events", owner_section)
         self.assertNotIn("Before the first round", owner_section)
         self.assertNotIn("Outside a round", owner_section)
+
+    def test_an_unheld_channels_events_stay_in_the_session_section(self) -> None:
+        """An item pushed on an external channel no agent holds yet, and the owner's close of it,
+        carry no subject: in a session with no primary they are the session's, and nothing
+        names a primary the session never had."""
+        events = no_primary_session()
+        unheld = [
+            (
+                "message.sent",
+                {
+                    "message": 7,
+                    "channel": "inbox",
+                    "from": "backend",
+                    "to": "none",
+                    "sender": "alice",
+                    "body": "first",
+                },
+                None,
+            ),
+            ("channel.closed", {"channel": "inbox", "reason": "peer gone"}, None),
+        ]
+        html = self.page([events[0], *unheld, *events[1:]])
+        self.assertNotIn("primary", html)
+        session_section = html[html.index('id="agent-0"') : html.index('id="agent-1"')]
+        self.assertIn("backend (from alice) -&gt; none on inbox: first", session_section)
+        self.assertIn("channel inbox closed: peer gone", session_section)
 
     def test_shared_events_with_no_subject_join_the_primary_section(self) -> None:
         """`session.state`, `session.report`, and the rest of what the schema gives no subject

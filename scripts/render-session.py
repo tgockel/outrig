@@ -990,6 +990,22 @@ class Builder:
             + f": {text(r.get('outcome'))}"
             for r in objs(d.get("requests"))
         ]
+        channels = [
+            f"channel {text(c.get('channel'))}, held by "
+            + (text(c.get("holder")) if c.get("holder") is not None else "no agent")
+            + "".join(
+                f"; {what} {', '.join(text(i) for i in c.get(key) or [])}"
+                for what, key in (("unread", "unread"), ("not acknowledged", "unacknowledged"))
+                if c.get(key)
+            )
+            + "".join(
+                f"; send {text(s.get('item'))} by {text(s.get('agent'))}: "
+                f"{text(s.get('outcome'))}"
+                + (f" ({text(s.get('reason'))})" if s.get("reason") is not None else "")
+                for s in objs(c.get("sends"))
+            )
+            for c in objs(d.get("channels"))
+        ]
         bindings = obj(d.get("bindings"))
         stop = (
             [
@@ -1015,6 +1031,7 @@ class Builder:
             *calls,
             *services,
             *requests,
+            *channels,
             *stop,
         ]
         self.add(text(d.get("verdict")), parts=[Part("the shutdown report", "\n".join(lines))])
@@ -1352,7 +1369,12 @@ class Builder:
         m = self.message(d.get("message"), d)
         m.body = text(d.get("body"))
         m.sent = f"{self.time}, {self.here().title}"
-        summary = f"message {m.id}: {m.sender} -> {m.to} on {m.channel}: {first_line(m.body)}"
+        # Who the far end says sent it, when that is not the end itself: an external channel's.
+        sender = d.get("sender")
+        said = f" (from {text(sender)})" if sender is not None and text(sender) != m.sender else ""
+        summary = (
+            f"message {m.id}: {m.sender}{said} -> {m.to} on {m.channel}: {first_line(m.body)}"
+        )
         self.add(summary, href=link(m.anchor))
 
     def settle(self, d: dict, outcome: str) -> None:
@@ -1366,6 +1388,33 @@ class Builder:
 
     def on_message_refused(self, d: dict) -> None:
         self.settle(d, f"refused: {text(d.get('reason'))}")
+
+    def on_channel_attached(self, d: dict) -> None:
+        self.add(
+            f"channel {text(d.get('channel'))} attached: a {text(d.get('kind'))} channel receiving "
+            f"{text(d.get('receives'))} and sending {text(d.get('sends'))}, {text(d.get('bound'))} "
+            f"unread at most, arrivals {text(d.get('wake'))}"
+        )
+
+    def on_channel_consumed(self, d: dict) -> None:
+        m = self.message(d.get("delivery"), d)
+        self.add(
+            f"message {m.id}: the backend of {text(d.get('channel'))} recorded item "
+            f"{text(d.get('item'))} as received",
+            href=link(m.anchor),
+        )
+
+    def on_channel_closed(self, d: dict) -> None:
+        self.add(f"channel {text(d.get('channel'))} closed: {text(d.get('reason'))}")
+
+    def on_channel_item_outcome(self, d: dict) -> None:
+        m = self.message(d.get("item"), d)
+        why = "".join(
+            f" ({text(d.get(k))})" for k in ("reason", "reference") if d.get(k) is not None
+        )
+        m.outcome = f"{text(d.get('outcome'))} at the backend{why}"
+        m.outcome_at = f"{self.time}, {self.here().title}"
+        self.add(f"message {m.id}: {m.outcome}", href=link(m.anchor))
 
     # -- the end ------------------------------------------------------------
 

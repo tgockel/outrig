@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use super::history::Window;
 use super::instructions::Instructions;
+use crate::harness::Wake;
 use crate::harness::bindings::Brief;
 use crate::harness::event::{FacilityBrief, FacilityKind, InputBrief};
 use crate::harness::services::ServiceBrief;
@@ -57,6 +58,88 @@ pub(crate) struct Holdings<'a> {
     pub(crate) services: &'a [ServiceBrief],
     pub(crate) skills: &'a [SkillBrief],
     pub(crate) catalog: Option<&'a Arc<Catalog>>,
+    /// The external channels it holds: every one the session declares.
+    pub(crate) channels: &'a [ExternalText],
+}
+
+/// One of the external channels an agent holds, as its instructions describe
+/// it: rendered from the channel's definition alone, never from what crosses it.
+pub(crate) struct ExternalText {
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    /// What arrives on it, and what is sent, in the agent's terms.
+    pub(crate) receives: String,
+    pub(crate) sends: String,
+    pub(crate) description: String,
+    pub(crate) wake: Wake,
+}
+
+/// What an agent is told of the external channels it holds, `channels`, of
+/// which there is at least one -- each by name, kind, contract and what an
+/// arrival does -- and how they are used; with `directive`, how an item naming
+/// one of the session's skills asks it to run that skill.
+pub(crate) fn externals(channels: &[ExternalText], directive: bool) -> String {
+    let mut text = String::from(
+        "These channels end in the program that owns this session -- its own messaging -- not at \
+         an agent:\n",
+    );
+    for channel in channels {
+        let _ = write!(
+            text,
+            "\n- `runtime.channels[{:?}]`, a {} channel",
+            channel.name, channel.kind
+        );
+        let description = channel.description.trim();
+        if !description.is_empty() {
+            let _ = write!(text, ": {description}");
+        }
+        let _ = write!(
+            text,
+            "\n  What arrives: {}\n  What you send: {}\n  {}\n",
+            channel.receives,
+            channel.sends,
+            match channel.wake {
+                Wake::Wake => {
+                    "An arrival ends a `runtime.wait` with `runtime.MessageAvailable`, is \
+                     announced, and opens a round when you are at rest."
+                }
+                Wake::Announce => {
+                    "An arrival is announced, and opens a round when you are at rest; it does not \
+                     end a `runtime.wait`."
+                }
+                Wake::Silent => {
+                    "An arrival is not announced and opens no round: read it when your code \
+                     chooses, with `pending()` and `receive()`."
+                }
+            }
+        );
+    }
+    text.push_str(
+        "\nWhat crosses them is messages, and a message owes no reply -- unlike a request, which \
+         you answer with `d.reply` or `d.fail`. Take one with `d = await \
+         runtime.channels[name].receive()`: `d.body` is it, `d.sender` who sent it, and `d.id` \
+         its id; receiving it tells the far end you have it, and an announcement says how many \
+         wait, never what they say. `await runtime.channels[name].send(value)` returns once the \
+         far end has taken it, not read it; it raises `outrig.SendNotAccepted` when the far end \
+         did not take it, so sending it again is safe, `outrig.SendUncertain` when it may have, \
+         so sending it again may deliver it twice, and `outrig.ChannelClosed` once the far end \
+         has closed the channel, after which `receive()` raises too once what waited is read.",
+    );
+    if directive {
+        text.push_str(
+            " A message whose `d.skill` names one of the session's skills asks you to run it, \
+             with what the message says: for a skill with a package, `await \
+             outrig.skills.invoke(d.skill, text)`; for one without, follow \
+             `outrig.skills.read(d.skill)`.",
+        );
+    }
+    text.push_str("\n\n");
+    text
+}
+
+/// Whether any of `channels` opens a round on an arrival.
+fn announcing(channels: &[ExternalText]) -> bool {
+    channels.iter().any(|channel| channel.wake != Wake::Silent)
 }
 
 /// The orientation, then `configured` after a blank line when there is one,
@@ -95,6 +178,9 @@ pub(crate) fn preamble(
          with it, with a `timeout=`, for anything that may not return -- tests, builds, \
          network calls.\n\n",
     );
+    if !holdings.channels.is_empty() {
+        text.push_str(&externals(holdings.channels, !holdings.skills.is_empty()));
+    }
     text.push_str(&rest(
         workspace,
         View::Session {
@@ -259,6 +345,7 @@ pub(crate) fn child_preamble(
     prompt: &str,
     inputs: &[InputBrief],
     brief: &ChildBrief<'_>,
+    external: &[ExternalText],
 ) -> String {
     let mut text = String::from(ACT);
     let root = matches!(brief, ChildBrief::Instance { root: true, .. });
@@ -333,6 +420,12 @@ pub(crate) fn child_preamble(
     {
         text.push_str(&facility_entries(given));
     }
+    if !external.is_empty() {
+        let directive = matches!(brief, ChildBrief::Instance { skills, .. } if !skills.is_empty());
+        text.push_str(&externals(external, directive));
+    }
+    let messages = announcing(external);
+    let begins_owned;
     let begins = match brief {
         ChildBrief::Call {
             result_type,
@@ -387,7 +480,12 @@ pub(crate) fn child_preamble(
                 "Your class declares no request channel, so no request arrives and you have no \
                  `runtime.complete`. {WAIT}{NOT_WAITING}\n\n"
             );
-            "as you are launched"
+            if messages {
+                "as you are launched, to get ready in, then when a message arrives on one of \
+                 your channels"
+            } else {
+                "as you are launched"
+            }
         }
         ChildBrief::Request(channels) | ChildBrief::Instance { channels, .. } => {
             text.push_str("You answer requests, which arrive on these channels:\n");
@@ -428,13 +526,18 @@ pub(crate) fn child_preamble(
                  two more, the last warning that the requests are cancelled if it ends the same \
                  way, and each sender then gets an exception.\n\n"
             );
-            match brief {
-                ChildBrief::Instance { .. } => {
-                    "as you are launched, to get ready in, then when requests are waiting, or \
-                     one you took is unanswered"
+            let launched = match brief {
+                ChildBrief::Instance { .. } => "as you are launched, to get ready in, then ",
+                _ => "",
+            };
+            let open = match messages {
+                false => ", or one you took is unanswered",
+                true => {
+                    ", one you took is unanswered, or a message arrives on one of your channels"
                 }
-                _ => "when requests are waiting, or one you took is unanswered",
-            }
+            };
+            begins_owned = format!("{launched}when requests are waiting{open}");
+            &begins_owned
         }
     };
     // A root the owner constructed is the application's primary, and is told the session's skills.
@@ -908,6 +1011,7 @@ mod tests {
             "Name the capital.",
             inputs,
             brief,
+            &[],
         )
     }
 
@@ -951,6 +1055,7 @@ mod tests {
                 "Review.",
                 &[],
                 &ChildBrief::Work,
+                &[],
             )
         }
         let mut files = given(
@@ -1018,6 +1123,7 @@ mod tests {
                 "Review.",
                 &[],
                 &ChildBrief::Work,
+                &[],
             )
         }
         let bindings = [Brief {
@@ -1308,6 +1414,7 @@ mod tests {
                     root: false,
                     skills: &[],
                 },
+                &[],
             )
         };
         let text = told(&sections);

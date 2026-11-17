@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 use super::application::{self, ApplicationSpec, Prepared};
 use super::approval::Approver;
 use super::bindings::{self, BindingSpec, Bindings, Declared, Places, Setup};
+use super::channels::{self, ChannelBackend, ChannelDefinition, Channels};
 use super::event::{DEFAULT_CAPACITY, Subscription};
 use super::lifecycle::Lifecycle;
 use super::root::ConstructSpec;
@@ -94,6 +95,8 @@ pub struct SessionBuilder {
     bound: Vec<(String, BindingSpec)>,
     /// Services given through [`SessionBuilder::serve`], in order.
     served: Vec<(String, Arc<dyn Service>)>,
+    /// Channels given through [`SessionBuilder::channel`], in order.
+    channels: Vec<(ChannelDefinition, Arc<dyn ChannelBackend>)>,
     /// How the session's services are called.
     service_policy: ServicePolicy,
     /// The bindings process's environment, exactly, when the owner gave one.
@@ -161,6 +164,7 @@ impl SessionBuilder {
             progress: None,
             bound: Vec::new(),
             served: Vec::new(),
+            channels: Vec::new(),
             service_policy: ServicePolicy::default(),
             bindings_env: None,
             approver: None,
@@ -279,6 +283,30 @@ impl SessionBuilder {
     /// that a binding or another service already takes, fails the start.
     pub fn serve(mut self, name: impl Into<String>, service: Arc<dyn Service>) -> Self {
         self.served.push((name.into(), service));
+        self
+    }
+
+    /// Declare an external channel: `definition` says what it is, and `backend`
+    /// is its far end, the owner's own messaging, which OutRig calls for each
+    /// item the holder sends and receives.
+    ///
+    /// One agent holds the channel, as `runtime.channels[name]`: the primary
+    /// agent, when the session has one; or, in a session with
+    /// [`SessionBuilder::no_primary`], the agent whose facility dict names it
+    /// with [`Facility::channel`](super::Facility::channel), and none until one
+    /// does. Its window exists from the start either way, holding the
+    /// definition's initial items and what [`Session::channel`] pushes. A name
+    /// a binding could not take, `user`, or one a binding, a service or another
+    /// channel already takes, fails the start; so does a bound past
+    /// [`CHANNEL_BOUND_MAX`](super::CHANNEL_BOUND_MAX), and a
+    /// [`Contract::Typed`](super::Contract::Typed) in a session with no
+    /// [`SessionBuilder::application`] or whose type does not import.
+    pub fn channel(
+        mut self,
+        definition: ChannelDefinition,
+        backend: Arc<dyn ChannelBackend>,
+    ) -> Self {
+        self.channels.push((definition, backend));
         self
     }
 
@@ -415,10 +443,23 @@ impl SessionBuilder {
         }
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         services::check_names(&declared, &self.served).map_err(start_error)?;
+        self.check_channels(&declared)?;
         skills::check_sources(&self.skill_sources)
             .map_err(|e| start_error(OutrigError::Configuration(e)))?;
         application::check(self.application.as_ref()).map_err(start_error)?;
         self.check_root()
+    }
+
+    /// The channels given through [`SessionBuilder::channel`], against the bindings `declared`
+    /// and the services given.
+    fn check_channels(&self, declared: &[Declared]) -> Result<(), SessionError> {
+        channels::check(
+            declared,
+            &self.served,
+            &self.channels,
+            self.application.is_some(),
+        )
+        .map_err(start_error)
     }
 
     /// The root [`SessionBuilder::construct`] asked for: its model, and the keys it names,
@@ -528,6 +569,22 @@ impl SessionBuilder {
         )
     }
 
+    /// The channels given through [`SessionBuilder::channel`], for `interpreter`'s session: told
+    /// the interpreter in [`assemble`], once the application code is there.
+    fn channels(
+        &mut self,
+        interpreter: &Interpreter,
+        lifecycle: &Arc<Lifecycle>,
+        catalog: &Arc<Catalog>,
+    ) -> Channels {
+        Channels::new(
+            std::mem::take(&mut self.channels),
+            interpreter,
+            lifecycle,
+            Some(Arc::clone(catalog)),
+        )
+    }
+
     fn report(&mut self, progress: Progress) {
         if let Some(report) = &mut self.progress {
             report(progress);
@@ -542,6 +599,7 @@ impl SessionBuilder {
         let mut resolved = self.resolution()?;
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         services::check_names(&declared, &self.served).map_err(start_error)?;
+        self.check_channels(&declared)?;
         skills::check_sources(&self.skill_sources)
             .map_err(|e| start_error(OutrigError::Configuration(e)))?;
         application::check(self.application.as_ref()).map_err(start_error)?;
@@ -610,6 +668,7 @@ impl SessionBuilder {
         bindings.declare(&interpreter, bindings::container_path);
         skills::serve(&catalog, &interpreter, &events);
         let services = self.serve_services(&interpreter, &lifecycle);
+        let channels = self.channels(&interpreter, &lifecycle, &catalog);
         self.report(Progress::Finished(Step::Python));
 
         let primary = outrig.primary();
@@ -629,14 +688,16 @@ impl SessionBuilder {
             lifecycle,
             bindings,
             services,
+            channels,
             setup,
         );
         #[cfg(test)]
         let session = session.failing(self.fail_stop.take());
-        let application = application.map(|application| (application, self.import_wait()));
+        let wait = self.import_wait();
         assemble(
             session,
             application,
+            wait,
             resolved.as_mut(),
             self.construct.take(),
             workspace.as_deref(),
@@ -786,6 +847,7 @@ impl SessionBuilder {
         let mut resolved = self.resolution()?;
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         services::check_names(&declared, &self.served).map_err(start_error)?;
+        self.check_channels(&declared)?;
         application::check(self.application.as_ref()).map_err(start_error)?;
         self.check_root()?;
         let repo_root = chosen_repo_root(self.repo_root.as_deref()).map_err(start_error)?;
@@ -818,6 +880,7 @@ impl SessionBuilder {
         bindings.declare(&interpreter, Path::to_path_buf);
         skills::serve(&catalog, &interpreter, &events);
         let services = self.serve_services(&interpreter, &lifecycle);
+        let channels = self.channels(&interpreter, &lifecycle, &catalog);
         self.report(Progress::Finished(Step::Python));
         let workspace = self.host_workspace.take().or(self.workdir.clone());
         let setup = self.child_setup(workspace.clone(), &catalog);
@@ -829,13 +892,15 @@ impl SessionBuilder {
             lifecycle,
             bindings,
             services,
+            channels,
             setup,
         )
         .failing(self.fail_stop.take());
-        let application = application.map(|application| (application, self.import_wait()));
+        let wait = self.import_wait();
         assemble(
             session,
             application,
+            wait,
             resolved.as_mut(),
             self.construct.take(),
             workspace.as_deref(),
@@ -889,25 +954,33 @@ async fn default_container(
 }
 
 /// `session`, with its application code provisioned -- each module imported
-/// at start within the bound beside it -- the primary agent `resolved` names
-/// -- none, for a session with no primary agent -- or the root `construct`
-/// describes, in a container whose workspace is `workspace`, holding the
-/// session's skills, `catalog`, and idle. Application code that does not
-/// import, a primary that cannot be built, or a root not constructed, stops
-/// what the start launched.
+/// at start within `wait` -- its channels declared within the same, the
+/// primary agent `resolved` names -- none, for a session with no primary agent
+/// -- or the root `construct` describes, in a container whose workspace is
+/// `workspace`, holding the session's skills, `catalog`, and idle. Application
+/// code that does not import, a channel that cannot be declared, a primary
+/// that cannot be built, or a root not constructed, stops what the start
+/// launched.
 async fn assemble(
     mut session: Session,
-    application: Option<(Prepared, std::time::Duration)>,
+    application: Option<Prepared>,
+    wait: std::time::Duration,
     resolved: Option<&mut ResolvedAgent>,
     construct: Option<ConstructSpec>,
     workspace: Option<&Path>,
     catalog: &Arc<Catalog>,
 ) -> Result<Session, SessionError> {
-    if let Some((application, bound)) = application
-        && let Err(e) = session.provision(application, bound).await
+    if let Some(application) = application
+        && let Err(e) = session.provision(application, wait).await
     {
         session.abandon().await;
         return Err(SessionError::Start(Failure(e.into())));
+    }
+    // Declared once the application code is there, which a typed contract names, and before
+    // any agent is built, so each window holds its initial items when its holder first looks.
+    if let Err(e) = session.declare_channels(wait).await {
+        session.abandon().await;
+        return Err(start_error(OutrigError::Configuration(e)));
     }
     if let Some(resolved) = resolved
         && let Err(e) = session.build_primary(resolved, workspace, catalog).await

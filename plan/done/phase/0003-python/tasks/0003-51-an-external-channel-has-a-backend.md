@@ -148,10 +148,13 @@ to the backend per item, and the primary's initial and later input arrive on one
   records), and an unread item earns one round at most. Nothing warns about or cancels a plain
   item. `runtime.wait` over a child's handle and an external channel stays one wait: nothing is
   added for it, and the acceptance runs it.
-- **The uniform user channel** (OR-A7-3). The owner pushes the primary's initial input through
-  the channel handle as it pushes any later input, under the same envelope; with empty initial
-  input nothing is pushed and nothing is announced or invented; no first-message prompt is
-  composed, and the instructions carry no item's body. The order of the docstring, the
+- **The uniform user channel** (OR-A7-3). The owner gives the primary's initial input as items of
+  the same envelope as any later input: through the channel handle, or -- for a holder the
+  builder constructs inside `start()`, before the owner holds any handle -- as the definition's
+  initial messages (`ChannelDefinition::deliver`), queued as `start()` declares the window and
+  before any kernel exists (revised in planning); with empty initial input nothing is pushed and
+  nothing is announced or invented; no first-message prompt is composed, and the instructions
+  carry no item's body. The order of the docstring, the
   contributions and the first delivery is `external-channels.md`'s, "Initial input is a
   delivery": the instructions whole, then the orienting round's opening line announcing what
   waits (fork 8), recorded in this task's `## Decisions` beside `0003-47`'s.
@@ -216,9 +219,10 @@ Each is a mock-driven test unless it says otherwise.
 - **The window.** With `bound = 2` and two items unread, `deliver` is refused `full`; after one
   `receive()` it is accepted; `room()` resolves then and not before. An item outside the contract
   is refused `contract`, naming the problem, and nothing is queued. A push into a declared
-  channel of a no-primary session before any kernel holds it is answered with a delivery id and
-  waits in the window, whether the root is then constructed by the builder form or by
-  `Session::construct`, and is delivered at the orienting round; `holder()` reads none before and
+  channel of a no-primary session before any kernel holds it -- a definition's initial message,
+  or a handle push before `Session::construct` -- waits in the window, whether the root is then
+  constructed by the builder form or by `Session::construct`, and is delivered at the orienting
+  round; `holder()` reads none before and
   the root's id after; a channel no dict names is listed at the close with its items unread.
 - **A directive.** A push with `skill: "review"` on `inbox` reaches the mock as a delivery whose
   `skill` is `review` and `skill.directive.received` names the channel; one naming a skill not in
@@ -342,3 +346,151 @@ Each is a mock-driven test unless it says otherwise.
   `_pending`), `crates/outrig/src/python/host.rs` (`posting`, `acknowledge`, `Reply::Sent`),
   `crates/outrig/src/agent/channel.rs`, `runner.rs`, `orientation.rs`,
   `crates/outrig/src/harness/builder.rs`, `session.rs`, `skills.rs`.
+
+## Decisions
+
+Every fork was taken as recommended: 1 `wake` by default; 2 asynchronous backend methods, each a
+boxed future (`BackendFuture`, as `ServiceFuture` is, so no `futures` type is public); 3 the push
+on a handle from `Session::channel(name)`; 4 a window from session start; 5 the structural check
+on arrival and construction at `receive()`; 6 a line of its own; 7 `module:Name`; 8 the opening
+line after the whole instructions; 9 not built. One change was made in planning, the maintainer's:
+**the definition carries initial items**, `ChannelDefinition::deliver(Inbound)`, because a root
+the builder constructs exists before its owner holds any handle to push with. They are pushed
+through the same path as any push, as the start declares the windows and before any agent is
+built, so the builder form's first message waits at the orienting round as `Session::construct`'s
+does. Passing the first message as a constructor argument was considered and dropped: the agent
+would read the first request from `self` and every later one from its channel.
+
+- **Spellings.** Rust: `ChannelDefinition` (`receives`, `sends`, `bound`, `wake`, `description`,
+  `call_timeout`, `deliver`), `ChannelKind::Plain`, `Contract::{Text, Json, Typed, Nothing}`,
+  `Wake::{Wake, Announce, Silent}`, `ChannelBackend` (`send(Outbound) -> SendAnswer`,
+  `consumed(Consumed) -> io::Result<()>`), `SendAnswer::{Accepted, NotAccepted, Uncertain}`,
+  `Channel` (`deliver`, `close`, `room`, `holder`), `Inbound` (`message`, then `kind`,
+  `correlation`, `reference`, `skill`), `ItemKind`, `Delivered::{Queued, Repeat}`, `Position`,
+  `DeliverError`, `Facility::Channel`, `FacilityKind::Channel`, `ItemOutcome`, and the report's
+  `ChannelClose` and `SendAtClose`. `RoundSend::items` is `Vec<MessageId>`, as `0003-48` allowed.
+  Python: `outrig.ChannelError` and under it `ChannelClosed`, `SendRefused`, `SendNotAccepted`,
+  `SendUncertain` (`.item`) and `UnreadableDelivery`; each carries `reason`. Lines: `channels`,
+  answered `declared` with each typed direction's schema text; `channel.msg`, answered `posted`;
+  `channel.close`; and from the kernels `channel.attached`, `channel.detached`, `channel.consumed`
+  and `channel.send`, answered `channel.sent`.
+- **The window lives in the interpreter.** `channels` makes one unheld `_External` per channel,
+  on a thread of its own, since a typed contract imports the application's code and the reader
+  never runs a module's code (`_class_named`, so a missing type fails as a construction's does).
+  A push is a session-level line under a delivery id the host mints; the kernel that claims the
+  channel takes the endpoint, queue and all. The host keeps its own record of each item -- owner's
+  id, delivery id, position -- which repeats, positions, counts and the report read.
+- **Claiming.** A kernel claims its channels before anything of it is made, so a channel another
+  kernel holds refuses the launch with nothing to undo, naming the holder: the primary takes every
+  channel unheld, any other kernel the channel references its facility dict holds (a root's at
+  `adopt`, which a construction then fails `invalid-argument`). `Kernel.end` gives them up, the
+  queue kept, so a later root's dict can take a channel a released one held. A channel reference
+  given as a bare argument rather than in a dict is `invalid-argument`, and one is never inherited
+  (`_KINDS["channel"]`'s `inherited` is false). An endpoint used from any loop but its holder's
+  raises naming the holder. `runtime.channels` is keyed by the channel's name; the dict's key is a
+  global. `runtime.bindings` and the facility entries leave channels out -- the channel manifest
+  says them -- and `outrig.facility(name)` resolves a channel's name to its kind.
+- **Bounds.** Each backend call is held to the definition's `call_timeout`, 30 seconds by default
+  (`SkillSource`'s), and each channel gives its backend at most eight sends at once; the wait for
+  one of the eight is not in the bound, and a send still waiting at the close is refused. Whether
+  these suit a slow store is not measured; the timeout is per definition so an owner can say.
+  Consumed notices go one at a time per channel, in order, retried after 100 ms doubling to 5 s
+  until acknowledged or the drain ends; an acknowledged item's delivery record is dropped, its
+  id kept for repeats.
+- **The send window is the host's answer.** No `received` line is sent for an external channel:
+  `channel.sent` frees the room, in a done-callback on the ask's future, shielded, so a `send`
+  the agent cancels keeps its room until the host has answered it.
+- **A review of the branch found five faults, each fixed where it arose:**
+  - *A released holder's sends kept its successor's window.* Room a send takes is given back by a
+    callback on its holder's loop, which stops at the release, and the host's late answer to a
+    kernel that has gone is dropped: a second holder inherited the count and, with 16 sends
+    unanswered, waited forever. The endpoint now counts its holders, gives every holder's room
+    back as one gives the channel up, and gives back room only to the holder that took it. The
+    host refuses that holder's sends still waiting for one of the eight calls -- no one would hear
+    their answers -- and those its backend holds run to their bound.
+  - *The host trusted the holder's contract check.* A holder's code can change its own endpoint,
+    or write a line itself, so the host now checks every send against the channel's sending
+    contract -- nothing, a `str`, or the typed one against the schema the interpreter rendered,
+    compiled offline as a service's is -- and the size bound, before the backend is given it.
+  - *`room()` outlived the session.* It waited for room or the channel's close, and a full window
+    in a session that closed never got either; it now resolves as admission closes too.
+  - *A request was news of a message.* A child's announcer kept one count over every channel,
+    so a request that arrived and was answered between results made an unread message announced
+    already look new, and opened a round to say it again. Messages now have a count of their own.
+  - *The envelope lost two fields.* An item's `correlation` now reaches the holder as
+    `Delivery.correlation`, and its backend `reference` comes back with its `Consumed` notice.
+- **Later reviews found five more:**
+  - *A close let a waiting send through.* A send waiting for one of the eight calls when the
+    owner closed the channel went to the backend once a call ended, though its far end was gone.
+    The flight's token, which a holder's release already cancelled, is now cancelled by the
+    close too, and checked again once the call is granted: a send waiting then is refused
+    `closed`, and one already handed to the backend runs to its answer.
+  - *One channel's message was news of another's.* The message count was summed over the
+    channels, so a message delivered and read on one channel, with another's announced message
+    still unread, looked like news and opened a round to repeat the old one. What the model was
+    told is now kept per channel, and a channel is news only while it holds a message unread
+    past that; a channel is read in order, so the newest delivery is then among what waits.
+  - *A refused result settled what it told.* A message that arrived during a tool call was told
+    of only in its result; the provider refusing the call that carried it, the round settled
+    everything announced, so the message was counted told and the holder rested with it unread
+    until something else arrived. A refused round now keeps only what its opening counted.
+  - *An unheld channel's events claimed the primary.* What happens on a channel no agent holds
+    -- an initial item, an owner's push, a refusal, the close -- was emitted on the session's
+    default event handle, which speaks for `agent/primary`, so a no-primary session's log named a
+    primary that never existed, and the renderer, seeing it, filed every session-level event
+    under it. `Events::for_session` is a handle that speaks for no agent: such an event carries
+    no subject, as `events.md` already said it would.
+  - *A late acknowledgment named the next holder.* The consumed-notice worker read the channel's
+    holder at each try, so a notice acknowledged after its receiver gave the channel up was
+    evented under the next holder. Each queued notice now keeps the agent that received it.
+- **A closed channel.** `receive` takes what was already waiting, then raises `ChannelClosed`
+  rather than waiting (`messages.md`, "Failure": "raises rather than waiting for a message that
+  cannot arrive"); `send` raises at once; `runtime.wait` raises it once whatever the channel's
+  policy, since a failure is not input. A send at the close raises `outrig.SessionClosing`, as
+  every refusal of new work there does.
+- **A typed body** is checked with a new check-only decode (`Schema._checking`), which builds no
+  dataclass and accepts a union two classes would both take, leaving that to the decode at
+  `receive()`. A body that then fails to build -- its class's `__post_init__` raised -- is taken,
+  its consumed notice sent, and `receive()` raises `UnreadableDelivery` with its id and JSON.
+  Untyped JSON is a private `_Json` node, rendered `{}`, nothing past being JSON checked.
+- **A directive** keeps the item's body as the owner sent it: unlike a `/name` on the user channel,
+  no `SKILL.md` text is put in front, since the body may be JSON or typed. The holder is told, in
+  its manifest, how a `.skill` delivery is run, when it is told the session's skills.
+- **Rounds.** A message is news when its channel's delivered count is past what a kept round
+  announced and a message waits unread (`Announcer::unannounced`, over the one counts snapshot a
+  pass reads, which also builds the opening -- `opened_at` records what the opening said). News
+  opens a round for an agent class instance's child, a root among them, and never makes a round
+  the warning or the one after it. A work child is left out: its rounds open on submissions, and a
+  news round with none to give would loop. A refused round settles what its opening told, so it
+  is not opened again for the same news; what only a result told of is left, since the model
+  never took the result the refused call carried, and opens the next round.
+- **The per-round read.** A send is recorded against the holder's round in flight when its line
+  arrives; one between rounds belongs to none. A round's facts read and drop its sends as it ends.
+- **The report.** Every declared channel is listed, with its holder, its unread items by item id,
+  each send whose outcome came after the close, and each unacknowledged notice. A send ended
+  `uncertain` there makes the verdict `StoppedWithUnknown`, as an unknown service call does; one
+  answered `uncertain` mid-session, already raised to the agent, does not.
+- **Events.** A push before any agent holds the channel is the session's `message.sent`, `to`
+  `none`. `channel.attached` is the holder's; `channel.closed` the holder's, or the session's.
+- **A Python host program's backend is not built** (fork 9). The constraint for whoever builds it:
+  the engine reads lines of at most 64 KiB from a program (`owner/connection.rs`) while an item may
+  be 1 MiB, so a program's push needs that bound raised for channel lines or the body in parts,
+  and the engine would need requests of its own on the owner connection.
+- **Testing.** The mock-driven tests are `agent/external_tests.rs`, one or more per acceptance
+  item. The real-model e2e, `a_root_answers_on_its_channel`, is gated as `0003-35`'s is and was
+  compiled, not run: no real-model configuration was available. Two environment notes: the
+  sandbox refuses `AF_UNIX` sockets, which a multiprocessing test needs, and `RUST_LOG=debug` in
+  the shell fails two CLI tests (`plan/next/run-program-tests-read-rust-log.md`).
+- **`/simplify`** adopted: the interpreter's typed import through `_class_named`, `_notify` for the
+  consumed notice, `Endpoint._encoded` and `_enqueue` shared with the external endpoint (which
+  gained `_bound` and `_counted` on `Endpoint`), a check that builds nothing for untyped JSON, one
+  exception `__init__`; on the host, one route for a send's end (`finish`), `Taken::Pushing` with
+  no payload, no unused getters, sends kept only per round and dropped once read, state reads that
+  notify no waiter, a send's body taken rather than cloned, delivery records dropped once
+  acknowledged, initial items taken from their definition and pushed together, the name check
+  shared with services, the import failure's error shared with `provision`, and one counts
+  snapshot per runner pass; and in the tests, the existing helpers. Deferred, each with a
+  `plan/next/` entry: one push path for the user channel and an external one
+  (`one-push-path-for-every-channel.md`), and one count source for the primary
+  (`the-primarys-channel-counts-have-two-sources.md`). Not taken: moving the claim into `_equip`,
+  which would claim after the kernel is made and leak its loop on a refusal.

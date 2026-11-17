@@ -270,6 +270,9 @@ pub enum Payload {
         /// Each request made of a child agent that was open at the close, and
         /// how it ended.
         requests: Vec<super::RequestOutcome>,
+        /// Each external channel the session declared, and what the close left
+        /// on it.
+        channels: Vec<super::ChannelClose>,
         /// What the report adds up to.
         verdict: super::Verdict,
     },
@@ -620,6 +623,9 @@ pub enum Payload {
         source: String,
         /// The id `message.sent` gave the message that carried it.
         message: MessageId,
+        /// The channel it arrived on: `user`, or an external channel whose
+        /// item named the skill.
+        channel: String,
     },
     /// The event's subject's code is calling `skill`'s entry through
     /// `outrig.skills.invoke`, as `invocation`. `source` serves the skill,
@@ -1156,16 +1162,24 @@ pub enum Payload {
     /// A message was put on a channel.
     #[non_exhaustive]
     MessageSent {
-        /// The id OutRig gives it, which its other events carry.
+        /// The id OutRig gives it, which its other events carry: on an
+        /// external channel, the delivery id of an item the session's owner
+        /// pushed, or the item id of one an agent sent.
         message: MessageId,
         /// The channel it was put on.
         channel: String,
-        /// Who sent it: `user`, or the agent's subject, such as
-        /// `agent/primary`.
+        /// Who sent it: `user`, `backend` -- an external channel's far end --
+        /// or the agent's subject, such as `agent/primary`.
         from: String,
-        /// Who it is for: `user`, or the agent's subject.
+        /// Who it is for: `user`, `backend`, or the agent's subject; `none`
+        /// for an item pushed on an external channel no agent holds yet.
         to: String,
-        /// Its text, as the channel carries it.
+        /// Who the far end says sent it: `user` on the user channel, the
+        /// backend's own identity on an external channel; `None` for a
+        /// message an agent sent.
+        sender: Option<String>,
+        /// Its text, as the channel carries it: JSON text, for an external
+        /// channel's.
         body: String,
     },
     /// A message the other end did not take.
@@ -1191,11 +1205,64 @@ pub enum Payload {
         message: MessageId,
         /// The channel it was put on.
         channel: String,
-        /// Who sent it: `user`, or the agent's subject, such as
+        /// Who sent it: `user`, `backend`, or the agent's subject, such as
         /// `agent/primary`.
         from: String,
-        /// Who took it: `user`, or the agent's subject.
+        /// Who took it: `user`, `backend`, or the agent's subject.
         to: String,
+    },
+    /// An external channel was attached to the kernel of its holder, the
+    /// event's subject: from now on that agent's code alone uses it.
+    #[non_exhaustive]
+    ChannelAttached {
+        /// The channel's name, the holder's `runtime.channels` key.
+        channel: String,
+        /// Its kind: `plain`.
+        kind: String,
+        /// What arrives on it: `str`, `JSON`, a type's `module:Name`, or
+        /// `nothing`.
+        receives: String,
+        /// What the agent may send on it, as `receives` says it.
+        sends: String,
+        /// How many items it holds unread.
+        bound: usize,
+        /// What an arrival does: `wake`, `announce` or `silent`.
+        wake: String,
+    },
+    /// An external channel's backend acknowledged that its holder's code
+    /// received inbound item `item`, delivered as `delivery`.
+    #[non_exhaustive]
+    ChannelConsumed {
+        /// The channel.
+        channel: String,
+        /// The id the session's owner gave the item.
+        item: String,
+        /// The id OutRig delivered it under.
+        delivery: MessageId,
+    },
+    /// The session's owner closed an external channel, its far end's peer
+    /// gone: its holder's `send` and `receive` raise from now on.
+    #[non_exhaustive]
+    ChannelClosed {
+        /// The channel.
+        channel: String,
+        /// Why, as the owner said.
+        reason: String,
+    },
+    /// What became of an item the event's subject sent on an external channel.
+    #[non_exhaustive]
+    ChannelItemOutcome {
+        /// The channel.
+        channel: String,
+        /// The id OutRig gave the item, which its backend was given.
+        item: MessageId,
+        /// What became of it.
+        outcome: ItemOutcome,
+        /// Why, for any outcome but `accepted`.
+        reason: Option<String>,
+        /// The backend's reference for the item, when it accepted it and gave
+        /// one.
+        reference: Option<String>,
     },
     /// The host program injected a live object it holds, which every kernel
     /// reaches as `outrig.bindings[binding]`: `type` is the qualified name of
@@ -1499,13 +1566,18 @@ impl Payload {
             Payload::ServiceCallDispatched { .. } => "service.call.dispatched",
             Payload::ServiceCallCancelSent { .. } => "service.call.cancel.sent",
             Payload::ServiceCallEnded { .. } => "service.call.ended",
+            Payload::ChannelAttached { .. } => "channel.attached",
+            Payload::ChannelConsumed { .. } => "channel.consumed",
+            Payload::ChannelClosed { .. } => "channel.closed",
+            Payload::ChannelItemOutcome { .. } => "channel.item.outcome",
         }
     }
 
     /// The agent the event belongs to, or `None` for one about the session or
     /// the interpreter every agent shares. An event that names no agent of its
-    /// own belongs to `emitter`, the agent whose handle published it.
-    pub(crate) fn subject(&self, emitter: &Subject) -> Option<Subject> {
+    /// own belongs to `emitter`, the agent whose handle published it, if its
+    /// handle speaks for one.
+    pub(crate) fn subject(&self, emitter: Option<&Subject>) -> Option<Subject> {
         match self {
             Self::SessionState { .. }
             | Self::SessionReport { .. }
@@ -1531,7 +1603,7 @@ impl Payload {
             | Self::ServiceCallDispatched { agent, .. }
             | Self::ServiceCallCancelSent { agent, .. }
             | Self::ServiceCallEnded { agent, .. } => Some(Subject::agent(agent)),
-            _ => Some(emitter.clone()),
+            _ => emitter.cloned(),
         }
     }
 }
@@ -1708,6 +1780,22 @@ pub enum ServiceKind {
     /// A [`Service`](super::Service) the owner bound with
     /// [`SessionBuilder::serve`](super::SessionBuilder::serve).
     Rust,
+}
+
+/// What became of an item an agent sent on an external channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ItemOutcome {
+    /// The backend took it durably: it is on its way, not yet processed.
+    Accepted,
+    /// It was refused before the backend was given it, so it was not sent.
+    Refused,
+    /// The backend said it did not take it, so sending it again is safe.
+    NotAccepted,
+    /// The backend may have taken it, or not: it did not answer within its
+    /// bound, said it could not tell, or the session ended first.
+    Uncertain,
 }
 
 /// How a call of a service's method ended: the five outcomes a hosted request
@@ -2273,6 +2361,9 @@ pub enum FacilityKind {
     /// One of the session's services, which each agent's kernel reaches
     /// through an object of its own, its calls attributed to that agent.
     Service,
+    /// An external channel the session declares, which the one agent given
+    /// it holds as `runtime.channels[name]`.
+    Channel,
 }
 
 /// One facility a child was given, by the name it sees it under: its kind,

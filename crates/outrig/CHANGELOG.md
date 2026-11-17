@@ -19,6 +19,31 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **An external channel has a backend.** `SessionBuilder::channel(definition, backend)` declares
+  a channel whose far end is the owner's own messaging: a `ChannelDefinition` -- its name, a
+  `Contract` each way (`Text`, untyped `Json`, a `Typed` `module:Name` from the application code,
+  or `Nothing`), a bound of up to 256 items unread, a `Wake` policy (`Wake`, `Announce` or
+  `Silent`), a description, a call timeout, and initial items -- and an `Arc<dyn
+  ChannelBackend>`, whose async `send` answers each item an agent sends `Accepted`, `NotAccepted`
+  or `Uncertain`, and whose `consumed` is told of each item an agent's code receives. One agent
+  holds the channel as `runtime.channels[name]`: the agent whose facility dict names it with
+  `Facility::channel`, or the primary agent the harness builds; a second dict naming it fails
+  that launch. `Session::channel(name)` hands the owner a `Channel` that pushes items with
+  `deliver` -- answered `Queued` with the delivery id, `Repeat` for an item id already taken, or a
+  `DeliverError` such as `Full` -- `close`s the channel when its peer is gone, waits for `room`,
+  and reads the `holder`. The window exists from the start, so what is pushed before any agent
+  holds it waits for the agent that does, announced in its first round. In the agent, `send`
+  returns once the backend accepted, and raises `outrig.SendNotAccepted`, `outrig.SendUncertain`
+  (with the item's id), `outrig.SendRefused` or `outrig.ChannelClosed`; the host checks every send
+  against the channel's sending contract before the backend sees it. A typed body is checked on
+  arrival and built as it is received; an item's `correlation` reaches the agent as
+  `delivery.correlation`, and its backend `reference` comes back in its `Consumed` notice. An arrival opens a round for a resting root, and is
+  never warned about or cancelled. New events: `channel.attached`, `channel.consumed`,
+  `channel.closed` and `channel.item.outcome`; `message.*` carry `backend` as the far end and a
+  `sender`, and `skill.directive.received` its `channel`. `ShutdownReport::channels` lists what
+  each channel was left holding at the close, and a send left `uncertain` makes the verdict
+  `StoppedWithUnknown`. `RoundFacts::sends` now lists a round's sends, `RoundSend::items` as the
+  `MessageId`s the backend was given.
 - **An agent has a model-request limit.** `model-request-limit`, at the top level or in
   `[agents.<name>]`, holds each agent of a `run-new` session -- the main agent, and every child,
   each from zero -- to that many model requests: a request is counted once, as a provider first

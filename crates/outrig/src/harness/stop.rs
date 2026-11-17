@@ -13,7 +13,7 @@ use std::time::SystemTime;
 
 use serde::Serialize;
 
-use super::event::AttemptId;
+use super::event::{AttemptId, MessageId};
 
 /// How many ended rounds' facts an agent keeps. An owner reads each round's as it ends, so a
 /// longer history serves only one that fell behind.
@@ -150,8 +150,9 @@ pub struct RoundFacts {
     pub stopped: Option<RoundStop>,
     /// The final message's reasoning, when it held no text.
     pub reasoning: Option<String>,
-    /// The deliberate sends the round made on each external channel, in order. Always empty
-    /// for now: external channels are not built yet.
+    /// The deliberate sends the round made on each external channel, in the order the
+    /// channels were declared: every item the agent's code sent while the round was open,
+    /// whatever its backend then said of it. A send made between rounds belongs to none.
     pub sends: Vec<RoundSend>,
 }
 
@@ -168,8 +169,18 @@ impl RoundFacts {
 pub struct RoundSend {
     /// The channel's name.
     pub channel: String,
-    /// Each item it sent there, by its id, in order.
-    pub items: Vec<String>,
+    /// Each item it sent there, by the id OutRig gave it -- the one its backend was given --
+    /// in order.
+    pub items: Vec<MessageId>,
+}
+
+impl RoundSend {
+    pub(crate) fn new(channel: &str, items: Vec<MessageId>) -> Self {
+        Self {
+            channel: channel.to_string(),
+            items,
+        }
+    }
 }
 
 /// Why OutRig ended a round before the model did: what [`RoundEnd::stopped`],

@@ -40,7 +40,10 @@ pub(super) fn ready_then(responder: Responder) -> Responder {
 }
 
 /// Every request `marker`'s agent made past its launch round.
-fn past_launch<'a>(requests: &'a [RecordedRequest], marker: &str) -> Vec<&'a RecordedRequest> {
+pub(super) fn past_launch<'a>(
+    requests: &'a [RecordedRequest],
+    marker: &str,
+) -> Vec<&'a RecordedRequest> {
     of_agent(requests, marker)
         .into_iter()
         .filter(|request| !launching(request))

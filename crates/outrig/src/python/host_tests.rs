@@ -557,7 +557,8 @@ async fn pending_counts_come_back_by_channel() {
         pending["user"],
         Counts {
             pending: 2,
-            delivered: 5
+            delivered: 5,
+            requests: false,
         }
     );
 }

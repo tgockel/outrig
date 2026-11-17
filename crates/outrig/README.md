@@ -287,6 +287,52 @@ opens on a line that says the program that owns the session constructed the root
 class contributed sections, that its task is in them; `agent.instance.started` lists each
 section's title and length.
 
+An agent receives the application's messages, and sends its own, on an external channel: one the
+owner declares with `SessionBuilder::channel`, giving its `ChannelDefinition` -- what crosses it
+each way, how many items it holds unread, whether an arrival wakes the agent -- and the
+`ChannelBackend` at its far end, the application's own messaging. OutRig calls the backend's `send`
+for each item the agent sends, which returns in the agent once the backend has taken it or raises
+saying why not, and its `consumed` for each item the agent's code receives, never for one merely
+queued. The owner pushes items with `Session::channel(name)`'s `deliver`; the definition's own
+items wait from the start, so a root the builder constructs finds its first message waiting as its
+first round opens and receives it as it receives every later one. The agent that holds the
+channel is the one whose facility dict names it:
+
+```rust,no_run
+# async fn example(config: outrig::config::Config, spec: outrig::harness::ApplicationSpec,
+#     backend: std::sync::Arc<dyn outrig::harness::ChannelBackend>)
+#     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+use std::collections::BTreeMap;
+
+use outrig::harness::{
+    Argument, ChannelDefinition, ConstructSpec, Facility, Inbound, SessionBuilder,
+};
+use serde_json::json;
+
+let question = Inbound::message("m-1", "alice", json!("What does this project do?"));
+let session = SessionBuilder::new(config, None, None)
+    .no_primary()
+    .application(spec)
+    .channel(
+        ChannelDefinition::new("inbox")
+            .description("Messages from the task's user.")
+            .deliver(question),
+        backend,
+    )
+    .construct(ConstructSpec::new("review.agents:Worker", "fast").arg(
+        "facilities",
+        Argument::Facilities(BTreeMap::from([("inbox".into(), Facility::channel("inbox"))])),
+    ))
+    .start()
+    .await?;
+let inbox = session.channel("inbox").expect("declared");
+let later = Inbound::message("m-2", "alice", json!("And how is it tested?"));
+let delivered = inbox.deliver(later).await?;
+println!("delivered as {}", delivered.delivery());
+# Ok(())
+# }
+```
+
 ## The container facade beside `harness`
 
 An application can run an engine of its own over the container facade beside one over `harness`,

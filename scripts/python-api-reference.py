@@ -160,6 +160,12 @@ KERNEL_ONLY = {
     "Service": "the class of a service's object, which only a kernel holds.",
     "ServiceError": "what a call of a service's method raises, which only a kernel makes.",
     "ServiceMethod": "what a service's object lists of its methods, which only a kernel holds.",
+    "ChannelError": "the base of what an external channel raises, which only a kernel holds.",
+    "ChannelClosed": "what an external channel raises once closed, which only a kernel holds.",
+    "SendRefused": "what an external channel's `send` raises, which only a kernel holds.",
+    "SendNotAccepted": "what an external channel's `send` raises, which only a kernel holds.",
+    "SendUncertain": "what an external channel's `send` raises, which only a kernel holds.",
+    "UnreadableDelivery": "what an external channel's `receive` may raise, only in a kernel.",
 }
 
 # Never constructed by a program; their constructors take internals.

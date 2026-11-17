@@ -10,8 +10,8 @@ use serde::Serialize;
 use super::ClosedBy;
 use super::ServiceErrorCategory;
 use super::event::{
-    AgentRequestId, ExecId, HostedOutcome, HostedReason, RequestEnd, RequestId, ServiceCallId,
-    ServiceOutcome, ServiceReason,
+    AgentRequestId, ExecId, HostedOutcome, HostedReason, ItemOutcome, MessageId, RequestEnd,
+    RequestId, ServiceCallId, ServiceOutcome, ServiceReason,
 };
 
 /// What [`Session::shutdown`](super::Session::shutdown) found. Read it before
@@ -40,6 +40,9 @@ pub struct ShutdownReport {
     /// Each request an agent had made of a child and not seen answered when
     /// admission closed, and how it ended.
     pub requests: Vec<RequestOutcome>,
+    /// Each external channel the session declared, and what the close left on
+    /// it.
+    pub channels: Vec<ChannelClose>,
     /// How the session's events reached its subscriptions and its log.
     pub events: EventDelivery,
 }
@@ -52,6 +55,7 @@ impl ShutdownReport {
             &self.executions,
             &self.hosted,
             &self.services,
+            &self.channels,
         )
     }
 }
@@ -61,6 +65,7 @@ pub(crate) fn verdict(
     executions: &[ExecutionOutcome],
     hosted: &[HostedCall],
     services: &[ServiceCall],
+    channels: &[ChannelClose],
 ) -> Verdict {
     let unknown = executions
         .iter()
@@ -70,7 +75,13 @@ pub(crate) fn verdict(
             .any(|call| call.outcome == HostedOutcome::Unknown)
         || services
             .iter()
-            .any(|call| call.outcome == ServiceOutcome::Unknown);
+            .any(|call| call.outcome == ServiceOutcome::Unknown)
+        || channels.iter().any(|channel| {
+            channel
+                .sends
+                .iter()
+                .any(|send| send.outcome == ItemOutcome::Uncertain)
+        });
     match stopped {
         Stopped::NotProven { .. } => Verdict::NotProvenStopped,
         Stopped::Proven if unknown => Verdict::StoppedWithUnknown,
@@ -155,6 +166,43 @@ pub struct ServiceCall {
     pub category: Option<ServiceErrorCategory>,
     /// Why, for a `refused`, `cancelled` or `unknown` call; otherwise `None`.
     pub reason: Option<ServiceReason>,
+}
+
+/// An external channel at the close: what its window still held, what its
+/// backend had not answered, and what it had not acknowledged. Nothing the
+/// close finds unread is taken: each item stays the backend's to deliver again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct ChannelClose {
+    /// The channel.
+    pub channel: String,
+    /// The agent that held it at the close, as the interpreter's protocol
+    /// names it, or `None` when no agent did.
+    pub holder: Option<String>,
+    /// Each item left unread in its window, by the id the session's owner gave
+    /// it, in the order it arrived.
+    pub unread: Vec<String>,
+    /// Each send whose outcome came after admission closed -- one its backend
+    /// held then, one made after -- and that outcome: an `uncertain` one makes
+    /// the verdict [`Verdict::StoppedWithUnknown`].
+    pub sends: Vec<SendAtClose>,
+    /// Each item its holder received whose notice the backend had not
+    /// acknowledged by the end of the drain, by the owner's item id.
+    pub unacknowledged: Vec<String>,
+}
+
+/// A send on an external channel whose outcome came after admission closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct SendAtClose {
+    /// The id OutRig gave the item, which its backend was given.
+    pub item: MessageId,
+    /// The agent that sent it, as the interpreter's protocol names it.
+    pub agent: String,
+    /// What became of it.
+    pub outcome: ItemOutcome,
+    /// Why, for any outcome but `accepted`.
+    pub reason: Option<String>,
 }
 
 /// A request an agent made of a child -- a submission, or a request on one of

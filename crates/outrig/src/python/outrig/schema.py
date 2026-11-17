@@ -61,6 +61,11 @@ _PLAIN_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 
 # What a node gives back for a value that has problems, so `None` can be a value.
 _BAD = object()
+# What a dataclass's node gives back for a value that would build it, when only checking: building
+# one runs the class's own code, which a check must not (`Schema._checking`).
+_CHECKED = object()
+# How deep untyped JSON may nest, as the host's parser allows.
+_JSON_DEPTH_MAX = 128
 
 _type_name = type.__dict__["__name__"].__get__
 _type_qualname = type.__dict__["__qualname__"].__get__
@@ -145,13 +150,15 @@ class DecodeError(ValueError):
 
 
 class _Problems:
-    """Problems found so far, bounded: past `PROBLEMS_MAX`, only counted."""
+    """Problems found so far, bounded: past `PROBLEMS_MAX`, only counted. `checking`, a decode
+    that builds no dataclass: see `Schema._checking`."""
 
-    __slots__ = ("found", "more")
+    __slots__ = ("found", "more", "checking")
 
-    def __init__(self):
+    def __init__(self, checking=False):
         self.found = []
         self.more = 0
+        self.checking = checking
 
     def __bool__(self):
         return bool(self.found or self.more)
@@ -477,7 +484,7 @@ class _Union:
     def decode(self, value, path, problems):
         accepted, refused = [], []
         for member in self.members:
-            trial = _Problems()
+            trial = _Problems(problems.checking)
             result = member.decode(value, path, trial)
             if result is _BAD:
                 refused.append((member, trial))
@@ -528,6 +535,80 @@ class _Union:
 
     def render(self, renderer):
         return {"anyOf": [renderer.render(member) for member in self.members]}
+
+
+class _JSON:
+    """Untyped JSON: what an external channel's contract names for a body the backend owns,
+    whose shape OutRig never learns. Private, since a declared type says its shape; only a
+    channel's definition names it."""
+
+
+_JSON.__qualname__ = _JSON.__name__ = "JSON"
+
+
+class _Json:
+    """Any JSON value, checked only for being JSON -- objects with string keys, arrays,
+    strings, finite numbers, true, false and null -- and copied, so nothing in it is kept."""
+
+    __slots__ = ()
+
+    def describe(self):
+        return "JSON"
+
+    def expected(self):
+        return "a JSON value"
+
+    def kinds(self):
+        return set(_KINDS.values())
+
+    def fits(self, value):
+        return _json_kind(value) is not None
+
+    def decode(self, value, path, problems):
+        return self._copy(value, path, problems, 0, not problems.checking)
+
+    def encode(self, value, path, problems):
+        return self._copy(value, path, problems, 0, True)
+
+    def _copy(self, value, path, problems, depth, build):
+        """`value`, copied when `build` says to -- a check builds nothing -- or `_BAD`."""
+        t = type(value)
+        if value is None or t in (str, bool, int):
+            return value
+        if t is float:
+            if math.isfinite(value):
+                return value
+            problems.add(path, f"expected a finite number, not {value!r}")
+            return _BAD
+        if t not in (list, dict):
+            problems.add(path, f"expected JSON, not {_type_qualname(t)}")
+            return _BAD
+        if depth == _JSON_DEPTH_MAX:
+            problems.add(path, f"nests past {_JSON_DEPTH_MAX} levels")
+            return _BAD
+        bad = False
+        if t is list:
+            out = [] if build else value
+            for i, item in enumerate(value):
+                item = self._copy(item, f"{path}[{i}]", problems, depth + 1, build)
+                bad = bad or item is _BAD
+                if build:
+                    out.append(item)
+        else:
+            out = {} if build else value
+            for key, item in value.items():
+                if type(key) is not str:
+                    problems.add(path, f"expected string keys, not {_type_qualname(type(key))}")
+                    bad = True
+                    continue
+                item = self._copy(item, _field_path(path, key), problems, depth + 1, build)
+                bad = bad or item is _BAD
+                if build:
+                    out[key] = item
+        return _BAD if bad else out
+
+    def render(self, renderer):
+        return {}
 
 
 class _Described:
@@ -621,6 +702,8 @@ class _Class:
                 bad = True
         if bad:
             return _BAD
+        if problems.checking:
+            return _CHECKED
         # The class's own constructor, so a field left out takes the default it declares, and a
         # `default_factory` makes each instance its own.
         try:
@@ -712,6 +795,8 @@ class _Compiler:
     def node(self, t, inside):
         if t is None or t is type(None):
             return _Null()
+        if t is _JSON:
+            return _Json()
         if isinstance(t, type) and t in _SCALARS:
             return _Scalar(t)
         origin, args = typing.get_origin(t), typing.get_args(t)
@@ -882,6 +967,16 @@ class Schema:
         """`(json, problems)`: what `encode` gives and finds, without raising."""
         problems = _Problems()
         return self._node.encode(value, "$", problems), problems
+
+    def _checking(self, value):
+        """The problems `decode` would find in `value`, a parsed JSON value, found without
+        building anything: no dataclass is constructed, so none of its code runs -- what the
+        interpreter's reader thread may do with a body that is the agent's to build. A value
+        this passes can still fail `decode`, in a dataclass's own `__post_init__` or a union
+        that only building tells apart."""
+        problems = _Problems(checking=True)
+        self._node.decode(value, "$", problems)
+        return problems
 
     def json_schema(self):
         """The JSON Schema of the declared type, as a new dict.

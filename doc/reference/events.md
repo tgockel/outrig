@@ -272,7 +272,20 @@ three times for one call before the rejection ends it.
   - `requests`: each request made of a child agent that was open at the close, as `{request,
     child, channel, outcome}`: `channel` is `null` for a submission, and `outcome` is how it
     ended -- `closed` by the close, or `terminated` when the interpreter died first.
+  - `channels`: each external channel the session declared, as `{channel, holder, unread, sends,
+    unacknowledged}`: the agent holding it at the close, or `null`; the items left unread in its
+    window, by the owner's item id, none of them consumed by the close; each send whose outcome
+    came after the close, as `{item, agent, outcome, reason}`, from its `channel.item.outcome` or
+    `uncertain` when the drain ended first; and each item received whose consumed notice the
+    backend had not acknowledged. One send ended `uncertain` makes the verdict
+    `stopped_with_unknown`.
   - `verdict`: `clean`, `stopped_with_unknown`, or `not_proven_stopped`.
+- `channel.attached` -- an external channel the session's owner declared was attached to the
+  subject's kernel, which holds it from then on as `runtime.channels[channel]`: `channel`;
+  `kind`, `plain`; `receives` and `sends`, what crosses it each way -- `str`, `JSON`, a type's
+  `module:Name`, or `nothing`; `bound`, how many items its window holds unread; and `wake`, what
+  an arrival does -- `wake`, `announce` or `silent`. The primary takes every channel no dict
+  names as its kernel is built; any other agent those its facility dict names.
 - `binding.refused` -- a binding a repository's config declared did not start, and the session
   runs without it: `binding`, its name; `declared_in`, the config file, or `null`; and
   `reason`, which says whether the operator did not approve the declaration, nobody could be
@@ -325,10 +338,11 @@ three times for one call before the rejection ends it.
   or `null` when the host gave none; `reload`, true when `outrig.skills.reload` imported it again;
   and `code` and `reason`, `null` unless the import failed, such as `unsatisfied-dependency` with
   each requirement it lacks. `reason` escapes control characters as a diagnostic's `message` does.
-- `skill.directive.received` -- a `/name` the user typed reached the subject on its user channel:
-  `skill`, the skill it names; `source`, the source serving it; and `message`, the id its
-  `message.sent` gives the message that carried it. Nothing of the skill has run: the agent's code
-  invokes it, or does not.
+- `skill.directive.received` -- a `/name` the user typed reached the subject on its user channel,
+  or an item naming a skill was pushed on an external channel it holds: `skill`, the skill it
+  names; `source`, the source serving it; `message`, the id its `message.sent` gives the message
+  that carried it; and `channel`, the channel it arrived on. Nothing of the skill has run: the
+  agent's code invokes it, or does not.
 - `skill.invocation.started` -- the subject's code called a skill's entry through
   `outrig.skills.invoke`.
   - `invocation`: its id, which the calls made inside it carry: `agent.call.started`,
@@ -540,9 +554,10 @@ between a child's failed rounds is in that read and has no event of its own.
   it, or as its parent runs -- `default-model` for the program's; `depth`, the main agent's and
   the program's children's being 1; `inputs`, each `{name, type, preview}`; `facilities`, what
   it was given to act through as the spawn found it, each `{name, kind, target, type}` --
-  `kind` `binding`, `service` or `object`, `target` the binding's or the service's own name, or
-  `null` for an object, `type` the qualified name of the object's type -- a service's is the
-  class generated for it, `outrig.services.<name>` -- or `null` when it sees the session's
+  `kind` `binding`, `service`, `channel` or `object`, `target` the binding's, the service's or
+  the channel's own name, or `null` for an object, `type` the qualified name of the object's type
+  -- a service's is the class generated for it, `outrig.services.<name>`, and a channel's is
+  `channel` -- or `null` when it sees the session's
   bindings and services; and
   `channels`, a request child's, each `{name, request, reply}`, its types as text. A change to
   an agent's facilities after its launch is not evented: nothing crosses when a dict changes.
@@ -632,14 +647,45 @@ between a child's failed rounds is in that read and has no event of its own.
   before the request ended: `instance`, and `request`. The request runs on, and nothing reads its
   answer.
 - `message.sent` -- a message put on a channel: `message`, an id OutRig gives it; `channel`;
-  `from` and `to`, `user` and the subject of the agent at the other end -- `agent/primary`, or
-  another agent's, whose send nothing on the host reads, so a `message.refused` follows it; and
-  `body`.
+  `from` and `to`, `user`, `backend` -- an external channel's far end -- or the subject of the
+  agent at the other end: `agent/primary`, or another agent's, whose send on the user channel
+  nothing on the host reads, so a `message.refused` follows it; `to` is `none` for an item pushed
+  on an external channel no agent holds yet, and the event is then the session's; `sender`, who
+  the far end says sent it -- `user` on the user channel, the backend's own identity for an item
+  its owner pushed -- or `null` for a message an agent sent; and `body`, which on an external
+  channel is the item as JSON text. An item pushed on an external channel is given its delivery
+  id here; one an agent sends there, the item id its backend is given.
 - `message.refused` -- a message the other end did not take: `message`, `channel`, `from`, `to`,
-  and `reason`.
+  and `reason`. On an external channel, an item the window refused: full, outside its contract
+  with the problems, or the channel closed.
 - `message.received` -- the other end took a message: `message`, the id its `message.sent` gave,
   then `channel`, `from`, and `to`. For a message to the agent, that is its code receiving it,
-  which can be well after it arrived.
+  which can be well after it arrived; on an external channel it is the item's consumption, which
+  its backend is then told of, and never its queueing.
+- `channel.consumed` -- an external channel's backend acknowledged that the subject's code
+  received an item: `channel`; `item`, the owner's id for it; `delivery`, the id its
+  `message.sent` gave. A notice the backend refuses is told again, with a growing pause, until
+  it is acknowledged or the session's drain ends. The subject is the agent that received the
+  item, whichever agent holds the channel by the time the backend acknowledges it.
+- `channel.closed` -- the session's owner closed an external channel, its far end's peer gone:
+  `channel`, and `reason`. The holder's `send` and `receive` raise `outrig.ChannelClosed` from
+  then on, `receive` once what waited is read, and a `runtime.wait` says so once. The subject is
+  the holder, or the session's when no agent holds it.
+- `channel.item.outcome` -- what became of an item the subject sent on an external channel:
+  `channel`; `item`, the id its `message.sent` gave, which its backend was given; `outcome`;
+  `reason`, for any outcome but `accepted`, else `null`; and `reference`, the backend's own
+  reference for an item it accepted, when it gave one, else `null`. `outcome` is:
+  - `accepted` -- the backend took it durably: on its way, not yet processed. The holder's
+    `send` returned.
+  - `refused` -- it was never given to the backend: the channel was closed, or closed while
+    the send waited for one of its backend's eight calls; the session was closing; the subject
+    gave the channel up while the send waited; or the channel is not the subject's. `send`
+    raised.
+  - `not_accepted` -- the backend said it did not take it, so sending it again is safe. `send`
+    raised `outrig.SendNotAccepted`.
+  - `uncertain` -- the backend may have taken it: it said it could not tell, did not answer
+    within the channel's call timeout, or the session's drain ended first. `send` raised
+    `outrig.SendUncertain`, carrying the item id.
 - `hosted.received` -- a request agent code made of a binding's object, as it arrived, before
   anything is decided about it. `request`, an id OutRig gives it, which the request's other events
   carry; `agent`; `binding`; `execid`, the execution that made it, or `null`; `invocation`, the

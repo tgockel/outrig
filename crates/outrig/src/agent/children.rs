@@ -50,6 +50,7 @@ use super::{Agent, AgentError, runner};
 use crate::config::{Config, Limits, Secrets};
 use crate::events::Events;
 use crate::harness::bindings::Brief;
+use crate::harness::channels::{Channels, Rounds};
 use crate::harness::event::{
     AgentInstanceId, AgentRequestId, ChannelBrief, ChildKind, ContributionBrief, FacilityBrief,
     FacilityKind, InputBrief, InstanceRelease, InvocationEnd, InvocationId, ParamsBy, Payload,
@@ -59,10 +60,11 @@ use crate::harness::lifecycle::Lifecycle;
 use crate::harness::roster::{AgentKind, AgentRow, Outstanding, Parent, Roster, RosterState};
 use crate::harness::services::ServiceBrief;
 use crate::harness::skills::SkillBrief;
-use crate::harness::stop::{AgentState, ModelRequests, RoundFacts, RoundStop, Snapshot};
+use crate::harness::stop::{AgentState, ModelRequests, RoundFacts, RoundSend, RoundStop, Snapshot};
 use crate::harness::{ClosedBy, RequestOutcome};
+use crate::python::host::Channels as Counted;
 use crate::python::host::{
-    Channels, ChildLines, Counts, ImportFailure, Interpreter, InterpreterError, OWNER,
+    ChildLines, Counts, ImportFailure, Interpreter, InterpreterError, OWNER,
 };
 
 /// How long a released child's kernel has to stop before it is taken for
@@ -100,6 +102,9 @@ pub(crate) struct Settings {
     /// kernel is told of: the application's primary.
     pub(crate) skills: Vec<SkillBrief>,
     pub(crate) container: String,
+    /// The session's external channels: those a child holds are counted with
+    /// its requests, and the sends its rounds make read from them.
+    pub(crate) channels: Channels,
 }
 
 /// A session's child agents. Cheap to clone.
@@ -412,6 +417,26 @@ impl Children {
             }
         }));
         Self(inner)
+    }
+
+    /// What the session's channels are lent of this registry: how to wake an agent's runner, as
+    /// an item arrives for it, and which round it has open, as it sends.
+    pub(crate) fn rounds(&self) -> Rounds {
+        let (wake, round) = (Arc::downgrade(&self.0), Arc::downgrade(&self.0));
+        Rounds {
+            wake: Box::new(move |agent: &str| {
+                if let Some(inner) = wake.upgrade()
+                    && let Some(child) = inner.state().child(agent)
+                {
+                    child.wake.notify_one();
+                }
+            }),
+            round: Box::new(move |agent: &str| {
+                let inner = round.upgrade()?;
+                let state = inner.state();
+                state.child(agent)?.round
+            }),
+        }
     }
 
     /// The session's agents as they are now, read in one hold of the state's lock: see
@@ -1175,6 +1200,10 @@ impl Inner {
         let facilities: Option<Vec<FacilityBrief>> = given
             .as_ref()
             .map(|given| given.iter().map(|given| given.brief.clone()).collect());
+        // A channel it holds is told of in its channels' manifest, and not again among them.
+        if let Some(given) = &mut given {
+            given.retain(|given| given.brief.kind != FacilityKind::Channel);
+        }
         let channels = channel_texts(&line["channels"]);
         // The sections its class contributed to its instructions, each a title and a text.
         let sections: Vec<(&str, &str)> = line["contributions"]
@@ -1303,6 +1332,7 @@ impl Inner {
             line["prompt"].as_str().unwrap_or_default(),
             &inputs,
             &brief,
+            &settings.channels.manifest_of(id),
         );
         let slot = CallSlot::new(self.ledger.clone(), events, Some(lineage))
             .limited(model_requests.clone());
@@ -1864,10 +1894,18 @@ impl Inner {
     }
 
     /// The requests waiting unread on each of `child`'s channels, and every
-    /// one ever delivered there: what its announcer counts.
-    fn counts(&self, child: &str) -> Channels {
+    /// one ever delivered there -- and the same of the external channels it
+    /// holds whose arrivals are announced: what its announcer counts.
+    pub(crate) fn counts(&self, child: &str) -> Counted {
+        let mut channels = self.request_counts(child);
+        channels.extend(self.settings.channels.counts_of(child));
+        channels
+    }
+
+    /// [`Inner::counts`] of `child`'s request channels alone.
+    fn request_counts(&self, child: &str) -> Counted {
         let state = self.state();
-        let mut channels: Channels = state
+        let mut channels: Counted = state
             .child(child)
             .map(|node| {
                 node.delivered
@@ -1878,6 +1916,7 @@ impl Inner {
                             Counts {
                                 pending: 0,
                                 delivered: *delivered,
+                                requests: true,
                             },
                         )
                     })
@@ -1912,16 +1951,15 @@ impl Inner {
             .collect()
     }
 
-    /// What `child`'s open requests on its channels come to, in the
-    /// announcer's words.
-    pub(crate) fn unread_text(&self, child: &str) -> String {
-        super::channel::announcement(&self.counts(child), super::channel::Noun::Request)
-            .unwrap_or_default()
+    /// The deliberate sends `child`'s round `round` made on the external
+    /// channels it holds.
+    pub(crate) fn sends_in(&self, child: &str, round: u32) -> Vec<RoundSend> {
+        self.settings.channels.sends_in(child, round)
     }
 
     /// Each of `child`'s channels with a request waiting unread.
     pub(crate) fn unread_on(&self, child: &str) -> Vec<String> {
-        self.counts(child)
+        self.request_counts(child)
             .into_iter()
             .filter(|(_, counts)| counts.pending > 0)
             .map(|(channel, _)| channel)
@@ -2481,6 +2519,7 @@ fn given(facilities: &Value) -> Option<Vec<Given>> {
                     kind: match facility["kind"].as_str() {
                         Some("binding") => FacilityKind::Binding,
                         Some("service") => FacilityKind::Service,
+                        Some("channel") => FacilityKind::Channel,
                         _ => FacilityKind::Object,
                     },
                     target: facility["target"].as_str().map(str::to_string),

@@ -177,6 +177,10 @@ pub enum Facility {
     /// A binding the session's configuration or
     /// [`SessionBuilder::bind`](super::SessionBuilder::bind) declares.
     Binding(String),
+    /// An external channel [`SessionBuilder::channel`](super::SessionBuilder::channel)
+    /// declares, which the root holds -- `runtime.channels[name]` -- once it is built: given only
+    /// in [`Argument::Facilities`], and to one agent, which a second dict naming it cannot be.
+    Channel(String),
 }
 
 impl Facility {
@@ -190,10 +194,16 @@ impl Facility {
         Self::Binding(name.into())
     }
 
+    /// The external channel named `name`.
+    pub fn channel(name: impl Into<String>) -> Self {
+        Self::Channel(name.into())
+    }
+
     fn line(&self) -> Value {
         match self {
             Self::Service(name) => json!({"kind": "service", "name": name}),
             Self::Binding(name) => json!({"kind": "binding", "name": name}),
+            Self::Channel(name) => json!({"kind": "channel", "name": name}),
         }
     }
 }

@@ -9,6 +9,7 @@ use std::time::Duration;
 use super::application::{ApplicationIdentity, Prepared};
 use super::bindings::{Bindings, Brief};
 use super::builder::{self, SessionBuilder};
+use super::channels::{Channel, Channels};
 use super::event::{AgentInstanceId, Payload, SessionState};
 use super::lifecycle::Lifecycle;
 use super::report::{
@@ -68,6 +69,8 @@ pub struct Session {
     bindings: Bindings,
     /// The services its owner gave, and their calls.
     services: Services,
+    /// The external channels its owner declared.
+    channels: Channels,
     /// The application code it runs, when its owner gave any.
     application: Option<ApplicationIdentity>,
     /// Every model call the session makes, whichever agent makes it.
@@ -113,6 +116,7 @@ impl Session {
         lifecycle: Arc<Lifecycle>,
         bindings: Bindings,
         services: Services,
+        channels: Channels,
         setup: ChildSetup,
     ) -> Self {
         lifecycle.attach(interpreter.gate());
@@ -145,8 +149,10 @@ impl Session {
                 services: services.briefs(),
                 skills: setup.skills,
                 container: container_name.clone(),
+                channels: channels.clone(),
             },
         );
+        channels.lend(children.rounds());
         Self {
             id,
             agent: None,
@@ -156,6 +162,7 @@ impl Session {
             lifecycle,
             bindings,
             services,
+            channels,
             application: None,
             ledger,
             children,
@@ -199,6 +206,7 @@ impl Session {
                 services: &self.services.briefs(),
                 skills: &catalog.briefs(),
                 catalog: Some(catalog),
+                channels: &self.channels.manifest_of(PRIMARY),
             },
             CallSlot::new(self.ledger.clone(), self.interpreter.events().clone(), None)
                 .limited(RequestLimit::new(self.children.limit_config())),
@@ -224,6 +232,13 @@ impl Session {
         let provisioned = application.provision(&self.interpreter, events, bound, in_container);
         self.application = Some(provisioned.await?);
         Ok(())
+    }
+
+    /// Tell the interpreter the session's channels, once its application code is there and
+    /// before any agent is built, waiting within `bound` for each to be made, then push each
+    /// one's initial items. `Err` says why the session cannot start.
+    pub(crate) async fn declare_channels(&self, bound: Duration) -> Result<(), String> {
+        self.channels.declare(&self.interpreter, bound).await
     }
 
     /// The session has started: idle.
@@ -302,6 +317,14 @@ impl Session {
     /// no primary agent, which has no user channel.
     pub fn user_channel(&self) -> Option<UserChannel> {
         self.agent.as_ref().and_then(Agent::user_channel)
+    }
+
+    /// The owner's end of the external channel `name`, which
+    /// [`SessionBuilder::channel`] declared: how the owner pushes its holder
+    /// items, closes it, and reads who holds it. Every call hands out the same
+    /// channel. `None` for a name the session does not declare.
+    pub fn channel(&self, name: &str) -> Option<Channel> {
+        self.channels.handle(name)
     }
 
     /// A function that stops the Python the current round is waiting on --
@@ -636,6 +659,7 @@ impl Session {
             lifecycle,
             mut bindings,
             services,
+            channels,
             application: _,
             ledger: _,
             children,
@@ -653,8 +677,9 @@ impl Session {
         let gate = interpreter.gate();
         {
             // What the drain waits for: the executions running at the close,
-            // the hosted calls the bindings process was sent, and the calls of
-            // the session's services.
+            // the hosted calls the bindings process was sent, the calls of the
+            // session's services, and the sends and notices its channels'
+            // backends have not answered.
             let (gate, hosted) = (&gate, &bindings);
             let drained = move || async move {
                 gate.drained().await;
@@ -663,12 +688,15 @@ impl Session {
             let all = async {
                 drained().await;
                 services.drained().await;
+                channels.drained().await;
             };
             if tokio::time::timeout_at(until, all).await.is_err() {
                 // A service call is told first, so its reason is the close and
                 // not the interrupt its caller is about to get; it has its
-                // grace, and is then abandoned.
+                // grace, and is then abandoned. A send its channel's backend
+                // has not answered is given up on, `uncertain`.
                 services.terminate();
+                channels.terminate();
                 // Interrupted first, which agent code can answer: a `finally`
                 // runs, the execution ends `error` rather than `unknown`, and a
                 // hosted call whose coroutine callback the interrupt wakes is
@@ -719,6 +747,7 @@ impl Session {
         // sent are in: nothing hosted is published after.
         let hosted = bindings.report();
         let service_calls = services.report();
+        let channel_close = channels.report();
         let stopped = match failed.is_empty() {
             true => Stopped::Proven,
             false => Stopped::NotProven {
@@ -748,7 +777,14 @@ impl Session {
             services: service_calls.clone(),
             bindings: binding_stop.clone(),
             requests: requests.clone(),
-            verdict: report::verdict(&stopped, &executions, &hosted, &service_calls),
+            channels: channel_close.clone(),
+            verdict: report::verdict(
+                &stopped,
+                &executions,
+                &hosted,
+                &service_calls,
+                &channel_close,
+            ),
         });
         let log = events
             .close_after(Payload::SessionState {
@@ -765,6 +801,7 @@ impl Session {
             services: service_calls,
             bindings: binding_stop,
             requests,
+            channels: channel_close,
             events: EventDelivery {
                 last_sequence: tally.last,
                 missed: tally.missed,
