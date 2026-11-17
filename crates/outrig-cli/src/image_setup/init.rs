@@ -17,6 +17,7 @@ use crate::error::{OutrigError, Result};
 use crate::image_setup::render::{self, BaseImage, McpServer};
 use crate::paths::{write_atomic, write_if_absent};
 use outrig::config::check_build_image_name;
+use outrig::error::IoPathExt as _;
 
 /// Scaffold a standalone image project in `dir` (relative to `cwd`, or `cwd`
 /// itself when `dir` is `None`). The project name -- used as the `image.ref`
@@ -34,11 +35,12 @@ pub fn run(cwd: &Path, dir: Option<&Path>, force: bool) -> Result<()> {
     let readme_path = target_dir.join("README.md");
 
     if !force {
-        let existing: Vec<String> = [&dockerfile_path, &image_toml_path]
-            .into_iter()
-            .filter(|p| p.exists())
-            .map(|p| display_rel(p, cwd).to_string())
-            .collect();
+        let mut existing = Vec::new();
+        for path in [&dockerfile_path, &image_toml_path] {
+            if entry_exists(path)? {
+                existing.push(display_rel(path, cwd).to_string());
+            }
+        }
         if !existing.is_empty() {
             return Err(OutrigError::Configuration(format!(
                 "{} already present; pass --force to overwrite.",
@@ -53,9 +55,7 @@ pub fn run(cwd: &Path, dir: Option<&Path>, force: bool) -> Result<()> {
     // Keep the probe for the common "already present" case. Exclusive creation
     // also preserves a README created after the probe, even with --force, and
     // works on shared filesystems without no-replace rename or hard links.
-    if readme_path.exists()
-        || readme_path.is_symlink()
-        || !write_if_absent(&readme_path, &render_readme(&name))?
+    if entry_exists(&readme_path)? || !write_if_absent(&readme_path, &render_readme(&name))?
     {
         eprintln!("[outrig] keeping existing {}", display_rel(&readme_path, cwd));
     } else {
@@ -64,6 +64,16 @@ pub fn run(cwd: &Path, dir: Option<&Path>, force: bool) -> Result<()> {
 
     eprintln!("[outrig] next: build this image with `outrig image build`");
     Ok(())
+}
+
+/// Probe the entry itself, not its symlink target. Only a missing path is
+/// absent; other stat failures must not grant permission to overwrite it.
+fn entry_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).path_ctx("stat", path).map_err(Into::into),
+    }
 }
 
 /// Derive the project name from the target directory's basename. `Path`'s
@@ -373,6 +383,72 @@ mod tests {
             assert_eq!(read(&proj.join(filename)), "keep me");
             assert_eq!(std::fs::read_dir(&proj).unwrap().count(), 1);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_build_input_symlinks_require_force() {
+        for filenames in [vec!["Dockerfile"], vec!["image.toml"], vec!["Dockerfile", "image.toml"]] {
+            let tmp = tempfile::tempdir().unwrap();
+            let proj = tmp.path().join("rust-dev");
+            std::fs::create_dir(&proj).unwrap();
+            for filename in &filenames {
+                std::os::unix::fs::symlink(
+                    format!("../shared/{filename}"),
+                    proj.join(filename),
+                )
+                .unwrap();
+            }
+
+            let err = run(tmp.path(), Some(Path::new("rust-dev")), false).unwrap_err();
+
+            let expected = filenames
+                .iter()
+                .map(|filename| format!("rust-dev/{filename}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert!(
+                err.to_string().contains(&format!(
+                    "{expected} already present; pass --force to overwrite."
+                )),
+                "{err}"
+            );
+            for filename in &filenames {
+                assert_eq!(
+                    std::fs::read_link(proj.join(filename)).unwrap(),
+                    Path::new(&format!("../shared/{filename}"))
+                );
+            }
+            assert_eq!(std::fs::read_dir(&proj).unwrap().count(), filenames.len());
+            assert!(!tmp.path().join("shared").exists());
+
+            run(tmp.path(), Some(Path::new("rust-dev")), true).unwrap();
+
+            for filename in ["Dockerfile", "image.toml"] {
+                assert!(!proj.join(filename).is_symlink());
+            }
+            assert_eq!(read(&proj.join("Dockerfile")), render_dockerfile());
+            assert_eq!(read(&proj.join("image.toml")), render_image_toml("rust-dev"));
+            assert_eq!(read(&proj.join("README.md")), render_readme("rust-dev"));
+            assert!(!tmp.path().join("shared").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_stat_error_is_reported_before_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Resolving a parent symlink loop fails with ELOOP, even as root.
+        let proj = tmp.path().join("rust-dev");
+        std::os::unix::fs::symlink("rust-dev", &proj).unwrap();
+
+        let err = run(tmp.path(), Some(Path::new("rust-dev")), false).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("stat"), "{msg}");
+        assert!(msg.contains("rust-dev/Dockerfile"), "{msg}");
+        assert_eq!(std::fs::read_link(&proj).unwrap(), Path::new("rust-dev"));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 
     #[test]

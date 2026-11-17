@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `image init` now refuses dangling `Dockerfile` and `image.toml` symlinks unless
+  `--force` is set, and reports existence-probe errors instead of treating the paths
+  as absent. (#812)
+
 - `image init` now exclusively creates its optional README, preserving a README that appears
   after the existence check, even with `--force`. This also works on shared filesystems without
   no-replace rename or hard links. (#811)
