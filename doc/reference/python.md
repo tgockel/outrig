@@ -968,10 +968,10 @@ class SessionClosing(AgentError): ...
 
 The session closed to new work before the child answered, or before this could start.
 
-### `outrig.RequestSettled`
+### `outrig.RequestEnded`
 
 ```python
-class RequestSettled(AgentError):
+class RequestEnded(AgentError):
     def __init__(self, message, ended): ...
 ```
 

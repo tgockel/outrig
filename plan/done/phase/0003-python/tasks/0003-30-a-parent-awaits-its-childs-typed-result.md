@@ -201,7 +201,7 @@ including when the session closes.
   is attributed to the child's round -- its round events carry its `subject` -- and added to the
   total of each round above it in the tree, up to the main agent's round whose execution made the
   outermost call, reported per fork 8. A round that answers several requests is attributed to the
-  round and not divided among them (fork 12); `agent.request.settled` names the rounds the request
+  round and not divided among them (fork 12); `agent.request.ended` names the rounds the request
   spanned, so a reader can see what was spent while it was open. `0003-33` adds the skill
   invocation the work ran under to the same chain.
 - **Depth.** `subagent-depth-max` is enforced at spawn, the main agent being depth 1: a spawn
@@ -252,10 +252,10 @@ including when the session closes.
   submission, and the sender; `agent.request.received`, when the child takes it;
   `agent.request.replied`, when the child answers; `agent.request.invalid`, with the attempt
   number and the problems; `agent.request.failed`, with `fail`'s message;
-  `agent.request.cancelled`; `agent.request.settled`, with the outcome, the attempts and the
+  `agent.request.cancelled`; `agent.request.ended`, with the outcome, the attempts and the
   rounds the request spanned; an answer refused because its request had settled (fork 3); and
   release, naming every child it ended and every request it settled. `agent.call.started` and
-  `agent.call.settled` are `0003-31`'s wrapper around a decorated call, and nothing else emits
+  `agent.call.ended` are `0003-31`'s wrapper around a decorated call, and nothing else emits
   them; there is no `agent.completion.*` family. A child's own executions and model rounds carry
   its own `subject`, so `0003-14` renders it as an agent, and its progress messages are evented as
   `0003-13` defines for messages between agents.
@@ -407,7 +407,7 @@ including when the session closes.
 - **Spend adds up, once each.** A parent whose child spawns a grandchild, against a mock provider
   that reports fixed usage per call: the grandchild's usage is in its own round events and in the
   total of the child's round that spawned it, the main round's total is the main agent's own usage
-  plus each descendant's, each counted once, and each request's settled event names the rounds it
+  plus each descendant's, each counted once, and each request's ended event names the rounds it
   spanned.
 - **At shutdown, `await h`, `asyncio.wait` over `h.future`, and a re-await all raise the
   documented error, and none hangs**, each under a deadline in the test, for a running submission,
@@ -526,7 +526,7 @@ including when the session closes.
     deliveries. The subclass's name is this task's; `outrig.Request` is the declaration, so the
     subclass is not spelled the same.
 12. **Spend of a round that answers several requests -- Recommended: to the round, with each
-    request's settled event naming the rounds it spanned.** Any division of one round's usage
+    request's ended event naming the rounds it spanned.** Any division of one round's usage
     among the requests it answered would be invented. The rounds spanned let a reader see what was
     spent while a request was open; the round's total stays whole.
 13. **Whether an invalid answer has an attempt limit -- Recommended: yes, 3 by default, shared by
@@ -637,7 +637,7 @@ no doc settled is recorded here.
   `reply`; `RequestDelivery(Delivery)` with `await d.reply(value)` and `await d.fail(message)`;
   `outrig.Request(request_type, reply_type, *, doc=None)`, or a bare `(request_type, reply_type)`.
   An answer that fails its check raises `outrig.schema.DecodeError` naming the attempt; one after
-  the request ended raises `RequestCancelled` if it was cancelled and `RequestSettled`, carrying
+  the request ended raises `RequestCancelled` if it was cancelled and `RequestEnded`, carrying
   `ended`, otherwise. An unknown `model=` and a refused release batch are the caller's mistakes,
   `ValueError`; the depth refusal is `AgentLimitReached`, as the other limits' are.
 - **`Status(state, reason, child)`** is frozen and fixed once the request ends. The child's state

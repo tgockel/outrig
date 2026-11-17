@@ -115,10 +115,10 @@ What a handle has to expose, and why each one is on the list rather than inferre
   otherwise makes `runtime.wait` unusable on it. The 0.2.x inbox keeps only the latest value and
   lets a later publication supersede an earlier one; that behavior is worth keeping, but it is a
   *revision stream* and belongs on its own feed with its own cursor rather than inside the
-  result. A late completion or reply against a settled request is refused and recorded as an
+  result. A late completion or reply against a request that has ended is refused and recorded as an
   event -- it never rewrites a settled result.
 - **`done()` and `result()`**, as a future has them: `done()` says whether the request has
-  settled, and `result()` returns the accepted value or raises the failure, and raises if nothing
+  ended, and `result()` returns the accepted value or raises the failure, and raises if nothing
   has settled yet. They are what code that is not awaiting asks.
 - **`future`, a shielded view the `asyncio` machinery accepts.** Being awaitable through
   `__await__` is not the same as being a future, and `asyncio.wait` takes futures. `runtime.wait`
@@ -141,7 +141,7 @@ What a handle has to expose, and why each one is on the list rather than inferre
   the queue and the child never sees it; after, the delivery stays with the child, and its `reply`
   or `fail` raises `RequestCancelled`. Either way the handle settles as cancelled. The host cancels
   a request the same way once the child's rounds leave it unanswered after a warning ("A request
-  settles once").
+  ends once").
 - **A wait that times out ends the wait, not the request.** `runtime.wait(timeout=...)` returning
   with a handle in its pending set has settled nothing: the request is still open, and its child
   or its instance is still held by it. The caller inspects what is pending -- `h.done()`,
@@ -157,7 +157,7 @@ What a handle has to expose, and why each one is on the list rather than inferre
   `async with FooAgent() as foo:`, and every request outstanding on it settles with
   `AgentReleased`.
 
-## A request settles once
+## A request ends once
 
 Everything a parent asks of a child is a **request** underneath: a submission to a work child, or
 a body sent on a request channel. Each has an id, a reply type, and a handle in the parent, and
@@ -170,7 +170,7 @@ each is answered once. The two kinds of child answer differently, and never mix:
   `await d.fail(message)`. It has no `runtime.complete`, and a work child has no request channels.
   The kind is fixed at spawn.
 
-`runtime.complete`, `reply` and `fail` are all awaited: each returns once the request has settled,
+`runtime.complete`, `reply` and `fail` are all awaited: each returns once the request has ended,
 or raises its problems (`0003-30`, fork 3).
 
 **Rejected: `runtime.complete` answering "the one outstanding request" in a request child.** It
@@ -281,11 +281,11 @@ The exceptions share one base, `outrig.AgentError`, over `CompletionRejected`, `
 that its request ended. Re-awaiting a settled failure is as stable as re-awaiting a settled
 success.
 
-A second completion, or a reply naming a request that has already settled -- answered, cancelled,
+A second completion, or a reply naming a request that has already ended -- answered, cancelled,
 or released -- is refused: the `complete` or `reply` call raises in the child's code, and the
 runtime records the attempt as an event in the request family (`observability.md`). It is never a
-new result, and it is not an edition on the revision feed either: a reply to a settled request is
-a defect in the child's round, not a later version of the answer.
+new result, and it is not an edition on the revision feed either: a reply to a request that has ended
+is a defect in the child's round, not a later version of the answer.
 
 ## Limits belong outside generated code
 
@@ -319,14 +319,14 @@ holds at most one entry per agent, because an agent has one round at a time and 
 request in flight at a time, so `children-max` bounds the queue as well.
 
 **Requests.** **Decided on 2026-10-05, after the follow-up review: `requests-max`, default 256,
-bounds the requests unsettled on one child**, counting every one of them -- a submission running
+bounds the requests still open on one child**, counting every one of them -- a submission running
 or queued behind another, a request held before the child exists, waiting unread, or received and
 not yet answered -- and a `request()` or `submit()` past it raises `AgentLimitReached` at once,
 with nothing sent. Nothing waits outside the child's queue. The design it replaces held a request
 past the queue's bound on the sending side, and the review named what that bounded: the child's
 unread queue, and nothing else. A parent could enqueue any number of bodies against one child
 without reaching `children-max` or `model-concurrency-max`, and a child that received requests
-without answering moved them outside the bound as well; counting everything unsettled on the child
+without answering moved them outside the bound as well; counting everything still open on the child
 closes both. A reply, a `fail`, a completion, `h.cancel()` or the release frees the place, so a
 parent that sends faster than its child answers is refused and handles it, as it handles
 `children-max`; a sender that would rather wait for room is
@@ -362,7 +362,7 @@ that can spawn children is where an unbounded one costs most. A request whose ch
 before answering settles with a budget error. A child's model usage is attributed to the child's
 round and added to the skill invocation the child ran under and to the main agent's round. A round
 in a request child may answer several requests; its usage is attributed to the round and not
-divided among them, and each request's settled event names the rounds it spanned, which is
+divided among them, and each request's ended event names the rounds it spanned, which is
 `0003-30`'s fork.
 
 ## What the parent sees
@@ -402,7 +402,7 @@ foo.release()`, which is idempotent; leaving `async with FooAgent() as foo:`; an
 backstop when an instance is collected unreleased. The backstop is a finalizer, which cannot await
 and runs on whatever thread dropped the last reference, so it schedules the release on the
 constructing kernel's event loop, and that release is recorded as `agent.instance.collected`. The
-runtime's record of each unsettled request holds the instance, so a child is never released while
+runtime's record of each open request holds the instance, so a child is never released while
 a request is in flight, even when agent code has dropped both the instance and the handle:
 `FooAgent().fizz("x")` with neither reference kept runs to settlement, then the child is released
 and `agent.instance.collected` is recorded. The handle wrapper itself is collectable, and a handle

@@ -507,7 +507,7 @@ async fn a_reply_is_decoded_into_the_programs_class_and_repaired() {
         "{}",
         ran.stderr
     );
-    let settled = of_kind(&records, "agent.request.settled");
+    let settled = of_kind(&records, "agent.request.ended");
     let outcomes: Vec<&Value> = settled.iter().map(|data| &data["outcome"]).collect();
     assert_eq!(outcomes, [&json!("accepted"), &json!("rejected")]);
     let invalid = of_kind(&records, "agent.request.invalid");
@@ -1528,7 +1528,7 @@ asyncio.run(main())
         .map(|data| &data["channel"])
         .collect();
     assert_eq!(sent.len(), 2, "the held request was never sent: {sent:?}");
-    let settled: Vec<&Value> = of_kind(&records, "agent.request.settled")
+    let settled: Vec<&Value> = of_kind(&records, "agent.request.ended")
         .iter()
         .map(|data| &data["outcome"])
         .collect();
@@ -1598,7 +1598,7 @@ asyncio.run(main())
         "{}",
         ran.stderr
     );
-    let attempts: Vec<(Value, Value)> = of_kind(&records, "agent.request.settled")
+    let attempts: Vec<(Value, Value)> = of_kind(&records, "agent.request.ended")
         .iter()
         .map(|data| (data["outcome"].clone(), data["attempts"].clone()))
         .collect();
@@ -2025,7 +2025,7 @@ asyncio.run(main())
     assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
     assert_eq!(
         ran.json(),
-        [json!(["first", ["accepted", "RequestSettled"]])],
+        [json!(["first", ["accepted", "RequestEnded"]])],
         "{}",
         ran.stderr
     );

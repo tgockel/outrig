@@ -431,7 +431,7 @@ needs (`A-06`, OR-A6-2; `rust-owner.md`) -- is served from the registry and neve
 
 ## Requests
 
-A request owes a reply; a plain message owes nothing. `work.md`, "A request settles once", gives the
+A request owes a reply; a plain message owes nothing. `work.md`, "A request ends once", gives the
 rules a request follows, and every one of them holds across an external channel: one terminal
 outcome per request in a session, which does not move; a late answer refused and evented; cancelling
 a waiter cancels nothing but the wait; `h.cancel()` as the explicit act. What this page adds is

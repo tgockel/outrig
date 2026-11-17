@@ -151,7 +151,7 @@ sender's `await` raises `AgentLimitReached`, whose message names the child, its 
 count; `h.status` reads `failed: limit`, and its `child` reads `limit-reached`
 (`_agents.py:164-182`, `Status`; `children.rs:128-145`, `Life`, which gains the state and tells
 the parent through the `child` line, `:1175-1192`). `RequestEnd` gains `Limit`
-(`event.rs:1238-1258`), so `agent.request.settled.outcome` says `limit` where the host's
+(`event.rs:1238-1258`), so `agent.request.ended.outcome` says `limit` where the host's
 `outcome()` would today read an unknown name as `terminated` (`children.rs:1401-1412`). An
 orienting round the limit stops part way has ended, so `ready()` settles and the child is at its
 limit from then on. `ready()` raises `AgentLimitReached` only when the orienting round cannot
@@ -325,7 +325,7 @@ Execution diagnostics, under the agent's subject: `model.limit.warned` (`thresho
 ids settled `limit`); `model.limit.reset` (`spent` and `limit` before and after). `0003-50`
 spelled them so, in place of this page's first `agent.model_requests.*`, since no event name
 holds an underscore. Beside them, `model.round.completed.stopped` carries the
-structured stop, `agent.request.settled.outcome` gains `limit`, and `agent.instance.ready.error`
+structured stop, `agent.request.ended.outcome` gains `limit`, and `agent.instance.ready.error`
 names the limit. The roster of `0003-49` shows `limit-reached` as an agent state, and the stop
 read of `0003-48` reports the limit with `spent` and `limit`; both are reads from the runner's
 state, never from the stream. The spellings are `0003-50`'s.

@@ -954,14 +954,14 @@ fn each_event_has_exactly_its_data_fields() {
             &["request", "body"],
         ),
         (
-            Payload::AgentRequestSettled {
+            Payload::AgentRequestEnded {
                 request: AgentRequestId::new(7),
                 outcome: RequestEnd::Accepted,
                 attempts: 1,
                 rounds: vec![1, 2],
                 cause: None,
             },
-            "agent.request.settled",
+            "agent.request.ended",
             &["request", "outcome", "attempts", "rounds", "cause"],
         ),
         (
@@ -992,14 +992,14 @@ fn each_event_has_exactly_its_data_fields() {
             ],
         ),
         (
-            Payload::AgentCallSettled {
+            Payload::AgentCallEnded {
                 request: AgentRequestId::new(7),
                 outcome: RequestEnd::Accepted,
                 usage: Some(usage),
                 invocation: None,
                 value: Some(text("{\"question\": \"Which paths?\"}")),
             },
-            "agent.call.settled",
+            "agent.call.ended",
             &["request", "outcome", "usage", "invocation", "value"],
         ),
         (

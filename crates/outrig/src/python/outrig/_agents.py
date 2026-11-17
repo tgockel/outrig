@@ -49,7 +49,7 @@ __all__ = [
     "Facility",
     "Request",
     "RequestCancelled",
-    "RequestSettled",
+    "RequestEnded",
     "Section",
     "SendNotAccepted",
     "SendRefused",
@@ -167,7 +167,7 @@ class RequestCancelled(AgentError):
     """
 
 
-class RequestSettled(AgentError):
+class RequestEnded(AgentError):
     """An answer to a request that had already ended -- answered, rejected, failed, released, or
     closed -- refused. `ended` says how it had ended."""
 

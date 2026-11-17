@@ -17,7 +17,7 @@ round only when they differ. What that leaves when a child does nothing with a r
   with it unread, and nothing changed, so it waits unread on an idle child in the same way.
 - **A work child** is asked twice, and when the second round ends without a completion, its
   submission ends `CompletionRejected` ("ended without completing"). The caller learns of it
-  (`work.md`, "A request settles once"; `typed-agents.md`, "Validation and repair").
+  (`work.md`, "A request ends once"; `typed-agents.md`, "Validation and repair").
 
 The maintainer's goal for messages is that they are reliable in how they are processed. A request
 is either being worked on -- the LLM responsible for it is acting on it -- or it is cancelled, and
@@ -237,7 +237,7 @@ Each is a mock-driven test unless it says otherwise.
 
 - `plan/phase/0003-python/agent-classes.md` -- "The child's rounds", where the rule `0003-30`
   shipped is written in full, with the traces it was decided on.
-- `plan/phase/0003-python/work.md` -- "A request settles once" and "The handle".
+- `plan/phase/0003-python/work.md` -- "A request ends once" and "The handle".
 - `plan/phase/0003-python/typed-agents.md` -- "Validation and repair".
 - `plan/done/phase/0003-python/tasks/0003-30-a-parent-awaits-its-childs-typed-result.md` -- its
   `## Decisions` for the rule this task replaces.
@@ -265,7 +265,7 @@ The deliverables were built as written. What they left to the task is recorded h
   after it reads as before; `refused()` builds every cancelled refusal from the request's error.
 - **#756's cause carries over to the cancel.** A work child's cancelled submission carries the
   failure of a round that failed after its code ran as `RequestCancelled.__cause__` and as
-  `agent.request.settled`'s `cause`, as the rejection did; `CompletionRejected`'s paragraph on
+  `agent.request.ended`'s `cause`, as the rejection did; `CompletionRejected`'s paragraph on
   it moved to `RequestCancelled`'s docstring. A request child's cancel carries none, as its idle
   ending never did. `_HOST_ENDS` swaps `rejected` for `cancelled`: the host rejects nothing now.
 - **The runner hears every end it sends before it decides again.** It keeps the requests it ended

@@ -215,12 +215,12 @@ async fn the_maintainers_example_runs_against_a_mock_model() {
             at("agent.request.sent"),
             at("agent.request.received"),
             at("agent.request.replied"),
-            at("agent.request.settled"),
+            at("agent.request.ended"),
         );
         assert!(sent < received && received < replied && replied < settled);
         assert!(settled < released[0], "released last");
     }
-    for settled in kind(&events, "agent.request.settled", child) {
+    for settled in kind(&events, "agent.request.ended", child) {
         let rounds = data(settled)["rounds"].clone();
         assert!(rounds.as_array().is_some_and(|r| !r.is_empty()), "{rounds}");
     }
@@ -684,7 +684,7 @@ async fn invalid_replies_count_attempts_and_fail_ends_a_request() {
     };
     assert_eq!(invalid(&ids[0]), [1, 2, 3]);
     assert_eq!(invalid(&ids[1]), [1, 2]);
-    let outcomes: Vec<_> = kind(&events, "agent.request.settled", None)
+    let outcomes: Vec<_> = kind(&events, "agent.request.ended", None)
         .into_iter()
         .map(|event| data(event)["outcome"].clone())
         .collect();
@@ -776,7 +776,7 @@ async fn release_settles_and_closes() {
         .find(|event| event.subject.as_ref().map(|s| s.as_str()) == Some("agent/c2"))
         .map(|event| data(event)["request"].clone())
         .expect("the grandchild's request");
-    let settled = kind(&events, "agent.request.settled", None)
+    let settled = kind(&events, "agent.request.ended", None)
         .into_iter()
         .map(data)
         .find(|data| data["request"] == grand)
@@ -873,7 +873,7 @@ async fn a_dropped_instance_lives_until_it_is_released() {
         kind(&events, "agent.instance.collected", None).is_empty(),
         "its child holds it"
     );
-    let (settled, released) = (at("agent.request.settled"), at("agent.instance.released"));
+    let (settled, released) = (at("agent.request.ended"), at("agent.instance.released"));
     assert_eq!((settled.len(), released.len()), (1, 1));
     assert_eq!(data(&events[settled[0]])["outcome"], "accepted");
     assert!(settled[0] < released[0], "the request first");

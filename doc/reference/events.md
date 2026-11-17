@@ -346,7 +346,7 @@ three times for one call before the rejection ends it.
 - `skill.invocation.started` -- the subject's code called a skill's entry through
   `outrig.skills.invoke`.
   - `invocation`: its id, which the calls made inside it carry: `agent.call.started`,
-    `agent.call.settled`, and `hosted.received`.
+    `agent.call.ended`, and `hosted.received`.
   - `skill`, `source`, and `digest`, of the skill's files when its package was imported.
   - `params`: the parameters the entry is called with, as the JSON of its `<Skill>Params`, cut to
     1,024 characters; `null` when the session's events are not observed.
@@ -355,7 +355,7 @@ three times for one call before the rejection ends it.
   - `bindings`: the bindings the entry's parameters were filled from.
 
   A parse that gives no parameters -- its answers refused, or a question for the user instead --
-  starts no invocation. Its typed call's `agent.call.settled` carries the invocation's id, with
+  starts no invocation. Its typed call's `agent.call.ended` carries the invocation's id, with
   the outcome `rejected`, or `accepted` and the question as its `value`.
 - `skill.invocation.finished` -- the entry ended: `invocation`; `outcome`, `returned`, `raised`, or
   `cancelled`; `duration`, seconds from the call; `result`, the qualified name of the type of what
@@ -383,7 +383,7 @@ three times for one call before the rejection ends it.
   request is made until its count is reset or its limit raised: `spent`, `limit`, `round`, the
   latest round it opened or `null`, and `requests`, the requests it held, each ended `limit`,
   empty for the main agent. Once per arrival at the limit; a request sent while it stays there
-  ends `limit` too, recorded only by its `agent.request.settled`.
+  ends `limit` too, recorded only by its `agent.request.ended`.
 - `model.limit.reset` -- the session's owner reset the subject's count, or raised its limit:
   `spent_before`, `limit_before`, `spent_after`, `limit_after`, a limit `null` for none. Its
   model is told once, as a warning is. Only the owner can: no agent's code lifts a limit.
@@ -579,7 +579,7 @@ between a child's failed rounds is in that read and has no event of its own.
   `received`, whether the child had taken it; and `reason`, `null` for its sender's cancel, or,
   when the engine cancelled it because the child ended its rounds without answering it after a
   warning, the text its sender's `RequestCancelled` carries.
-- `agent.request.settled` -- how it ended: `request`; `outcome`, which is `accepted`, `rejected`,
+- `agent.request.ended` -- how it ended: `request`; `outcome`, which is `accepted`, `rejected`,
   `failed`, `cancelled`, `released`, `budget`, `limit` -- the child's model-request limit was
   reached first -- `closed`, or `terminated`; `attempts`, the answers
   it took; `rounds`, the child's rounds it was open during; and `cause`, `null`, or, for a
@@ -597,13 +597,13 @@ between a child's failed rounds is in that read and has no event of its own.
   invocation the call was made inside, or `null`. The parse `outrig.skills.invoke` makes is such a
   call, declared in the skill's entry module as `parse_params`. A call whose launch was refused,
   by a limit say, has no child and records neither event; its handle raises the refusal.
-- `agent.call.settled` -- the call settled and its child, the subject, was released: `request`;
-  `outcome`, as `agent.request.settled` says it; `usage`, the sum over every model request the
+- `agent.call.ended` -- the call ended and its child, the subject, was released: `request`;
+  `outcome`, as `agent.request.ended` says it; `usage`, the sum over every model request the
   child made, or `null` when none reported any; `invocation`, as on `agent.call.started`; and
   `value`, a preview of the result it was accepted with, cut to 1,024 characters, or `null` when it
   was not accepted or the session's events are not observed. It follows the `agent.released` that
   ended the child, except at the session's close, which ends every call `closed` at once and tears
-  its children down afterward: a call settled `closed` precedes its child's release.
+  its children down afterward: a call ended `closed` precedes its child's release.
 - `agent.instance.started` -- an instance of an agent class, a subclass of `outrig.Agent`, launched
   the subject, a child, to answer its requests: `instance`, the instance's id, which its other
   events carry; `parent`, the subject of the agent whose code constructed it, or `owner` for one the

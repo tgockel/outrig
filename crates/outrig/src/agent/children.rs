@@ -1579,7 +1579,7 @@ impl Inner {
             .get(&child)
             .map(|node| node.slot.attempts())
             .unwrap_or_default();
-        self.events_of(&child).emit(Payload::AgentCallSettled {
+        self.events_of(&child).emit(Payload::AgentCallEnded {
             request: AgentRequestId::new(id),
             outcome: outcome(line["outcome"].as_str().unwrap_or_default()),
             usage: self.ledger.total(&attempts),
@@ -1822,7 +1822,7 @@ impl Inner {
             }),
             _ => {}
         }
-        events.emit(Payload::AgentRequestSettled {
+        events.emit(Payload::AgentRequestEnded {
             request,
             outcome,
             attempts,

@@ -255,7 +255,7 @@ A child's model calls are its own, recorded under its subject, and they are adde
 that launched it. Each round's events carry `descendants`, the attempts and tokens of the children
 the round launched, and `total`, the round's own with theirs; what a child spends after its
 parent's round ended is published as `model.round.usage`. A call of an `@outrig.agent` function
-records its child's whole spend on `agent.call.settled`, and a skill invocation records the
+records its child's whole spend on `agent.call.ended`, and a skill invocation records the
 spend of every child made inside it on `skill.invocation.finished`. The
 [event log](../reference/events.md) lists the fields.
 

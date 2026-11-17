@@ -70,7 +70,7 @@ fn literal(path: &Path) -> String {
 }
 
 /// Shut `tree` down and check the one call it ran: `agent.call.started` under
-/// the child's subject names the declaration, `agent.call.settled` follows
+/// the child's subject names the declaration, `agent.call.ended` follows
 /// the child's release with the outcome, and the two share the submission's
 /// id. Returns the events and requests.
 async fn one_call(
@@ -91,7 +91,7 @@ async fn one_call(
     assert_eq!(started["parent"], "agent/primary");
     assert_eq!(started["module"], module);
     assert_eq!(started["qualname"], qualname);
-    let settled = kind(&events, "agent.call.settled", Some(&subject));
+    let settled = kind(&events, "agent.call.ended", Some(&subject));
     assert_eq!(settled.len(), 1, "one end for {child}");
     let settled = data(settled[0]);
     assert_eq!(settled["outcome"], outcome);
@@ -106,7 +106,7 @@ async fn one_call(
             .as_array()
             .is_some_and(|ended| ended.iter().any(|id| id == child))
     });
-    let ended = position(&events, "agent.call.settled", |event| {
+    let ended = position(&events, "agent.call.ended", |event| {
         event.subject.as_ref().map(|s| s.as_str()) == Some(subject.as_str())
     });
     assert!(
@@ -197,7 +197,7 @@ async fn the_maintainers_analyze_code_returns_a_review_result() {
     );
     let started = data(kind(&events, "agent.call.started", None)[0]);
     assert_eq!(started["digest"], sha256_hex(REVIEW_SKILL.as_bytes()));
-    let settled = data(kind(&events, "agent.call.settled", None)[0]);
+    let settled = data(kind(&events, "agent.call.ended", None)[0]);
     assert!(
         settled["usage"]["input_tokens"]
             .as_u64()
@@ -321,7 +321,7 @@ async fn a_gather_of_three_calls_makes_three_children_each_gone_once_settled() {
         "three, the nested one, its leaf"
     );
     assert_eq!(kind(&events, "agent.call.started", None).len(), 4);
-    assert_eq!(kind(&events, "agent.call.settled", None).len(), 4);
+    assert_eq!(kind(&events, "agent.call.ended", None).len(), 4);
     let releases = kind(&events, "agent.released", Some("agent/primary"));
     assert_eq!(releases.len(), 4, "one release per call");
     let ended: Vec<usize> = releases
@@ -403,7 +403,7 @@ async fn a_typed_calls_round_ends_when_its_submission_is_accepted() {
                 "{subject}: {turn}"
             );
         }
-        let settled = position(&events, "agent.request.settled", |event| {
+        let settled = position(&events, "agent.request.ended", |event| {
             event.subject.as_ref().map(|s| s.as_str()) == Some(subject)
         });
         let calls = position(&events, "model.call", |event| {
@@ -473,7 +473,7 @@ async fn a_child_that_never_completes_has_the_call_cancelled() {
     );
     assert!(kind(&events, "agent.request.invalid", None).is_empty());
     assert_eq!(
-        data(kind(&events, "agent.request.settled", None)[0])["outcome"],
+        data(kind(&events, "agent.request.ended", None)[0])["outcome"],
         "cancelled"
     );
 }
@@ -717,7 +717,7 @@ async fn a_cancelled_waiter_leaves_the_call_running_and_cancel_releases_the_chil
     let cancelled = kind(&events, "agent.request.cancelled", Some("agent/c2"));
     assert_eq!(cancelled.len(), 1);
     assert_eq!(data(cancelled[0])["received"], true);
-    let settled: Vec<Value> = kind(&events, "agent.call.settled", None)
+    let settled: Vec<Value> = kind(&events, "agent.call.ended", None)
         .into_iter()
         .map(|event| data(event)["outcome"].clone())
         .collect();
@@ -757,13 +757,13 @@ async fn a_call_never_awaited_still_runs_and_releases_its_child() {
     )
     .await;
     round(&mut tree.session, "go").await;
-    tree.seen("agent.call.settled", 1).await;
+    tree.seen("agent.call.ended", 1).await;
     let (events, requests) =
         one_call(tree, "c1", "outrig_session_primary", "add", "accepted").await;
     assert_eq!(printed(&requests, "p1"), "sent\n");
     assert_eq!(kind(&events, "agent.spawned", None).len(), 1);
     assert_eq!(
-        data(kind(&events, "agent.request.settled", None)[0])["outcome"],
+        data(kind(&events, "agent.request.ended", None)[0])["outcome"],
         "accepted"
     );
     assert_eq!(

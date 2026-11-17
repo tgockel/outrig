@@ -84,8 +84,8 @@ The two ends differ, because each offers what its direction's contract allows:
 
 Queues are bounded here as on every channel, and a request channel's bound is `requests-max`
 itself (default 256, per child, `0003-30`): it counts every request of the child's that has not
-settled -- queued, or received and not yet answered -- and a `request()` past it raises
-`AgentLimitReached` at once. Nothing waits on the sender's side; cancelling, settling or releasing
+ended -- queued, or received and not yet answered -- and a `request()` past it raises
+`AgentLimitReached` at once. Nothing waits on the sender's side; cancelling, answering or releasing
 frees the count (`agent-classes.md`).
 
 ## Contracts
@@ -181,9 +181,9 @@ channel that is not a request channel is `0003-30`'s fork.
 - Ordering holds within a channel. There is no ordering between channels.
 - A successful send means accepted for delivery.
 - Receiving removes a message. Notification does not.
-- A reply names its request. A reply to a request that has settled -- answered, cancelled, or
+- A reply names its request. A reply to a request that has ended -- answered, cancelled, or
   released -- is refused: `reply` raises in the child, and an event records the attempt
-  (`work.md`, "A request settles once").
+  (`work.md`, "A request ends once").
 - Queues are bounded; overload is observable rather than silent.
 - Closure is observable.
 

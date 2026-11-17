@@ -155,7 +155,7 @@ a child's requests settled `limit`, with nothing released, failed or rolled back
   `spent`, `limit`); `agent.model_requests.reached` (`spent`, `limit`, `round` or null,
   `requests`, the ids settled `limit`); `agent.model_requests.reset` (`by`, `owner` or `parent`;
   `spent` and `limit` before and after). `model.round.completed.stopped`'s entry gains the kind;
-  `agent.request.settled.outcome`'s list gains `limit`; `agent.instance.ready.error`'s names the
+  `agent.request.ended.outcome`'s list gains `limit`; `agent.instance.ready.error`'s names the
   limit. The renderer's fixture is updated where the stop's shape changed.
 - **`lifecycle.md`'s close table** gains rows for an agent at its limit: *idle at the limit,
   holding nothing* -- as an idle agent; *stopped at the limit with Python still running* -- as an
@@ -196,7 +196,7 @@ Each is a mock-driven test unless it says otherwise.
   `runtime.spawn(..., requests=...)` with the limit keyword -- answers two requests in two rounds,
   and a third request settles `limit` without a model call: the sender's `await` raises
   `AgentLimitReached` naming the child, 2 and 2; `h.status` reads `failed: limit` with child
-  `limit-reached`; `agent.request.settled.outcome` is `limit`; the child is resident, counted by
+  `limit-reached`; `agent.request.ended.outcome` is `limit`; the child is resident, counted by
   `children-max`, and the mock receives no call. After the parent's reset, a fourth request is
   answered from a variable the first round bound. The same through `Session`'s reset by agent id.
 - **The orienting round and `ready()`.** With limit 1, under fork 2's recommendation, the
@@ -392,7 +392,7 @@ the Python owner's half of the reset (below).
   `model-policy.md`'s first `agent.model_requests.*`: no event name holds an underscore, and the
   renderer's sweep pins them to `[a-z.]`. `reached` is once per arrival at the limit, its `round`
   the latest round the agent opened, and for a child it lists the requests open as the runner's
-  check fired; a request that arrives later ends `limit` with only its `agent.request.settled`.
+  check fired; a request that arrives later ends `limit` with only its `agent.request.ended`.
   `reset` names the count and limit before and after.
 - **The state.** `AgentState::LimitReached { spent, limit, round }`, `round` the latest the agent
   opened, `None` when it opened none. The runner says it, and `Life::LimitReached` (the parent's

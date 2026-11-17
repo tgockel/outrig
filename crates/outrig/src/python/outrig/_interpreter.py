@@ -5321,7 +5321,7 @@ class _Work:
         if reason == "cancelled":
             # Its error says who cancelled it, and the host's why.
             return _agents.RequestCancelled(f"{self.error}; it takes no answer")
-        return _agents.RequestSettled(
+        return _agents.RequestEnded(
             f"{self} has already ended ({reason or 'answered'}), so it takes no further answer",
             reason or "accepted",
         )

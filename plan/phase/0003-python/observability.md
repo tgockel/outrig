@@ -193,7 +193,7 @@ a failover hop of the same logical call -- is a new attempt under its own id, ne
 of an earlier one. After a replacement, every aggregate that counted the attempt is recomputed
 from unique attempts, so a round's total changes once, by that attempt's usage. A round that
 answers several requests is attributed to the round, and its usage is not divided among the
-requests (`agent-classes.md`); `agent.request.settled` names the rounds a request spanned instead.
+requests (`agent-classes.md`); `agent.request.ended` names the rounds a request spanned instead.
 
 **Everything else that happens and is reported nowhere.** This is the part of the subject that
 grows, and the first entries are already known: a tool result truncated (`rig_tool.rs` writes a
@@ -246,10 +246,10 @@ Four more tasks add events beside them that are execution diagnostics, not integ
 
 - `0003-30`: each request a child is given -- a submission, or a request on one of its request
   channels -- as one family, `agent.request.sent`, `received`, `replied`, `invalid`, `failed`,
-  `cancelled` and `settled`, with request and reply bodies as bounded previews;
-  `agent.call.started` and `agent.call.settled` only as the wrapper around a decorated call
+  `cancelled` and `ended`, with request and reply bodies as bounded previews;
+  `agent.call.started` and `agent.call.ended` only as the wrapper around a decorated call
   (`0003-31`). The child's model usage is attributed to the child's round and added to the skill
-  invocation it ran under and to the main agent's round; a request's settled event names the
+  invocation it ran under and to the main agent's round; a request's ended event names the
   rounds it spanned;
 - `0003-33`, built: each directive the user sends, `skill.directive.received`, and each skill
   invocation, `skill.invocation.started` and `skill.invocation.finished`, whose id the typed calls

@@ -25,7 +25,7 @@ joins a reader wants are not carried:
   though the runner holds the summary of requests it opens on
   (`crates/outrig/src/agent/runner.rs:100-134`) and the registry marks each open request with the
   round (`children.rs:1130-1148`), which is what `agent.request.received.round` and
-  `agent.request.settled.rounds` carry.
+  `agent.request.ended.rounds` carry.
 - The interpreter's `took` line names a message's channel and id (`_interpreter.py:3654`;
   `host.rs:2269-2278`), not the execution whose code took it, though the kernel keeps the current
   execution in a context variable (`_interpreter.py:186`).

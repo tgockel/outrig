@@ -157,7 +157,7 @@ attempt* is one request actually sent to a provider: `attempt_id`, unique within
 one per retry or failover hop under one `call_id` (`ledger.rs:238-240`; `observability.md`, "Every
 model event ... carries two ids"). An *answer attempt* is one answer a child gave a request that
 failed its check: `agent.request.replied.attempt`, `agent.request.invalid.attempt`,
-`agent.request.settled.attempts` and `agent.request.sent.attempts_max`, three by default, and only
+`agent.request.ended.attempts` and `agent.request.sent.attempts_max`, three by default, and only
 an invalid reply counts one (`agent-classes.md`, "Only an invalid reply counts toward the attempt
 limit"). The requirement's word means the first. A third field, `model.retry.attempt`, is a
 retry's ordinal within one candidate's retries (`events.md`, `model.retry`), neither of the two.
@@ -189,7 +189,7 @@ causality". The ids exist; four joins are not carried.
    (`agent/mod.rs:155-157`, `:187-189`). The runner holds the summary -- the requests unread and
    taken, by id -- as it opens the round (`agent/runner.rs:100-134`), and the registry marks each
    open request with the round (`children.rs:1130-1148`), which is how `agent.request.received`
-   carries `round` and `agent.request.settled` carries `rounds` (`events.md`). The join from the
+   carries `round` and `agent.request.ended` carries `rounds` (`events.md`). The join from the
    round's side is missing: `round.started` gains `requests`, the ids the round opened on -- a
    work child's one submission, a request child's unread and taken ids -- an empty list for an
    orienting round, which opens on no request (`agent-classes.md`, "The orienting round"), and

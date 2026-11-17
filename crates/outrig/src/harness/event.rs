@@ -792,7 +792,7 @@ pub enum Payload {
     /// submission for the child's rounds ending without completing it: the
     /// text its sender's exception carries as `__cause__`.
     #[non_exhaustive]
-    AgentRequestSettled {
+    AgentRequestEnded {
         /// The request that ended.
         request: AgentRequestId,
         /// How it ended.
@@ -903,7 +903,7 @@ pub enum Payload {
     /// `None` when it was not accepted or the session's events are not
     /// observed.
     #[non_exhaustive]
-    AgentCallSettled {
+    AgentCallEnded {
         /// The call's submission, as `agent.call.started` named it.
         request: AgentRequestId,
         /// How the submission ended.
@@ -1541,7 +1541,7 @@ impl Payload {
             Payload::AgentRequestFailed { .. } => "agent.request.failed",
             Payload::AgentRequestCancelled { .. } => "agent.request.cancelled",
             Payload::AgentRequestProgress { .. } => "agent.request.progress",
-            Payload::AgentRequestSettled { .. } => "agent.request.settled",
+            Payload::AgentRequestEnded { .. } => "agent.request.ended",
             Payload::AgentRequestRefused { .. } => "agent.request.refused",
             Payload::AgentReleased { .. } => "agent.released",
             Payload::AgentWedged {} => "agent.wedged",
@@ -1549,7 +1549,7 @@ impl Payload {
             Payload::ModelLimitReached { .. } => "model.limit.reached",
             Payload::ModelLimitReset { .. } => "model.limit.reset",
             Payload::AgentCallStarted { .. } => "agent.call.started",
-            Payload::AgentCallSettled { .. } => "agent.call.settled",
+            Payload::AgentCallEnded { .. } => "agent.call.ended",
             Payload::AgentInstanceStarted { .. } => "agent.instance.started",
             Payload::AgentInstanceReady { .. } => "agent.instance.ready",
             Payload::AgentInstanceReleased { .. } => "agent.instance.released",

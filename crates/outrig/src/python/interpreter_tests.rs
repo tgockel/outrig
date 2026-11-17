@@ -5473,7 +5473,7 @@ fn a_request_is_received_answered_and_settles_its_handle_once() {
 
     let (late, notices) = k.exec_collecting("c1", 10, "await d.reply(Thing(n=1))");
     assert!(
-        text(&late["error"]).contains("RequestSettled")
+        text(&late["error"]).contains("RequestEnded")
             && text(&late["error"]).contains("already ended"),
         "{late}"
     );
@@ -5503,7 +5503,7 @@ fn every_failure_of_a_wait_is_an_agent_error() {
         import outrig
         errors = (outrig.CompletionRejected, outrig.AgentReleased, outrig.AgentRequestFailed,
                   outrig.AgentLimitReached, outrig.BudgetExhausted, outrig.SessionClosing,
-                  outrig.RequestCancelled, outrig.RequestSettled)
+                  outrig.RequestCancelled, outrig.RequestEnded)
         print(all(issubclass(e, outrig.AgentError) for e in errors), issubclass(TypeError, outrig.AgentError))
         "#);
     assert_eq!(k.output(1, &hierarchy), "True False\n");
@@ -5891,7 +5891,7 @@ fn runtime_fail_ends_a_submission_and_only_a_work_child_has_it() {
         "no such file failed: failed (child idle)\n"
     );
     let (again, _) = k.exec_collecting("c1", 7, "await runtime.fail('again')");
-    assert!(text(&again["error"]).contains("RequestSettled"), "{again}");
+    assert!(text(&again["error"]).contains("RequestEnded"), "{again}");
 
     let primary = k.exec(8, "runtime.fail");
     assert!(

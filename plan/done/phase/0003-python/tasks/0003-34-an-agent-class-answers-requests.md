@@ -207,7 +207,7 @@ its context kept; releasing the instance ends the child.
   `inspect.iscoroutinefunction(FooAgent.fizz)` is false.
 - **The instance events are in order** for the example: `agent.instance.started` before the three
   `agent.request.sent`, and `agent.instance.ready` after it; for each request `received`, `replied`
-  and `settled` naming the rounds it spanned, in that order after its `sent`; then
+  and `ended` naming the rounds it spanned, in that order after its `sent`; then
   `agent.instance.released`. (Corrected in execution: the requests made before the child exists
   are sent as the spawn answers, so `ready` falls wherever the orienting round ends; see
   Decisions.)
@@ -336,7 +336,7 @@ recorded here.
   before the runner starts; ready as the round ends. Released, collected and the handle's
   collection come from the interpreter's notices. Released's `requests` are the host's own record
   of the child's requests that ended `released` or `closed`, and its `usage` the child's own model
-  requests', as `agent.call.settled`'s is. An instance whose launch was refused records none of
+  requests', as `agent.call.ended`'s is. An instance whose launch was refused records none of
   them, as a refused typed call records no call events (`0003-31`). The handle's collection is a
   fifth instance event, `agent.instance.handle.collected`, since the request family is
   `0003-30`'s; a handle collected while its request is held is said once the request is sent.
@@ -354,7 +354,7 @@ recorded here.
   good. Retiring then rather than as the end begins takes in one that code still running made as
   the kernel ended, whose launch never runs. The instance's child ends in that kernel's subtree, so
   no `agent.instance.released` is recorded for it, as a typed call in flight there records no
-  `agent.call.settled`. A release that begins once the kernel has ended -- from the finalizer of an
+  `agent.call.ended`. A release that begins once the kernel has ended -- from the finalizer of an
   instance its cancelled tasks' cleanup dropped, a `release()` in that cleanup, or the session's
   close while the kernel's loop has yet to stop -- releases and records nothing: it begins after
   `_stop` took the tasks it cancels, so only that check keeps it from running. A failed launch, or a release other than the close's, detaches the

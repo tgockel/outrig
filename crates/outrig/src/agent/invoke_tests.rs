@@ -238,7 +238,7 @@ async fn the_parse_is_a_typed_call_and_the_entry_gets_its_binding() {
     assert_eq!(started["qualname"], "parse_params");
     assert_eq!(started["invocation"], id);
     assert!(started["digest"].is_string(), "{started}");
-    let settled = data(one(&events, "agent.call.settled"));
+    let settled = data(one(&events, "agent.call.ended"));
     assert_eq!(settled["invocation"], id);
     assert_eq!(settled["outcome"], "accepted");
 
@@ -437,7 +437,7 @@ async fn a_parse_the_child_cannot_complete_calls_nothing() {
     );
 
     assert_eq!(kind(&events, "agent.request.invalid", None).len(), 3);
-    let settled = data(one(&events, "agent.call.settled"));
+    let settled = data(one(&events, "agent.call.ended"));
     assert_eq!(settled["outcome"], "rejected");
     assert_eq!(settled["invocation"], id);
     let started = data(one(&events, "skill.invocation.started"));
@@ -574,7 +574,7 @@ async fn the_parser_may_ask_and_params_calls_the_entry_without_a_child() {
         "only the parse asked a model: {}",
         parser.len()
     );
-    let settled = data(one(&events, "agent.call.settled"));
+    let settled = data(one(&events, "agent.call.ended"));
     assert_eq!(settled["invocation"], ids[0]);
     assert_eq!(settled["outcome"], "accepted");
     let value: Value =
@@ -1363,7 +1363,7 @@ async fn an_invocations_spend_is_its_childrens() {
     let (_, events, requests) = tree.end().await;
 
     assert_eq!(printed(&requests, "p1"), "[0, 2]\n");
-    let calls = kind(&events, "agent.call.settled", None);
+    let calls = kind(&events, "agent.call.ended", None);
     assert_eq!(calls.len(), 3, "the parser and two workers");
     let children = total_tokens(&calls);
     assert!(children > 0);

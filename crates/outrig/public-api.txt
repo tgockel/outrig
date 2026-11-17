@@ -1325,12 +1325,12 @@ pub outrig::harness::event::Operation::Unknown
 pub outrig::harness::event::ParamsBy::Caller
 pub outrig::harness::event::ParamsBy::Parser
 #[non_exhaustive] pub enum outrig::harness::event::Payload
-#[non_exhaustive] pub outrig::harness::event::Payload::AgentCallSettled
-pub outrig::harness::event::Payload::AgentCallSettled::invocation: core::option::Option<outrig::harness::event::InvocationId>
-pub outrig::harness::event::Payload::AgentCallSettled::outcome: outrig::harness::event::RequestEnd
-pub outrig::harness::event::Payload::AgentCallSettled::request: outrig::harness::event::AgentRequestId
-pub outrig::harness::event::Payload::AgentCallSettled::usage: core::option::Option<outrig::harness::event::Usage>
-pub outrig::harness::event::Payload::AgentCallSettled::value: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub outrig::harness::event::Payload::AgentCallEnded
+pub outrig::harness::event::Payload::AgentCallEnded::invocation: core::option::Option<outrig::harness::event::InvocationId>
+pub outrig::harness::event::Payload::AgentCallEnded::outcome: outrig::harness::event::RequestEnd
+pub outrig::harness::event::Payload::AgentCallEnded::request: outrig::harness::event::AgentRequestId
+pub outrig::harness::event::Payload::AgentCallEnded::usage: core::option::Option<outrig::harness::event::Usage>
+pub outrig::harness::event::Payload::AgentCallEnded::value: core::option::Option<alloc::string::String>
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentCallStarted
 pub outrig::harness::event::Payload::AgentCallStarted::digest: core::option::Option<alloc::string::String>
 pub outrig::harness::event::Payload::AgentCallStarted::invocation: core::option::Option<outrig::harness::event::InvocationId>
@@ -1376,6 +1376,12 @@ pub outrig::harness::event::Payload::AgentReleased::requests: alloc::vec::Vec<ou
 pub outrig::harness::event::Payload::AgentRequestCancelled::reason: core::option::Option<alloc::string::String>
 pub outrig::harness::event::Payload::AgentRequestCancelled::received: bool
 pub outrig::harness::event::Payload::AgentRequestCancelled::request: outrig::harness::event::AgentRequestId
+#[non_exhaustive] pub outrig::harness::event::Payload::AgentRequestEnded
+pub outrig::harness::event::Payload::AgentRequestEnded::attempts: u32
+pub outrig::harness::event::Payload::AgentRequestEnded::cause: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::AgentRequestEnded::outcome: outrig::harness::event::RequestEnd
+pub outrig::harness::event::Payload::AgentRequestEnded::request: outrig::harness::event::AgentRequestId
+pub outrig::harness::event::Payload::AgentRequestEnded::rounds: alloc::vec::Vec<u32>
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentRequestFailed
 pub outrig::harness::event::Payload::AgentRequestFailed::message: alloc::string::String
 pub outrig::harness::event::Payload::AgentRequestFailed::request: outrig::harness::event::AgentRequestId
@@ -1402,12 +1408,6 @@ pub outrig::harness::event::Payload::AgentRequestSent::body: alloc::string::Stri
 pub outrig::harness::event::Payload::AgentRequestSent::channel: core::option::Option<alloc::string::String>
 pub outrig::harness::event::Payload::AgentRequestSent::request: outrig::harness::event::AgentRequestId
 pub outrig::harness::event::Payload::AgentRequestSent::sender: alloc::string::String
-#[non_exhaustive] pub outrig::harness::event::Payload::AgentRequestSettled
-pub outrig::harness::event::Payload::AgentRequestSettled::attempts: u32
-pub outrig::harness::event::Payload::AgentRequestSettled::cause: core::option::Option<alloc::string::String>
-pub outrig::harness::event::Payload::AgentRequestSettled::outcome: outrig::harness::event::RequestEnd
-pub outrig::harness::event::Payload::AgentRequestSettled::request: outrig::harness::event::AgentRequestId
-pub outrig::harness::event::Payload::AgentRequestSettled::rounds: alloc::vec::Vec<u32>
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentSpawned
 pub outrig::harness::event::Payload::AgentSpawned::channels: alloc::vec::Vec<outrig::harness::event::ChannelBrief>
 pub outrig::harness::event::Payload::AgentSpawned::depth: u32

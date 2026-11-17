@@ -37,7 +37,7 @@ section, a request's outcome and value, and which agent a token-table row belong
   `Builder.add_to(subject, summary, **kw)` that posts a row into another subject's section.
 - **A handler for every `agent.*` kind and for `model.round.usage`:** `agent.spawned` (already
   there, now cross-posting), `agent.request.sent/received/replied/invalid/progress/failed/
-  cancelled/settled/refused`, `agent.call.started/settled`, `agent.released`, `agent.wedged`,
+  cancelled/ended/refused`, `agent.call.started/ended`, `agent.released`, `agent.wedged`,
   `agent.instance.started/ready/released/collected/handle.collected`, and `model.round.usage`.
   A request's events are gathered on one `Request` entry (keyed by its id, correlated the way
   `Exec` and `Msg` are), linked from both the sender's row (`agent.request.sent` cross-posts to
@@ -131,8 +131,8 @@ section, a request's outcome and value, and which agent a token-table row belong
   - `agent.request.replied` was setting the Requests table's aggregate `attempts` count from its
     own per-reply attempt number. A reply can arrive after the request has already settled --
     cancellation racing an answer being checked -- and a late one was overwriting the count
-    `agent.request.settled` had already recorded authoritatively. `replied` no longer touches
-    `req.attempts`; only `settled` does, which is the one event that counts them.
+    `agent.request.ended` had already recorded authoritatively. `replied` no longer touches
+    `req.attempts`; only `ended` does, which is the one event that counts them.
   - A session-level event -- `session.state`, `session.report`, and the rest the schema gives no
     subject -- was read as its own subject, `""`, making it a second section instead of joining
     the main agent's. `section()` now canonicalizes through `MAIN`, the existing constant that

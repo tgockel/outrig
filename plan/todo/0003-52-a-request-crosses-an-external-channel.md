@@ -75,7 +75,7 @@ delivered to the backend as that one outcome.
   through a new trait method `settled(channel, request, outcome)` carrying the owner's item id,
   OutRig's id and the reference; that is the one path by which the requester learns the outcome, and
   no owner-side awaitable is built beside it (fork 5). A reply after the request ended raises
-  `RequestSettled` in the agent's code, is evented `agent.request.refused`, and is reported to the
+  `RequestEnded` in the agent's code, is evented `agent.request.refused`, and is reported to the
   backend through `settled` as a refusal that changes no outcome (OR-A7-5).
 - **The owner cancels an inbound request.** `cancel(request)` on the channel handle: a request the
   holder has not received is withdrawn from its queue, as `_Work.cancel` withdraws, and the holder
@@ -140,10 +140,10 @@ Each is a mock-driven test unless it says otherwise.
   `"q-1"` and sender `"bob"` on `questions` answers with a delivery id; the application primary's
   mock receives `d.body == "2+2?"` and `d.sender == "bob"` and replies `"4"`; the backend's
   `settled` is called once, with `questions`, `"q-1"`, the delivery id and `replied("4")`; the
-  record shows `agent.request.sent` with `sender` `bob`, `received`, `replied` and `settled` with
+  record shows `agent.request.sent` with `sender` `bob`, `received`, `replied` and `ended` with
   `accepted`.
 - **`fail` and the late reply.** `await d.fail("no")` makes `settled` receive `failed("no")`; a
-  second `reply` raises `RequestSettled`, `agent.request.refused` is recorded, and `settled`
+  second `reply` raises `RequestEnded`, `agent.request.refused` is recorded, and `settled`
   receives a refusal that names the request's end and changes nothing. A typed reply contract: a
   reply that does not fit raises the problems in the agent's code with their paths and settles
   nothing; a third invalid reply ends the request `CompletionRejected`, told to the backend as
@@ -247,7 +247,7 @@ Each is a mock-driven test unless it says otherwise.
 - `plan/phase/0003-python/external-channels.md` -- "Requests", "Positions, the registry and
   the close".
 - `plan/phase/0003-python/rust-owner.md` -- the application's primary and its runner.
-- `plan/phase/0003-python/work.md` -- "The handle", "A request settles once", "Limits belong
+- `plan/phase/0003-python/work.md` -- "The handle", "A request ends once", "Limits belong
   outside generated code".
 - `plan/phase/0003-python/agent-classes.md` -- "The child's rounds", "From the host program",
   "Explicit plumbing".

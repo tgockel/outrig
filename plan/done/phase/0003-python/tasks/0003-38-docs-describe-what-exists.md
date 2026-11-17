@@ -226,7 +226,7 @@ MCP now sits, and what a binding lets an agent do on the host.
   the page. The page's placement decides what each event may hold, and the tasks that added them
   placed them there on purpose, so it stands; this task changes no event and no comment.
 - **Three event entries had drifted from the code**, each since `0003-37` or before:
-  `agent.request.cancelled` gains `reason`; `agent.request.settled`'s `cause` belongs to a
+  `agent.request.cancelled` gains `reason`; `agent.request.ended`'s `cause` belongs to a
   submission the engine cancelled, carried by `RequestCancelled.__cause__`, not to a rejected
   one; and `message.sent`'s `from` can be a child's subject, which a `message.refused` follows.
 - **`SECURITY.md` gains what the phase changed and it lacked**, checked against

@@ -646,7 +646,7 @@ each name the task's to settle: `history.exported` and `history.imported` (`0003
 `continuation.cut.degraded` naming the blocker (`0003-62`); `continuation.published` with the
 identity and the acknowledgement, and `session.report` gaining the last committed checkpoint and
 what a forced stop relied on (`0003-63`); `continuation.resumed` and the notice as a bounded
-record (`0003-64`); the `suspended` outcome on `agent.request.settled` and
+record (`0003-64`); the `suspended` outcome on `agent.request.ended` and
 `continuation.disposition` per open item (`0003-65`). All are execution diagnostics except the
 notice and the designation round's turns, which are model view, and the adapter's calls, which
 are integration audit.

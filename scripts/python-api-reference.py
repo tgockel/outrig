@@ -124,7 +124,7 @@ SECTIONS = [
             "outrig.AgentLimitReached",
             "outrig.BudgetExhausted",
             "outrig.SessionClosing",
-            "outrig.RequestSettled",
+            "outrig.RequestEnded",
         ],
     ),
     (

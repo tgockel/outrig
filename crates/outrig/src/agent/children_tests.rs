@@ -436,14 +436,14 @@ async fn a_parent_awaits_its_work_childs_typed_result() {
     assert_eq!(spawned.len(), 1);
     assert_eq!(data(spawned[0])["parent"], "agent/primary");
     assert_eq!(data(spawned[0])["kind"], "work");
-    for step in ["sent", "received", "replied", "settled"] {
+    for step in ["sent", "received", "replied", "ended"] {
         assert_eq!(
             kind(&events, &format!("agent.request.{step}"), Some("agent/c1")).len(),
             1,
             "{step}"
         );
     }
-    let settled = data(kind(&events, "agent.request.settled", None)[0]);
+    let settled = data(kind(&events, "agent.request.ended", None)[0]);
     assert_eq!(settled["outcome"], "accepted");
     assert_eq!(settled["rounds"], serde_json::json!([1]));
     let released = data(kind(&events, "agent.released", Some("agent/primary"))[0]);
@@ -651,7 +651,7 @@ async fn a_work_child_that_never_completes_is_cancelled_after_three_rounds() {
         "{warning}"
     );
     assert!(kind(&events, "agent.request.invalid", None).is_empty());
-    let settled: Vec<(Value, Value)> = kind(&events, "agent.request.settled", None)
+    let settled: Vec<(Value, Value)> = kind(&events, "agent.request.ended", None)
         .into_iter()
         .map(|event| (data(event)["outcome"].clone(), data(event)["cause"].clone()))
         .collect();
@@ -714,7 +714,7 @@ async fn a_cancel_chains_the_round_an_unusable_reply_failed() {
         2 + 2,
         "the failed round's calls, then the nudge and the warning"
     );
-    let settled = data(kind(&events, "agent.request.settled", None)[0]);
+    let settled = data(kind(&events, "agent.request.ended", None)[0]);
     assert_eq!(settled["outcome"], "cancelled");
     assert!(
         settled["cause"]
@@ -1021,7 +1021,7 @@ async fn a_request_taken_and_never_answered_is_cancelled_after_three_rounds() {
     assert_eq!(cancelled["received"], true);
     assert_eq!(cancelled["reason"], why.as_str());
     assert_eq!(
-        data(kind(&events, "agent.request.settled", None)[0])["outcome"],
+        data(kind(&events, "agent.request.ended", None)[0])["outcome"],
         "cancelled"
     );
     assert_eq!(
@@ -1664,7 +1664,7 @@ async fn an_end_the_host_does_not_hear_is_asked_for_again() {
         "mute cancelled 2\ndeaf cancelled 2\n"
     );
     assert_eq!(kind(&events, "agent.request.cancelled", None).len(), 2);
-    let outcomes: Vec<Value> = kind(&events, "agent.request.settled", None)
+    let outcomes: Vec<Value> = kind(&events, "agent.request.ended", None)
         .into_iter()
         .map(|event| data(event)["outcome"].clone())
         .collect();
@@ -1755,7 +1755,7 @@ async fn a_release_tells_an_unheard_end_and_keeps_nothing() {
         printed(&requests, "p1"),
         "told 1 accepted False\nlost 1 accepted False\n"
     );
-    let outcomes: Vec<Value> = kind(&events, "agent.request.settled", None)
+    let outcomes: Vec<Value> = kind(&events, "agent.request.ended", None)
         .into_iter()
         .map(|event| data(event)["outcome"].clone())
         .collect();
@@ -2355,7 +2355,7 @@ async fn a_cancel_ends_the_submission_not_the_child() {
         "a round for the cancelled submission and one for the next"
     );
     assert_eq!(tool_result(child[1], "c1"), "RequestCancelled\n");
-    assert_eq!(tool_result(child[3], "c2"), "RequestSettled\n");
+    assert_eq!(tool_result(child[3], "c2"), "RequestEnded\n");
     assert!(
         child
             .iter()
@@ -2507,7 +2507,7 @@ async fn handles_work_in_runtime_wait_and_asyncio_wait() {
         "False False\nTrue True\nTrue True\n1 2\n1\n"
     );
     let child = of_agent(&requests, "ROLE waited");
-    assert_eq!(tool_result(child[1], "c1"), "RequestSettled accepted\n");
+    assert_eq!(tool_result(child[1], "c1"), "RequestEnded accepted\n");
     let refused = kind(&events, "agent.request.refused", None);
     assert_eq!(refused.len(), 1);
     assert_eq!(data(refused[0])["ended"], "accepted");
@@ -3953,7 +3953,7 @@ async fn a_released_childs_subtree_goes_with_it() {
     assert_eq!(released["released"], serde_json::json!(["c1"]));
     assert_eq!(released["ended"], serde_json::json!(["c1", "c2"]));
     assert_eq!(released["requests"].as_array().map(Vec::len), Some(2));
-    let outcomes: Vec<Value> = kind(&events, "agent.request.settled", None)
+    let outcomes: Vec<Value> = kind(&events, "agent.request.ended", None)
         .into_iter()
         .map(|event| data(event)["outcome"].clone())
         .collect();
@@ -4159,7 +4159,7 @@ async fn spend_adds_up_once_each() {
     let mut below_main = [middle.0.clone(), leaf.0.clone()].concat();
     below_main.sort();
     assert_eq!(main.2, below_main, "each descendant's attempt, once");
-    for settled in kind(&events, "agent.request.settled", None) {
+    for settled in kind(&events, "agent.request.ended", None) {
         assert_eq!(data(settled)["rounds"], serde_json::json!([1]));
     }
 }

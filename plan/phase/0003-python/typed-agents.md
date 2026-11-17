@@ -251,7 +251,7 @@ This is how a *work child* answers, and a decorated call's child is one. The oth
 it receives each request as a delivery and answers it with `await d.reply(value)` or
 `await d.fail(message)`.
 A completion and a reply are decoded, repaired and limited by one path, and settle their handle
-the same way (`work.md`, "A request settles once").
+the same way (`work.md`, "A request ends once").
 
 ## Validation and repair
 
@@ -319,7 +319,7 @@ completion that failed a check counts toward the per-request attempt limit, 3 by
 (`work.md`); past it the call settles with `CompletionRejected` carrying the last value submitted
 and its problems. Neither end re-runs anything. The rounds that ask again count no attempt: a round
 ending with the submission open is not evidence of a bad answer, and the token budget bounds spend
-(`work.md`, "A request settles once"). A call can still be long, since a child's own waits happen
+(`work.md`, "A request ends once"). A call can still be long, since a child's own waits happen
 inside executions, where no round ends, so a workflow that fans out bounds its own waiting as well
 ("A workflow").
 
@@ -574,8 +574,8 @@ request family that every submission and channel request shares (`work.md`):
 - `agent.request.replied` -- a completion was called, with a bounded preview of the value;
 - `agent.request.invalid` -- the problems and the attempt's number;
 - `agent.request.cancelled` -- `h.cancel()` ended it;
-- `agent.request.settled` -- the outcome, and the rounds the request spanned;
-- `agent.call.settled` -- the outcome, and the usage attributed to the child;
+- `agent.request.ended` -- the outcome, and the rounds the request spanned;
+- `agent.call.ended` -- the outcome, and the usage attributed to the child;
 - the child's own model events, and its progress deliveries observed as every message between
   agents is (`observability.md`).
 

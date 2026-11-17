@@ -118,7 +118,7 @@ agent's history like anything else it ran.
   naming it, before any child is spawned. When the parser completes with a `Clarification`, the
   parse call settles with it, the child is released, and `invoke` raises
   `SkillNeedsClarification`, an `outrig.AgentError` whose `question` attribute is the child's,
-  with nothing called and no `skill.invocation.started`; the parse call's settled event carries the
+  with nothing called and no `skill.invocation.started`; the parse call's ended event carries the
   invocation's id and the `Clarification`. The agent asks on its user channel and calls `invoke`
   again with `params=`, which makes no parse call, or with new text, which parses again; the
   second call is a new invocation with an id of its own.
@@ -150,7 +150,7 @@ agent's history like anything else it ran.
   included. A parse that settles with
   `CompletionRejected` ends the invocation before `skill.invocation.started`; the parse call's own
   events carry the invocation's id and the rejection. A parse that completes with a
-  `Clarification` ends it at the same point, the parse call's settled event carrying the
+  `Clarification` ends it at the same point, the parse call's ended event carrying the
   invocation's id and the `Clarification`. The invocation is the link between a call
   and the main agent's round that `0003-30`'s spend chain leaves for this task: a child's usage is
   added to the invocation it ran under, and from there to the round (`typed-agents.md`).
@@ -217,7 +217,7 @@ model makes of a directive is not measured here.
   `{"question": "Which paths are the auth changes?"}`: `await invoke(...)` raises
   `SkillNeedsClarification` whose `question` is that string, and `except outrig.AgentError`
   catches it; the entry is not called, no `skill.invocation.started` is emitted, and the parse
-  call's settled event carries the invocation's id and the `Clarification`. The call that follows,
+  call's ended event carries the invocation's id and the `Clarification`. The call that follows,
   `invoke("review-diff", params=ReviewDiffParams(paths=["src/auth/", "tests/test_auth.py"]))`,
   spawns no child and makes no model request, calls the entry as
   `main(<repo>, "origin/main", "src/auth/", "tests/test_auth.py", max_parallel=4,
@@ -353,10 +353,10 @@ Forks 1, 2 and 3 were taken as recommended: the parser runs on the calling agent
 invocation of the skill runs, in any kernel still open, is refused with `skill-busy`. What no doc
 settled is recorded here.
 
-- **`agent.call.settled` gains `value` (the maintainer's call).** The acceptance asks that the
-  parse call's settled event carry the `Clarification`, and also that `public-api.txt` gain only
+- **`agent.call.ended` gains `value` (the maintainer's call).** The acceptance asks that the
+  parse call's ended event carry the `Clarification`, and also that `public-api.txt` gain only
   the directive API, the invocation events and the invocation's id. The two disagree:
-  `AgentCallSettled` had no field for a result. It now has `value`, a preview of the result a
+  `AgentCallEnded` had no field for a result. It now has `value`, a preview of the result a
   call was accepted with -- every typed call's, not the parser's alone -- `None` when it was not
   accepted or the session's events are not observed. It is the one public addition outside the
   list; the same JSON is also `agent.request.replied`'s `value`.
@@ -473,5 +473,5 @@ settled is recorded here.
   of records, and one read of the catalog before the loop. The derivation stayed this one's: the
   alternative derived the class twice when two kernels invoked a skill at once, and stacked two
   `doc()` markers on a parameter whose annotation had one.
-- **Follow-up.** Renaming `agent.call.settled` and `agent.request.settled`, whose names do not say
+- **Follow-up.** Renaming `agent.call.ended` and `agent.request.ended`, whose names do not say
   what happened, is #718, at the maintainer's request.

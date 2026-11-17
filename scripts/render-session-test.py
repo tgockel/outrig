@@ -311,7 +311,7 @@ def no_primary_session() -> list[tuple[str, dict, str | None]]:
         ("agent.request.received", {"request": 1, "round": 1}, c),
         ("agent.request.replied", {"request": 1, "attempt": 1, "value": "v"}, c),
         (
-            "agent.request.settled",
+            "agent.request.ended",
             {"request": 1, "outcome": "accepted", "attempts": 1, "rounds": [1], "cause": None},
             c,
         ),
@@ -846,7 +846,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
         ),
         ("agent.request.failed", {"request": 7, "message": "why"}, c),
         (
-            "agent.request.settled",
+            "agent.request.ended",
             {"request": 7, "outcome": "failed", "attempts": 1, "rounds": [1], "cause": None},
             c,
         ),
@@ -872,7 +872,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
         ("agent.request.cancelled", {"request": 8, "received": True, "reason": "r"}, c),
         ("agent.released", {"released": ["c1"], "ended": ["c1", "c2"], "requests": [8]}, a),
         (
-            "agent.call.settled",
+            "agent.call.ended",
             {
                 "request": 8,
                 "outcome": "cancelled",
@@ -1358,11 +1358,11 @@ class RenderSession(unittest.TestCase):
             if kind.startswith("agent.") or kind == "model.round.usage":
                 self.assertNotIn(f"org.outrig.{kind}", html)
 
-    def test_a_late_reply_does_not_undo_a_settled_attempt_count(self) -> None:
-        """Cancellation racing an answer being checked can settle a request before a reply the
-        interpreter already sent reaches the log: `settled(attempts=0)`, then `replied`, then
+    def test_a_late_reply_does_not_undo_an_ended_requests_attempt_count(self) -> None:
+        """Cancellation racing an answer being checked can end a request before a reply the
+        interpreter already sent reaches the log: `ended(attempts=0)`, then `replied`, then
         `refused` once the late reply is read against the request's already-recorded end. The
-        settled count is authoritative and a later reply must not touch it."""
+        final count is authoritative and a later reply must not touch it."""
         c = "agent/c1"
         child = [
             ("agent.spawned", {"name": "n", "parent": "agent/primary", "kind": "request", "model": "m"}, c),
@@ -1371,7 +1371,7 @@ class RenderSession(unittest.TestCase):
                                      "body": "b", "attempts_max": 3}, c),
             ("round.started", {"round": 1}, c),
             (
-                "agent.request.settled",
+                "agent.request.ended",
                 {"request": 9, "outcome": "cancelled", "attempts": 0, "rounds": [1], "cause": None},
                 c,
             ),
@@ -1718,7 +1718,7 @@ class RenderSession(unittest.TestCase):
             ("agent.request.received", {"request": 7, "round": 1}, c),
             ("agent.request.replied", {"request": 7, "attempt": 1, "value": '{"n": 5}'}, c),
             (
-                "agent.request.settled",
+                "agent.request.ended",
                 {"request": 7, "outcome": "accepted", "attempts": 1, "rounds": [1], "cause": None},
                 c,
             ),
@@ -1728,7 +1728,7 @@ class RenderSession(unittest.TestCase):
                 c,
             ),
             (
-                "agent.call.settled",
+                "agent.call.ended",
                 {"request": 7, "outcome": "accepted", "usage": usage, "invocation": None,
                  "value": '{"n": 5}'},
                 c,

@@ -1032,7 +1032,7 @@ async fn a_request_the_owner_cancels_ends_cancelled() {
     assert!(!within(request.cancel()).await, "it had ended");
     let (report, events, _) = tree.end().await;
     assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
-    let settled = kind(&events, "agent.request.settled", None);
+    let settled = kind(&events, "agent.request.ended", None);
     assert_eq!(data(settled[0])["outcome"], "cancelled");
 }
 

@@ -2095,7 +2095,7 @@ async fn a_directive_runs_a_skill_whose_children_work_at_once() {
 
     // Each child's spend: in its own events, in its call's, in the
     // invocation's and in the round's, each once.
-    let settled = records(&log, "agent.call.settled");
+    let settled = records(&log, "agent.call.ended");
     assert_eq!(settled.len(), 4);
     let by_calls: u64 = settled.iter().map(|(call, _)| tokens(&call["usage"])).sum();
     let by_attempts: u64 = records(&log, "model.attempt")
@@ -2179,7 +2179,7 @@ async fn quitting_while_a_skills_children_work_reports_each_of_them() {
         .map(|(call, _)| call["request"].clone())
         .collect();
     assert_eq!(reviews.len(), 3);
-    let closed: Vec<Value> = records(&log, "agent.call.settled")
+    let closed: Vec<Value> = records(&log, "agent.call.ended")
         .iter()
         .filter(|(call, _)| call["outcome"] == "closed")
         .map(|(call, _)| call["request"].clone())

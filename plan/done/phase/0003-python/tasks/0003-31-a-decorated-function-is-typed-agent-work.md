@@ -73,7 +73,7 @@ is validated before the caller sees it.
   round asking for the result by id, and if that round ends the same way the handle settles with
   `CompletionRejected` whose message says the child ended without completing, and the child is
   released as it is for every settlement. The invalid-completion attempt limit, 3, is separate.
-- **Events**: `agent.call.started` and `agent.call.settled` around each call, the wrapper over
+- **Events**: `agent.call.started` and `agent.call.ended` around each call, the wrapper over
   `0003-30`'s request events, with the declaration's qualified name -- its `__module__` and
   `__qualname__` -- and its module's digest on the start event, as `typed-agents.md` lists them.
   The digest is a hash of the declaring module's source, or of the submission's for a function
@@ -104,7 +104,7 @@ is validated before the caller sees it.
   in the child's instructions unchanged, and an argument whose text contains braces appears only in
   the input manifest's preview, never inside the docstring.
 - **A call never awaited still runs, and its child is released when it settles**: `analyze_code(s)`
-  with its handle dropped shows one spawn, the settled event and one release in the host's record,
+  with its handle dropped shows one spawn, the ended event and one release in the host's record,
   with no await anywhere.
 - `analyze_code(s)` returns a handle with `0003-30`'s rules,
   `inspect.iscoroutinefunction(analyze_code)` is false, and `help(analyze_code)` says a call returns
@@ -190,7 +190,7 @@ Fork 1 was taken as recommended. What no doc settled is recorded here.
 - **A call is a `_Work` with no child yet.** `_Call` subclasses the request the handle reads,
   taking its id from the interpreter's counter as the call is made and giving the submission
   that id, so the handle has it before the child exists and `agent.call.started`,
-  `agent.call.settled` and the request family all name the same request. Calls not yet ended
+  `agent.call.ended` and the request family all name the same request. Calls not yet ended
   are `_launching`, under the works' lock, which the close sweeps beside `_works`, settling
   each at once, since a call still launching may never hear its spawn's answer. Of two
   implementations compared for complexity, this one -- a subclass, one registry, a straight
@@ -203,9 +203,9 @@ Fork 1 was taken as recommended. What no doc settled is recorded here.
   call with no child says `child released`, since none remains.
 - **No call events for a refused launch.** A call whose spawn is refused -- a limit, the depth,
   an unknown model, the close -- has no child and records neither `agent.call.started` nor
-  `agent.call.settled`, as a refused `spawn` has no spawn in the record; the handle raises the
+  `agent.call.ended`, as a refused `spawn` has no spawn in the record; the handle raises the
   refusal. Both events carry the child's subject, with `parent` naming the caller as
-  `agent.spawned` does, and `agent.call.settled` follows `agent.released`, carrying the sum
+  `agent.spawned` does, and `agent.call.ended` follows `agent.released`, carrying the sum
   over every attempt the child made, which `CallSlot` now keeps. The session's close is the
   exception: it ends every call `closed` with its submission, before the children are torn
   down, so a call settled `closed` precedes its child's release, as `events.md` says.

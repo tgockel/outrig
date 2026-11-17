@@ -9,5 +9,5 @@ round -- before the child's runner has made that call, so the mock never recorde
 
 Nothing in `0003-51` reaches a work child that holds no channel, and the failure does not
 reproduce alone. The test, not the behavior, is what to fix: wait for the child's
-`model.round.completed` (or `agent.request.settled`) before ending the session, as
+`model.round.completed` (or `agent.request.ended`) before ending the session, as
 `Tree::seen` waits for an event, rather than assuming the primary's round outlasts it.

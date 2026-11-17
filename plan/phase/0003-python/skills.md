@@ -363,7 +363,7 @@ with a `Clarification`, or the call ends without one.
 
 The call does not stay open on a child that will not complete. A parser whose round ends without
 a completion gets a round from the host asking for the result by the request's id, and then the
-warning round (`work.md`, "A request settles once"); if that one ends the same way, the call is
+warning round (`work.md`, "A request ends once"); if that one ends the same way, the call is
 cancelled -- `RequestCancelled`, whose message says the child ended its rounds without completing
 it -- and the child is released. Three completions that fail a check settle it with
 `CompletionRejected`, carrying the last value and its problems, and a parser that says it cannot
@@ -508,7 +508,7 @@ directive, and `invoke` for the rest.
 A parse the child could not complete ends the invocation before `skill.invocation.started`: the
 parse call's own events carry the invocation's id and how the call ended, and `invoke` raises it.
 A parse that completed with a `Clarification` ends it at the same point:
-the parse call's settled event carries the invocation's id and the `Clarification`, and `invoke`
+the parse call's ended event carries the invocation's id and the `Clarification`, and `invoke`
 raises `SkillNeedsClarification`. The call the agent makes after the user's answer is a new
 invocation, with an id of its own.
 
@@ -518,7 +518,7 @@ hosted call is: each request's events are published on the session's stream
 (`boundary-policy.md`), and the CLI writes them to `events.jsonl` only when `[events] mode =
 "record"`. A direct helper call produces boundary events and no invocation events. **Decided in
 `0003-33`:** the names are as above, and `doc/reference/events.md` gives their fields; the
-`invocation` id they share is also on `agent.call.started`, `agent.call.settled` and
+`invocation` id they share is also on `agent.call.started`, `agent.call.ended` and
 `hosted.received`.
 
 The states one invocation passes through, as explanation rather than enum names: directive

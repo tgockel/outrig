@@ -558,9 +558,9 @@ async fn a_child_at_its_limit_ends_what_it_is_sent_until_its_owner_resets_it() {
         6,
         "four, none for the third or the forged resets, then two"
     );
-    let third = field_of(&events, "agent.request.settled", "agent/c1", "request")[2].clone();
+    let third = field_of(&events, "agent.request.ended", "agent/c1", "request")[2].clone();
     assert_eq!(
-        field_of(&events, "agent.request.settled", "agent/c1", "outcome"),
+        field_of(&events, "agent.request.ended", "agent/c1", "outcome"),
         ["accepted", "accepted", "limit", "limit", "accepted"]
     );
     assert_eq!(
@@ -720,11 +720,11 @@ async fn a_limit_reached_mid_round_ends_what_the_child_holds() {
     );
     assert_eq!(of_agent(&requests, "ROLE taker").len(), 1, "nothing after");
     assert_eq!(
-        field_of(&events, "agent.request.settled", "agent/c1", "outcome"),
+        field_of(&events, "agent.request.ended", "agent/c1", "outcome"),
         ["limit", "limit"]
     );
     assert!(kind(&events, "agent.request.cancelled", None).is_empty());
-    let ids = field_of(&events, "agent.request.settled", "agent/c1", "request");
+    let ids = field_of(&events, "agent.request.ended", "agent/c1", "request");
     assert_eq!(
         field_of(&events, "model.limit.reached", "agent/c1", "requests"),
         [json!(ids)],

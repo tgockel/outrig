@@ -752,7 +752,7 @@ class Builder:
         if ended and ended != released:
             parts.append(Part("every child this ended, in their subtrees", "\n".join(ended)))
         if requests:
-            parts.append(Part("requests this settled", ", ".join(requests)))
+            parts.append(Part("requests this ended", ", ".join(requests)))
         self.add(summary, parts=parts)
 
     def on_agent_wedged(self, d: dict) -> None:
@@ -812,9 +812,9 @@ class Builder:
         )
 
     def on_agent_request_replied(self, d: dict) -> None:
-        """A reply, which may arrive after the request has already settled -- a cancellation
+        """A reply, which may arrive after the request has already ended -- a cancellation
         racing an answer being checked, say. The aggregate `attempts` the Requests table shows
-        is `agent.request.settled`'s alone, the one event that counts them authoritatively; a
+        is `agent.request.ended`'s alone, the one event that counts them authoritatively; a
         reply never sets it, so a late one cannot undo a count already recorded."""
         req = self.request(d.get("request"))
         req.value = text(d.get("value"))
@@ -861,7 +861,7 @@ class Builder:
         )
         self.add(f"request {req.id}: {said}", href=link(req.anchor))
 
-    def on_agent_request_settled(self, d: dict) -> None:
+    def on_agent_request_ended(self, d: dict) -> None:
         req = self.request(d.get("request"))
         self.request_outcome(req, d.get("outcome"))
         req.attempts = num(d.get("attempts"))
@@ -891,7 +891,7 @@ class Builder:
         req.digest = text(d.get("digest"))
         self.add(f"typed call {req.call} by {req.sender}", href=link(req.anchor))
 
-    def on_agent_call_settled(self, d: dict) -> None:
+    def on_agent_call_ended(self, d: dict) -> None:
         req = self.request(d.get("request"))
         self.request_outcome(req, d.get("outcome"))
         req.usage = reported(d.get("usage"))
@@ -930,7 +930,7 @@ class Builder:
         if d.get("usage") is not None:
             summary += f" -- {usage_summary(d.get('usage'))}"
         self.add(
-            summary, parts=[Part("requests settled", ", ".join(requests))] if requests else []
+            summary, parts=[Part("requests ended", ", ".join(requests))] if requests else []
         )
 
     def on_agent_instance_collected(self, d: dict) -> None:

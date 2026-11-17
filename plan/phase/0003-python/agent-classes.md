@@ -451,7 +451,7 @@ a model call failed and ended one of its rounds after the round's code ran, the 
 of its own accord, and the exception's `__cause__` is an `AgentRequestFailed` saying how the call
 failed, as `raise ... from` would set it. A decorated call's child is then released, as on any end
 of its call; an explicit work child is idle, or, with a submission queued behind the cancelled one,
-opens that one's round at once (`work.md`, "A request settles once"). A work child that cannot
+opens that one's round at once (`work.md`, "A request ends once"). A work child that cannot
 complete a submission ends it with `await runtime.fail(message)`, which its sender gets as
 `AgentRequestFailed`.
 
@@ -514,7 +514,7 @@ async with FooAgent() as foo:          # ready() on entry, release() on exit
 `async with` releases on exit however the body ended. Every outstanding request -- held before the
 child existed, waiting unread, or received and unanswered -- settles with `AgentReleased`, and a
 reply the child makes during or after the release is refused and evented, as a late reply to a
-settled request is. A call on a released instance raises `AgentReleased` at the call, and sends
+request that has ended is. A call on a released instance raises `AgentReleased` at the call, and sends
 nothing. A release before `ready()` has settled settles it with `AgentReleased`; once settled,
 by either, it stays settled.
 
@@ -529,8 +529,8 @@ holds a finalizer that cannot await and runs on whichever thread dropped the las
 it does one thing: it schedules `release()` on the constructing kernel's event loop, and the
 release is evented as a collection. Three consequences:
 
-- **An unsettled request holds its instance.** The runtime's record of each request that has not
-  settled holds a reference to the instance, so a child is never released while a request is in
+- **An open request holds its instance.** The runtime's record of each request that has not
+  ended holds a reference to the instance, so a child is never released while a request is in
   flight, even when agent code has dropped both the instance and the handle: `FooAgent().fizz("x")`
   with neither reference kept runs to settlement, then the child is released and
   `agent.instance.collected` is recorded. The request holds the reference rather than the handle
@@ -604,7 +604,7 @@ there being no round above it.
   `model-policy.md` has the rule and how it composes with `0003-37`.
 - **Spend.** A child's model usage is attributed to the child's round. A round that answers
   several requests is attributed to the round and not divided among them, because a division
-  would be invented; each request's settled event names the rounds it spanned, so a reader can
+  would be invented; each request's ended event names the rounds it spanned, so a reader can
   see what was spent while it was open. Upward, the child's usage is added to the instance's total,
   which its released event carries, and to the skill invocation and the main agent's round under
   which the instance was constructed, with spend after that round yielded published as usage
@@ -637,7 +637,7 @@ records none of them (`0003-34`).
   request ended;
 - the request family, shared with submissions (`work.md`): `agent.request.sent`, with the id, the
   channel, a bounded body preview and the parent execution; `received`; `replied`; `invalid`, with
-  the problems and the attempt number; `failed`, with the message; `cancelled`; and `settled`, with
+  the problems and the attempt number; `failed`, with the message; `cancelled`; and `ended`, with
   the outcome, the attempts, and the rounds spanned;
 - the child's own execution and model events, under its own `subject`.
 

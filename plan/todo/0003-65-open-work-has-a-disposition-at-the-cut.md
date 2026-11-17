@@ -54,7 +54,7 @@ are ended or refuse the cut, and calls whose outcome cannot be known are recorde
 ## Deliverables
 
 - **A terminal end for suspension.** `RequestEnd::Suspended`, its name in `outcome`, in
-  `_HOST_ENDS`, and in `doc/reference/events.md`'s `agent.request.settled`; a Python exception
+  `_HOST_ENDS`, and in `doc/reference/events.md`'s `agent.request.ended`; a Python exception
   `outrig.SessionSuspended`, an `AgentError` (fork 4), raised by a `reply` or `fail` on a request so
   ended and by `await` on its handle in a kernel, and the same end read on the Rust control
   handle `0003-46` gives an owner for a root instance (A-02) -- and on a host program's
@@ -108,12 +108,12 @@ are ended or refuse the cut, and calls whose outcome cannot be known are recorde
   its spent count, its limit and the request the limit ended, so the resumed owner can set a fresh
   limit (OR-A4-2).
 - **Events**: `continuation.disposition` per open item, with its kind, its id and its
-  disposition, execution diagnostics; `agent.request.settled` gains the outcome. Added to
+  disposition, execution diagnostics; `agent.request.ended` gains the outcome. Added to
   `doc/reference/events.md`.
 - **`lifecycle.md`'s close table** gains rows: a request open at a sleep's close has ended
   `suspended` before the close and is listed so, not `closed`; a local child idle at a sleep is
   released before the close; a `reply` arriving for a suspended request is refused and evented as a
-  late reply is (`work.md`, "A request settles once").
+  late reply is (`work.md`, "A request ends once").
 - **`## Decisions` records the reversal**: the sentences quoted above, what was added and what was
   narrowed; the end's name and exception; its order against the close; what is reattached and by
   what id, in both directions, and what is ended; the limit-reached child's disposition; and the
@@ -126,7 +126,7 @@ Each is a mock-driven test unless it says otherwise.
 
 - **An external request at a sleep.** With `0003-52`'s fixture backend holding a reply-owed
   request the agent has taken, `sleep` ends it `suspended`: the backend is told so under the
-  durable id and not told cancelled; `agent.request.settled` carries `suspended`;
+  durable id and not told cancelled; `agent.request.ended` carries `suspended`;
   `ShutdownReport.requests` lists it `suspended`; the manifest holds its id and channel. The
   resumed session (`0003-64`) has the backend's redelivery under the same id on the same channel,
   and the agent's reply reaches the backend under it.
@@ -142,7 +142,7 @@ Each is a mock-driven test unless it says otherwise.
   error is an `AgentError`, and none is `SessionClosing`. Where `0003-35` exists, a host
   program's `await handle.future` raises the same.
 - **A limit-reached child.** A child whose limit (`0003-50`) ended its last request `limit` is
-  present at a sleep: the cut is not refused for it, no `agent.request.settled` with `suspended`
+  present at a sleep: the cut is not refused for it, no `agent.request.ended` with `suspended`
   is recorded for it, no warning round opens, it is released as an idle child is, and the
   manifest holds its spent count, its limit and the ended request's id; at a save it stays
   resident with the same record.
@@ -158,7 +158,7 @@ Each is a mock-driven test unless it says otherwise.
   policy, and each refuses the cut under the clean one; no cancel is sent for any of them, and
   the notice lists each.
 - **Order against the close.** The sequence of events for a sleep reads `continuation.disposition`
-  and the `suspended` settlements before `session.state` `closing`, and no `agent.request.settled`
+  and the `suspended` settlements before `session.state` `closing`, and no `agent.request.ended`
   with `closed` follows for a request that had a disposition.
 - **`0003-37` after a resume.** The resumed root agent holds no local request, so no warning and no
   cancel fires from the old session's state; a new request arriving after the resume opens a
@@ -219,7 +219,7 @@ Each is a mock-driven test unless it says otherwise.
   reattached through.
 - `plan/phase/0003-python/lifecycle.md` -- "Closing a session", "The close table", "The
   interpreter's death ends the session".
-- `plan/phase/0003-python/work.md` -- "A request settles once".
+- `plan/phase/0003-python/work.md` -- "A request ends once".
 - `plan/phase/0003-python/messages.md` -- why a local request's body never reaches the host.
 - `crates/outrig/src/agent/children.rs`; `crates/outrig/src/harness/event.rs`, `report.rs`;
   `crates/outrig/src/python/outrig/_interpreter.py`, `host.rs`;

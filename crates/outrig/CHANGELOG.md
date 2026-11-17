@@ -366,7 +366,7 @@ without touching each other, from one ensured image. [The container facade besid
   A work child's submission cancelled for its rounds ending without completing it raises a
   `RequestCancelled` whose `__cause__` is an `AgentRequestFailed` saying how a model call ended a
   round, when one did after the round's code ran, so a parent can tell a provider that refused the
-  replies from a child that gave up; `agent.request.settled` records the same text as `cause`.
+  replies from a child that gave up; `agent.request.ended` records the same text as `cause`.
   (#756) An alias naming
   several models resolves to each this build can reach, in order, and a call that still fails moves
   to the next, starting again at the first on every call. Each model a call goes to is sent a view
@@ -754,7 +754,7 @@ without touching each other, from one ensured image. [The container facade besid
   `inspect.iscoroutinefunction` is false of a declared function, and `help()` on it says that
   a call returns a handle and the body is not run. Two events bracket each call under the
   child's subject: `agent.call.started`, with the declaration's `module`, `qualname` and a
-  `digest` of the source that declared it, and `agent.call.settled`, with the outcome and the
+  `digest` of the source that declared it, and `agent.call.ended`, with the outcome and the
   child's usage, after the `agent.released` that ended the child.
 - **`outrig.Agent` declares an agent class, whose instance is one long-lived child.** A
   subclass's docstring is the first part of the child's instructions, and each `async def` it
@@ -894,8 +894,8 @@ without touching each other, from one ensured image. [The container facade besid
   anything runs, as a `SkillError` whose `code` is `signature-unsupported`, `entry-not-found`,
   `missing-binding`, `skill-changed` or `unknown-skill`, and `outrig.skills.reload` of a skill an
   invocation is running is refused as `skill-busy`. The invocation's id is on
-  `agent.call.started`, `agent.call.settled` and `hosted.received` for the calls made inside it,
-  as `invocation`; `agent.call.settled` also carries `value`, a preview of the accepted result.
+  `agent.call.started`, `agent.call.ended` and `hosted.received` for the calls made inside it,
+  as `invocation`; `agent.call.ended` also carries `value`, a preview of the accepted result.
   `skill.invocation.finished` carries the usage of every child made inside the invocation.
 - **`Payload::ModelText`, the text of a model's reply as its call returns.** Its event kind is
   `model.text`. A reply with no text, only tool calls or reasoning, records none, so a round whose
@@ -914,6 +914,13 @@ without touching each other, from one ensured image. [The container facade besid
   window. A child agent is not given them. `outrig run` ignores the key. (#672)
 
 ### Changed
+
+- **Agent calls and requests end.** The preview events `agent.call.settled` and
+  `agent.request.settled` are now `agent.call.ended` and `agent.request.ended`, with payload
+  variants `Payload::AgentCallEnded` and `Payload::AgentRequestEnded`. An answer to a request
+  that already ended raises `outrig.RequestEnded`, formerly `outrig.RequestSettled`. Event
+  fields and terminal outcomes are unchanged; event consumers and Python callers must use
+  the new names.
 
 - **A round's stop is a `RoundStop`, not a text.** `RoundEnd::stopped`, `RoundFacts::stopped` and
   `model.round.completed`'s `stopped` carry `harness::RoundStop` -- `ToolCallMax { max }`,
