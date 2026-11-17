@@ -117,7 +117,7 @@ struct McpChild {
     stderr_buf: Arc<Mutex<String>>,
     stderr_task: tokio::task::JoinHandle<()>,
     /// Holds the empty `--global-config` file, removed with the child.
-    _global_config_dir: tempfile::TempDir,
+    _global_config: common::EmptyGlobalConfig,
 }
 
 /// A host variable every spawned `outrig mcp` has, for a config to reference
@@ -131,9 +131,7 @@ const TOKEN_VALUE: &str = "sidecar-token-value-324";
 /// `storage.conf`, which would put outrig's containers in a different store than the one the
 /// harness's own `podman` calls query.
 fn spawn_mcp(repo: &Path, session_root: &Path, extra_args: &[&str]) -> McpChild {
-    let global_config_dir = tempfile::tempdir().expect("tempdir global config");
-    let empty_global = global_config_dir.path().join("config.toml");
-    std::fs::write(&empty_global, "").expect("write empty global config");
+    let global = common::EmptyGlobalConfig::new();
     let own_global = extra_args.contains(&"--global-config");
     let bin = env!("CARGO_BIN_EXE_outrig");
     let mut command = Command::new(bin);
@@ -143,7 +141,7 @@ fn spawn_mcp(repo: &Path, session_root: &Path, extra_args: &[&str]) -> McpChild 
         .arg("mcp")
         .args(extra_args);
     if !own_global {
-        command.arg("--global-config").arg(&empty_global);
+        command.arg("--global-config").arg(global.path());
     }
     let mut child = command
         .current_dir(repo)
@@ -167,7 +165,7 @@ fn spawn_mcp(repo: &Path, session_root: &Path, extra_args: &[&str]) -> McpChild 
         stdout,
         stderr_buf,
         stderr_task,
-        _global_config_dir: global_config_dir,
+        _global_config: global,
     }
 }
 

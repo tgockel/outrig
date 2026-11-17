@@ -245,8 +245,11 @@ context = "{context}"
     std::fs::write(agents_dir.join("config.toml"), config_toml).expect("write config");
 
     let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let global = common::EmptyGlobalConfig::new();
     let bin = env!("CARGO_BIN_EXE_outrig");
     let mut child = Command::new(bin)
+        .arg("--global-config")
+        .arg(global.path())
         .arg("--session-root")
         .arg(sessions.path())
         .arg("mcp")

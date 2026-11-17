@@ -198,3 +198,44 @@ async fn config_init_does_not_place_the_global_config_in_the_working_directory()
         "nothing is written beside the cwd"
     );
 }
+
+/// #841: MCP e2e children use this guard rather than redirecting the config
+/// environment, which would also redirect Podman's own configuration. Check
+/// both default locations with a malformed file, without needing a runtime.
+#[tokio::test]
+async fn an_empty_global_config_isolates_mcp_from_the_host_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let home = tmp.path().join("home");
+    let xdg = tmp.path().join("xdg");
+    write_config(&home.join(".outrig"), BROKEN);
+    write_config(&xdg.join("outrig"), BROKEN);
+    let sessions = tmp.path().join("sessions");
+    let global = common::EmptyGlobalConfig::new();
+
+    for (config_home, broken) in [
+        (xdg.as_path(), xdg.join("outrig/config.toml")),
+        (Path::new(""), home.join(".outrig/config.toml")),
+    ] {
+        let env = [("HOME", home.as_path()), ("XDG_CONFIG_HOME", config_home)];
+        let args = ["--session-root", utf8(&sessions), "mcp"];
+        let control = run_outrig_output(&work, &args, &env).await;
+        let stderr = String::from_utf8_lossy(&control.stderr);
+        assert!(!control.status.success(), "{stderr}");
+        assert!(stderr.contains(utf8(&broken)), "{stderr}");
+        assert!(!stderr.contains("[outrig] config loaded"), "{stderr}");
+
+        let args = [
+            "--global-config",
+            utf8(global.path()),
+            "--session-root",
+            utf8(&sessions),
+            "mcp",
+        ];
+        let isolated = run_outrig_output(&work, &args, &env).await;
+        let stderr = String::from_utf8_lossy(&isolated.stderr);
+        assert!(stderr.contains("[outrig] config loaded"), "{stderr}");
+        assert!(!stderr.contains(utf8(&broken)), "{stderr}");
+    }
+}

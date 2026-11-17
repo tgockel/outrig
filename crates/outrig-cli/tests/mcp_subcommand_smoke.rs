@@ -127,8 +127,11 @@ struct McpRun {
 }
 
 async fn run_mcp_client(args: &[String], repo: &Path) -> McpRun {
+    let global = common::EmptyGlobalConfig::new();
     let bin = env!("CARGO_BIN_EXE_outrig");
     let mut child = Command::new(bin)
+        .arg("--global-config")
+        .arg(global.path())
         .args(args)
         .current_dir(repo)
         .env("OUTRIG_LOG", "info")
@@ -354,8 +357,11 @@ async fn mcp_subcommand_serves_namespaced_tools_and_exits_clean() {
     std::fs::write(repo_dir.path().join("HELLO.txt"), "hi\n").expect("write HELLO.txt");
 
     // 2. Spawn `outrig mcp` with all three pipes piped.
+    let global = common::EmptyGlobalConfig::new();
     let bin = env!("CARGO_BIN_EXE_outrig");
     let mut child = Command::new(bin)
+        .arg("--global-config")
+        .arg(global.path())
         .arg("mcp")
         .current_dir(repo_dir.path())
         .env("OUTRIG_LOG", "info")
@@ -513,8 +519,11 @@ async fn mcp_listen_http_serves_multiple_independent_sessions() {
     write_mcp_config(repo_dir.path());
     std::fs::write(repo_dir.path().join("HELLO.txt"), "hi\n").expect("write HELLO.txt");
 
+    let global = common::EmptyGlobalConfig::new();
     let bin = env!("CARGO_BIN_EXE_outrig");
     let mut child = Command::new(bin)
+        .arg("--global-config")
+        .arg(global.path())
         .args(["mcp", "--listen", "127.0.0.1:0"])
         .current_dir(repo_dir.path())
         .env("OUTRIG_LOG", "info")
@@ -838,8 +847,11 @@ async fn mcp_attach_exits_when_host_stops_container() {
     let sessions = tempfile::tempdir().expect("tempdir sessions");
     let host_sid = create_host_session(sessions.path(), repo_dir.path(), &container, &image);
 
+    let global = common::EmptyGlobalConfig::new();
     let bin = env!("CARGO_BIN_EXE_outrig");
     let mut child = Command::new(bin)
+        .arg("--global-config")
+        .arg(global.path())
         .args([
             "--session-root",
             sessions.path().to_str().expect("session root utf-8"),
@@ -901,9 +913,12 @@ async fn run_mcp_expecting_failure(
     repo: &Path,
     args: &[&str],
 ) -> (String, Vec<Session>) {
+    let global = common::EmptyGlobalConfig::new();
     let output = timeout(
         E2E_TIMEOUT,
         Command::new(env!("CARGO_BIN_EXE_outrig"))
+            .arg("--global-config")
+            .arg(global.path())
             .arg("--session-root")
             .arg(session_root)
             .arg("mcp")
@@ -939,7 +954,10 @@ async fn mcp_show_merged_survives_stderr_closing_mid_startup() {
     write_mcp_config(repo_dir.path());
     let sessions = tempfile::tempdir().expect("tempdir sessions");
 
+    let global = common::EmptyGlobalConfig::new();
     let mut child = Command::new(env!("CARGO_BIN_EXE_outrig"))
+        .arg("--global-config")
+        .arg(global.path())
         .arg("--session-root")
         .arg(sessions.path())
         .args(["mcp", "show-merged"])
