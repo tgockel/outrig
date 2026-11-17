@@ -3,8 +3,8 @@
 //! Walks the user through providers, models, and `default-model`, then writes
 //! a parseable + validated TOML file to the resolved global-config path. The
 //! file refuses to clobber an existing one without `--force`. Atomic writes go
-//! through `tempfile::NamedTempFile::persist` so an interrupted prompt never
-//! leaves a half-written config behind.
+//! through staged temp files so an interrupted prompt never leaves a half-written
+//! config behind; non-forced writes publish without replacing an existing file.
 //!
 //! `run` constructs real terminal I/O; `run_with` is the test seam that takes
 //! an arbitrary `PromptSource` and target path.
@@ -17,7 +17,7 @@ use serde::Serialize;
 use crate::error::{OutrigError, Result};
 use crate::hf::{self, HfTreeFetcher};
 use crate::init::prompt::{self, Field, PromptSource};
-use crate::paths::{global_config_path, write_atomic};
+use crate::paths::{global_config_path, write_atomic, write_atomic_noclobber};
 use outrig::config::{AnthropicOptions, ApiKeyRef, Config, LlmProvider, Model, OpenAiOptions};
 
 /// Public entry: resolve the path, pick a `PromptSource` via
@@ -65,7 +65,11 @@ pub async fn run_with(
     // fails this -- each answer a load would refuse is asked for again where it
     // was given -- so it keeps the module doc true rather than catching a typo.
     Config::load_from_str(&toml_text)?.validate(None)?;
-    write_atomic(path, &toml_text)?;
+    if force {
+        write_atomic(path, &toml_text)?;
+    } else {
+        write_atomic_noclobber(path, &toml_text)?;
+    }
     Ok(())
 }
 

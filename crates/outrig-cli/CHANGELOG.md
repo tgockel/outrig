@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Non-forced global config initialization now refuses a config created while the wizard
+  is prompting instead of silently replacing it. `--force` still permits overwrites. (#793)
+
 - Concurrent `mcp --listen unix:<path>` starts now serialize socket startup with a
   persistent `<path>.lock` advisory lock. A start can no longer mistake another
   start's bound-but-not-listening socket for a stale entry, or clear its fresh

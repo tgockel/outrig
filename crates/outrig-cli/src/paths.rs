@@ -128,6 +128,23 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     write_atomic_all(&[(path, contents)])
 }
 
+/// Publish a complete file only if the target is still absent. Unlike
+/// [`write_atomic`], this never replaces an existing directory entry, even
+/// one created after staging or a dangling symlink.
+pub(crate) fn write_atomic_noclobber(path: &Path, contents: &str) -> Result<()> {
+    stage(path, contents)?.persist_noclobber(path).map_err(|err| {
+        if err.error.kind() == ErrorKind::AlreadyExists {
+            OutrigError::Configuration(format!(
+                "{} already exists; pass --force to overwrite.",
+                path.display()
+            ))
+        } else {
+            OutrigError::from(err)
+        }
+    })?;
+    Ok(())
+}
+
 /// Writes each file atomically, in order, after staging every one in a temp
 /// file beside its target: creating, writing, or syncing any of them fails
 /// before a single target changes. Only a failed rename can leave the
@@ -1086,6 +1103,21 @@ mod tests {
         let config = agents.join("config.toml");
         fs::write(&config, b"# fixture\n").unwrap();
         config
+    }
+
+    #[test]
+    fn write_atomic_noclobber_keeps_a_dangling_symlink() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let missing = dir.path().join("missing");
+        std::os::unix::fs::symlink(&missing, &path).unwrap();
+
+        let err = write_atomic_noclobber(&path, "new").unwrap_err();
+
+        assert!(err.to_string().contains("already exists; pass --force"));
+        assert_eq!(fs::read_link(&path).unwrap(), missing);
+        assert!(!missing.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     /// A file that can't be staged fails the write before any file changes,

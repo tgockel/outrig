@@ -133,6 +133,69 @@ async fn refuses_to_clobber_without_force() {
     );
 }
 
+/// Wait for the first prompt before publishing a competing config. This puts
+/// the creation after the early existence check without timing-dependent sleeps.
+async fn config_created_during_prompts(force: bool) {
+    use outrig_cli::init::prompt::TerminalPrompt;
+    use tokio::io::{AsyncWriteExt, BufReader, duplex};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+    let (mut stdin_w, stdin_r) = duplex(4096);
+    let (stderr_w, mut stderr_r) = duplex(4096);
+    let mut prompt = TerminalPrompt::new(BufReader::new(stdin_r), stderr_w);
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    let competing_writer = async {
+        stderr_r.read_exact(&mut [0u8; 1]).await.unwrap();
+        std::fs::write(&target, "# created during prompts\n").unwrap();
+        stdin_w.write_all(b"\n\n\n\n\n\n\n\n\n\n\n").await.unwrap();
+    };
+    let (result, ()) = timeout(TEST_TIMEOUT, async {
+        tokio::join!(
+            run_with(force, &target, &mut prompt, &mut hf),
+            competing_writer
+        )
+    })
+    .await
+    .expect("run_with must not hang");
+
+    let text = std::fs::read_to_string(&target).unwrap();
+    if force {
+        result.expect("force must allow replacing the competing config");
+        Config::load_from_str(&text)
+            .unwrap()
+            .validate(None)
+            .unwrap();
+        assert!(!text.contains("# created during prompts"));
+    } else {
+        let err = result.expect_err("must not replace the competing config");
+        assert!(
+            err.to_string().contains(&format!(
+                "{} already exists; pass --force to overwrite.",
+                target.display()
+            )),
+            "unexpected error: {err}"
+        );
+        assert_eq!(text, "# created during prompts\n");
+    }
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        1,
+        "no staged temp file should be left behind"
+    );
+}
+
+#[tokio::test]
+async fn refuses_config_created_during_prompts_without_force() {
+    config_created_during_prompts(false).await;
+}
+
+#[tokio::test]
+async fn force_overwrites_config_created_during_prompts() {
+    config_created_during_prompts(true).await;
+}
+
 #[tokio::test]
 async fn force_overwrites_existing_file() {
     let tmp = tempfile::tempdir().unwrap();
