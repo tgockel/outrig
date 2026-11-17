@@ -1,8 +1,8 @@
 //! End-to-end smoke for `outrig run`. Gated behind `--features e2e`.
 //!
-//! Sets up a fixture repo in a tempdir, plus a global config under a private
-//! `XDG_CONFIG_HOME` whose OpenAI provider points at a local hand-rolled mock
-//! server (a repo config may not declare a keyed provider), then runs the
+//! Sets up a fixture repo in a tempdir, plus a private global config selected
+//! with `--global-config` whose OpenAI provider points at a local hand-rolled
+//! mock server (a repo config may not declare a keyed provider), then runs the
 //! `outrig` binary as a subprocess, pipes one prompt to stdin, and asserts on
 //! captured stdout/stderr.
 //!
@@ -65,14 +65,21 @@ default-model = "fast"
 
 /// Where the fixture's global config lives, beside the repo and not in it: the
 /// repo is the default workspace, and `run` refuses one that holds the global
-/// config (#609). `run_child` points `XDG_CONFIG_HOME` here, so the provider
-/// and its model are read from the operator's side of the merge -- a repo
-/// config may not declare a provider that carries an `api-key` -- and the
-/// developer's real global config is never read.
+/// config (#609). Children select the file with `--global-config`, so the
+/// provider and its model are read from the operator's side of the merge -- a
+/// repo config may not declare a provider that carries an `api-key` -- and the
+/// developer's real global config is never read. Leave `XDG_CONFIG_HOME` alone:
+/// it also selects Podman's `storage.conf`, and outrig and the harness must
+/// query the same container store (#840).
 fn xdg_config_home(repo: &Path) -> PathBuf {
     repo.parent()
         .expect("a fixture repo has a parent")
         .join("xdg")
+}
+
+/// The fixture's global config file, for `--global-config`.
+fn global_config_path(repo: &Path) -> PathBuf {
+    xdg_config_home(repo).join("outrig/config.toml")
 }
 
 /// `top` lands with the other scalar keys, above every table; `agents` lands
@@ -1061,6 +1068,8 @@ struct GroupRun {
 impl GroupRun {
     fn spawn(repo: &Path, sessions: &Path, session_dir: &Path, extra_args: &[&str]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_outrig"))
+            .arg("--global-config")
+            .arg(global_config_path(repo))
             .arg("--session-root")
             .arg(sessions)
             .arg("run")
@@ -1070,7 +1079,6 @@ impl GroupRun {
             .current_dir(repo)
             .env("OUTRIG_TEST_KEY", "test-key")
             .env("OUTRIG_LOG", "info")
-            .env("XDG_CONFIG_HOME", xdg_config_home(repo))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1413,11 +1421,12 @@ async fn run_child(args: &[&str], repo: &Path) -> Captured {
 async fn run_child_with_input(args: &[&str], repo: &Path, input: &[u8]) -> Captured {
     let bin = env!("CARGO_BIN_EXE_outrig");
     let mut child = Command::new(bin)
+        .arg("--global-config")
+        .arg(global_config_path(repo))
         .args(args)
         .current_dir(repo)
         .env("OUTRIG_TEST_KEY", "test-key")
         .env("OUTRIG_LOG", "info")
-        .env("XDG_CONFIG_HOME", xdg_config_home(repo))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
