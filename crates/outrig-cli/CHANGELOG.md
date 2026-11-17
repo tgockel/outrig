@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`discard` now preserves sessions when Podman cannot determine their running state.**
+  Engine-query failures abort before removal instead of deleting the record, logs, and launcher
+  of a potentially running session. (#877)
+
 - `clean` now checks the store-resolved session directory for a live launch, both
   before the preview and before removal. Records with a stale relative `session_dir`
   no longer lose their files when cleaned from another working directory. (#876)

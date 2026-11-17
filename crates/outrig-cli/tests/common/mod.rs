@@ -782,12 +782,25 @@ impl EmptyGlobalConfig {
 }
 
 /// A `PATH` whose `podman` and `buildah` exit non-zero immediately, so image
-/// probes and pulls fail instantly instead of hitting the network.
+/// probes and pulls fail instantly instead of hitting the network. Container
+/// inspect reports explicit absence, rather than an indeterminate engine error.
 #[allow(dead_code)]
 fn stub_runtime_path(dir: &Path) -> std::ffi::OsString {
     for name in ["podman", "buildah"] {
         let stub = dir.join(name);
-        std::fs::write(&stub, "#!/bin/sh\nexit 1\n").expect("write runtime stub");
+        let script = if name == "podman" {
+            r#"#!/bin/sh
+if [ "$1" = container ] && [ "$2" = inspect ]; then
+    for arg do container=$arg; done
+    printf 'Error: no such container "%s"\n' "$container" >&2
+    exit 125
+fi
+exit 1
+"#
+        } else {
+            "#!/bin/sh\nexit 1\n"
+        };
+        std::fs::write(&stub, script).expect("write runtime stub");
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
             .expect("chmod runtime stub");
     }

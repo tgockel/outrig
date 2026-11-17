@@ -1018,6 +1018,67 @@ async fn discard_refuses_when_running() {
     assert!(dir.exists(), "dir must remain after refusal");
 }
 
+/// #877: an engine error, at either check, must preserve all session data.
+#[tokio::test]
+async fn discard_preserves_session_when_running_probe_fails() {
+    for yes in [false, true] {
+        for by_dir in [false, true] {
+            for fail_at in [1, 2] {
+                let root = tempfile::tempdir().expect("tempdir root");
+                let explicit = tempfile::tempdir().expect("tempdir explicit");
+                let store = SessionStore::new(root.path().to_path_buf());
+                let sid = SessionId("20260501T134412-3f2a".into());
+                let dir = store
+                    .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
+                    .expect("create")
+                    .0;
+                std::fs::create_dir_all(dir.join("logs")).unwrap();
+                let log = dir.join("logs/agent.log");
+                std::fs::write(&log, b"session log").unwrap();
+                let launcher = dir.join("outrig-enter");
+                std::fs::write(&launcher, b"session launcher").unwrap();
+                let record = std::fs::read(dir.join("session.json")).unwrap();
+
+                let (mut ew, stderr_r) = duplex(4096);
+                let stdin = tokio::io::BufReader::new(&b"y\n"[..]);
+                let args = if by_dir {
+                    args_for_dir(&dir, yes)
+                } else {
+                    args_for_id(sid.as_str(), yes)
+                };
+                let mut calls = 0;
+                let err = discard::execute_with(&mut ew, stdin, &store, &args, |_| {
+                    calls += 1;
+                    let fail = calls == fail_at;
+                    async move {
+                        if fail {
+                            Err(outrig::error::OutrigError::Configuration(
+                                "podman: connection refused".into(),
+                            )
+                            .into())
+                        } else {
+                            Ok(false)
+                        }
+                    }
+                })
+                .await
+                .expect_err("an unknown running state must prevent discard");
+                assert!(err.to_string().contains("connection refused"), "{err}");
+                assert_eq!(calls, fail_at);
+                assert_eq!(std::fs::read(dir.join("session.json")).unwrap(), record);
+                assert_eq!(std::fs::read(log).unwrap(), b"session log");
+                assert_eq!(std::fs::read(launcher).unwrap(), b"session launcher");
+                assert_eq!(std::fs::read_link(store.symlink_path(&sid)).unwrap(), dir);
+                drop(ew);
+                let stderr = drain(stderr_r).await;
+                if fail_at == 1 {
+                    assert!(!stderr.contains("Discard"), "no prompt on query failure");
+                }
+            }
+        }
+    }
+}
+
 /// #869: the container was stopped when `discard` made its first check --
 /// the one its own `[y/N]` prompt is answered for -- and is running by the
 /// time the removal would run. A closure that answers `false` once and
