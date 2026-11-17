@@ -357,6 +357,8 @@ class Request:
     rounds: list[str] = field(default_factory=list)
     value: str = ""
     usage: dict[str, int | float] | None = None
+    # What became of an outbound request's send at its channel's backend.
+    sent: str = ""
 
 
 @dataclass
@@ -523,6 +525,12 @@ class Builder:
         self.execs: dict[int | str, Exec] = {}
         self.messages: dict[int | str, Msg] = {}
         self.requests: dict[int | str, Request] = {}
+        # Each outbound request on an external channel, by the item its send was given: what
+        # became of that send is the request's, not a message's.
+        self.request_items: dict[int | str, Request] = {}
+        # Each agent's inbound request channel, as (subject, channel): what is sent on one is
+        # sent by a backend's identity, not an agent's or the owner's.
+        self.inbound: set[tuple[str, str]] = set()
         self.health: list[str] = []
         self.facts: dict[str, str] = {}
         # Each agent's instructions -- a heading naming it and its max tokens, and the parts -- by
@@ -796,7 +804,9 @@ class Builder:
         where = f"on {req.channel}" if channel is not None else "a submission"
         summary = f"request {req.id} sent by {req.sender} ({where}): {first_line(req.body)}"
         self.add(summary, href=link(req.anchor))
-        if req.sender:
+        # An inbound request on an external channel names its sender as the backend gave it:
+        # no section of the record's is theirs.
+        if (self.subject, req.channel) not in self.inbound:
             self.add_to(
                 req.sender,
                 f"sent request {req.id} to {self.label(self.subject)} ({where})",
@@ -852,13 +862,17 @@ class Builder:
     def on_agent_request_cancelled(self, d: dict) -> None:
         req = self.request(d.get("request"))
         taken = " (already taken)" if d.get("received") else " (not yet taken)"
-        # Only the host's cancel says why: the child's rounds left the request unanswered.
+        # Who cancelled it; a record from before `by` was carried says it by `reason` alone.
         reason = d.get("reason")
-        said = (
-            f"cancelled by its sender{taken}"
-            if reason is None
-            else f"cancelled by the host{taken}: {first_line(text(reason))}"
-        )
+        by = d.get("by") or ("sender" if reason is None else "host")
+        who = {
+            "sender": "its sender",
+            "owner": "the session's owner",
+            "host": "the host",
+            "peer": "the channel's close",
+        }.get(text(by), text(by))
+        why = f": {first_line(text(reason))}" if reason is not None else ""
+        said = f"cancelled by {who}{taken}{why}"
         self.add(f"request {req.id}: {said}", href=link(req.anchor))
 
     def on_agent_request_ended(self, d: dict) -> None:
@@ -1003,6 +1017,13 @@ class Builder:
                 f"{text(s.get('outcome'))}"
                 + (f" ({text(s.get('reason'))})" if s.get("reason") is not None else "")
                 for s in objs(c.get("sends"))
+            )
+            + "".join(
+                f"; {text(r.get('direction'))} request {text(r.get('request'))}"
+                + (f" (item {text(r.get('item'))})" if r.get("item") is not None else "")
+                + f": {text(r.get('end'))}"
+                + ("" if r.get("acknowledged") else ", not acknowledged")
+                for r in objs(c.get("requests"))
             )
             for c in objs(d.get("channels"))
         ]
@@ -1390,10 +1411,15 @@ class Builder:
         self.settle(d, f"refused: {text(d.get('reason'))}")
 
     def on_channel_attached(self, d: dict) -> None:
+        direction = d.get("direction")
+        if direction == "inbound":
+            # What its requests are sent by is the backend's identity, which no section holds.
+            self.inbound.add((self.subject, text(d.get("channel"))))
+        kind = text(d.get("kind")) + (f" ({text(direction)})" if direction is not None else "")
         self.add(
-            f"channel {text(d.get('channel'))} attached: a {text(d.get('kind'))} channel receiving "
+            f"channel {text(d.get('channel'))} attached: a {kind} channel receiving "
             f"{text(d.get('receives'))} and sending {text(d.get('sends'))}, {text(d.get('bound'))} "
-            f"unread at most, arrivals {text(d.get('wake'))}"
+            f"open at most, arrivals {text(d.get('wake'))}"
         )
 
     def on_channel_consumed(self, d: dict) -> None:
@@ -1407,12 +1433,66 @@ class Builder:
     def on_channel_closed(self, d: dict) -> None:
         self.add(f"channel {text(d.get('channel'))} closed: {text(d.get('reason'))}")
 
+    def on_channel_request_sent(self, d: dict) -> None:
+        req = self.request(d.get("request"))
+        req.sender = self.label(self.subject)
+        req.child = "backend"
+        req.channel = text(d.get("channel"))
+        req.body = text(d.get("body"))
+        item = d.get("item")
+        self.request_items[key(item)] = req
+        self.add(
+            f"request {req.id} sent to the backend of {req.channel} as item "
+            f"{text(item)}: {first_line(req.body)}",
+            href=link(req.anchor),
+        )
+
+    def on_channel_request_ended(self, d: dict) -> None:
+        req = self.request(d.get("request"))
+        self.request_outcome(req, d.get("outcome"))
+        reason = d.get("reason")
+        if reason is not None:
+            req.value = text(reason)
+        self.add(
+            f"request {req.id} on {text(d.get('channel'))}: {text(d.get('outcome'))}"
+            + (f": {first_line(text(reason))}" if reason is not None else ""),
+            href=link(req.anchor),
+        )
+
+    def on_channel_request_refused(self, d: dict) -> None:
+        req = self.request(d.get("request"))
+        self.add(
+            f"request {req.id} on {text(d.get('channel'))}: the owner's settle refused, it had "
+            f"ended {text(d.get('ended'))}",
+            href=link(req.anchor),
+        )
+
+    def on_channel_settled(self, d: dict) -> None:
+        req = self.request(d.get("request"))
+        item = d.get("item")
+        # A refused answer's notice, or the end's: the backend is told of both.
+        what = "a refused answer to it" if d.get("refused") is True else "its end"
+        self.add(
+            f"request {req.id}: the backend of {text(d.get('channel'))} recorded {what}"
+            + (f" (item {text(item)})" if item is not None else ""),
+            href=link(req.anchor),
+        )
+
     def on_channel_item_outcome(self, d: dict) -> None:
-        m = self.message(d.get("item"), d)
         why = "".join(
             f" ({text(d.get(k))})" for k in ("reason", "reference") if d.get(k) is not None
         )
-        m.outcome = f"{text(d.get('outcome'))} at the backend{why}"
+        outcome = f"{text(d.get('outcome'))} at the backend{why}"
+        req = self.request_items.get(key(d.get("item")))
+        if req is not None:
+            req.sent = outcome
+            self.add(
+                f"request {req.id} on {text(d.get('channel'))}: its send {outcome}",
+                href=link(req.anchor),
+            )
+            return
+        m = self.message(d.get("item"), d)
+        m.outcome = outcome
         m.outcome_at = f"{self.time}, {self.here().title}"
         self.add(f"message {m.id}: {m.outcome}", href=link(m.anchor))
 
@@ -2201,7 +2281,9 @@ on whether reported input counts cached input: Anthropic's does not, OpenAI's do
 <td>{{ r.id }}</td><td>{{ r.sender }}</td><td>{{ r.child }}</td>
 <td>{{ r.call }}{% if r.digest %} ({{ r.digest }}){% endif %}</td>
 <td>{% if r.channel %}on {{ r.channel }}{% else %}a submission{% endif %}: {{ r.body }}</td>
-<td>{{ r.outcome }}</td><td class="n">{{ r.attempts }}</td>
+<td>{{ r.outcome }}
+{%- if r.sent %} <span class="label">its send {{ r.sent }}</span>{% endif %}</td>
+<td class="n">{{ r.attempts }}</td>
 <td>{% if r.value %}<pre>{{ r.value }}</pre>{% endif %}</td>
 <td>{{ r.usage|usage_text }}</td>
 </tr>

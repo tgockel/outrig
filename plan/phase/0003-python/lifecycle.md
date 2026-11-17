@@ -353,6 +353,35 @@ session.
 A backend has no process of its own to stop: it is the embedder's object, dropped with the
 session.
 
+**Requests on external channels** (`0003-52`)
+
+- *An inbound request waiting unread, or received and unanswered.* Outcome: ended `closed` as the
+  interpreter's close ends every request: an unread one leaves the window, and a received one's
+  `reply` or `fail` then raises `outrig.RequestEnded`; the backend's `settled` is told `closed`
+  within the drain, and the request is listed in the report's `requests` as its holder's and in
+  its channel's `requests`, `acknowledged` once the backend answered. Invoked: yes, `settled`.
+  Effects: the backend's record of the request moves to closed.
+- *An inbound request waiting on a channel no agent holds.* Outcome: ended `closed` the same way,
+  told the backend the same way, and listed in its channel's `requests` alone: it was never an
+  agent's. Invoked: yes, `settled`. Effects: as above.
+- *An outbound request outstanding* -- its send unanswered, waiting for the backend's settlement,
+  or `uncertain`. Outcome: its handle raises `outrig.SessionClosing`, and the backend's
+  `withdrawn` is called with `released` within the drain -- for one whose send was still
+  unanswered, once the send is answered and only if the backend took it; for one its code
+  cancelled already, not at all, that withdrawal standing for this one -- listed in its channel's
+  `requests`, `acknowledged` once the backend answered the withdrawal. Invoked: yes, `withdrawn`,
+  once per request. Effects: what a withdrawal does at the request's peer is the backend's; the handle
+  has ended and its answer changes nothing.
+- *A settlement notice the backend has not acknowledged.* Outcome: told again through the drain,
+  in order with the channel's consumed notices, a growing pause between tries; still
+  unacknowledged when the drain ends, its request is listed with `acknowledged` false. Invoked:
+  yes, perhaps more than once, which the backend takes as idempotent per request. Effects: the
+  backend may or may not have recorded the end.
+- *An owner's settle of an outbound request, or cancel of an inbound one, during or after the
+  close.* Outcome: the request has ended `closed`, or ends so before the settle reaches it: the
+  settle is answered that it had ended, `channel.request.refused` is recorded, and nothing
+  changes. Invoked: no. Effects: none.
+
 **The host program** (`0003-29`)
 
 - *Alive, with the session open.* Outcome: the program's session exit runs this sequence and

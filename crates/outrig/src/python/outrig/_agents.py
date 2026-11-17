@@ -268,11 +268,14 @@ class Status:
     """What a handle's request is doing, read without waiting.
 
     `state` is `queued` or `running` for a submission, `waiting` or `received` for a request on a
-    channel, and `accepted` or `failed` once it has ended; `reason` says why a failed one failed --
-    `rejected`, `failed`, `cancelled`, `released`, `budget`, `closed`, `terminated`, or `limit`
-    for a typed call whose child a limit refused, or a request its child's model-request limit
-    ended -- and is `None` otherwise. `child` is its child's state: `running`, `idle`,
-    `limit-reached`, `wedged` or `released`. Fixed once the request has ended.
+    channel, and `accepted` or `failed` once it has ended; a request on a channel of the
+    session's owner is `sending` until the channel's far end has taken it, then `waiting`, or
+    `uncertain` while it is not known whether it took it or what became of a `cancel()`. `reason`
+    says why a failed one failed -- `rejected`, `failed`, `cancelled`, `released`, `budget`,
+    `closed`, `terminated`, or `limit` for a typed call whose child a limit refused, or a request
+    its child's model-request limit ended -- and is `None` otherwise. `child` is its child's
+    state: `running`, `idle`, `limit-reached`, `wedged` or `released`; `None` for a request on a
+    channel of the session's owner, which no child answers. Fixed once the request has ended.
     """
 
     state: str
@@ -281,7 +284,7 @@ class Status:
 
     def __str__(self):
         state = self.state if self.reason is None else f"{self.state}: {self.reason}"
-        return f"{state} (child {self.child})"
+        return state if self.child is None else f"{state} (child {self.child})"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -367,7 +370,10 @@ class Handle:
         return value
 
     def cancel(self):
-        """Cancel the request; whether this ended it. Not the child, which takes more work."""
+        """Cancel the request; whether this ended it. Not the child, which takes more work. A
+        request on a channel of the session's owner is not ended here: its far end is asked, once,
+        to withdraw it, and the handle settles on the answer, or reads `uncertain` with none; this
+        says whether it has been asked."""
         return self._work.cancel()
 
     @property

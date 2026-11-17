@@ -189,6 +189,32 @@ pub struct ChannelClose {
     /// Each item its holder received whose notice the backend had not
     /// acknowledged by the end of the drain, by the owner's item id.
     pub unacknowledged: Vec<String>,
+    /// Each request on it -- inbound or outbound -- that ended after admission
+    /// closed, or that nothing ended, and how, in the order each ended.
+    pub requests: Vec<ChannelRequestAtClose>,
+}
+
+/// A request on an external channel that ended after admission closed: an
+/// inbound one its holder had not answered, ended `closed` and its backend
+/// told so through [`ChannelBackend::settled`](super::ChannelBackend::settled);
+/// an outbound one outstanding, whose handle raised `SessionClosing` and whose
+/// backend was asked through
+/// [`ChannelBackend::withdrawn`](super::ChannelBackend::withdrawn) to withdraw
+/// it. One the interpreter's death left with no end is `terminated`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct ChannelRequestAtClose {
+    /// The request.
+    pub request: AgentRequestId,
+    /// Which way it went.
+    pub direction: super::Direction,
+    /// The id the session's owner gave an inbound request.
+    pub item: Option<String>,
+    /// How it ended.
+    pub end: RequestEnd,
+    /// Whether its backend answered what it was told of the end -- the
+    /// notice, or the withdrawal -- by the end of the drain.
+    pub acknowledged: bool,
 }
 
 /// A send on an external channel whose outcome came after admission closed.

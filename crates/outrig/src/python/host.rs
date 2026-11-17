@@ -296,9 +296,9 @@ pub(crate) struct Counts {
     /// Every message ever delivered to it, read or not.
     pub(crate) delivered: u64,
     /// Whether what it carries are requests, which owe a reply, rather than
-    /// messages: a child's request channels'. The host knows; the interpreter
-    /// counts only the agent's messages.
-    #[serde(skip)]
+    /// messages: a child's request channels', and an inbound request channel
+    /// of the session's owner, which the interpreter says.
+    #[serde(default)]
     pub(crate) requests: bool,
 }
 
@@ -585,7 +585,16 @@ enum Query {
     Declared(oneshot::Sender<Result<Value, ImportFailure>>),
     /// An item the session's owner pushed on one of its channels: how many then waited, or why
     /// it was refused.
-    Posted(oneshot::Sender<Result<usize, PostRefusal>>),
+    Posted(oneshot::Sender<Result<Posted, PostRefusal>>),
+}
+
+/// What the interpreter said of an item the session's owner pushed on a channel, queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Posted {
+    /// How many items then waited.
+    pub(crate) pending: usize,
+    /// For a request, the id the interpreter gave it: every request's, its delivery's too.
+    pub(crate) request: Option<u64>,
 }
 
 /// Why the interpreter refused an item the session's owner pushed on a channel, nothing queued:
@@ -734,10 +743,12 @@ enum Reply {
         schemas: Option<Value>,
         error: Option<ImportFailure>,
     },
-    /// The answer to an item pushed on a channel under `id`, which carries one of the two.
+    /// The answer to an item pushed on a channel under `id`, which carries one of the two, and,
+    /// for a request, the request's id.
     Posted {
         id: ExecId,
         pending: Option<usize>,
+        request: Option<u64>,
         error: Option<PostRefusal>,
     },
     #[serde(other)]
@@ -1183,7 +1194,7 @@ impl Interpreter {
         line: Value,
         before: &mut dyn FnMut(ExecId),
     ) -> Result<
-        impl Future<Output = Result<Result<usize, PostRefusal>, InterpreterError>> + Send + use<>,
+        impl Future<Output = Result<Result<Posted, PostRefusal>, InterpreterError>> + Send + use<>,
         InterpreterError,
     > {
         let receiver = self.request(line, Query::Posted, |_, id| before(id))?;
@@ -2711,11 +2722,16 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
             }
             _ => tracing::warn!("ignored channels declared under {id}, which nothing asked for"),
         },
-        Reply::Posted { id, pending, error } => match lock(table).queries.remove(&id) {
+        Reply::Posted {
+            id,
+            pending,
+            request,
+            error,
+        } => match lock(table).queries.remove(&id) {
             Some(Query::Posted(waiter)) => {
                 let answer = match (pending, error) {
                     (_, Some(error)) => Err(error),
-                    (Some(pending), None) => Ok(pending),
+                    (Some(pending), None) => Ok(Posted { pending, request }),
                     (None, None) => Err(PostRefusal {
                         code: None,
                         message: "the interpreter answered without saying".to_string(),

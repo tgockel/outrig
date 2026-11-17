@@ -19,6 +19,33 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **A request crosses an external channel.** `ChannelDefinition::kind(ChannelKind::Request(
+  Direction::Inbound | Direction::Outbound))` declares a request channel, each request owing one
+  reply. Inbound, the owner pushes `Inbound::request(item, sender, body)`, answered
+  `Delivered::Queued` with a `DeliveryId::Request` -- the session's `AgentRequestId` for it -- and
+  the holder's code takes a `RequestDelivery` with `receive()` and answers it with `reply` or
+  `fail`. It is a request of its holder's: the same `agent.request.*` events, with `sender` the
+  backend's identity, and the same rule as a child's -- a holder whose rounds leave it unanswered is
+  warned, then the request is cancelled. Every end -- replied, failed, cancelled by the owner
+  (`Channel::cancel`), the host or the channel's close, closed, released -- and every reply refused
+  after it reaches the new `ChannelBackend::settled` once, as a `Settled` notice with a
+  `Settlement`, retried in order with the consumed notices until acknowledged. Outbound, the
+  holder's `request(body)` returns a handle at once, `sending` until the backend's `send` takes it
+  -- `Outbound::request` naming it -- then `waiting`; the owner ends it with `Channel::settle`
+  (`Settle::Reply`, `Fail` or `Cancel`), a reply built into the reply type in the holder's kernel
+  and one that does not fit ending it failed, which the backend is told; a settle after its end is
+  refused (`SettleError::Ended`). `h.cancel()` asks the new `ChannelBackend::withdrawn`, whose
+  `WithdrawAnswer` settles the handle -- withdrawn, or the reply or failure already recorded -- and
+  whose silence leaves it `uncertain`; a holder's release or the session's close withdraws what it
+  held, `WithdrawEnd::Released`, and no request is withdrawn twice. An outbound request that ends
+  while its send is with the backend is told or withdrawn once the send is answered, and only if the
+  backend took it. The bound counts requests open, and a channel's close cancels them. A backend
+  runs at most eight calls at once per channel, its notices and withdrawals counted with its sends.
+  `DeliveryId` replaces the `MessageId` in `Delivered`, and `Position` gains `Settled`. New events:
+  `channel.request.sent`, `channel.request.ended`, `channel.request.refused` and `channel.settled`;
+  `channel.attached` carries the `direction`, and `agent.request.cancelled` says `by` whom --
+  `sender`, `owner`, `host` or `peer`. `ChannelClose::requests` lists each request that ended at the
+  close, with whether its backend acknowledged being told.
 - **An external channel has a backend.** `SessionBuilder::channel(definition, backend)` declares
   a channel whose far end is the owner's own messaging: a `ChannelDefinition` -- its name, a
   `Contract` each way (`Text`, untyped `Json`, a `Typed` `module:Name` from the application code,

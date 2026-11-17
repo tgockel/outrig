@@ -31,14 +31,16 @@ use serde_json::{Value, json};
 use tokio::sync::{Semaphore, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::event::{ItemOutcome, MessageId, Payload, Subject};
+use super::event::{AgentRequestId, ItemOutcome, MessageId, Payload, RequestEnd, Subject};
 use super::lifecycle::Lifecycle;
-use super::report::{ChannelClose, SendAtClose};
+use super::report::{ChannelClose, ChannelRequestAtClose, SendAtClose};
 use super::skills::Catalog;
 use super::stop::RoundSend;
 use crate::agent::orientation::ExternalText;
 use crate::events::Events;
-use crate::python::host::{Counts, Interpreter, InterpreterError, MESSAGE_MAX, PostRefusal};
+use crate::python::host::{
+    Counts, Interpreter, InterpreterError, MESSAGE_MAX, PostRefusal, Posted,
+};
 use crate::python::hosted::ToInterpreter;
 
 /// What a [`ChannelBackend`]'s methods return: a future of their answer, which
@@ -50,9 +52,9 @@ pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// OutRig calls it for every item the holder sends and every item the holder
 /// receives, and never the other way: what arrives for the holder, the owner
 /// pushes through [`Channel::deliver`]. Each call runs on the session's tokio
-/// runtime, at most eight at once per channel, and is dropped -- its future
-/// never polled again -- once it has run past the channel's
-/// [`ChannelDefinition::call_timeout`]: a send dropped so is
+/// runtime, at most eight at once per channel whatever their kind, and is
+/// dropped -- its future never polled again -- once it has run past the
+/// channel's [`ChannelDefinition::call_timeout`]: a send dropped so is
 /// [`ItemOutcome::Uncertain`].
 pub trait ChannelBackend: Send + Sync + 'static {
     /// The holder sent `item`: take it durably and say so, with a reference
@@ -65,6 +67,35 @@ pub trait ChannelBackend: Send + Sync + 'static {
     /// it returns `Ok`, while the session lasts: treat it as idempotent per
     /// item.
     fn consumed(&self, notice: Consumed) -> BackendFuture<'_, io::Result<()>>;
+
+    /// A request on a request channel ended as `notice` says, or an answer to
+    /// one that had ended was refused, which changed nothing. Called once for
+    /// each end of an inbound request -- the one path by which its requester
+    /// learns the outcome -- and for each end of an outbound request the
+    /// backend did not give itself: a reply that did not fit, or the channel's
+    /// close, told once the request's [`send`](Self::send) has answered, and
+    /// only if it took the request. In order with the channel's
+    /// [`consumed`](Self::consumed) notices, and again after an error until it
+    /// returns `Ok`, while the session lasts: treat it as idempotent per
+    /// request. Acknowledge a notice of a request with no record here as well
+    /// -- one whose send answered uncertain and was never kept: an error asks
+    /// for the notice again, and holds back every later one on the channel
+    /// until the session's drain ends.
+    fn settled(&self, notice: Settled) -> BackendFuture<'_, io::Result<()>>;
+
+    /// The holder's side ended outbound request `withdrawal` names -- its code
+    /// cancelled it, or its holder was released or the session closed -- and
+    /// asks the backend to withdraw it: answer [`WithdrawAnswer::Withdrawn`],
+    /// or the reply or failure already recorded, which the request then
+    /// settles with instead; a request with no record here is answered
+    /// withdrawn. Called at most once per request, and only once the request's
+    /// [`send`](Self::send) has answered that it took the request, or may
+    /// have: a holder released, or a session closed, after its code cancelled
+    /// the request asks nothing more. What withdrawing does at the request's
+    /// peer is the backend's. A call that does not answer within the
+    /// channel's [`ChannelDefinition::call_timeout`] leaves the request
+    /// `uncertain`, and is not made again.
+    fn withdrawn(&self, withdrawal: Withdrawal) -> BackendFuture<'_, io::Result<WithdrawAnswer>>;
 }
 
 /// What an external channel is, fixed for the session: given with its backend
@@ -88,7 +119,8 @@ pub const CHANNEL_BOUND_MAX: usize = 256;
 /// How long a backend's method has to answer, unless the definition says.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How many of one channel's sends its backend is given at once.
+/// How many of one channel's calls its backend is given at once: its sends,
+/// notices and withdrawals together.
 const CALLS_MAX: usize = 8;
 
 /// How long the interpreter has to say whether it queued an item: it answers
@@ -121,6 +153,16 @@ impl ChannelDefinition {
         }
     }
 
+    /// What the channel carries: messages, by default, or requests one way.
+    /// A request channel's contracts are the holder's still: an inbound one
+    /// receives requests and sends their replies, and an outbound one sends
+    /// requests and receives their replies.
+    #[must_use]
+    pub fn kind(mut self, kind: ChannelKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
     /// What may arrive for the holder.
     #[must_use]
     pub fn receives(mut self, contract: Contract) -> Self {
@@ -136,14 +178,20 @@ impl ChannelDefinition {
     }
 
     /// How many items the channel holds unread, 1 to [`CHANNEL_BOUND_MAX`]: a
-    /// push past it is refused [`DeliverError::Full`].
+    /// push past it is refused [`DeliverError::Full`]. On an inbound request
+    /// channel, how many requests it holds unsettled -- unread, or received and
+    /// unanswered; on an outbound one, how many its holder has outstanding, past
+    /// which its `request` raises `outrig.AgentLimitReached`.
     #[must_use]
     pub fn bound(mut self, bound: usize) -> Self {
         self.bound = bound;
         self
     }
 
-    /// What an arrival does.
+    /// What an arrival does. On an inbound request channel it decides only
+    /// whether an arrival ends a `runtime.wait`: every request is announced,
+    /// and opens a round for a holder at rest. Nothing arrives on an outbound
+    /// one.
     #[must_use]
     pub fn wake(mut self, wake: Wake) -> Self {
         self.wake = wake;
@@ -187,6 +235,13 @@ impl ChannelDefinition {
             ));
         }
         for contract in [&self.receives, &self.sends] {
+            if matches!(self.kind, ChannelKind::Request(_)) && *contract == Contract::Nothing {
+                return Some(
+                    "it carries requests, so it carries something each way: a request and its \
+                     reply"
+                        .to_string(),
+                );
+            }
             if let Contract::Typed(path) = contract {
                 let (module, name) = path.split_once(':').unwrap_or_default();
                 if module.is_empty() || name.is_empty() {
@@ -207,6 +262,7 @@ impl ChannelDefinition {
         json!({
             "name": self.name,
             "kind": self.kind.to_string(),
+            "direction": self.kind.direction().map(|direction| direction.to_string()),
             "receives": self.receives.line(),
             "sends": self.sends.line(),
             "bound": self.bound,
@@ -223,12 +279,52 @@ pub enum ChannelKind {
     /// Messages, each owing nothing, either way.
     #[default]
     Plain,
+    /// Requests, each owing one reply, going one way: each ends once, and the
+    /// backend's record and what the agent saw agree on how.
+    Request(Direction),
+}
+
+impl ChannelKind {
+    /// Which way a request channel's requests go.
+    pub fn direction(self) -> Option<Direction> {
+        match self {
+            Self::Plain => None,
+            Self::Request(direction) => Some(direction),
+        }
+    }
 }
 
 impl fmt::Display for ChannelKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Plain => "plain",
+            Self::Request(_) => "request",
+        })
+    }
+}
+
+/// Which way a request channel's requests go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum Direction {
+    /// The backend requests and the holder replies: the owner pushes each
+    /// request with [`Inbound::request`], the holder's code takes it with
+    /// `receive()` and answers it with `reply` or `fail`, and
+    /// [`ChannelBackend::settled`] hears how it ended.
+    Inbound,
+    /// The holder requests and the backend replies: the holder's code asks
+    /// with `request(body)`, which hands the request to
+    /// [`ChannelBackend::send`] and returns a handle, and the owner settles
+    /// it with [`Channel::settle`].
+    Outbound,
+}
+
+impl fmt::Display for Direction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
         })
     }
 }
@@ -314,7 +410,7 @@ pub struct Inbound {
     /// `delivery.correlation`.
     pub correlation: Option<String>,
     /// The backend's own reference for it, which OutRig never reads and gives
-    /// back with the item's [`Consumed`] notice.
+    /// back with the item's [`Consumed`] or [`Settled`] notice.
     pub reference: Option<String>,
     /// A skill of the session's it asks the holder to run, as a `/name` on the
     /// user channel does: what the holder's code reads as `delivery.skill`.
@@ -333,6 +429,12 @@ impl Inbound {
             reference: None,
             skill: None,
         }
+    }
+
+    /// A request, `item` by the backend's id, from `sender`, for an inbound
+    /// request channel's holder to answer.
+    pub fn request(item: impl Into<String>, sender: impl Into<String>, body: Value) -> Self {
+        Self::message(item, sender, body).kind(ItemKind::Request)
     }
 
     /// The item as `kind`.
@@ -371,7 +473,7 @@ pub enum ItemKind {
     /// A message, which owes no reply.
     #[default]
     Message,
-    /// A request, which owes one: a plain channel refuses it.
+    /// A request, which owes one: only an inbound request channel takes it.
     Request,
 }
 
@@ -392,13 +494,13 @@ pub enum Delivered {
     /// `delivery.id`.
     Queued {
         /// The id OutRig delivers it under.
-        delivery: MessageId,
+        delivery: DeliveryId,
     },
     /// The channel had taken an item of this id already, under `delivery`, and
     /// it is now at `position`: nothing more was queued.
     Repeat {
         /// The id OutRig delivered it under.
-        delivery: MessageId,
+        delivery: DeliveryId,
         /// Where it is.
         position: Position,
     },
@@ -406,9 +508,49 @@ pub enum Delivered {
 
 impl Delivered {
     /// The id the item was delivered under, the first time or this one.
-    pub fn delivery(&self) -> MessageId {
+    pub fn delivery(&self) -> DeliveryId {
         match self {
             Self::Queued { delivery } | Self::Repeat { delivery, .. } => *delivery,
+        }
+    }
+}
+
+/// The id OutRig delivered an item under: what the holder's code reads as
+/// `delivery.id`, and every event about the item names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DeliveryId {
+    /// A message's, which its `message.*` events carry.
+    Message(MessageId),
+    /// A request's: the session's id for it, which its `agent.request.*`
+    /// events, its [`Settled`] notice and [`Channel::cancel`] name.
+    Request(AgentRequestId),
+}
+
+impl fmt::Display for DeliveryId {
+    /// The number, as the event log writes it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Message(id) => id.fmt(f),
+            Self::Request(id) => id.fmt(f),
+        }
+    }
+}
+
+impl DeliveryId {
+    /// A message's id, if it is one.
+    pub fn message(self) -> Option<MessageId> {
+        match self {
+            Self::Message(id) => Some(id),
+            Self::Request(_) => None,
+        }
+    }
+
+    /// A request's id, if it is one.
+    pub fn request(self) -> Option<AgentRequestId> {
+        match self {
+            Self::Request(id) => Some(id),
+            Self::Message(_) => None,
         }
     }
 }
@@ -419,10 +561,14 @@ impl Delivered {
 pub enum Position {
     /// In the window, unread.
     Unread,
-    /// Received by the holder's code; the backend has not yet acknowledged
-    /// [`ChannelBackend::consumed`].
+    /// Received by the holder's code; for a message, the backend has not yet
+    /// acknowledged [`ChannelBackend::consumed`].
     Consumed,
-    /// Received, and acknowledged.
+    /// A request that has ended, the backend not yet having acknowledged
+    /// [`ChannelBackend::settled`].
+    Settled,
+    /// Received, and acknowledged; for a request, ended, and its end
+    /// acknowledged.
     Acknowledged,
 }
 
@@ -463,6 +609,9 @@ pub struct Outbound {
     pub item: MessageId,
     /// What it is.
     pub kind: ItemKind,
+    /// For a request, the session's id for it: what [`Channel::settle`] and
+    /// [`ChannelBackend::withdrawn`] name it by.
+    pub request: Option<AgentRequestId>,
     /// The type the channel's contract gives it: `str`, `JSON`, or a
     /// `module:Name`.
     pub body_type: String,
@@ -511,6 +660,145 @@ pub struct Consumed {
     pub delivery: MessageId,
     /// The backend's own reference for the item, as its push gave it.
     pub reference: Option<String>,
+}
+
+/// The notice that a request on a channel ended, or that an answer to one
+/// that had ended was refused, as its backend is given it.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct Settled {
+    /// The channel.
+    pub channel: String,
+    /// The session's id for the request.
+    pub request: AgentRequestId,
+    /// The id the session's owner gave an inbound request; `None` for an
+    /// outbound one, which the backend knows by `request`.
+    pub item: Option<String>,
+    /// The backend's own reference for the request, as its push or its send's
+    /// acceptance gave it.
+    pub reference: Option<String>,
+    /// How it ended.
+    pub outcome: Settlement,
+}
+
+/// How a request on a channel ended, as its backend is told.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum Settlement {
+    /// Its holder's code replied: the reply, as JSON.
+    Replied(Value),
+    /// It failed, saying why: its holder's `fail(message)`, its replies
+    /// refused past the attempt limit -- each problem named -- a request that
+    /// could not be built, or an outbound request's reply that did not fit the
+    /// channel's type.
+    Failed(String),
+    /// It was cancelled.
+    Cancelled {
+        /// Who cancelled it.
+        by: CancelledBy,
+        /// Why, as OutRig says it; empty for the owner's own cancel.
+        reason: String,
+    },
+    /// The session closed with it open.
+    Closed,
+    /// Its holder was released with it open.
+    Released,
+    /// An answer came after it had ended, and was refused: nothing changed.
+    Refused {
+        /// How it had ended.
+        ended: RequestEnd,
+    },
+}
+
+/// Who cancelled a request on a channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CancelledBy {
+    /// The session's owner, with [`Channel::cancel`]: its requester gave up.
+    Owner,
+    /// OutRig: its holder's rounds left it unanswered after one that warned
+    /// it would be, or the holder could make no further round -- the
+    /// session's token budget spent, or its model-request limit reached.
+    Host,
+    /// The channel's peer: the owner closed the channel.
+    Peer,
+}
+
+/// An outbound request the holder's side ended, as its backend is asked to
+/// withdraw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Withdrawal {
+    /// The channel.
+    pub channel: String,
+    /// The session's id for the request.
+    pub request: AgentRequestId,
+    /// The id its send was given, as [`Outbound::item`].
+    pub item: MessageId,
+    /// The backend's reference for it, as the send's acceptance gave it.
+    pub reference: Option<String>,
+    /// Why it is withdrawn.
+    pub end: WithdrawEnd,
+}
+
+/// Why an outbound request is withdrawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum WithdrawEnd {
+    /// The holder's code cancelled it, and its handle settles on the answer.
+    Cancelled,
+    /// Its holder was released, or the session closed: the handle has ended
+    /// already, and the answer changes it no more.
+    Released,
+}
+
+/// What a backend says of an outbound request it was asked to withdraw.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum WithdrawAnswer {
+    /// It is withdrawn.
+    Withdrawn,
+    /// It had been answered already, with this reply, as JSON.
+    Replied(Value),
+    /// It had failed already, saying why.
+    Failed(String),
+}
+
+/// How the session's owner settles an outbound request, with
+/// [`Channel::settle`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum Settle {
+    /// It was answered: the reply, as JSON, which the holder's code receives
+    /// built into the channel's reply type.
+    Reply(Value),
+    /// It failed, saying why: the handle raises `outrig.AgentRequestFailed`.
+    Fail(String),
+    /// It was cancelled, saying why -- its peer finished, say: the handle
+    /// raises `outrig.RequestCancelled`.
+    Cancel(String),
+}
+
+/// Why [`Channel::settle`] or [`Channel::cancel`] did not end a request as
+/// asked.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SettleError {
+    /// The channel has no such request open: none of that id, or not one
+    /// the call ends -- an inbound request for [`Channel::cancel`], an
+    /// outbound one for [`Channel::settle`].
+    #[error("the channel has no request {0} open that this ends")]
+    Unknown(AgentRequestId),
+    /// It had already ended, as this says: nothing changed.
+    #[error("the request had already ended ({0:?}), and nothing changed")]
+    Ended(RequestEnd),
+    /// The reply does not fit the channel's reply type, so the request ended
+    /// failed, naming each problem -- which its backend is told too.
+    #[error("the reply does not fit the channel's reply type, so the request failed: {}", .0.join("; "))]
+    Rejected(Vec<String>),
+    /// The session ended before the request did.
+    #[error("the session ended before the request did")]
+    Gone,
 }
 
 /// The owner's end of one external channel: what it pushes the holder, and
@@ -577,9 +865,10 @@ impl Channel {
         self.table.close(&self.name, reason);
     }
 
-    /// Resolves once the window has room for another item, the channel is
-    /// closed, or the session is closing: once a push can be answered other
-    /// than [`DeliverError::Full`].
+    /// Resolves once the window has room for another item -- on an inbound
+    /// request channel, once fewer requests are unsettled than its bound --
+    /// the channel is closed, or the session is closing: once a push can be
+    /// answered other than [`DeliverError::Full`].
     pub fn room(&self) -> impl Future<Output = ()> + Send + 'static + use<> {
         let mut state = self.table.state.subscribe();
         let closing = self.table.closing.clone();
@@ -588,12 +877,48 @@ impl Channel {
             let roomy = state.wait_for(|state| {
                 state
                     .find(&name)
-                    .is_none_or(|chan| chan.closed.is_some() || chan.unread < chan.bound())
+                    .is_none_or(|chan| chan.closed.is_some() || chan.held() < chan.bound())
             });
             tokio::select! {
                 _ = roomy => {}
                 () = closing.cancelled() => {}
             }
+        }
+    }
+
+    /// Cancel inbound request `request`: its requester gave up. One its holder
+    /// has not received is taken out of the window, and the holder never sees
+    /// it; one it has received stays with it, and its answer then raises
+    /// `outrig.RequestCancelled`. Cancelling never interrupts the holder's
+    /// code. The end reaches [`ChannelBackend::settled`] as
+    /// [`CancelledBy::Owner`], as every end of the request does; this says
+    /// only whether it was asked.
+    pub fn cancel(&self, request: AgentRequestId) -> Result<(), SettleError> {
+        self.table.cancel(&self.name, request)
+    }
+
+    /// Settle outbound request `request`, its holder's, as `settle` says: its
+    /// backend's outcome for it. A reply is built into the channel's reply
+    /// type in the holder's kernel, and one that does not fit ends the request
+    /// failed instead, naming each problem, which [`ChannelBackend::settled`]
+    /// is told too: [`SettleError::Rejected`]. A request that has ended
+    /// already -- answered, cancelled, withdrawn, its holder released -- is
+    /// left as it ended: [`SettleError::Ended`], and `channel.request.refused`
+    /// is recorded.
+    ///
+    /// Call it inside the session's tokio runtime; the future answers once the
+    /// request has ended.
+    pub fn settle(
+        &self,
+        request: AgentRequestId,
+        settle: Settle,
+    ) -> impl Future<Output = Result<(), SettleError>> + Send + 'static + use<> {
+        let table = Arc::clone(&self.table);
+        let name = self.name.clone();
+        let started = table.settle(&name, request, settle);
+        async move {
+            let number = started?;
+            table.settled_by(&name, request, number).await
         }
     }
 
@@ -606,6 +931,30 @@ impl Channel {
             .borrow()
             .find(&self.name)
             .and_then(|chan| chan.holder.clone())
+    }
+
+    /// Each outbound request outstanding on the channel, with its state:
+    /// `sending`, `waiting`, `withdrawing`, `withdrawn` -- its backend's answer
+    /// on its way to its holder -- or `uncertain`.
+    #[cfg(test)]
+    pub(crate) fn outstanding(&self) -> Vec<(AgentRequestId, &'static str)> {
+        let state = self.table.state.borrow();
+        let Some(chan) = state.find(&self.name) else {
+            return Vec::new();
+        };
+        chan.outgoing
+            .iter()
+            .map(|(id, outgoing)| {
+                let state = match outgoing.state {
+                    Out::Sending { .. } => "sending",
+                    Out::Waiting => "waiting",
+                    Out::Withdrawing => "withdrawing",
+                    Out::Withdrawn { answered: true } => "withdrawn",
+                    Out::Uncertain | Out::Withdrawn { answered: false } => "uncertain",
+                };
+                (AgentRequestId::new(*id), state)
+            })
+            .collect()
     }
 }
 
@@ -680,6 +1029,9 @@ struct Table {
     /// Cancelled once the session's drain has ended: what the backend has not
     /// answered is given up on.
     stopping: CancellationToken,
+    /// The last of the owner's settles of an outbound request, numbered so
+    /// each knows whether it ended the request.
+    settles: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -718,6 +1070,19 @@ struct Chan {
     /// Each item the owner pushed that the channel took, or is taking, by the
     /// owner's id for it.
     items: HashMap<String, Taken>,
+    /// The owner's id of each inbound request the channel took, by the
+    /// request's id, until its backend has acknowledged how it ended: where
+    /// it is, `items` says.
+    asked: BTreeMap<u64, String>,
+    /// Each outbound request outstanding, by its id.
+    outgoing: BTreeMap<u64, Outgoing>,
+    /// How each request on the channel ended, by its id: what a later settle
+    /// or cancel of it is answered with.
+    finished: HashMap<u64, Finished>,
+    /// Each request that ended after admission closed, and how, in order.
+    requests_after_close: Vec<ChannelRequestAtClose>,
+    /// How many withdrawals its backend has not answered.
+    withdrawing: usize,
     /// The owner's id of each item not yet acknowledged, and the backend's
     /// reference for it, by the id it was delivered under, in that order.
     deliveries: BTreeMap<MessageId, (String, Option<String>)>,
@@ -731,10 +1096,9 @@ struct Chan {
     sent: HashMap<(String, u32), Vec<MessageId>>,
     /// Each send whose outcome came after admission closed.
     after_close: Vec<SendAtClose>,
-    /// The items received whose notice the backend has not acknowledged, each
-    /// with the agent that received it, in the order they were received, and
-    /// whether a task is telling it.
-    notices: VecDeque<(MessageId, String)>,
+    /// What its backend has not acknowledged being told, in the order it
+    /// happened, and whether a task is telling it.
+    notices: VecDeque<Notice>,
     notifying: bool,
 }
 
@@ -742,6 +1106,290 @@ impl Chan {
     fn bound(&self) -> usize {
         self.definition.bound
     }
+
+    /// What counts against its bound: unread messages, or the inbound
+    /// requests not yet ended.
+    fn held(&self) -> usize {
+        match self.definition.kind {
+            ChannelKind::Request(Direction::Inbound) => {
+                self.asked.keys().filter(|id| self.open(**id)).count()
+            }
+            _ => self.unread,
+        }
+    }
+
+    /// Whether any request on it is still to end.
+    fn requests_open(&self) -> bool {
+        !self.outgoing.is_empty() || self.asked.keys().any(|id| self.open(*id))
+    }
+
+    /// Whether inbound request `id` has yet to end: unread, or received.
+    fn open(&self, id: u64) -> bool {
+        let taken = self.asked.get(&id).and_then(|item| self.items.get(item));
+        matches!(
+            taken,
+            Some(Taken::Queued(_, Position::Unread | Position::Consumed))
+        )
+    }
+
+    /// Inbound request `id`, the owner's `item`, is now at `position`.
+    fn place(&mut self, id: u64, item: &str, position: Position) {
+        self.asked.insert(id, item.to_string());
+        let delivery = DeliveryId::Request(AgentRequestId::new(id));
+        self.items
+            .insert(item.to_string(), Taken::Queued(delivery, position));
+    }
+
+    /// Queue `notice` for the backend: whether a task must start to tell it.
+    fn push_notice(&mut self, notice: Notice) -> bool {
+        self.notices.push_back(notice);
+        !std::mem::replace(&mut self.notifying, true)
+    }
+
+    /// Request `id` ended as `finished`: whether this is the first word of
+    /// its end, recorded once; `at_close` lists it at the close.
+    fn end_request(
+        &mut self,
+        id: u64,
+        finished: Finished,
+        at_close: Option<ChannelRequestAtClose>,
+    ) -> bool {
+        match self.finished.entry(id) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(finished);
+                self.requests_after_close.extend(at_close);
+                true
+            }
+        }
+    }
+
+    /// Request `id`'s entry in what the close left, if it ended after the
+    /// close.
+    fn at_close(&mut self, id: u64) -> Option<&mut ChannelRequestAtClose> {
+        self.requests_after_close
+            .iter_mut()
+            .find(|at| at.request.get() == id)
+    }
+
+    /// How its backend is called.
+    fn calls(&self) -> Calls {
+        Calls {
+            backend: Arc::clone(&self.backend),
+            permits: Arc::clone(&self.permits),
+            bound: self.definition.call_timeout,
+        }
+    }
+
+    /// Count `withdrawal` toward the drain, as its backend is asked it.
+    fn ask_withdrawal(&mut self, withdrawal: Withdrawal) -> Asking {
+        self.withdrawing += 1;
+        Asking {
+            withdrawal,
+            calls: self.calls(),
+        }
+    }
+
+    /// Its holder's code cancelled outbound request `id`, which its backend
+    /// is asked to withdraw a single time, after its send has been answered:
+    /// the withdrawal to ask now, if any, and the agent whose request it is.
+    fn cancel_outgoing(&mut self, id: u64) -> Option<(Asking, String)> {
+        let outgoing = self.outgoing.get_mut(&id)?;
+        match outgoing.state {
+            Out::Sending { .. } => {
+                outgoing.state = Out::Sending { withdraw: true };
+                None
+            }
+            Out::Withdrawing | Out::Withdrawn { .. } => None,
+            Out::Waiting | Out::Uncertain => {
+                outgoing.state = Out::Withdrawing;
+                let withdrawal =
+                    outgoing.withdrawal(&self.definition.name, id, WithdrawEnd::Cancelled);
+                let agent = outgoing.agent.clone();
+                Some((self.ask_withdrawal(withdrawal), agent))
+            }
+        }
+    }
+
+    /// Give its backend what outbound request `id`, `agent`'s, sent as `item`
+    /// and taken under `reference`, is `owed` for how it ended.
+    fn owe(
+        &mut self,
+        id: u64,
+        agent: &str,
+        (item, reference): (MessageId, Option<String>),
+        owed: Owed,
+    ) -> Giving {
+        let (channel, request) = (self.definition.name.clone(), AgentRequestId::new(id));
+        match owed {
+            Owed::Withdrawn => Giving::Withdrawal(self.ask_withdrawal(Withdrawal {
+                channel,
+                request,
+                item,
+                reference,
+                end: WithdrawEnd::Released,
+            })),
+            Owed::Told(outcome) => {
+                let notice = Settled {
+                    channel,
+                    request,
+                    item: None,
+                    reference,
+                    outcome,
+                };
+                let agent = Some(agent.to_string());
+                Giving::Notice(self.push_notice(Notice::Settled(notice, agent)))
+            }
+        }
+    }
+
+    /// The send of outbound request `id` ended `wire`, as `sent` says -- its
+    /// item, and the backend's reference if it took it: the request now
+    /// waits for its backend's settlement, is uncertain, or ended unsent, and
+    /// its holder's cancel meanwhile is asked of the backend now. One that
+    /// ended as its send went is given now what it was owed, if its backend
+    /// took it.
+    fn request_sent(
+        &mut self,
+        id: u64,
+        wire: &str,
+        sent: (MessageId, Option<String>),
+    ) -> (Sent, Option<Giving>) {
+        let taken = matches!(wire, "accepted" | "uncertain");
+        if let Some(outgoing) = self.outgoing.get_mut(&id) {
+            if !taken {
+                return (Sent::Told, None);
+            }
+            let withdraw = matches!(outgoing.state, Out::Sending { withdraw: true });
+            outgoing.reference = sent.1;
+            let (state, named) = match wire {
+                "accepted" => (Out::Waiting, "waiting"),
+                _ => (Out::Uncertain, "uncertain"),
+            };
+            outgoing.state = state;
+            let cancelled = if withdraw {
+                self.cancel_outgoing(id)
+            } else {
+                None
+            };
+            let giving = cancelled.map(|(asking, _)| Giving::Withdrawal(asking));
+            return (Sent::Moved(named), giving);
+        }
+        // Ended before its send did: owed nothing by a backend that never took it.
+        let owed = self
+            .finished
+            .get_mut(&id)
+            .and_then(|finished| Some((finished.owed.take()?, finished.agent.clone()?)));
+        match owed.filter(|_| taken) {
+            Some((owed, agent)) => (Sent::Ended, Some(self.owe(id, &agent, sent, owed))),
+            None => {
+                if let Some(at) = self.at_close(id) {
+                    at.acknowledged = true;
+                }
+                (Sent::Ended, None)
+            }
+        }
+    }
+}
+
+/// An outbound request its backend has not settled.
+struct Outgoing {
+    /// The agent that made it.
+    agent: String,
+    /// The id its send was given, and the backend's reference once it took it.
+    item: MessageId,
+    reference: Option<String>,
+    state: Out,
+}
+
+impl Outgoing {
+    /// It, request `id` on `channel`, withdrawn as `end` says.
+    fn withdrawal(&self, channel: &str, id: u64, end: WithdrawEnd) -> Withdrawal {
+        Withdrawal {
+            channel: channel.to_string(),
+            request: AgentRequestId::new(id),
+            item: self.item,
+            reference: self.reference.clone(),
+            end,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Out {
+    /// Its send is with the backend, unanswered; and whether its holder asked
+    /// to withdraw it meanwhile.
+    Sending { withdraw: bool },
+    /// The backend took it.
+    Waiting,
+    /// Whether the backend took it is not known.
+    Uncertain,
+    /// Its backend is asked to withdraw it, and has not answered.
+    Withdrawing,
+    /// Its backend was asked to withdraw it, and answered -- the request ends
+    /// as it said -- or did not within the call's bound, which leaves the
+    /// request uncertain. It is asked no more.
+    Withdrawn { answered: bool },
+}
+
+/// How a request on a channel ended.
+#[derive(Debug, Clone)]
+struct Finished {
+    end: RequestEnd,
+    /// The agent whose request it was, if any held it.
+    agent: Option<String>,
+    /// The owner's settle that ended it, by number.
+    settle: Option<u64>,
+    /// What was wrong with a reply that ended it failed.
+    problems: Vec<String>,
+    /// What its backend is owed once its send is answered, for an outbound
+    /// request that ended first, if the backend takes it.
+    owed: Option<Owed>,
+}
+
+/// What an outbound request's backend is owed for how it ended.
+#[derive(Debug, Clone)]
+enum Owed {
+    /// Told how it ended, an end it did not give itself: a reply that did not
+    /// fit, the channel's close.
+    Told(Settlement),
+    /// Asked to withdraw it: its holder was released, or the session closed.
+    Withdrawn,
+}
+
+/// What a channel's backend is given for a request, counted toward the drain
+/// in the step that decided it, so the drain never finds the request ended
+/// and what its backend is owed not yet begun.
+enum Giving {
+    /// Asked to withdraw it.
+    Withdrawal(Asking),
+    /// Told how it ended: whether a task must start to tell it.
+    Notice(bool),
+}
+
+/// A withdrawal to ask of a channel's backend.
+struct Asking {
+    withdrawal: Withdrawal,
+    calls: Calls,
+}
+
+/// How a channel's backend is called: no more calls at once than it has
+/// permits, each given up on past its bound.
+struct Calls {
+    backend: Arc<dyn ChannelBackend>,
+    permits: Arc<Semaphore>,
+    bound: Duration,
+}
+
+/// What a channel's backend is told, in order, until it acknowledges it, with
+/// the agent it is of.
+#[derive(Clone)]
+enum Notice {
+    /// The holder's code, the agent named, received an item.
+    Consumed(Consumed, String),
+    /// A request ended, or an answer to it was refused: the agent named is the
+    /// holder whose request it was, if it was any agent's.
+    Settled(Settled, Option<String>),
 }
 
 /// A send its backend has not answered.
@@ -760,7 +1408,7 @@ struct Flight {
 enum Taken {
     /// Pushed, the interpreter not yet having said.
     Pushing,
-    Queued(MessageId, Position),
+    Queued(DeliveryId, Position),
 }
 
 /// How a push began.
@@ -795,6 +1443,11 @@ impl Channels {
                 holder: None,
                 closed: None,
                 items: HashMap::new(),
+                asked: BTreeMap::new(),
+                outgoing: BTreeMap::new(),
+                finished: HashMap::new(),
+                requests_after_close: Vec::new(),
+                withdrawing: 0,
                 deliveries: BTreeMap::new(),
                 delivered: 0,
                 unread: 0,
@@ -816,6 +1469,7 @@ impl Channels {
             rounds: OnceLock::new(),
             closing: closing.clone(),
             stopping: CancellationToken::new(),
+            settles: std::sync::atomic::AtomicU64::new(0),
         });
         lifecycle.on_close(Arc::new(move |_| closing.cancel()));
         Self(table)
@@ -920,7 +1574,7 @@ impl Channels {
         })
     }
 
-    /// The channels `agent` holds whose arrivals are announced, as its
+    /// The plain channels `agent` holds whose arrivals are announced, as its
     /// announcer counts them: what waits unread, and every item ever queued.
     pub(crate) fn counts_of(&self, agent: &str) -> BTreeMap<String, Counts> {
         self.0
@@ -928,8 +1582,12 @@ impl Channels {
             .borrow()
             .channels
             .iter()
+            // An inbound request channel's are counted from its holder's
+            // requests, as every request of an agent's is.
             .filter(|chan| {
-                chan.holder.as_deref() == Some(agent) && chan.definition.wake != Wake::Silent
+                chan.holder.as_deref() == Some(agent)
+                    && chan.definition.wake != Wake::Silent
+                    && chan.definition.kind == ChannelKind::Plain
             })
             .map(|chan| {
                 (
@@ -957,7 +1615,7 @@ impl Channels {
                 let definition = &chan.definition;
                 ExternalText {
                     name: definition.name.clone(),
-                    kind: definition.kind.to_string(),
+                    kind: definition.kind,
                     receives: contract_text(&definition.receives, chan.schemas.0.as_deref()),
                     sends: contract_text(&definition.sends, chan.schemas.1.as_deref()),
                     description: definition.description.clone(),
@@ -985,20 +1643,30 @@ impl Channels {
         })
     }
 
-    /// Resolves once no send is waiting on a backend and every received item's
-    /// notice has been acknowledged.
+    /// Resolves once no send or withdrawal is waiting on a backend, every
+    /// request on a channel has ended, and every notice has been
+    /// acknowledged.
     pub(crate) fn drained(&self) -> impl Future<Output = ()> + Send + 'static {
         let mut state = self.0.state.subscribe();
         async move {
             let _ = state
                 .wait_for(|state| {
-                    state
-                        .channels
-                        .iter()
-                        .all(|chan| chan.flights.is_empty() && chan.notices.is_empty())
+                    state.channels.iter().all(|chan| {
+                        chan.flights.is_empty()
+                            && chan.notices.is_empty()
+                            && chan.withdrawing == 0
+                            && !chan.requests_open()
+                    })
                 })
                 .await;
         }
+    }
+
+    /// One line the interpreter sent about a request of an agent's on an
+    /// inbound channel -- received, ended, or answered after it ended --
+    /// which the children registry has recorded: what its backend is told.
+    pub(crate) fn request_line(&self, line: &Value) {
+        self.0.asked_line(line);
     }
 
     /// The session's drain has ended: give up on every send its backend has
@@ -1037,16 +1705,38 @@ impl Channels {
                 let unacknowledged = chan
                     .notices
                     .iter()
-                    .filter_map(|(delivery, _)| {
-                        chan.deliveries.get(delivery).map(|(id, _)| id.clone())
+                    .filter_map(|notice| match notice {
+                        Notice::Consumed(notice, _) => Some(notice.item.clone()),
+                        Notice::Settled(..) => None,
                     })
                     .collect();
+                let mut requests = std::mem::take(&mut chan.requests_after_close);
+                // Nothing ended these: the interpreter was gone first.
+                for (id, item) in chan.asked.iter().filter(|(id, _)| chan.open(**id)) {
+                    requests.push(ChannelRequestAtClose {
+                        request: AgentRequestId::new(*id),
+                        direction: Direction::Inbound,
+                        item: Some(item.clone()),
+                        end: RequestEnd::Terminated,
+                        acknowledged: false,
+                    });
+                }
+                for id in chan.outgoing.keys() {
+                    requests.push(ChannelRequestAtClose {
+                        request: AgentRequestId::new(*id),
+                        direction: Direction::Outbound,
+                        item: None,
+                        end: RequestEnd::Terminated,
+                        acknowledged: false,
+                    });
+                }
                 report.push(ChannelClose {
                     channel: chan.definition.name.clone(),
                     holder: chan.holder.clone(),
                     unread,
                     sends,
                     unacknowledged,
+                    requests,
                 });
             }
         });
@@ -1099,8 +1789,20 @@ impl Table {
                 None => tracing::warn!("ignored a consumed notice naming no delivery: {line}"),
             },
             "channel.send" => match line["id"].as_u64() {
-                Some(ask) => self.send(&agent, ask, &channel, line["body"].take()),
+                Some(ask) => self.send(&agent, Waiter::Send(ask), &channel, line["body"].take()),
                 None => tracing::warn!("ignored a send with no id: {line}"),
+            },
+            "channel.request" => match line["id"].as_u64() {
+                Some(id) => self.send(&agent, Waiter::Request(id), &channel, line["body"].take()),
+                None => tracing::warn!("ignored a request with no id: {line}"),
+            },
+            "channel.withdraw" => match line["request"].as_u64() {
+                Some(id) => self.withdraw(&channel, id),
+                None => tracing::warn!("ignored a withdrawal naming no request: {line}"),
+            },
+            "channel.ended" => match line["request"].as_u64() {
+                Some(id) => self.outbound_ended(&agent, &channel, id, &line),
+                None => tracing::warn!("ignored an end naming no request: {line}"),
             },
             _ => tracing::warn!("ignored a {kind} line, which nothing reads"),
         }
@@ -1114,6 +1816,10 @@ impl Table {
             Some(Payload::ChannelAttached {
                 channel: channel.to_string(),
                 kind: definition.kind.to_string(),
+                direction: definition
+                    .kind
+                    .direction()
+                    .map(|direction| direction.to_string()),
                 receives: definition.receives.to_string(),
                 sends: definition.sends.to_string(),
                 bound: definition.bound,
@@ -1161,15 +1867,28 @@ impl Table {
                 }
                 None => {}
             }
+            let unfit = match (chan.definition.kind, item.kind) {
+                (ChannelKind::Plain, ItemKind::Message)
+                | (ChannelKind::Request(Direction::Inbound), ItemKind::Request) => None,
+                (ChannelKind::Request(Direction::Outbound), kind) => Some(format!(
+                    "a {kind} on an outbound request channel, which carries its holder's \
+                     requests: settle each with `Channel::settle`"
+                )),
+                (ChannelKind::Plain, kind) => Some(format!(
+                    "a {kind} on a plain channel, which carries messages"
+                )),
+                (_, kind) => Some(format!(
+                    "a {kind} on an inbound request channel, which carries requests"
+                )),
+            };
             let refused = if let Some(reason) = &chan.closed {
                 DeliverError::Closed(reason.clone())
             } else if closing {
                 DeliverError::Closed("the session is closing".to_string())
-            } else if item.kind != ItemKind::Message {
-                DeliverError::Contract(vec![format!(
-                    "a {} on a plain channel, which carries messages",
-                    item.kind
-                )])
+            } else if let Some(unfit) = unfit {
+                DeliverError::Contract(vec![unfit])
+            } else if item.kind == ItemKind::Request && item.skill.is_some() {
+                DeliverError::Contract(vec!["a request names no skill".to_string()])
             } else {
                 chan.items.insert(item.item.clone(), Taken::Pushing);
                 return None;
@@ -1217,12 +1936,18 @@ impl Table {
                 body.len()
             )]));
         }
+        let asking = item.kind == ItemKind::Request;
         let mut line = json!({
             "t": "channel.msg",
             "channel": name,
+            "kind": item.kind.to_string(),
+            "item": item.item,
             "body": item.body,
             "sender": item.sender,
         });
+        if let Some(reference) = &item.reference {
+            line["reference"] = json!(reference);
+        }
         if let Some(skill) = &item.skill {
             line["skill"] = json!(skill);
         }
@@ -1230,13 +1955,17 @@ impl Table {
             line["correlation"] = json!(correlation);
         }
         // Recorded before the line is sent, under the lock it is sent under, so the holder's
-        // taking it -- which can reach the host ahead of this answer -- finds it.
+        // taking it -- which can reach the host ahead of this answer -- finds it. A request is
+        // recorded by its id, which the interpreter gives it, and evented as one of its holder's.
         let mut delivery = None;
         let answer = self
             .interpreter
             .post_item(line, &mut |id| {
                 let id = id.message();
                 delivery = Some(id);
+                if asking {
+                    return;
+                }
                 let holder = self.with(|state| {
                     let chan = state.find_mut(name)?;
                     chan.deliveries
@@ -1280,12 +2009,12 @@ impl Table {
         name: &str,
         id: &str,
         delivery: MessageId,
-        posted: Result<Result<usize, PostRefusal>, InterpreterError>,
+        posted: Result<Result<Posted, PostRefusal>, InterpreterError>,
     ) -> Result<Delivered, DeliverError> {
-        let refused = match posted {
-            Ok(Ok(_)) => None,
-            Ok(Err(refusal)) => Some(refused(name, refusal)),
-            Err(e) => Some(DeliverError::Closed(e.to_string())),
+        let (refused, request) = match posted {
+            Ok(Ok(posted)) => (None, posted.request),
+            Ok(Err(refusal)) => (Some(refused(name, refusal)), None),
+            Err(e) => (Some(DeliverError::Closed(e.to_string())), None),
         };
         let (holder, wakes) = self.with(|state| {
             let Some(chan) = state.find_mut(name) else {
@@ -1294,11 +2023,18 @@ impl Table {
             if refused.is_some() {
                 chan.items.remove(id);
                 chan.deliveries.remove(&delivery);
+            } else if let Some(request) = request {
+                // Its holder may have taken it, or it may have ended, before this answer came.
+                if chan.items.get(id) == Some(&Taken::Pushing) {
+                    chan.place(request, id, Position::Unread);
+                }
+                // The children registry wakes its holder, as it records the request.
+                return (chan.holder.clone(), false);
             } else {
                 chan.delivered += 1;
                 // The holder may have taken it before this answer came.
                 if let Some(taken @ Taken::Pushing) = chan.items.get_mut(id) {
-                    *taken = Taken::Queued(delivery, Position::Unread);
+                    *taken = Taken::Queued(DeliveryId::Message(delivery), Position::Unread);
                     chan.unread += 1;
                 }
             }
@@ -1318,7 +2054,12 @@ impl Table {
         if wakes && let (Some(holder), Some(rounds)) = (&holder, self.rounds.get()) {
             (rounds.wake)(holder);
         }
-        Ok(Delivered::Queued { delivery })
+        Ok(Delivered::Queued {
+            delivery: match request {
+                Some(request) => DeliveryId::Request(AgentRequestId::new(request)),
+                None => DeliveryId::Message(delivery),
+            },
+        })
     }
 
     /// Wait until no push of item `id` on `name` is under way.
@@ -1338,7 +2079,13 @@ impl Table {
     fn consumed(self: &Arc<Self>, agent: &str, channel: &str, delivery: MessageId) {
         let start = self.with(|state| {
             let chan = state.find_mut(channel)?;
-            let (id, _) = chan.deliveries.get(&delivery)?;
+            let (id, reference) = chan.deliveries.get(&delivery)?;
+            let notice = Consumed {
+                channel: channel.to_string(),
+                item: id.clone(),
+                delivery,
+                reference: reference.clone(),
+            };
             let taken = chan.items.get_mut(id)?;
             match taken {
                 Taken::Queued(_, position @ Position::Unread) => {
@@ -1346,13 +2093,12 @@ impl Table {
                     chan.unread -= 1;
                 }
                 // Taken before the push's answer came: never counted unread.
-                Taken::Pushing => *taken = Taken::Queued(delivery, Position::Consumed),
+                Taken::Pushing => {
+                    *taken = Taken::Queued(DeliveryId::Message(delivery), Position::Consumed);
+                }
                 Taken::Queued(..) => return None,
             }
-            chan.notices.push_back((delivery, agent.to_string()));
-            let start = !chan.notifying;
-            chan.notifying = true;
-            Some(start)
+            Some(chan.push_notice(Notice::Consumed(notice, agent.to_string())))
         });
         let Some(start) = start else {
             tracing::warn!("agent {agent} took {delivery} on {channel}, which it was never given");
@@ -1364,6 +2110,12 @@ impl Table {
             from: BACKEND_END.to_string(),
             to: Subject::agent(agent).to_string(),
         });
+        self.notifying(channel, start);
+    }
+
+    /// Start telling `channel`'s backend what it has not acknowledged, unless
+    /// a task is telling it already: `start` says, as the notice was queued.
+    fn notifying(self: &Arc<Self>, channel: &str, start: bool) {
         if start {
             let table = Arc::clone(self);
             let channel = channel.to_string();
@@ -1371,8 +2123,20 @@ impl Table {
         }
     }
 
-    /// Tell `channel`'s backend of each item received, in order, each until it
-    /// acknowledges, while the session lasts.
+    /// Queue `notice` for `channel`'s backend, and start telling it. Nothing
+    /// waits on a notice queued, only on the last told, so no waiter is woken.
+    fn queue(self: &Arc<Self>, channel: &str, notice: Notice) {
+        let start = self.changing(|state| {
+            let start = state
+                .find_mut(channel)
+                .is_some_and(|chan| chan.push_notice(notice));
+            (start, false)
+        });
+        self.notifying(channel, start);
+    }
+
+    /// Tell `channel`'s backend of each item received and each request ended,
+    /// in order, each until it acknowledges, while the session lasts.
     async fn notify(&self, channel: &str) {
         let mut wait = NOTICE_RETRY_FIRST;
         loop {
@@ -1382,33 +2146,34 @@ impl Table {
                 let Some(chan) = state.find_mut(channel) else {
                     return (None, false);
                 };
-                let Some((delivery, agent)) = chan.notices.front().cloned() else {
+                let Some(notice) = chan.notices.front() else {
                     chan.notifying = false;
                     return (None, true);
                 };
-                let (item, reference) = chan.deliveries.get(&delivery).cloned().unwrap_or_default();
-                let next = (
-                    delivery,
-                    agent,
-                    item,
-                    reference,
-                    Arc::clone(&chan.backend),
-                    chan.definition.call_timeout,
-                );
-                (Some(next), false)
+                (Some((notice.clone(), chan.calls())), false)
             });
-            let Some((delivery, agent, item, reference, backend, bound)) = next else {
+            let Some((notice, calls)) = next else {
                 return;
             };
-            let notice = Consumed {
-                channel: channel.to_string(),
-                item: item.clone(),
-                delivery,
-                reference,
+            let what = match &notice {
+                Notice::Consumed(notice, _) => format!("the notice of item {}", notice.item),
+                Notice::Settled(notice, _) => {
+                    format!("the notice of request {}'s end", notice.request)
+                }
             };
-            let told = tokio::select! {
-                told = tokio::time::timeout(bound, backend.consumed(notice)) => told,
-                () = self.stopping.cancelled() => {
+            let answered = self
+                .call(&calls, || match notice {
+                    Notice::Consumed(notice, _) => calls.backend.consumed(notice),
+                    Notice::Settled(notice, _) => calls.backend.settled(notice),
+                })
+                .await;
+            match answered {
+                Ok(()) => {
+                    self.acknowledged(channel);
+                    wait = NOTICE_RETRY_FIRST;
+                }
+                // The drain has ended: nothing more is told.
+                Err(_) if self.stopping.is_cancelled() => {
                     self.with(|state| {
                         if let Some(chan) = state.find_mut(channel) {
                             chan.notifying = false;
@@ -1416,37 +2181,10 @@ impl Table {
                     });
                     return;
                 }
-            };
-            match told {
-                Ok(Ok(())) => {
-                    self.with(|state| {
-                        if let Some(chan) = state.find_mut(channel) {
-                            chan.notices.pop_front();
-                            // Acknowledged: no notice, no report and no take reads it again.
-                            chan.deliveries.remove(&delivery);
-                            if let Some(Taken::Queued(_, position)) = chan.items.get_mut(&item) {
-                                *position = Position::Acknowledged;
-                            }
-                        }
-                    });
-                    // The receiver's, though another agent may hold the channel by now.
-                    self.events
-                        .for_agent(&agent)
-                        .emit(Payload::ChannelConsumed {
-                            channel: channel.to_string(),
-                            item,
-                            delivery,
-                        });
-                    wait = NOTICE_RETRY_FIRST;
-                }
-                failed => {
-                    let why = match failed {
-                        Ok(Err(e)) => e.to_string(),
-                        _ => format!("it did not answer within {bound:?}"),
-                    };
+                Err(why) => {
                     tracing::warn!(
-                        "channel {channel}'s backend did not take the notice of item {item}; \
-                         telling it again in {wait:?}: {why}"
+                        "channel {channel}'s backend did not take {what}; telling it again in \
+                         {wait:?}: {why}"
                     );
                     tokio::select! {
                         () = tokio::time::sleep(wait) => {}
@@ -1458,10 +2196,65 @@ impl Table {
         }
     }
 
-    /// `agent`'s code sent `body` on `channel`, waiting on the answer under
-    /// `ask`: given an id, recorded with the round it has open, and handed to
-    /// the backend, or refused.
-    fn send(self: &Arc<Self>, agent: &str, ask: u64, channel: &str, body: Value) {
+    /// `channel`'s backend acknowledged the first of its notices: nothing
+    /// reads it again, and it is evented under the agent it was of.
+    fn acknowledged(&self, channel: &str) {
+        let told = self.with(|state| {
+            let chan = state.find_mut(channel)?;
+            let told = chan.notices.pop_front()?;
+            match &told {
+                Notice::Consumed(notice, _) => {
+                    // Acknowledged: no notice, no report and no take reads it again.
+                    chan.deliveries.remove(&notice.delivery);
+                    if let Some(Taken::Queued(_, position)) = chan.items.get_mut(&notice.item) {
+                        *position = Position::Acknowledged;
+                    }
+                }
+                Notice::Settled(notice, _) => {
+                    let request = notice.request.get();
+                    if let Some(at) = chan.at_close(request) {
+                        at.acknowledged = true;
+                    }
+                    // An end, and not a refused answer after it: the request is done with.
+                    if !matches!(notice.outcome, Settlement::Refused { .. })
+                        && let Some(item) = chan.asked.remove(&request)
+                        && let Some(Taken::Queued(_, position)) = chan.items.get_mut(&item)
+                    {
+                        *position = Position::Acknowledged;
+                    }
+                }
+            }
+            Some(told)
+        });
+        match told {
+            // The receiver's, though another agent may hold the channel by now.
+            Some(Notice::Consumed(notice, agent)) => {
+                self.events
+                    .for_agent(&agent)
+                    .emit(Payload::ChannelConsumed {
+                        channel: channel.to_string(),
+                        item: notice.item,
+                        delivery: notice.delivery,
+                    });
+            }
+            Some(Notice::Settled(notice, agent)) => {
+                self.events_of(agent.as_deref())
+                    .emit(Payload::ChannelSettled {
+                        channel: channel.to_string(),
+                        request: notice.request,
+                        item: notice.item,
+                        refused: matches!(notice.outcome, Settlement::Refused { .. }),
+                    });
+            }
+            None => {}
+        }
+    }
+
+    /// `agent`'s code sent `body` on `channel` -- a message, its `send` waiting
+    /// on the answer, or a request, by its id -- as `waiter` says: given an id,
+    /// recorded with the round it has open, and handed to the backend, or
+    /// refused.
+    fn send(self: &Arc<Self>, agent: &str, waiter: Waiter, channel: &str, body: Value) {
         let item = self.interpreter.mint().message();
         // Read before the channels' state is locked, as `push` reads the close.
         let round = self.rounds.get().and_then(|rounds| (rounds.round)(agent));
@@ -1492,6 +2285,12 @@ impl Table {
                     &format!("channel {channel:?} is not held by agent {agent:?}"),
                 ));
             }
+            if chan.definition.kind != waiter.carried_on() {
+                return Err(Ended::refused(
+                    "refused",
+                    &format!("channel {channel:?} carries no such item"),
+                ));
+            }
             // A send between rounds belongs to none, and no round's facts read it.
             if let Some(round) = round {
                 chan.sent
@@ -1515,34 +2314,52 @@ impl Table {
                     unsent: unsent.clone(),
                 },
             );
-            Ok((
-                Arc::clone(&chan.backend),
-                Arc::clone(&chan.permits),
-                chan.definition.call_timeout,
-                chan.definition.sends.to_string(),
-            ))
+            if let Some(id) = waiter.request() {
+                chan.outgoing.insert(
+                    id,
+                    Outgoing {
+                        agent: agent.to_string(),
+                        item,
+                        reference: None,
+                        state: Out::Sending { withdraw: false },
+                    },
+                );
+            }
+            Ok((chan.calls(), chan.definition.sends.to_string()))
         });
-        self.events
-            .for_agent(agent)
-            .emit_with(|| Payload::MessageSent {
+        let events = self.events.for_agent(agent);
+        match waiter {
+            Waiter::Send(_) => events.emit_with(|| Payload::MessageSent {
                 message: item,
                 channel: channel.to_string(),
                 from: Subject::agent(agent).to_string(),
                 to: BACKEND_END.to_string(),
                 sender: None,
                 body: text,
-            });
-        let (backend, permits, bound, body_type) = match decided {
+            }),
+            Waiter::Request(id) => events.emit_with(|| Payload::ChannelRequestSent {
+                channel: channel.to_string(),
+                request: AgentRequestId::new(id),
+                item,
+                body: text,
+            }),
+        }
+        let (calls, body_type) = match decided {
             Ok(decided) => decided,
             Err(refused) => {
-                self.finish(agent, ask, channel, item, refused, false);
+                self.finish(agent, waiter, channel, item, refused, false);
                 return;
             }
         };
+        let request = waiter.request().map(AgentRequestId::new);
         let outbound = Outbound {
             channel: channel.to_string(),
             item,
-            kind: ItemKind::Message,
+            kind: match request {
+                None => ItemKind::Message,
+                Some(_) => ItemKind::Request,
+            },
+            request,
             body_type,
             sender: agent.to_string(),
             correlation: None,
@@ -1552,31 +2369,23 @@ impl Table {
         let table = Arc::clone(self);
         let (agent, channel) = (agent.to_string(), channel.to_string());
         tokio::spawn(async move {
-            let ended = table
-                .handed(&backend, &permits, &unsent, bound, outbound)
-                .await;
-            table.finish(&agent, ask, &channel, item, ended, true);
+            let ended = table.handed(&calls, &unsent, outbound).await;
+            table.finish(&agent, waiter, &channel, item, ended, true);
         });
     }
 
-    /// Hand `outbound` to `backend` once one of `permits` is free, unless the
-    /// session closes, or the channel closes or its sender gives it up --
-    /// `unsent` -- first, and say what became of it.
-    async fn handed(
-        &self,
-        backend: &Arc<dyn ChannelBackend>,
-        permits: &Arc<Semaphore>,
-        unsent: &CancellationToken,
-        bound: Duration,
-        outbound: Outbound,
-    ) -> Ended {
+    /// Hand `outbound` to its backend once one of the permits `calls` holds
+    /// is free, unless the session closes, or the channel closes or its
+    /// sender gives it up -- `unsent` -- first, and say what became of it.
+    async fn handed(&self, calls: &Calls, unsent: &CancellationToken, outbound: Outbound) -> Ended {
+        let bound = calls.bound;
         let permit = tokio::select! {
             biased;
             () = self.closing.cancelled() => {
                 return Ended::refused("closing", "the session closed before it was sent");
             }
             () = unsent.cancelled() => return self.unsent(&outbound.channel),
-            permit = Arc::clone(permits).acquire_owned() => permit.ok(),
+            permit = calls.permits.acquire() => permit.ok(),
         };
         let Some(_permit) = permit else {
             return Ended::refused("closing", "the session closed before it was sent");
@@ -1587,7 +2396,7 @@ impl Table {
             return self.unsent(&outbound.channel);
         }
         let answered = tokio::select! {
-            answered = tokio::time::timeout(bound, backend.send(outbound)) => answered,
+            answered = tokio::time::timeout(bound, calls.backend.send(outbound)) => answered,
             () = self.stopping.cancelled() => {
                 return Ended::uncertain("the session's drain ended before the backend answered");
             }
@@ -1628,26 +2437,28 @@ impl Table {
         }
     }
 
-    /// The send of `item` on `channel`, which `agent` waits on under `ask`, has
-    /// `ended`: recorded in the report once admission has closed, evented, and
-    /// answered. One `in_flight` that the report gave up on already is left as
-    /// the report says it.
+    /// The send of `item` on `channel`, which `agent` -- or its request --
+    /// waits on as `waiter` says, has `ended`: recorded in the report once
+    /// admission has closed, evented, and answered. One `in_flight` that the
+    /// report gave up on already is left as the report says it.
     fn finish(
-        &self,
+        self: &Arc<Self>,
         agent: &str,
-        ask: u64,
+        waiter: Waiter,
         channel: &str,
         item: MessageId,
         ended: Ended,
         in_flight: bool,
     ) {
         let closed = self.lifecycle.closed().is_some();
-        let live = self.with(|state| {
+        // What a request's send leaves to do is decided in the step that ends its flight, so the
+        // drain never finds the flight gone and what its backend is owed not yet counted.
+        let next = self.with(|state| {
             let Some(chan) = state.find_mut(channel) else {
-                return !in_flight;
+                return (!in_flight).then_some((Sent::Told, None));
             };
             if in_flight && chan.flights.remove(&item).is_none() {
-                return false;
+                return None;
             }
             if closed {
                 chan.after_close.push(SendAtClose {
@@ -1657,11 +2468,14 @@ impl Table {
                     reason: ended.reason.clone(),
                 });
             }
-            true
+            Some(match waiter.request() {
+                Some(id) => chan.request_sent(id, ended.wire, (item, ended.reference.clone())),
+                None => (Sent::Told, None),
+            })
         });
-        if !live {
+        let Some((sent, giving)) = next else {
             return;
-        }
+        };
         let reason = ended.reason.unwrap_or_default();
         self.events
             .for_agent(agent)
@@ -1672,14 +2486,434 @@ impl Table {
                 reason: (!reason.is_empty()).then(|| reason.clone()),
                 reference: ended.reference,
             });
-        (self.to_interpreter)(json!({
-            "t": "channel.sent",
-            "agent": agent,
-            "id": ask,
-            "outcome": ended.wire,
-            "reason": reason,
-            "item": item,
-        }));
+        match (waiter, sent) {
+            (Waiter::Send(ask), _) => (self.to_interpreter)(json!({
+                "t": "channel.sent",
+                "agent": agent,
+                "id": ask,
+                "outcome": ended.wire,
+                "reason": reason,
+                "item": item,
+            })),
+            (Waiter::Request(id), Sent::Told) => self.tell(
+                "channel.settle",
+                agent,
+                id,
+                json!({"outcome": ended.wire, "message": reason}),
+            ),
+            (Waiter::Request(id), Sent::Moved(state)) => {
+                self.tell("channel.requested", agent, id, json!({"state": state}));
+            }
+            (Waiter::Request(_), Sent::Ended) => {}
+        }
+        if let Some(giving) = giving {
+            self.give(channel, agent, giving);
+        }
+    }
+
+    /// Begin giving `channel`'s backend what `giving` says, for a request of
+    /// `agent`'s.
+    fn give(self: &Arc<Self>, channel: &str, agent: &str, giving: Giving) {
+        match giving {
+            Giving::Withdrawal(asking) => self.withdrawal(asking, agent),
+            Giving::Notice(start) => self.notifying(channel, start),
+        }
+    }
+
+    /// The holder's code cancelled its outbound request `id` on `channel`: its
+    /// backend is asked to withdraw it, once its send has been answered.
+    fn withdraw(self: &Arc<Self>, channel: &str, id: u64) {
+        // No waiter reads an outstanding request's state, and one more withdrawal to drain can
+        // only keep `drained` waiting.
+        let asked = self.changing(|state| {
+            let asked = state
+                .find_mut(channel)
+                .and_then(|chan| chan.cancel_outgoing(id));
+            (asked, false)
+        });
+        if let Some((asking, agent)) = asked {
+            self.withdrawal(asking, &agent);
+        }
+    }
+
+    /// Ask the backend `asking` names to withdraw its request, `agent`'s,
+    /// counted toward the drain already. One its holder cancelled settles on
+    /// the answer, or reads uncertain without one; one released is told only,
+    /// the request having ended.
+    fn withdrawal(self: &Arc<Self>, asking: Asking, agent: &str) {
+        let table = Arc::clone(self);
+        let agent = agent.to_string();
+        tokio::spawn(async move {
+            let Asking { withdrawal, calls } = asking;
+            let channel = withdrawal.channel.clone();
+            let (id, end) = (withdrawal.request.get(), withdrawal.end);
+            let answer = table
+                .call(&calls, || calls.backend.withdrawn(withdrawal))
+                .await;
+            let outstanding = table.with(|state| {
+                let Some(chan) = state.find_mut(&channel) else {
+                    return false;
+                };
+                chan.withdrawing -= 1;
+                // The answer its close row waits on, when the request ended released or closed:
+                // this withdrawal, or its holder's cancel's, standing for that end's.
+                let released = chan.finished.get(&id).is_some_and(|finished| {
+                    matches!(finished.end, RequestEnd::Released | RequestEnd::Closed)
+                });
+                if answer.is_ok()
+                    && released
+                    && let Some(at) = chan.at_close(id)
+                {
+                    at.acknowledged = true;
+                }
+                let Some(outgoing) = chan.outgoing.get_mut(&id) else {
+                    return false;
+                };
+                if outgoing.state == Out::Withdrawing {
+                    outgoing.state = Out::Withdrawn {
+                        answered: answer.is_ok(),
+                    };
+                }
+                true
+            });
+            match (end, answer) {
+                (WithdrawEnd::Released, Ok(_)) => {}
+                (WithdrawEnd::Released, Err(why)) => tracing::warn!(
+                    "channel {channel}'s backend did not answer the withdrawal of request {id}, \
+                     whose holder is gone: {why}"
+                ),
+                // Ended meanwhile -- released, closed, settled -- so the answer changes nothing.
+                (_, Ok(_)) if !outstanding => {}
+                (_, Ok(answer)) => {
+                    let settle = match answer {
+                        WithdrawAnswer::Withdrawn => {
+                            Settle::Cancel("its far end withdrew it".to_string())
+                        }
+                        WithdrawAnswer::Replied(value) => Settle::Reply(value),
+                        WithdrawAnswer::Failed(message) => Settle::Fail(message),
+                    };
+                    let mut line = settle_line(settle);
+                    line["by"] = json!("backend");
+                    table.tell("channel.settle", &agent, id, line);
+                }
+                (_, Err(why)) => {
+                    tracing::warn!(
+                        "channel {channel}'s backend did not answer the withdrawal of request \
+                         {id}, which is uncertain until it is resolved: {why}"
+                    );
+                    if outstanding {
+                        table.tell(
+                            "channel.requested",
+                            &agent,
+                            id,
+                            json!({"state": "uncertain"}),
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// `agent`'s outbound request `id` on `channel` ended as `line` says:
+    /// recorded, evented, and its backend told what it did not give itself --
+    /// a reply that did not fit, the channel's close -- or asked to withdraw it,
+    /// when its holder was released or the session closed.
+    fn outbound_ended(self: &Arc<Self>, agent: &str, channel: &str, id: u64, line: &Value) {
+        let end = RequestEnd::named(line["outcome"].as_str().unwrap_or_default());
+        let problems: Vec<String> = line["problems"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|problem| problem.as_str().map(str::to_string))
+            .collect();
+        let message = said_why(line);
+        let closed = self.lifecycle.closed().is_some();
+        let request = AgentRequestId::new(id);
+        let owed = if matches!(end, RequestEnd::Released | RequestEnd::Closed) {
+            Some(Owed::Withdrawn)
+        } else if !problems.is_empty() {
+            Some(Owed::Told(Settlement::Failed(message.clone())))
+        } else if end == RequestEnd::Cancelled && line["by"].as_str() == Some("peer") {
+            Some(Owed::Told(Settlement::Cancelled {
+                by: CancelledBy::Peer,
+                reason: message.clone(),
+            }))
+        } else {
+            None
+        };
+        // What its backend is owed is begun in the step that ends it, so the drain never finds
+        // it ended and that not yet counted.
+        let given = self.with(|state| {
+            let chan = state.find_mut(channel)?;
+            // Owed nothing by a backend never handed it; by one whose send is unanswered, only
+            // once it is answered, so the backend has the request before it hears its end.
+            let state = chan.outgoing.get(&id).map(|out| out.state);
+            let (owed, acknowledged) = match (owed, state) {
+                (_, None) => (None, true),
+                // Asked to withdraw it already, by its holder's cancel: that withdrawal stands for
+                // this one, and its answer is the one the close waits on.
+                (Some(Owed::Withdrawn), Some(Out::Withdrawing)) => (None, false),
+                (Some(Owed::Withdrawn), Some(Out::Withdrawn { answered })) => (None, answered),
+                (owed, Some(_)) => {
+                    let acknowledged = owed.is_none();
+                    (owed, acknowledged)
+                }
+            };
+            let at_close = closed.then_some(ChannelRequestAtClose {
+                request,
+                direction: Direction::Outbound,
+                item: None,
+                end,
+                acknowledged,
+            });
+            let (now, later) = match state {
+                Some(Out::Sending { .. }) => (None, owed),
+                _ => (owed, None),
+            };
+            let finished = Finished {
+                end,
+                agent: Some(agent.to_string()),
+                settle: line["settle"].as_u64(),
+                problems,
+                owed: later,
+            };
+            if !chan.end_request(id, finished, at_close) {
+                return None;
+            }
+            let outgoing = chan.outgoing.remove(&id);
+            Some(
+                outgoing
+                    .zip(now)
+                    .map(|(out, owed)| chan.owe(id, agent, (out.item, out.reference), owed)),
+            )
+        });
+        let Some(giving) = given else {
+            return;
+        };
+        self.events
+            .for_agent(agent)
+            .emit(Payload::ChannelRequestEnded {
+                channel: channel.to_string(),
+                request,
+                outcome: end,
+                reason: (!message.is_empty()).then_some(message),
+            });
+        if let Some(giving) = giving {
+            self.give(channel, agent, giving);
+        }
+    }
+
+    /// A line about an inbound request -- received, ended, or answered after
+    /// it ended -- naming its channel, the owner's id for it and the backend's
+    /// reference: recorded, and its backend told each end.
+    fn asked_line(self: &Arc<Self>, line: &Value) {
+        let external = &line["external"];
+        let (Some(channel), Some(item), Some(id)) = (
+            external["channel"].as_str(),
+            external["item"].as_str(),
+            line["request"].as_u64(),
+        ) else {
+            return;
+        };
+        let agent = line["agent"]
+            .as_str()
+            .filter(|agent| !agent.is_empty())
+            .map(str::to_string);
+        let request = AgentRequestId::new(id);
+        let notice = |outcome| Settled {
+            channel: channel.to_string(),
+            request,
+            item: Some(item.to_string()),
+            reference: external["reference"].as_str().map(str::to_string),
+            outcome,
+        };
+        match line["t"].as_str().unwrap_or_default() {
+            "agent.received" => self.changing(|state| match state.find_mut(channel) {
+                // Received is as open as unread: no waiter is woken for it.
+                Some(chan) if !chan.finished.contains_key(&id) => {
+                    chan.place(id, item, Position::Consumed);
+                    ((), false)
+                }
+                _ => ((), false),
+            }),
+            "agent.ended" => {
+                let end = RequestEnd::named(line["outcome"].as_str().unwrap_or_default());
+                let outcome = match end {
+                    RequestEnd::Accepted => Settlement::Replied(
+                        serde_json::from_str(line["json"].as_str().unwrap_or("null"))
+                            .unwrap_or(Value::Null),
+                    ),
+                    RequestEnd::Rejected => Settlement::Failed(text_of(&line["error"])),
+                    RequestEnd::Cancelled => Settlement::Cancelled {
+                        by: match line["by"].as_str() {
+                            Some("owner") => CancelledBy::Owner,
+                            Some("peer") => CancelledBy::Peer,
+                            _ => CancelledBy::Host,
+                        },
+                        reason: text_of(&line["message"]),
+                    },
+                    RequestEnd::Budget | RequestEnd::Limit => Settlement::Cancelled {
+                        by: CancelledBy::Host,
+                        reason: said_why(line),
+                    },
+                    RequestEnd::Released => Settlement::Released,
+                    RequestEnd::Closed | RequestEnd::Terminated => Settlement::Closed,
+                    _ => Settlement::Failed(said_why(line)),
+                };
+                let closed = self.lifecycle.closed().is_some();
+                let start = self.with(|state| {
+                    let chan = state.find_mut(channel)?;
+                    let finished = Finished {
+                        end,
+                        agent: agent.clone(),
+                        settle: None,
+                        problems: Vec::new(),
+                        owed: None,
+                    };
+                    let at_close = closed.then(|| ChannelRequestAtClose {
+                        request,
+                        direction: Direction::Inbound,
+                        item: Some(item.to_string()),
+                        end,
+                        acknowledged: false,
+                    });
+                    // Told again, for a settle sent again: it ended once.
+                    if !chan.end_request(id, finished, at_close) {
+                        return None;
+                    }
+                    chan.place(id, item, Position::Settled);
+                    // Queued in the step that ends it, so the drain never finds it ended and its
+                    // notice not yet queued.
+                    Some(chan.push_notice(Notice::Settled(notice(outcome), agent)))
+                });
+                if let Some(start) = start {
+                    self.notifying(channel, start);
+                }
+            }
+            "agent.refused" => {
+                let ended = RequestEnd::named(line["ended"].as_str().unwrap_or_default());
+                let notice = notice(Settlement::Refused { ended });
+                self.queue(channel, Notice::Settled(notice, agent));
+            }
+            _ => {}
+        }
+    }
+
+    /// The owner cancelled inbound request `id` on `name`.
+    fn cancel(&self, name: &str, id: AgentRequestId) -> Result<(), SettleError> {
+        {
+            let state = self.state.borrow();
+            let chan = state.find(name).ok_or(SettleError::Unknown(id))?;
+            if let Some(finished) = chan.finished.get(&id.get()) {
+                return Err(SettleError::Ended(finished.end));
+            }
+            if !chan.open(id.get()) {
+                return Err(SettleError::Unknown(id));
+            }
+        }
+        (self.to_interpreter)(json!({"t": "channel.cancel", "channel": name, "request": id}));
+        Ok(())
+    }
+
+    /// Begin the owner's `settle` of outbound request `id` on `name`: the
+    /// settle's number, which its end names if this settle made it.
+    fn settle(&self, name: &str, id: AgentRequestId, settle: Settle) -> Result<u64, SettleError> {
+        let number = self
+            .settles
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        // Whose it is, or how it ended, or neither.
+        let found = {
+            let state = self.state.borrow();
+            state.find(name).and_then(|chan| {
+                if let Some(finished) = chan.finished.get(&id.get()) {
+                    return Some(Err((finished.end, finished.agent.clone())));
+                }
+                Some(Ok(chan.outgoing.get(&id.get())?.agent.clone()))
+            })
+        };
+        let agent = match found {
+            Some(Ok(agent)) => agent,
+            Some(Err((end, agent))) => {
+                self.refused_settle(name, id, end, agent.as_deref());
+                return Err(SettleError::Ended(end));
+            }
+            None => return Err(SettleError::Unknown(id)),
+        };
+        let mut line = settle_line(settle);
+        line["by"] = json!("owner");
+        line["settle"] = json!(number);
+        self.tell("channel.settle", &agent, id.get(), line);
+        Ok(number)
+    }
+
+    /// The answer to the owner's settle `number` of outbound request `id` on
+    /// `name`, once the request has ended.
+    async fn settled_by(
+        &self,
+        name: &str,
+        id: AgentRequestId,
+        number: u64,
+    ) -> Result<(), SettleError> {
+        let mut state = self.state.subscribe();
+        let finished = tokio::select! {
+            found = state.wait_for(|state| {
+                state.find(name).is_some_and(|chan| chan.finished.contains_key(&id.get()))
+            }) => found.ok().and_then(|state| state.find(name)?.finished.get(&id.get()).cloned()),
+            () = self.stopping.cancelled() => None,
+        };
+        let finished = finished.ok_or(SettleError::Gone)?;
+        if finished.settle != Some(number) {
+            self.refused_settle(name, id, finished.end, finished.agent.as_deref());
+            return Err(SettleError::Ended(finished.end));
+        }
+        match finished.problems {
+            problems if problems.is_empty() => Ok(()),
+            problems => Err(SettleError::Rejected(problems)),
+        }
+    }
+
+    /// The owner's settle of request `id` on `name`, `agent`'s, came after it
+    /// ended `end`, and was refused.
+    fn refused_settle(&self, name: &str, id: AgentRequestId, end: RequestEnd, agent: Option<&str>) {
+        self.events_of(agent).emit(Payload::ChannelRequestRefused {
+            channel: name.to_string(),
+            request: id,
+            ended: end,
+        });
+    }
+
+    /// Call a channel's backend as `call` does, once one of the permits
+    /// `calls` holds is free, within its call timeout and the drain: its
+    /// answer, or why there is none.
+    async fn call<'a, T>(
+        &self,
+        calls: &Calls,
+        call: impl FnOnce() -> BackendFuture<'a, io::Result<T>>,
+    ) -> Result<T, String> {
+        const DRAINED: &str = "the session's drain ended before it answered";
+        let permit = tokio::select! {
+            permit = calls.permits.acquire() => permit,
+            () = self.stopping.cancelled() => return Err(DRAINED.to_string()),
+        };
+        // Held while the call runs; the permits are never closed.
+        let _permit = permit.map_err(|e| e.to_string())?;
+        tokio::select! {
+            answer = tokio::time::timeout(calls.bound, call()) => match answer {
+                Ok(Ok(answer)) => Ok(answer),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err(format!("it did not answer within {:?}", calls.bound)),
+            },
+            () = self.stopping.cancelled() => Err(DRAINED.to_string()),
+        }
+    }
+
+    /// Tell `agent`'s kernel `kind` of request `id`, with `line`'s fields.
+    fn tell(&self, kind: &str, agent: &str, id: u64, mut line: Value) {
+        line["t"] = json!(kind);
+        line["agent"] = json!(agent);
+        line["id"] = json!(id);
+        (self.to_interpreter)(line);
     }
 
     /// The owner closed `name`, saying `reason`.
@@ -1705,6 +2939,44 @@ impl Table {
                 reason: reason.to_string(),
             });
     }
+}
+
+/// What waits on a send's answer: a message's `send`, under the interpreter's
+/// ask; or an outbound request, by its id.
+#[derive(Debug, Clone, Copy)]
+enum Waiter {
+    Send(u64),
+    Request(u64),
+}
+
+impl Waiter {
+    /// The request's id, for a request.
+    fn request(self) -> Option<u64> {
+        match self {
+            Self::Send(_) => None,
+            Self::Request(id) => Some(id),
+        }
+    }
+
+    /// The kind of channel it is sent on.
+    fn carried_on(self) -> ChannelKind {
+        match self {
+            Self::Send(_) => ChannelKind::Plain,
+            Self::Request(_) => ChannelKind::Request(Direction::Outbound),
+        }
+    }
+}
+
+/// What a send's answer leaves its waiter to be told.
+enum Sent {
+    /// How the send ended: a message's `send` is told whatever it was, and a
+    /// request's holder that it ended unsent.
+    Told,
+    /// The request waits on its backend, or is uncertain, as the state named
+    /// says.
+    Moved(&'static str),
+    /// The request had ended: nothing.
+    Ended,
 }
 
 /// What became of a send at its backend.
@@ -1794,6 +3066,30 @@ fn unsendable(
             "channel {channel:?} sends {path}, whose schema the host does not have"
         )),
         _ => None,
+    }
+}
+
+/// The text of `value`, a field of a line, or nothing.
+fn text_of(value: &Value) -> String {
+    value.as_str().unwrap_or_default().to_string()
+}
+
+/// Why a request ended, as its end's line says it: its message, else its
+/// error's text.
+fn said_why(line: &Value) -> String {
+    match text_of(&line["message"]) {
+        message if message.is_empty() => text_of(&line["error"]),
+        message => message,
+    }
+}
+
+/// The fields of a `channel.settle` line ending an outbound request as
+/// `settle` says.
+fn settle_line(settle: Settle) -> Value {
+    match settle {
+        Settle::Reply(value) => json!({"outcome": "replied", "value": value}),
+        Settle::Fail(message) => json!({"outcome": "failed", "message": message}),
+        Settle::Cancel(reason) => json!({"outcome": "cancelled", "message": reason}),
     }
 }
 

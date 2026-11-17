@@ -891,6 +891,16 @@ impl Inner {
             self.to_owner(line.clone());
         }
         let kind = line["t"].as_str().unwrap_or_default().to_string();
+        // A step of a request on an external channel, which its backend hears of too: whether or
+        // not an agent held it, and so whether or not it is recorded here.
+        if line["external"].is_object()
+            && matches!(
+                kind.as_str(),
+                "agent.received" | "agent.ended" | "agent.refused"
+            )
+        {
+            self.settings.channels.request_line(&line);
+        }
         match kind.as_str() {
             "agent.spawn" | "agent.release" => {
                 let (inner, parent) = (Arc::clone(self), agent.to_string());
@@ -1535,10 +1545,15 @@ impl Inner {
                 submission,
             },
         );
+        // An external channel's request names its sender as the backend gave it.
+        let sender = match line["external"].is_object() {
+            true => text(&line["sender"]),
+            false => Subject::agent(sender).to_string(),
+        };
         self.events_of(&child).emit(Payload::AgentRequestSent {
             request: AgentRequestId::new(id),
             channel,
-            sender: Subject::agent(sender).to_string(),
+            sender,
             body: line["body"].as_str().unwrap_or_default().to_string(),
             attempts_max: line["attempts"].as_u64().unwrap_or_default() as u32,
         });
@@ -1581,7 +1596,7 @@ impl Inner {
             .unwrap_or_default();
         self.events_of(&child).emit(Payload::AgentCallEnded {
             request: AgentRequestId::new(id),
-            outcome: outcome(line["outcome"].as_str().unwrap_or_default()),
+            outcome: RequestEnd::named(line["outcome"].as_str().unwrap_or_default()),
             usage: self.ledger.total(&attempts),
             invocation: line["invocation"].as_u64().map(InvocationId::new),
             value: line["value"].as_str().map(str::to_string),
@@ -1789,7 +1804,7 @@ impl Inner {
         let Some(id) = line["request"].as_u64() else {
             return;
         };
-        let outcome = outcome(line["outcome"].as_str().unwrap_or_default());
+        let outcome = RequestEnd::named(line["outcome"].as_str().unwrap_or_default());
         let (child, attempts, rounds) = {
             let mut state = self.state();
             let Some(record) = state.requests.get_mut(&id) else {
@@ -1810,12 +1825,21 @@ impl Inner {
         let events = self.events_of(&child);
         let request = AgentRequestId::new(id);
         match outcome {
-            // Only the host's own cancel says why.
-            RequestEnd::Cancelled => events.emit(Payload::AgentRequestCancelled {
-                request,
-                received: line["received"].as_bool().unwrap_or_default(),
-                reason: line["message"].as_str().map(str::to_string),
-            }),
+            // Only the host's own cancel, and a channel's close, says why.
+            RequestEnd::Cancelled => {
+                let reason = line["message"].as_str().map(str::to_string);
+                let by = match line["by"].as_str() {
+                    Some(by) => by,
+                    None if reason.is_none() => "sender",
+                    None => "host",
+                };
+                events.emit(Payload::AgentRequestCancelled {
+                    request,
+                    received: line["received"].as_bool().unwrap_or_default(),
+                    by: by.to_string(),
+                    reason,
+                })
+            }
             RequestEnd::Failed => events.emit(Payload::AgentRequestFailed {
                 request,
                 message: line["message"].as_str().unwrap_or_default().to_string(),
@@ -1840,7 +1864,7 @@ impl Inner {
         };
         self.events_of(&child).emit(Payload::AgentRequestRefused {
             request: AgentRequestId::new(id),
-            ended: outcome(line["ended"].as_str().unwrap_or_default()),
+            ended: RequestEnd::named(line["ended"].as_str().unwrap_or_default()),
         });
     }
 
@@ -2479,21 +2503,6 @@ pub(crate) fn channel_texts(channels: &Value) -> Vec<ChannelText> {
             reply: text(&channel["reply"]),
         })
         .collect()
-}
-
-/// How a request ended, as the interpreter names it.
-fn outcome(name: &str) -> RequestEnd {
-    match name {
-        "accepted" => RequestEnd::Accepted,
-        "rejected" => RequestEnd::Rejected,
-        "failed" => RequestEnd::Failed,
-        "cancelled" => RequestEnd::Cancelled,
-        "released" => RequestEnd::Released,
-        "budget" => RequestEnd::Budget,
-        "limit" => RequestEnd::Limit,
-        "closed" => RequestEnd::Closed,
-        _ => RequestEnd::Terminated,
-    }
 }
 
 /// A manifest the interpreter sent: each input's name, type and preview.

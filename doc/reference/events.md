@@ -273,19 +273,27 @@ three times for one call before the rejection ends it.
     child, channel, outcome}`: `channel` is `null` for a submission, and `outcome` is how it
     ended -- `closed` by the close, or `terminated` when the interpreter died first.
   - `channels`: each external channel the session declared, as `{channel, holder, unread, sends,
-    unacknowledged}`: the agent holding it at the close, or `null`; the items left unread in its
-    window, by the owner's item id, none of them consumed by the close; each send whose outcome
-    came after the close, as `{item, agent, outcome, reason}`, from its `channel.item.outcome` or
-    `uncertain` when the drain ended first; and each item received whose consumed notice the
-    backend had not acknowledged. One send ended `uncertain` makes the verdict
-    `stopped_with_unknown`.
+    unacknowledged, requests}`: the agent holding it at the close, or `null`; the items left
+    unread in its window, by the owner's item id, none of them consumed by the close; each send
+    whose outcome came after the close, as `{item, agent, outcome, reason}`, from its
+    `channel.item.outcome` or `uncertain` when the drain ended first; each item received whose
+    consumed notice the backend had not acknowledged; and each request on it that ended after
+    the close, or that nothing ended, as `{request, direction, item, end, acknowledged}`:
+    `direction`, `inbound` or `outbound`; `item`, the owner's id for an inbound one, else
+    `null`; `end`, how it ended -- `closed` by the close, or `terminated` when the interpreter
+    died first; and `acknowledged`, whether its backend answered what it was told of the end --
+    an inbound request's settlement notice, an outbound one's withdrawal. One send ended
+    `uncertain` makes the verdict `stopped_with_unknown`.
   - `verdict`: `clean`, `stopped_with_unknown`, or `not_proven_stopped`.
 - `channel.attached` -- an external channel the session's owner declared was attached to the
   subject's kernel, which holds it from then on as `runtime.channels[channel]`: `channel`;
-  `kind`, `plain`; `receives` and `sends`, what crosses it each way -- `str`, `JSON`, a type's
-  `module:Name`, or `nothing`; `bound`, how many items its window holds unread; and `wake`, what
-  an arrival does -- `wake`, `announce` or `silent`. The primary takes every channel no dict
-  names as its kernel is built; any other agent those its facility dict names.
+  `kind`, `plain` or `request`; `direction`, a request channel's -- `inbound`, the backend
+  requests and the subject replies, or `outbound`, the subject requests -- else `null`;
+  `receives` and `sends`, what crosses it each way as the subject sees it -- `str`, `JSON`, a
+  type's `module:Name`, or `nothing`; `bound`, how many items its window holds unread, or for a
+  request channel how many requests may be open on it; and `wake`, what an arrival does --
+  `wake`, `announce` or `silent`. The primary takes every channel no dict names as its kernel is
+  built; any other agent those its facility dict names.
 - `binding.refused` -- a binding a repository's config declared did not start, and the session
   runs without it: `binding`, its name; `declared_in`, the config file, or `null`; and
   `reason`, which says whether the operator did not approve the declaration, nobody could be
@@ -564,7 +572,11 @@ between a child's failed rounds is in that read and has no event of its own.
 - `agent.request.sent` -- a request was made of the subject, a child: `request`; `channel`, or
   `null` for a submission; `sender`, the subject of the agent that made it, or `owner` for the
   program's; `body`, a preview of what was sent, a submission's inputs by name; and
-  `attempts_max`, how many answers that fail their check it takes before it ends rejected.
+  `attempts_max`, how many answers that fail their check it takes before it ends rejected. A
+  request the session's owner pushed on an inbound request channel is a request of the channel's
+  holder, the subject, recorded as it becomes the holder's -- as it arrives, or as the holder
+  takes a channel it waited on -- with `sender` the identity the owner's backend gave; its
+  `agent.request.*` events follow as any request's do, and its backend is told each end.
 - `agent.request.received` -- the child took it: its code received it, or a submission was given
   to it as a round began. `request`, and `round`, the child's round then, or `null`.
 - `agent.request.replied` -- the child answered it: `request`; `attempt`, counted from 1; and
@@ -575,10 +587,13 @@ between a child's failed rounds is in that read and has no event of its own.
   `body`, its text, cut to 1,024 characters. Progress settles nothing.
 - `agent.request.failed` -- `request`, and `message`, why, cut to 1,024 characters: the child's
   code failed it, or its model failed in a way that does not recover.
-- `agent.request.cancelled` -- it was cancelled, by its sender or by the engine: `request`;
-  `received`, whether the child had taken it; and `reason`, `null` for its sender's cancel, or,
-  when the engine cancelled it because the child ended its rounds without answering it after a
-  warning, the text its sender's `RequestCancelled` carries.
+- `agent.request.cancelled` -- it was cancelled: `request`; `received`, whether the child had
+  taken it; `by`, who cancelled it -- `sender`, the agent or program that made it; `owner`, the
+  session's owner, for a request its backend made on an inbound request channel; `host`, when the
+  engine cancelled it because the child ended its rounds without answering it after a warning, or
+  could make no further round; or `peer`, for a request on a channel its owner closed -- and
+  `reason`, `null` for a sender's or the owner's cancel, else the text its sender's
+  `RequestCancelled` carries.
 - `agent.request.ended` -- how it ended: `request`; `outcome`, which is `accepted`, `rejected`,
   `failed`, `cancelled`, `released`, `budget`, `limit` -- the child's model-request limit was
   reached first -- `closed`, or `terminated`; `attempts`, the answers
@@ -686,6 +701,29 @@ between a child's failed rounds is in that read and has no event of its own.
   - `uncertain` -- the backend may have taken it: it said it could not tell, did not answer
     within the channel's call timeout, or the session's drain ended first. `send` raised
     `outrig.SendUncertain`, carrying the item id.
+- `channel.request.sent` -- the subject asked an outbound request channel's far end: `channel`;
+  `request`, its handle's `id`, by which the owner settles it; `item`, the id its send was
+  given, which its backend was given beside `request`; and `body`, the request as JSON text. Its
+  send's outcome is the `channel.item.outcome` of `item`: `accepted` moves its handle from
+  `sending` to `waiting`, `uncertain` leaves it `uncertain`, and any other ends it.
+- `channel.request.ended` -- an outbound request the subject made ended, once: `channel`,
+  `request`, `outcome`, and `reason`, why, or `null`. `outcome` is `accepted` for a reply --
+  the owner's, or what its backend had recorded when asked to withdraw it -- `failed` for a
+  failure, a reply that did not fit the channel's type, naming each problem, or a send not
+  accepted or refused; `cancelled` by the owner, by its withdrawal, or by the channel's close;
+  `released` with its holder; or `closed` by the session's close.
+- `channel.request.refused` -- the session's owner settled an outbound request that had already
+  ended: `channel`, `request`, and `ended`, how it had ended. Nothing changed, and the owner's
+  settle was answered so.
+- `channel.settled` -- an external channel's backend acknowledged a notice that a request on it
+  ended, or that an answer to one that had ended was refused: `channel`, `request`, `item`, the
+  owner's id for an inbound request, else `null`, and `refused`, `true` for a refused answer's
+  notice and `false` for the end's. Every end of an inbound request is told, and
+  an outbound request's end the backend did not give itself -- a reply that did not fit, the
+  channel's close -- once its send is answered, and only if the backend took it. Told in order
+  with the channel's consumed notices, and again, with a growing pause, until acknowledged or the
+  session's drain ends; the subject is the agent the request was of, or the session's when it was
+  none's.
 - `hosted.received` -- a request agent code made of a binding's object, as it arrived, before
   anything is decided about it. `request`, an id OutRig gives it, which the request's other events
   carry; `agent`; `binding`; `execid`, the execution that made it, or `null`; `invocation`, the

@@ -3815,6 +3815,15 @@ class Endpoint:
     def _take(self):
         return self._queue.popleft() if self._queue else None
 
+    def _withdraw(self, item):
+        """Take `item` out of the queue, if it is there: whether it was, unread."""
+        with self._lock:
+            try:
+                self._queue.remove(item)
+            except ValueError:
+                return False
+            return True
+
     def _take_room(self):
         if self._unreceived < SEND_WINDOW:
             self._unreceived += 1
@@ -4097,22 +4106,11 @@ class _External(Endpoint):
         outcome, reason, item = answer.get("outcome"), answer.get("reason") or "", answer.get("item")
         if outcome == "accepted":
             return None
-        where = f"channel {self._name!r}"
-        if outcome == "not_accepted":
-            raise _agents.SendNotAccepted(
-                f"{where}'s far end did not take message {item}, so sending it again is safe: "
-                f"{reason}", reason)
         if outcome == "uncertain":
             raise _agents.SendUncertain(
-                f"{where}'s far end may have taken message {item}, or not; sending it again may "
-                f"deliver it twice: {reason}", item, reason)
-        if outcome == "closed":
-            raise _agents.ChannelClosed(f"{where} was closed by its far end: {reason}", reason)
-        if outcome == "closing":
-            raise _agents.SessionClosing(f"the session is closing -- {reason} -- so nothing was "
-                                         f"sent")
-        raise _agents.SendRefused(f"{where} refused the message, and nothing was sent: {reason}",
-                                  reason)
+                f"channel {self._name!r}'s far end may have taken message {item}, or not; sending "
+                f"it again may deliver it twice: {reason}", item, reason)
+        raise _unsent(self._name, f"message {item}", outcome, reason)
 
     def _room_or_closed(self):
         """Room for one more send, as the holder it was taken by; or `_CLOSED`. Under the
@@ -4148,6 +4146,17 @@ class _External(Endpoint):
         `_Refused` -- `contract`, `full` or `closed` -- having queued nothing. The append is the
         last step that can fail, as `Endpoint._deliver`'s is.
         """
+        self._admit(body)
+        # Queued as it arrived, its body still JSON, which `receive` builds.
+        return self._enqueue(message, Delivery(
+            message, body, sender, datetime.datetime.now(datetime.timezone.utc), skill=skill,
+            correlation=correlation,
+        ))
+
+    def _admit(self, body):
+        """Raise `_Refused` -- `closed`, or `contract` naming each problem -- for `body`, pushed
+        on this channel, unless it may be queued. Checked as JSON, building nothing, since
+        building runs the type's own code, and this is the reader thread."""
         if self._closed is not None:
             raise _Refused(f"channel {self._name!r} was closed: {self._closed}", "closed")
         problems = self._receiving._checking(body)
@@ -4158,11 +4167,6 @@ class _External(Endpoint):
                 "contract",
                 [str(problem) for problem in problems.found],
             )
-        # Queued as it arrived, its body still JSON, which `receive` builds.
-        return self._enqueue(message, Delivery(
-            message, body, sender, datetime.datetime.now(datetime.timezone.utc), skill=skill,
-            correlation=correlation,
-        ))
 
     def _close(self, reason):
         """The far end closed the channel, saying `reason`: every waiting receive, send and
@@ -4178,6 +4182,278 @@ class _External(Endpoint):
     def _said(self):
         """What the host is told of this channel as a kernel takes it."""
         return {"t": "channel.attached", "agent": self._claimant, "channel": self._name}
+
+    def _attach(self):
+        """Its holder's kernel has told the host it holds this channel. On that kernel's thread,
+        before anything runs in it."""
+
+    def _drop(self, why):
+        """Its holder is being released, `why` saying so: a request channel ends what it holds.
+        Before the channel is unclaimed."""
+
+
+def _unsent(channel, what, outcome, reason):
+    """What a send of `what` on `channel` raises -- or a request, its handle -- when the host
+    says it ended `outcome`, saying `reason`: not taken, so a retry is safe; the channel closed;
+    the session closing; or refused before anything was sent."""
+    where = f"channel {channel!r}"
+    if outcome == "not_accepted":
+        return _agents.SendNotAccepted(
+            f"{where}'s far end did not take {what}, so sending it again is safe: {reason}", reason)
+    if outcome == "closed":
+        return _agents.ChannelClosed(f"{where} was closed by its far end: {reason}", reason)
+    if outcome == "closing":
+        return _agents.SessionClosing(f"the session is closing -- {reason} -- so nothing was sent")
+    return _agents.SendRefused(f"{where} refused {what}, and nothing was sent: {reason}", reason)
+
+
+def _answered_not_sent(channel):
+    """What sending on `channel`, which carries requests to its agent, raises."""
+    return TypeError(f"channel {channel!r} carries requests to you, and nothing back: answer a "
+                     f"request with `await delivery.reply(value)` on the delivery receive() gave "
+                     f"you")
+
+
+class _RequestChannel(_External):
+    """A request channel's end, either way: the requests open on it, which its bound counts, each
+    a `_Work` this endpoint stands as the counterpart of -- the holder, for one the far end made;
+    the far end, for one the holder made."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        # Each request not yet ended, by id.
+        self._open = {}
+
+    def __str__(self):
+        return f"channel {self._name!r}"
+
+    @property
+    def kernel(self):
+        return self._kernel
+
+    def settled(self, work):
+        with self._lock:
+            self._open.pop(work.id, None)
+
+    def _held(self):
+        """What a release of its holder ends."""
+        with self._lock:
+            return list(self._open.values())
+
+    def _drop(self, why):
+        for work in self._held():
+            work.end("released", error=_agents.AgentReleased(why))
+            work.forget()
+
+    def _close(self, reason):
+        super()._close(reason)
+        with self._lock:
+            held = list(self._open.values())
+        text = f"the channel's far end closed it: {reason}"
+        for work in held:
+            # Out of the holder's reach first, as every cancel takes it.
+            received = not self.withdraw(work)
+            work.end("cancelled", error=_agents.RequestCancelled(f"{work} was cancelled: {text}"),
+                     message=text, received=received, by="peer")
+
+
+class _Inbound(_RequestChannel):
+    """An inbound request channel's end: `await receive()` takes the next request its far end
+    made, as a `RequestDelivery` to answer with `reply(value)` or end with `fail(message)`, and
+    `pending()` counts those waiting. Nothing is sent on it -- a reply names its request -- so
+    `send` raises. Used only from the loop of the kernel holding it.
+
+    Each request is a request of its holder's, which the host records and holds to the rule every
+    request is held to: worked on, or cancelled."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        # Each is in its holder's summary whatever the policy, so always counted; the policy
+        # decides only whether an arrival ends a wait.
+        self._counted = True
+        # Whether its holder has told the host it holds this channel: from then on a request is
+        # told to the host as the holder's as it arrives, and those waiting were told as it did.
+        self._attached = False
+
+    # As each request's counterpart: who holds it, as the host has been told, and that agent's
+    # state.
+    @property
+    def id(self):
+        return self._claimant if self._attached else None
+
+    @property
+    def state(self):
+        record = _children.get(self._claimant) if self._claimant is not None else None
+        return "idle" if record is None else record.state
+
+    def withdraw(self, work):
+        return self._withdraw(work)
+
+    def _counts(self):
+        return {**super()._counts(), "requests": True}
+
+    async def receive(self):
+        """Take the next request on this channel, waiting until there is one, as a
+        `RequestDelivery`; see `help(type(delivery))` for answering it. `.body` is the request,
+        built into the channel's type here. Once the far end has closed the channel, this raises
+        `outrig.ChannelClosed` rather than waiting."""
+        self._here()
+        work = await self._when(self._receivers, self._take_or_closed)
+        if work is _CLOSED:
+            raise self._closed_error()
+        with work.lock:
+            if work.state == "waiting":
+                work.state = "received"
+        _notify({"t": "agent.received", "agent": self._claimant, "request": work.id, "ask": None,
+                 **work._external()})
+        try:
+            body = self._receiving.decode(work.body)
+        except Exception as e:
+            text = (f"request {work.id} on channel {self._name!r} could not be built as "
+                    f"{_describe_all(self._receives)}: {e}")
+            work.end("failed", error=_agents.AgentRequestFailed(text), message=_agents.cut(text))
+            raise _agents.UnreadableDelivery(text, work.id, work.body) from e
+        return RequestDelivery(work.id, body, work.sender.agent,
+                               datetime.datetime.now(datetime.timezone.utc), work,
+                               correlation=work.correlation)
+
+    async def send(self, message):
+        raise _answered_not_sent(self._name)
+
+    def _ask(self, body, sender, item, reference, correlation):
+        """Queue a request of `body` from `sender`, the owner's `item` with the far end's
+        `reference`, following `correlation` when given, and return how many requests then wait
+        and its id. Reader thread only.
+
+        Admitted as `_deliver` admits a message. Raises `_Refused` -- `contract`, `full` or
+        `closed` -- having queued nothing. The host is told it is the holder's before it is
+        queued, so its holder's taking it is never heard first."""
+        self._admit(body)
+        work = _Asked(self, sender, body, item, reference, correlation)
+        with self._lock:
+            if len(self._open) >= self._bound:
+                raise _Refused(
+                    f"channel {self._name!r} already holds {self._bound} requests unanswered",
+                    "full",
+                )
+            self._open[work.id] = work
+            told = self._attached
+        with _works_lock:
+            _works[work.id] = work
+        if told:
+            work._record()
+        with self._lock:
+            # Ended already -- the channel closed, or the session -- it is not queued.
+            if work.state not in _ENDED:
+                self._queue.append(work)
+                self._delivered += 1
+            count = len(self._queue)
+            wake = iter(self._receivers.copy())
+        _wake_all(wake, self._name)
+        return count, work.id
+
+    def _attach(self):
+        with self._lock:
+            self._attached = True
+            untold = [work for work in self._open.values() if not work.recorded]
+        for work in untold:
+            work._record()
+
+    def _held(self):
+        # Only what it was told it held: a kernel that ends before it said so -- its launch
+        # failed -- leaves what waits for the next.
+        with self._lock:
+            return list(self._open.values()) if self._attached else []
+
+    def _drop(self, why):
+        super()._drop(why)
+        with self._lock:
+            self._attached = False
+
+
+class _Outbound(_RequestChannel):
+    """An outbound request channel's end: `request(body)` asks the channel's far end and returns
+    the request's handle at once, and `pending()` counts the requests the far end has not yet
+    taken. Its answers settle each handle, so nothing is received or sent on it. Used only from
+    the loop of the kernel holding it."""
+
+    # A request's child: there is none, only the far end.
+    state = None
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        # Nothing arrives on it to read.
+        self._counted = False
+
+    @property
+    def id(self):
+        return self._claimant
+
+    def withdraw(self, work):
+        return False
+
+    def pending(self):
+        """How many requests the far end has not yet taken."""
+        with self._lock:
+            return sum(1 for work in self._open.values() if work.state == "sending")
+
+    async def receive(self):
+        raise TypeError(f"channel {self._name!r} carries your requests to its far end, and its "
+                        f"answers settle each request's handle: await the handle")
+
+    async def send(self, message):
+        raise TypeError(f"channel {self._name!r} carries requests: ask with "
+                        f"`runtime.channels[{self._name!r}].request(body)`, which returns a handle")
+
+    def request(self, body):
+        """Ask the channel's far end `body`, and return the request's handle at once.
+
+        `await handle` gives the reply, built into the channel's reply type, or raises how the
+        request ended: `outrig.AgentRequestFailed` when the far end failed it or its reply does
+        not fit, `outrig.RequestCancelled`, or what `send` raises when it was not sent. Its
+        `status` reads `sending` until the far end has taken it, then `waiting`, or `uncertain`
+        while it is not known whether the far end took it. `handle.cancel()` asks the far end to
+        withdraw it, and the handle settles on the answer. A wait that ends with it pending
+        settles nothing: the request stands until the far end answers. Raises `TypeError` for a
+        body the channel does not carry, `ValueError` for one too long to send, and
+        `outrig.AgentLimitReached` with the channel's bound of requests outstanding.
+        """
+        kernel = self._here()
+        if self._closed is not None:
+            raise self._closed_error()
+        _refuse_closing()
+        work = _Sent(self, kernel)
+        line = {"t": "channel.request", "agent": kernel.agent, "id": work.id,
+                "channel": self._name}
+        encoded = self._encoded(body, line, _encode_strict)
+        with self._lock:
+            if len(self._open) >= self._bound:
+                raise _agents.AgentLimitReached(
+                    f"channel {self._name!r} already has {self._bound} requests outstanding, its "
+                    f"bound, so nothing was sent; cancel one, or wait for an answer"
+                )
+            self._open[work.id] = work
+        with _works_lock:
+            _works[work.id] = work
+        try:
+            work.recorded = True
+            _write_line(encoded)
+        except BaseException:
+            work.recorded = False
+            with self._lock:
+                self._open.pop(work.id, None)
+            with _works_lock:
+                _works.pop(work.id, None)
+            raise
+        return _agents.Handle(work)
+
+
+# The endpoint each kind of channel, and direction of a request channel, is made as.
+_KINDS_OF_CHANNEL = {
+    ("plain", None): _External,
+    ("request", "inbound"): _Inbound,
+    ("request", "outbound"): _Outbound,
+}
 
 
 def _external_contract(said, where):
@@ -4219,15 +4495,17 @@ def _declaring_channels(reply, entries):
             name = entry.get("name")
             where = f"channel {name!r}"
             bound, wake = entry.get("bound"), entry.get("wake")
+            kind = _KINDS_OF_CHANNEL.get((entry.get("kind"), entry.get("direction")))
             if (
                 type(name) is not str
                 or name in made
                 or type(bound) is not int
                 or not 0 < bound <= QUEUE_MAX
                 or wake not in _WAKES
+                or kind is None
             ):
                 raise ValueError(f"{where} is not a channel the host could have declared")
-            made[name] = _External(
+            made[name] = kind(
                 name,
                 _external_contract(entry.get("receives"), f"{where}'s receiving contract"),
                 _external_contract(entry.get("sends"), f"{where}'s sending contract"),
@@ -4309,20 +4587,35 @@ def _channel_msg(message):
     queueing reaches `_handle`'s retry, as in `_msg`."""
     reply = {"t": "posted", "agent": message.get("agent"), "id": message.get("id")}
     channel, sender, skill = message.get("channel"), message.get("sender"), message.get("skill")
-    correlation = message.get("correlation")
+    correlation, item, reference = (
+        message.get("correlation"), message.get("item"), message.get("reference")
+    )
     endpoint = _CHANNELS.get(channel) if type(channel) is str else None
+    asking = message.get("kind") == "request"
     try:
         if endpoint is None:
             raise _Refused(f"the session declares no channel {channel!r}", "unknown")
         if type(sender) is not str or any(
-            value is not None and type(value) is not str for value in (skill, correlation)
+            value is not None and type(value) is not str
+            for value in (skill, correlation, item, reference)
         ):
             raise _Refused(
-                "a message names its sender, and any skill or correlation, with a str", "contract"
+                "an item names its sender, and any skill, correlation, item or reference, with a "
+                "str", "contract"
             )
-        pending = endpoint._deliver(
-            message.get("body"), sender, message.get("id"), skill, correlation
-        )
+        if asking != (type(endpoint) is _Inbound) or type(endpoint) is _Outbound:
+            raise _Refused(f"channel {channel!r} takes no such item", "contract")
+        if asking:
+            if skill is not None:
+                raise _Refused("a request names no skill", "contract")
+            pending, request = endpoint._ask(
+                message.get("body"), sender, item, reference, correlation
+            )
+            reply["request"] = request
+        else:
+            pending = endpoint._deliver(
+                message.get("body"), sender, message.get("id"), skill, correlation
+            )
     except _Refused as e:
         _send({**reply, "error": {"code": e.code, "message": str(e), "problems": e.problems}})
         return
@@ -4341,6 +4634,36 @@ def _channel_close(message):
     if endpoint is None:
         raise ValueError(f"no channel {message.get('channel')!r} to close")
     endpoint._close(str(message.get("reason") or ""))
+
+
+def _channel_cancel(message):
+    """The session's owner cancelled a request on one of its inbound channels: its requester gave
+    up. One not yet received is taken out of the queue; one received stays with its holder, whose
+    answer then raises `outrig.RequestCancelled`."""
+    with _works_lock:
+        work = _works.get(message.get("request"))
+    if type(work) is not _Asked or work.channel != message.get("channel"):
+        return  # ended, and the host told: its backend hears how
+    work.cancel(by="owner")
+
+
+def _channel_request(kernel, request_id, message):
+    """The host says what became of the send of request `request_id`, which `kernel`'s code made:
+    taken, `waiting`, or not known, `uncertain`."""
+    with _works_lock:
+        work = _works.get(request_id)
+    if type(work) is _Sent and message.get("state") in ("waiting", "uncertain"):
+        work.moved(message["state"])
+
+
+def _channel_settle(kernel, request_id, message):
+    """The host ends request `request_id`, which `kernel`'s code made of a channel's far end: on
+    the kernel's loop, which builds a reply into its type."""
+    with _works_lock:
+        work = _works.get(request_id)
+    if type(work) is _Sent:
+        with contextlib.suppress(RuntimeError):  # its kernel has ended, and the request with it
+            kernel.loop.call_soon_threadsafe(work.settle, message)
 
 
 # What `return_when` may be: asyncio's own constants, which in CPython are strings.
@@ -5237,15 +5560,7 @@ class _Work:
         # rather than ended with no notice to tell the host.
         state = "accepted" if reason is None else "failed"
         final = _agents.Status(state, reason, self.child.state)
-        # A request held for a child that never came to exist was never told of.
-        notice = None
-        if self.child.id is not None:
-            if self.sender is _OWNER:
-                # What the program's handle ends with: why, or the reply the program accepted.
-                said.update(error=None if error is None else str(error)[:OWNER_TEXT_MAX],
-                            reply=reply)
-            notice = {"t": "agent.ended", "agent": self.child.id, "request": self.id,
-                      "outcome": reason or "accepted", "ask": self.ask, **said}
+        notice = self._notice(reason, error, reply, said)
         with self.lock:
             if self.state in _ENDED:
                 return False
@@ -5278,6 +5593,27 @@ class _Work:
         # instance.
         self.instance = None
         return True
+
+    # Whether the host hears an answer's JSON form, and why the request ended, with its end: so
+    # an owner on the host can give them on.
+    @property
+    def _tells_json(self):
+        return self.sender is _OWNER
+
+    def _notice(self, reason, error, reply, said):
+        """What the host is told as the request ends `reason` with `error`, saying `said`; `None`
+        for a request held for a child that never came to exist, which was never told of."""
+        if self.child.id is None:
+            return None
+        if self._tells_json:
+            # What the owner's handle ends with: why, or the reply the program accepted.
+            said.update(error=None if error is None else str(error)[:OWNER_TEXT_MAX], reply=reply)
+        return {"t": "agent.ended", "agent": self.child.id, "request": self.id,
+                "outcome": reason or "accepted", "ask": self.ask, **said}
+
+    def _external(self):
+        """What every notice about the request adds for an external channel's backend."""
+        return {}
 
     def tell(self):
         """Tell the host this request has ended. Until it has been told, the request stays in
@@ -5317,7 +5653,7 @@ class _Work:
         """What an answer to this request, which has ended, raises; the host is told."""
         reason = self.reason
         _notify({"t": "agent.refused", "agent": self.child.id, "request": self.id,
-                 "ended": reason or "accepted"})
+                 "ended": reason or "accepted", **self._external()})
         if reason == "cancelled":
             # Its error says who cancelled it, and the host's why.
             return _agents.RequestCancelled(f"{self.error}; it takes no answer")
@@ -5367,7 +5703,7 @@ class _Work:
         # bounded as a program's root's reply is, before it counts, so one past the bound,
         # whatever it is, counts no attempt and ends nothing.
         told = {}
-        if self.sender is _OWNER and not judged:
+        if self._tells_json and not judged:
             told = {"json": json.dumps(_json_form(value) if problems
                                        else self.declared.encode(accepted))}
             _refuse_long({"t": "agent.ended", "agent": self.child.id, "request": self.id,
@@ -5446,7 +5782,8 @@ class _Work:
                         message=_agents.cut(message)):
             raise self.refused()
 
-    def cancel(self):
+    def cancel(self, **said):
+        """End the request cancelled by its sender, saying `said` with its end."""
         with self.lock:
             if self.state in _ENDED:
                 return False
@@ -5454,7 +5791,133 @@ class _Work:
         received = not self.child.withdraw(self)
         return self.end("cancelled",
                         error=_agents.RequestCancelled(f"{self} was cancelled by its sender"),
-                        received=received)
+                        received=received, **said)
+
+
+class _Asked(_Work):
+    """A request the far end of an inbound channel made of the channel's holder, which the
+    holder's code answers with `reply` or ends with `fail`: a request of its holder's, as one a
+    parent makes of its child is, whose every end -- and every answer refused after it -- the
+    host gives the channel's backend, with the owner's id for it and the backend's reference.
+
+    Its child is the channel's endpoint, which stands for the holder; its sender is who the far
+    end says asked, on no loop of its own, since nothing here awaits its end."""
+
+    # The host gives the backend the reply's JSON form, and why it ended.
+    _tells_json = True
+
+    def __init__(self, endpoint, sender, body, item, reference, correlation):
+        super().__init__(endpoint, types.SimpleNamespace(agent=sender, loop=_OWNER.loop),
+                         "request", endpoint._name, body, endpoint._sending, 3)
+        self.item, self.reference, self.correlation = item, reference, correlation
+
+    def __str__(self):
+        return f"request {self.id} on channel {self.channel!r}"
+
+    def _record(self):
+        """Tell the host this request is its holder's: recorded first, since the host may end it
+        as soon as it reads it, and unrecorded only if the line was never made."""
+        self.recorded = True
+        self.recorded = _notify(self._asked()) is not False
+
+    def _external(self):
+        return {"external": {"channel": self.channel, "item": self.item,
+                             "reference": self.reference}}
+
+    def _asked(self):
+        """The notice that the request is its holder's: the host records it, as it records each
+        request a child is sent, under its holder."""
+        holder = self.child.id
+        return {"t": "agent.request", "agent": holder, "request": self.id, "child": holder,
+                "channel": self.channel, "sender": self.sender.agent,
+                "attempts": self.attempts_max,
+                "body": _agents.preview(self.body) if _observing else None, **self._external()}
+
+    def _notice(self, reason, error, reply, said):
+        # Told whether or not an agent held it, since the backend hears every end: one that ended
+        # while the channel was unheld -- cancelled, closed -- was never its holder's, and the
+        # host records nothing of it but that.
+        if reason == "cancelled":
+            said.setdefault("by", "host")
+        said.update(error=None if error is None else str(error)[:OWNER_TEXT_MAX])
+        return {"t": "agent.ended", "agent": self.child.id or "", "request": self.id,
+                "outcome": reason or "accepted", **said, **self._external()}
+
+
+class _Sent(_Work):
+    """A request the holder of an outbound channel made of the channel's far end: its handle's,
+    which settles as the far end says -- through the session's owner -- or as its holder's
+    `cancel()` and the far end's answer to it do. Its child is the channel's endpoint; its sender
+    the holder's kernel, on whose loop its handle settles."""
+
+    def __init__(self, endpoint, kernel):
+        super().__init__(endpoint, kernel, "request", endpoint._name, None, endpoint._receiving, 1)
+        # Until the far end has taken it; then `waiting`, or `uncertain` when it is not known
+        # whether it has.
+        self.state = "sending"
+        # Whether its holder asked the far end to withdraw it, and has not yet heard.
+        self.withdrawing = False
+
+    __str__ = _Asked.__str__
+
+    def _notice(self, reason, error, reply, said):
+        return {"t": "channel.ended", "agent": self.sender.agent, "channel": self.channel,
+                "request": self.id, "outcome": reason or "accepted",
+                "error": None if error is None else str(error)[:OWNER_TEXT_MAX], **said}
+
+    def cancel(self, **said):
+        """Ask the far end to withdraw the request: its handle settles on the answer -- cancelled,
+        or the reply or failure the far end had already recorded -- and stays open until then.
+        Whether this asked: not once it has ended."""
+        with self.lock:
+            if self.state in _ENDED:
+                return False
+            asking = not self.withdrawing
+            self.withdrawing = True
+        if asking:
+            _notify({"t": "channel.withdraw", "agent": self.sender.agent, "channel": self.channel,
+                     "request": self.id})
+        return True
+
+    def moved(self, state):
+        """The far end took it, `waiting`, or it is not known whether it took it, or what became
+        of its withdrawal, `uncertain`. A withdrawal is asked for once: one not answered is not
+        asked for again."""
+        with self.lock:
+            if self.state in _ENDED:
+                return
+            self.state = state
+
+    def settle(self, message):
+        """End the request as the host says, on its holder's loop: a reply, built here into the
+        channel's reply type -- one that does not fit ends it failed, naming what is wrong -- a
+        failure, a cancel, or what became of its send."""
+        outcome, text = message.get("outcome"), message.get("message") or ""
+        said = {"by": message.get("by"), "settle": message.get("settle")}
+        if outcome == "replied":
+            try:
+                value = self.declared.decode(message.get("value"))
+            except Exception as e:
+                problems = [str(p) for p in getattr(e, "problems", ())] or [_said_of(e)]
+                why = (f"the far end's reply to {self} is not {_describe_all(self.child._receives)}"
+                       f": " + "; ".join(problems))
+                self.end("failed", error=_agents.AgentRequestFailed(why),
+                         message=_agents.cut(why), problems=problems, **said)
+                return
+            self.end(None, value=value, **said)
+            return
+        if outcome == "failed":
+            reason, error = "failed", _agents.AgentRequestFailed(text)
+        elif outcome == "cancelled":
+            reason = "cancelled"
+            error = _agents.RequestCancelled(f"{self} was cancelled{': ' + text if text else ''}")
+        elif outcome in ("not_accepted", "refused", "closed", "closing"):
+            # Never sent, or not taken: as a send would raise.
+            reason = "closed" if outcome == "closing" else "failed"
+            error = _unsent(self.channel, str(self), outcome, text)
+        else:
+            return
+        self.end(reason, error=error, message=_agents.cut(text) if text else None, **said)
 
 
 class ChildChannel:
@@ -6172,9 +6635,7 @@ class RequestEndpoint(Endpoint):
                                datetime.datetime.now(datetime.timezone.utc), work)
 
     async def send(self, message):
-        raise TypeError(f"channel {self._name!r} carries requests to you, and nothing back: answer "
-                        f"a request with `await delivery.reply(value)` on the delivery receive() "
-                        f"gave you")
+        raise _answered_not_sent(self._name)
 
     def _take(self):
         if not self._queue and _kernels[self._agent].child.orienting:
@@ -6200,15 +6661,6 @@ class RequestEndpoint(Endpoint):
             wake = iter(self._receivers.copy())
         _wake_all(wake, self._name)
         return True
-
-    def _withdraw(self, work):
-        with self._lock:
-            try:
-                self._queue.remove(work)
-            except ValueError:
-                return False
-            return True
-
 
 class Kernel:
     """One agent's execution environment: its namespace, its loop, its slot, its backlog."""
@@ -6357,6 +6809,7 @@ class Kernel:
         before anything runs in it."""
         for endpoint in self.externals.values():
             _notify(endpoint._said())
+            endpoint._attach()
 
     def offer_session(self):
         """Give each of the session's bindings and services not yet offered here what this kernel
@@ -6569,8 +7022,12 @@ class Kernel:
         self.ended = True
         # The session's channels it held are unheld from now on, what waits on each kept for the
         # next kernel to take it.
-        # A detach of one the host never heard it take, it ignores.
+        # A detach of one the host never heard it take, it ignores. A request channel's
+        # requests, owed by this agent, end with it first.
         if self.externals:
+            why = f"{self.child or 'the primary agent'} was released"
+            for endpoint in self.externals.values():
+                endpoint._drop(why)
             _unclaim(self.externals.values())
             for name in self.externals:
                 _notify({"t": "channel.detached", "agent": self.agent, "channel": name})
@@ -8364,6 +8821,8 @@ _ROUTES = {
     "spawned": _answer_ask,
     "released": _answer_ask,
     "channel.sent": _answer_ask,
+    "channel.requested": _channel_request,
+    "channel.settle": _channel_settle,
     "assign": _assign,
     "settle": _settle_work,
     "oriented": _oriented,
@@ -8427,6 +8886,9 @@ def _route(line):
         return
     if kind == "channel.close":
         _channel_close(message)
+        return
+    if kind == "channel.cancel":
+        _channel_cancel(message)
         return
     if kind in _OWNER_ROUTES:
         # The program on the host's, about its requests: no kernel of its own to address.

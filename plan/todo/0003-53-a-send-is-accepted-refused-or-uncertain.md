@@ -51,8 +51,10 @@ outstanding, and what each round sent, and hands the backend its positions at a 
 ## Deliverables
 
 - **Identities.** An outbound item's id is the host's `MessageId`, minted as it is sent and given to
-  the backend on every call about the item; `send()` returns it (fork 1) and an outbound request's
-  `Handle.id` is it. An inbound item has two: the owner's item id from the push, by which OutRig
+  the backend on every call about the item; `send()` returns it (fork 1). An outbound request's
+  `Handle.id` is the session's `AgentRequestId` for it, which `0003-52` mints in the interpreter so
+  `request()` can return its handle at once, and which `Outbound::request`, `Channel::settle` and
+  `withdrawn` name; its send's `MessageId` is `Outbound::item` beside it. An inbound item has two: the owner's item id from the push, by which OutRig
   deduplicates and reports positions, and OutRig's delivery id, which `Delivery.id` carries and a
   reply names; the registry keeps both and every notice to the backend carries both. Ids are stable
   for the life of the session and never reused; across a resume the manifest carries them and

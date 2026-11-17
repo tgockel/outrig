@@ -120,7 +120,7 @@ delivered to the backend as that one outcome.
   policy; the warning-then-cancel does not run there, which `external-channels.md` and the
   channel's rustdoc say (fork 4).
 - **Events**, in `doc/reference/events.md`: inbound external requests under `agent.request.*`
-  with `sender`; `channel.request.sent`, `channel.request.settled` and `channel.request.refused`
+  with `sender`; `channel.request.sent`, `channel.request.ended` and `channel.request.refused`
   for outbound requests, under the requesting agent's subject; `channel.settled`, when the
   backend acknowledged a settlement notice. Bodies as bounded previews, as the request family's.
 - **The close**, in `lifecycle.md`'s table, tested here: an inbound request waiting unread or
@@ -175,11 +175,11 @@ Each is a mock-driven test unless it says otherwise.
 - **`h.cancel()`.** The backend's `withdrawn` is called with the id and `cancelled`; when it answers
   withdrawn, the handle reads cancelled, a later `settle` is answered refused and
   `channel.request.refused` is recorded; when the test backend answers with a reply it had already
-  recorded, the handle settles with that reply and `channel.request.settled` says `replied`; when it
+  recorded, the handle settles with that reply and `channel.request.ended` says `replied`; when it
   never answers, the handle reads `uncertain` past the bound and the registry lists the request so;
-  a test backend whose `resolve(.., withdrawal)` then answers `replied` with a value settles the
-  handle with that reply, and one answering `accepted` to a send query for the same id changes
-  nothing. A `runtime.wait` with `timeout=0.1` returns an uncancelled handle in `pending`; the
+  what `resolve(.., withdrawal)` then does with it is `0003-53`'s, whose "A withdrawal's
+  uncertainty" tests it (revised in planning: `resolve` is that task's trait method). A
+  `runtime.wait` with `timeout=0.1` returns an uncancelled handle in `pending`; the
   request is still outstanding, the backend has not been told anything, and a later `settle` settles
   it.
 - **Peer termination.** With one outbound request outstanding and one inbound request received,
@@ -262,3 +262,131 @@ Each is a mock-driven test unless it says otherwise.
   `runner.rs`, `orientation.rs`; `crates/outrig/src/python/outrig/_interpreter.py`
   (`RequestEndpoint`, `_Work`, `Handle`, `ChildChannel`, `_HOST_ENDS`);
   `crates/outrig/src/harness/event.rs` (`AgentRequest*`, `RequestEnd`).
+
+## Decisions
+
+Every fork was taken as recommended: 1 an inbound request is recorded in the children registry as
+a request of its holder, under the id the interpreter gives every request; 2 the owner's cancel of
+a received request leaves the delivery, whose answer then raises; 3 a backend reply that does not
+fit ends the request failed, naming each problem; 4 a harness-built primary's inbound request
+channel is announced and listed, its owner the policy; 5 no owner-side awaitable, `settled` the
+one path. One acceptance line was moved in planning: what `resolve(.., withdrawal)` does with a
+withdrawal left `uncertain` is `0003-53`'s, whose own acceptance tests it, since `resolve` is that
+task's trait method.
+
+- **Spellings.** Rust: `ChannelKind::Request(Direction::{Inbound, Outbound})` with
+  `ChannelDefinition::kind`, the contracts still the holder's (`receives` and `sends`);
+  `Inbound::request`; `DeliveryId::{Message, Request}` in `Delivered`, and `Position::Settled`;
+  `Outbound::request`; the trait's `settled(Settled)` -- `Settlement::{Replied, Failed,
+  Cancelled { by: CancelledBy::{Owner, Host, Peer}, reason }, Closed, Released, Refused { ended
+  }}` -- and `withdrawn(Withdrawal) -> WithdrawAnswer::{Withdrawn, Replied, Failed}`, with
+  `WithdrawEnd::{Cancelled, Released}`; `Channel::cancel` and `Channel::settle(request,
+  Settle::{Reply, Fail, Cancel})`, answered `Ok`, or `SettleError::{Unknown, Ended, Rejected,
+  Gone}`; the report's `ChannelClose::requests` of `ChannelRequestAtClose`. Both trait methods are
+  required, as `send` and `consumed` are. Python: `_Inbound` and `_Outbound`, over one
+  `_RequestChannel` endpoint, the second's `request(body)` returning `outrig`'s `Handle`; a
+  request's `Status` reads `sending`, `waiting` or `uncertain`, its `child` `None`. Lines:
+  `channel.msg` gains `kind`, `item` and `reference`, and `posted` answers a request's id;
+  `channel.cancel`; from the kernels `channel.request`, `channel.withdraw` and `channel.ended`; to
+  them `channel.requested` and `channel.settle`.
+- **Every request id is the interpreter's.** An inbound request's delivery id is its id among the
+  session's requests (fork 1), so `Delivered` carries a `DeliveryId`. `request()` returns its
+  handle at once, so an outbound request's id is minted there too; its send keeps the host's
+  `MessageId` as `Outbound::item`, beside `Outbound::request`. The owner settles, and `withdrawn`
+  names, the request by its id. `0003-53`'s identities paragraph was edited to say so.
+- **A request is its holder's.** The endpoint stands as each request's counterpart -- `_Asked`
+  and `_Sent` are `_Work`s whose `child` it is -- so the end, the refusal, the host's settle, the
+  close and `tell`'s retry are `_Work`'s, with three hooks: the end's notice, what a notice adds
+  for the backend (`external`: channel, owner's item id, reference), and whether the reply's JSON
+  is told. A request pushed before any agent holds the channel waits in the window and is told the
+  host as the holder's once the holder has said it holds the channel, each once; one that ends
+  unheld -- cancelled, closed -- is told all the same, with no agent, so the backend hears it. A
+  holder's release ends every request it holds `released`, unread ones too: a request is owed by
+  the agent that held it, and moving an unread one to the next holder would leave a record and an
+  `agent.request.sent` under an agent that is gone. Plain messages keep `0003-51`'s rule.
+- **The backend hears every end it did not give itself.** Inbound, every end through `settled`,
+  and every answer refused after one; outbound, a reply that did not fit and the channel's close
+  through `settled`, and an end of the holder's side through `withdrawn`: `h.cancel()`
+  (`cancelled`, the handle settling on the answer), a release or the close (`released`, the
+  handle ended already). A settle the owner made as given is answered to the owner and not told
+  again. The budget and the model-request limit reach the backend as `Cancelled { by: Host }`,
+  a rejection as `Failed` with its problems. Settlement notices go one at a time per channel, in
+  order with consumed notices and retried as they are, so a backend refusing one holds the rest.
+- **The owner's settle hears its own end.** Each settle is numbered and the interpreter's end
+  names the number that made it, so a settle racing another end -- a withdrawal's answer, the
+  close -- is answered with how the request had ended and `channel.request.refused` is recorded.
+  A reply is built into the reply type on the holder's loop, as a parent builds a child's.
+- **An outbound request's send is a send.** It takes `send`'s path, its refusals and its
+  `channel.item.outcome`, and is one of the round's sends. A send not taken settles the handle
+  with what `send` would raise (`SendNotAccepted`, `SendRefused`, `ChannelClosed`,
+  `SessionClosing`); `uncertain` leaves it pending. `h.cancel()` while the send is unanswered
+  withdraws once it is; `cancel()` returns whether it asked. The bound caps requests outstanding,
+  past which `request()` raises `AgentLimitReached`.
+- **Wake policy on a request channel** decides only whether an arrival ends a `runtime.wait`:
+  every inbound request is in its holder's summary, counted and announced whatever the policy;
+  nothing arrives on an outbound one. The children announcer counts a request channel from its
+  records and leaves it out of the plain channels' counts; the primary's interpreter says
+  `requests` of an inbound endpoint, so `Session::round` says "request". No `consumed` notice is
+  sent for a request: its receipt is `agent.request.received`, its outcome `settled`.
+- **The instructions.** The manifest names each kind and what crosses it, and says once per kind
+  present how it is used. A root whose class declares no request channel but holds an inbound one
+  is told the request rule as one that does, in the same words; message news counts only plain
+  channels.
+- **Events.** `agent.request.cancelled` gains `by` -- `sender`, `owner`, `host` or `peer` --
+  which the interpreter's end already said, so the renderer no longer guesses from `reason`; the
+  renderer learns an inbound channel from `channel.attached` and files no section under a
+  backend's sender.
+- **The close** waits in the drain for every request on a channel to end and every notice and
+  withdrawal to be answered. The interpreter's close ends each request; the backend is told as
+  above; `ChannelClose::requests` lists each with whether its backend answered.
+- **A lock found and already fixed.** Forwarding a request's end from the children registry
+  deadlocked: `dispatch` held the host's table across the children hook, and reading the close
+  takes that lock. Upstream's 88f7e35 made `dispatch` release it, as for every other hook; the
+  branch was rebased onto it and reads the close as the rest of the table does.
+- **`0003-51`'s idle-holder test asserted on an event kind that did not exist**
+  (`agent.request.ended`, which named no event until the terminal events were renamed), so it
+  checked nothing; it now asserts no `agent.request.cancelled`, which is what "nothing is
+  cancelled" means.
+- **`/simplify`** adopted: one `_RequestChannel` base, `Endpoint._withdraw`, one admission check
+  for a message and a request, one outcome-to-exception map for a send and a request; notices
+  built whole as they are queued, so no second notice type; the inbound requests indexed by id
+  with their position kept in `items` alone; one ending of a request (`Chan::end_request`), one
+  wire parser for an end (`RequestEnd::named`), forwarded once at the top of the registry's line
+  handler; `channel.*` lines built by one helper; reads that change nothing take no write lock;
+  the arrival sentences and the request rule each written once; the test responder over
+  `serving`. Not taken: a per-kind enum inside `Chan` (a restructuring of `0003-51`'s table with no
+  behavior to gain here); trimming `finished`, which grows by a request's end as `items` already
+  grows by an item; a counter for `held()`, bounded by 256; and re-encoding a reply once in the
+  interpreter, a cost of the owner-root path this reuses.
+- **Review fixes.** An outbound request that ends while its send is with the backend -- the
+  channel's close, a release, the session's close -- owes the backend nothing until the send is
+  answered: then, if the backend took it, it is told the end or asked to withdraw it, so it never
+  hears of a request's end before it holds the request; one never handed to it owes it nothing.
+  What a request's end owes its backend is queued or counted in the step that ends it -- for an
+  inbound request, in the step that records the end; for an outbound one, in the step that ends
+  it or that ends its send's flight -- so the drain never finds the request ended and that not
+  yet begun. That gap needs a second thread to observe and the tests run on a current-thread
+  runtime, so no test reaches it. Every backend call -- notices and withdrawals as well as sends
+  -- takes one of the channel's eight permits, so a release ending many requests cannot run past
+  that. The renderer files an outbound request's send outcome on the request's row, not as a
+  message whose sending was never recorded.
+- **A request is withdrawn once.** A release or the close that follows its code's `cancel()`
+  asks the backend nothing more: the cancel's withdrawal stands for the release's, and the close
+  row is acknowledged only once that one is answered. One that went unanswered is not asked
+  again, by a second `cancel()` either: OutRig retries nothing, and `0003-53`'s `resolve` is how
+  an uncertain withdrawal is settled. If an answer comes after the request ended, it changes
+  nothing and is not passed to the interpreter. The trait says a backend acknowledges a notice
+  of a request it holds no record of, such as one whose send answered uncertain and was never
+  kept, and answers its withdrawal `Withdrawn`: an error asks for the notice again, and holds
+  back the channel's later notices until the session's drain deadline.
+- **Rebased onto the terminal events' rename.** Upstream renamed `agent.request.settled` to
+  `agent.request.ended` and `RequestSettled` to `RequestEnded`, since "settled" did not say the
+  request had ended; the outbound request's terminal event follows, `channel.request.ended`
+  (`Payload::ChannelRequestEnded`). `channel.settled` keeps its name: it records the backend's
+  acknowledgment of a notice, not an end. Upstream's advice on waiting for the next request --
+  `receive()` waits on its own channel alone, so end the round -- is given for an inbound request
+  channel as well, the same trap.
+- **`channel.settled` says which notice was acknowledged.** The backend is told a refused late
+  answer as well as the end, so the event carries `refused`, and the renderer no longer reads a
+  refused answer's acknowledgment as a second end. The record says it, rather than the renderer
+  inferring it from the notices' order, which a gap in the log would break.

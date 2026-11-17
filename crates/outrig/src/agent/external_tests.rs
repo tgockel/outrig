@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,8 +26,9 @@ use crate::harness::event::ItemOutcome;
 use crate::harness::skills::DirectorySource;
 use crate::harness::{
     AgentState, ApplicationSpec, Argument, BackendFuture, ChannelBackend, ChannelDefinition,
-    ConstructSpec, Consumed, Contract, DeliverError, Delivered, Facility, Inbound, ItemKind,
-    Outbound, Position, RootHandle, SendAnswer, SessionBuilder, SessionError, Verdict, Wake,
+    ConstructSpec, Consumed, Contract, DeliverError, Delivered, DeliveryId, Facility, Inbound,
+    ItemKind, Outbound, Position, RootHandle, SendAnswer, SessionBuilder, SessionError, Settled,
+    Verdict, Wake, WithdrawAnswer, Withdrawal,
 };
 use crate::python::testing::{Flag, py, within};
 
@@ -87,8 +89,10 @@ fn application() -> (tempfile::TempDir, ApplicationSpec) {
 
 /// How the test backend answers the next send.
 #[derive(Debug, Clone)]
-enum Answer {
+pub(super) enum Answer {
     Accept,
+    /// Accepted, once the test lets it be.
+    After(Arc<tokio::sync::Notify>),
     NotAccept(&'static str),
     Uncertain(&'static str),
     /// Never: the call runs past its bound.
@@ -97,28 +101,71 @@ enum Answer {
 
 /// The test's far end of every channel: what it was sent and told, and how it answers.
 #[derive(Default)]
-struct Backend {
+pub(super) struct Backend {
     sent: Mutex<Vec<Outbound>>,
     notices: Mutex<Vec<Consumed>>,
     /// How each next send is answered; once these run out, accepted.
     answers: Mutex<VecDeque<Answer>>,
     /// Whether a consumed notice fails, as an unreachable store's would.
-    refusing: Mutex<bool>,
+    pub(super) refusing: Mutex<bool>,
+    /// Each settlement notice it was given, acknowledged or not, in order.
+    settlements: Mutex<Vec<Settled>>,
+    /// The owner's item whose settlement notice fails, as an unreachable store's would.
+    pub(super) unsettling: Mutex<Option<String>>,
+    /// Each withdrawal it was asked for, in order.
+    withdrawals: Mutex<Vec<Withdrawal>>,
+    /// How each next withdrawal is answered -- `None` never -- and once these
+    /// run out, withdrawn.
+    pub(super) verdicts: Mutex<VecDeque<Option<WithdrawAnswer>>>,
+    /// How long each withdrawal waits before it is answered.
+    pub(super) withdraw_after: Mutex<Duration>,
+    /// How many of its calls are running, and the most that ever ran at once.
+    running: AtomicUsize,
+    most: AtomicUsize,
+}
+
+/// One call of the backend's, running until it answers or is dropped.
+struct Running<'a>(&'a Backend);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Backend {
-    fn answering(answers: impl IntoIterator<Item = Answer>) -> Arc<Self> {
+    pub(super) fn answering(answers: impl IntoIterator<Item = Answer>) -> Arc<Self> {
         let backend = Self::default();
         backend.answers.lock().unwrap().extend(answers);
         Arc::new(backend)
     }
 
-    fn sent(&self) -> Vec<Outbound> {
+    pub(super) fn sent(&self) -> Vec<Outbound> {
         self.sent.lock().unwrap().clone()
     }
 
+    pub(super) fn settlements(&self) -> Vec<Settled> {
+        self.settlements.lock().unwrap().clone()
+    }
+
+    pub(super) fn withdrawals(&self) -> Vec<Withdrawal> {
+        self.withdrawals.lock().unwrap().clone()
+    }
+
+    /// The most of its calls -- of every kind -- that ever ran at once.
+    pub(super) fn most(&self) -> usize {
+        self.most.load(Ordering::SeqCst)
+    }
+
+    /// A call begins.
+    fn run(&self) -> Running<'_> {
+        let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most.fetch_max(now, Ordering::SeqCst);
+        Running(self)
+    }
+
     /// Each notice's channel and item id, in the order the backend was told.
-    fn notices(&self) -> Vec<(String, String)> {
+    pub(super) fn notices(&self) -> Vec<(String, String)> {
         self.notices
             .lock()
             .unwrap()
@@ -130,6 +177,7 @@ impl Backend {
 
 impl ChannelBackend for Backend {
     fn send(&self, item: Outbound) -> BackendFuture<'_, SendAnswer> {
+        let running = self.run();
         self.sent.lock().unwrap().push(item);
         let answer = self
             .answers
@@ -138,10 +186,17 @@ impl ChannelBackend for Backend {
             .pop_front()
             .unwrap_or(Answer::Accept);
         Box::pin(async move {
+            let _running = running;
             match answer {
                 Answer::Accept => SendAnswer::Accepted {
                     reference: Some("ref".to_string()),
                 },
+                Answer::After(go) => {
+                    go.notified().await;
+                    SendAnswer::Accepted {
+                        reference: Some("ref".to_string()),
+                    }
+                }
                 Answer::NotAccept(reason) => SendAnswer::NotAccepted {
                     reason: reason.to_string(),
                 },
@@ -154,9 +209,11 @@ impl ChannelBackend for Backend {
     }
 
     fn consumed(&self, notice: Consumed) -> BackendFuture<'_, io::Result<()>> {
+        let running = self.run();
         self.notices.lock().unwrap().push(notice);
         let refusing = *self.refusing.lock().unwrap();
         Box::pin(async move {
+            let _running = running;
             if refusing {
                 Err(io::Error::other("the store is unreachable"))
             } else {
@@ -164,16 +221,50 @@ impl ChannelBackend for Backend {
             }
         })
     }
+
+    fn settled(&self, notice: Settled) -> BackendFuture<'_, io::Result<()>> {
+        let running = self.run();
+        let refusing = notice.item.is_some() && *self.unsettling.lock().unwrap() == notice.item;
+        self.settlements.lock().unwrap().push(notice);
+        Box::pin(async move {
+            let _running = running;
+            if refusing {
+                Err(io::Error::other("the store is unreachable"))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn withdrawn(&self, withdrawal: Withdrawal) -> BackendFuture<'_, io::Result<WithdrawAnswer>> {
+        let running = self.run();
+        self.withdrawals.lock().unwrap().push(withdrawal);
+        let verdict = self
+            .verdicts
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Some(WithdrawAnswer::Withdrawn));
+        let after = *self.withdraw_after.lock().unwrap();
+        Box::pin(async move {
+            let _running = running;
+            tokio::time::sleep(after).await;
+            match verdict {
+                Some(verdict) => Ok(verdict),
+                None => std::future::pending().await,
+            }
+        })
+    }
 }
 
 /// `inbox`: text both ways, waking its holder.
-fn inbox() -> ChannelDefinition {
+pub(super) fn inbox() -> ChannelDefinition {
     ChannelDefinition::new("inbox").description("Messages from the task's user.")
 }
 
 /// A session with no primary agent, holding the application, its model calls answered by
 /// `routes`, and built further by `build`.
-async fn holding(
+pub(super) async fn holding(
     var: &str,
     routes: Vec<(&'static str, Responder)>,
     build: impl FnOnce(SessionBuilder) -> SessionBuilder,
@@ -188,7 +279,7 @@ async fn holding(
 }
 
 /// An `Inbox` holding the channels `channels` name, each under its own name.
-fn holder(channels: &[&str]) -> ConstructSpec {
+pub(super) fn holder(channels: &[&str]) -> ConstructSpec {
     let facilities: BTreeMap<String, Facility> = channels
         .iter()
         .map(|name| ((*name).to_string(), Facility::channel(*name)))
@@ -198,7 +289,7 @@ fn holder(channels: &[&str]) -> ConstructSpec {
 }
 
 /// Construct `spec` in `tree`'s session and wait until its orienting round has ended.
-async fn ready(tree: &Tree, spec: ConstructSpec) -> RootHandle {
+pub(super) async fn ready(tree: &Tree, spec: ConstructSpec) -> RootHandle {
     let root = within(tree.session.construct(spec))
         .await
         .expect("constructed");
@@ -208,14 +299,14 @@ async fn ready(tree: &Tree, spec: ConstructSpec) -> RootHandle {
 
 /// Construct `spec` in `tree`'s session, its orienting round left to run: for a test whose code
 /// runs there and waits on the test.
-async fn constructed(tree: &Tree, spec: ConstructSpec) -> RootHandle {
+pub(super) async fn constructed(tree: &Tree, spec: ConstructSpec) -> RootHandle {
     within(tree.session.construct(spec))
         .await
         .expect("constructed")
 }
 
 /// Wait until `done` holds -- `what` -- failing rather than hanging.
-async fn until(what: &str, done: impl Fn() -> bool) {
+pub(super) async fn until(what: &str, done: impl Fn() -> bool) {
     let waited = tokio::time::timeout(Duration::from_secs(20), async {
         while !done() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -227,7 +318,7 @@ async fn until(what: &str, done: impl Fn() -> bool) {
 
 /// The opening of each round the agent whose class carries `marker` had past its orienting
 /// round: each round's first call.
-fn openings(requests: &[RecordedRequest], marker: &str) -> Vec<String> {
+pub(super) fn openings(requests: &[RecordedRequest], marker: &str) -> Vec<String> {
     past_launch(requests, marker)
         .into_iter()
         .filter(|request| !after_result(request))
@@ -238,13 +329,13 @@ fn openings(requests: &[RecordedRequest], marker: &str) -> Vec<String> {
 /// A responder for an agent's rounds past its orienting round: each round's first call runs
 /// the next of `sources` -- the last again once they run out -- and the call after its result
 /// ends the round.
-fn running(sources: &[&str]) -> Responder {
+pub(super) fn running(sources: &[&str]) -> Responder {
     ready_then(from_launch(sources))
 }
 
 /// [`running`], its orienting round among the rounds: the round an item already waiting when
 /// the holder launched is announced in, and so the one that reads it.
-fn from_launch(sources: &[&str]) -> Responder {
+pub(super) fn from_launch(sources: &[&str]) -> Responder {
     serving_each(sources.iter().map(|source| (*source).to_string()).collect())
 }
 
@@ -274,7 +365,10 @@ async fn a_pushed_item_becomes_a_pending_delivery() {
         .correlation("m-0")
         .reference("row-17");
     let delivered = within(channel.deliver(item)).await.expect("queued");
-    let Delivered::Queued { delivery } = delivered else {
+    let Delivered::Queued {
+        delivery: DeliveryId::Message(delivery),
+    } = delivered
+    else {
         panic!("{delivered:?}");
     };
     until("the notice", || !backend.notices().is_empty()).await;
@@ -1170,7 +1264,7 @@ async fn an_arrival_opens_one_round_for_an_idle_holder() {
             "[outrig] 2 messages are waiting on runtime.channels[\"inbox\"].".to_string(),
         ]
     );
-    assert!(kind(&events, "agent.request.ended", None).is_empty());
+    assert!(kind(&events, "agent.request.cancelled", None).is_empty());
 }
 
 /// The far end's close fails the endpoint: a wait says so once and not again, and `receive` and

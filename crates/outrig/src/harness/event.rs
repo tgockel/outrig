@@ -783,7 +783,14 @@ pub enum Payload {
         request: AgentRequestId,
         /// Whether the child had taken it.
         received: bool,
-        /// Why the host cancelled it, or `None` when its sender did.
+        /// Who cancelled it: `sender`, the agent or program that made it;
+        /// `owner`, the session's owner, for a request its backend made on an
+        /// inbound channel; `host`, after rounds that left it unanswered, or
+        /// once the child could make no further round; or `peer`, the
+        /// channel's close.
+        by: String,
+        /// Why, as its sender's `RequestCancelled` says it, or `None` for its
+        /// sender's or the owner's cancel.
         reason: Option<String>,
     },
     /// How the request ended, how many answers it took, and the child's
@@ -1217,8 +1224,11 @@ pub enum Payload {
     ChannelAttached {
         /// The channel's name, the holder's `runtime.channels` key.
         channel: String,
-        /// Its kind: `plain`.
+        /// Its kind: `plain` or `request`.
         kind: String,
+        /// Which way a request channel's requests go: `inbound` or `outbound`;
+        /// `None` for a plain channel.
+        direction: Option<String>,
         /// What arrives on it: `str`, `JSON`, a type's `module:Name`, or
         /// `nothing`.
         receives: String,
@@ -1248,6 +1258,56 @@ pub enum Payload {
         channel: String,
         /// Why, as the owner said.
         reason: String,
+    },
+    /// The event's subject asked an outbound request channel's far end: its
+    /// request went to the backend as item `item`.
+    #[non_exhaustive]
+    ChannelRequestSent {
+        /// The channel.
+        channel: String,
+        /// The request: its handle's `id`.
+        request: AgentRequestId,
+        /// The id its send was given, which its backend was given.
+        item: MessageId,
+        /// The request, bounded as a message's body is.
+        body: String,
+    },
+    /// An outbound request the event's subject made ended, once.
+    #[non_exhaustive]
+    ChannelRequestEnded {
+        /// The channel.
+        channel: String,
+        /// The request.
+        request: AgentRequestId,
+        /// How it ended: `accepted` for a reply.
+        outcome: RequestEnd,
+        /// Why, for any outcome but `accepted`, where one was said.
+        reason: Option<String>,
+    },
+    /// The session's owner settled an outbound request that had already
+    /// ended: nothing changed, and its settle was answered so.
+    #[non_exhaustive]
+    ChannelRequestRefused {
+        /// The channel.
+        channel: String,
+        /// The request.
+        request: AgentRequestId,
+        /// How it had ended.
+        ended: RequestEnd,
+    },
+    /// An external channel's backend acknowledged a notice that a request on
+    /// it ended, or that an answer to one that had ended was refused.
+    #[non_exhaustive]
+    ChannelSettled {
+        /// The channel.
+        channel: String,
+        /// The request.
+        request: AgentRequestId,
+        /// The id the session's owner gave an inbound request.
+        item: Option<String>,
+        /// Whether the notice was of an answer refused after the request
+        /// ended, rather than of its end.
+        refused: bool,
     },
     /// What became of an item the event's subject sent on an external channel.
     #[non_exhaustive]
@@ -1570,6 +1630,10 @@ impl Payload {
             Payload::ChannelConsumed { .. } => "channel.consumed",
             Payload::ChannelClosed { .. } => "channel.closed",
             Payload::ChannelItemOutcome { .. } => "channel.item.outcome",
+            Payload::ChannelRequestSent { .. } => "channel.request.sent",
+            Payload::ChannelRequestEnded { .. } => "channel.request.ended",
+            Payload::ChannelRequestRefused { .. } => "channel.request.refused",
+            Payload::ChannelSettled { .. } => "channel.settled",
         }
     }
 
@@ -2471,6 +2535,24 @@ pub enum RequestEnd {
     Closed,
     /// The interpreter died before it was answered.
     Terminated,
+}
+
+impl RequestEnd {
+    /// The end the interpreter's lines name `name`: `terminated` for one they
+    /// do not name.
+    pub(crate) fn named(name: &str) -> Self {
+        match name {
+            "accepted" => Self::Accepted,
+            "rejected" => Self::Rejected,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            "released" => Self::Released,
+            "budget" => Self::Budget,
+            "limit" => Self::Limit,
+            "closed" => Self::Closed,
+            _ => Self::Terminated,
+        }
+    }
 }
 
 /// How an agent class's instance was released.

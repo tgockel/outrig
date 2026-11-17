@@ -606,6 +606,31 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             },
             a,
         ),
+        (
+            "channel.attached",
+            {
+                "channel": "asks",
+                "kind": "request",
+                "direction": "outbound",
+                "receives": "str",
+                "sends": "str",
+                "bound": 8,
+                "wake": "wake",
+            },
+            a,
+        ),
+        (
+            "channel.request.sent",
+            {"request": 5, "channel": "asks", "item": 8, "body": '"may I?"'},
+            a,
+        ),
+        (
+            "channel.request.ended",
+            {"request": 5, "channel": "asks", "outcome": "failed", "reason": "no"},
+            a,
+        ),
+        ("channel.request.refused", {"request": 5, "channel": "asks", "ended": "failed"}, a),
+        ("channel.settled", {"request": 5, "channel": "asks", "item": "q-1", "refused": False}, a),
         ("channel.closed", {"channel": "inbox", "reason": "peer gone"}, a),
         (
             "message.refused",
@@ -869,7 +894,11 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             c,
         ),
         ("agent.request.progress", {"request": 8, "body": "p"}, c),
-        ("agent.request.cancelled", {"request": 8, "received": True, "reason": "r"}, c),
+        (
+            "agent.request.cancelled",
+            {"request": 8, "received": True, "by": "host", "reason": "r"},
+            c,
+        ),
         ("agent.released", {"released": ["c1"], "ended": ["c1", "c2"], "requests": [8]}, a),
         (
             "agent.call.ended",
@@ -1111,6 +1140,15 @@ def every_event() -> list[tuple[str, dict, str | None]]:
                             {"item": 9, "agent": "c2", "outcome": "uncertain", "reason": "r"},
                         ],
                         "unacknowledged": ["m-1"],
+                        "requests": [
+                            {
+                                "request": 11,
+                                "direction": "inbound",
+                                "item": "q-1",
+                                "end": "closed",
+                                "acknowledged": False,
+                            },
+                        ],
                     },
                 ],
                 "verdict": "not_proven_stopped",
@@ -1404,6 +1442,78 @@ class RenderSession(unittest.TestCase):
         html = self.page(events[:4] + child + events[4:])
         self.assertIn("request 9: cancelled by its sender (not yet taken)", html)
         self.assertIn(f"request 10: cancelled by the host (already taken): {why}", html)
+
+    def test_an_external_request_is_its_holders_and_names_its_sender(self) -> None:
+        """A request the owner pushed on an inbound channel names its sender as the backend gave
+        it, which is no agent: no section is made for them. A cancel the channel's close made
+        says so, as its `by` does, rather than calling it the host's."""
+        c = "agent/c1"
+        closed = "the channel's far end closed it: peer gone"
+        attached = {"channel": "questions", "kind": "request", "direction": "inbound",
+                    "receives": "str", "sends": "str", "bound": 8, "wake": "wake"}
+        child = [
+            ("agent.spawned", {"name": "n", "parent": "owner", "kind": "request", "model": "m"}, c),
+            ("agent.started", {"model": "m", "python": "3.13.15", "container": "x"}, c),
+            ("channel.attached", attached, c),
+            ("agent.request.sent", {"request": 9, "channel": "questions", "sender": "bob",
+                                     "body": "b", "attempts_max": 3}, c),
+            ("round.started", {"round": 1}, c),
+            ("agent.request.cancelled",
+             {"request": 9, "received": True, "by": "peer", "reason": closed}, c),
+        ]
+        events = ordinary()
+        html = self.page(events[:4] + child + events[4:])
+        self.assertIn("request 9 sent by bob (on questions)", html)
+        self.assertNotIn('id="agent-bob"', html)
+        self.assertNotIn(">bob</h3>", html)
+        said = f"request 9: cancelled by the channel's close (already taken): {closed}"
+        self.assertIn(said.replace("'", "&#39;"), html)
+
+    def test_a_refused_answers_notice_is_not_a_second_end(self) -> None:
+        """An inbound request failed and then answered again: the backend acknowledges the end's
+        notice and the refused answer's, and the page says which each was, so the request does
+        not read as ending twice."""
+        a = "agent/primary"
+        attached = {"channel": "questions", "kind": "request", "direction": "inbound",
+                    "receives": "str", "sends": "str", "bound": 8, "wake": "wake"}
+        asked = [
+            ("channel.attached", attached, a),
+            ("agent.request.sent", {"request": 9, "channel": "questions", "sender": "bob",
+                                     "body": "b", "attempts_max": 3}, a),
+            ("agent.request.failed", {"request": 9, "message": "no"}, a),
+            ("channel.settled",
+             {"request": 9, "channel": "questions", "item": "q-1", "refused": False}, a),
+            ("agent.request.refused", {"request": 9, "ended": "failed"}, a),
+            ("channel.settled",
+             {"request": 9, "channel": "questions", "item": "q-1", "refused": True}, a),
+        ]
+        events = ordinary()
+        html = self.page(events[:4] + asked + events[4:])
+        self.assertEqual(html.count("recorded its end"), 1)
+        self.assertIn(
+            "request 9: the backend of questions recorded a refused answer to it (item q-1)", html
+        )
+
+    def test_an_outbound_requests_send_is_its_own(self) -> None:
+        """What became of an outbound request's send is the request's: it is on the request's
+        row, and no message is made for the item it was sent as."""
+        a = "agent/primary"
+        attached = {"channel": "asks", "kind": "request", "direction": "outbound",
+                    "receives": "str", "sends": "str", "bound": 8, "wake": "wake"}
+        asked = [
+            ("channel.attached", attached, a),
+            ("channel.request.sent",
+             {"request": 5, "channel": "asks", "item": 31, "body": '"may I?"'}, a),
+            ("channel.item.outcome",
+             {"channel": "asks", "item": 31, "outcome": "accepted", "reason": None,
+              "reference": "ref-9"}, a),
+        ]
+        events = ordinary()
+        html = self.page(events[:4] + asked + events[4:])
+        self.assertIn("request 5 on asks: its send accepted at the backend (ref-9)", html)
+        self.assertIn('<span class="label">its send accepted at the backend (ref-9)</span>', html)
+        self.assertNotIn('id="msg-31"', html)
+        self.assertNotIn("message 31", html)
 
     def test_a_session_with_no_primary_titles_its_shared_section_session(self) -> None:
         """`no_primary()` means `agent/primary` never names a real agent, so the section a

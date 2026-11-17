@@ -39,11 +39,11 @@ use std::time::Duration;
 
 use super::history::Window;
 use super::instructions::Instructions;
-use crate::harness::Wake;
 use crate::harness::bindings::Brief;
 use crate::harness::event::{FacilityBrief, FacilityKind, InputBrief};
 use crate::harness::services::ServiceBrief;
 use crate::harness::skills::{Catalog, SkillBrief};
+use crate::harness::{ChannelKind, Direction, Wake};
 
 /// What every agent is told first: how it acts.
 const ACT: &str = "You act on this project by writing Python. Your one tool, `submit_python`, runs \
@@ -66,7 +66,7 @@ pub(crate) struct Holdings<'a> {
 /// it: rendered from the channel's definition alone, never from what crosses it.
 pub(crate) struct ExternalText {
     pub(crate) name: String,
-    pub(crate) kind: String,
+    pub(crate) kind: ChannelKind,
     /// What arrives on it, and what is sent, in the agent's terms.
     pub(crate) receives: String,
     pub(crate) sends: String,
@@ -76,18 +76,36 @@ pub(crate) struct ExternalText {
 
 /// What an agent is told of the external channels it holds, `channels`, of
 /// which there is at least one -- each by name, kind, contract and what an
-/// arrival does -- and how they are used; with `directive`, how an item naming
-/// one of the session's skills asks it to run that skill.
+/// arrival does -- and how each kind is used; with `directive`, how an item
+/// naming one of the session's skills asks it to run that skill.
 pub(crate) fn externals(channels: &[ExternalText], directive: bool) -> String {
     let mut text = String::from(
         "These channels end in the program that owns this session -- its own messaging -- not at \
          an agent:\n",
     );
     for channel in channels {
+        // What it is, what crosses it each way under which label, and what an arrival does.
+        let (what, (first, first_says), (second, second_says)) = match channel.kind {
+            ChannelKind::Request(Direction::Inbound) => (
+                "an inbound request",
+                ("A request", &channel.receives),
+                ("Its reply", &channel.sends),
+            ),
+            ChannelKind::Request(_) => (
+                "an outbound request",
+                ("A request you make", &channel.sends),
+                ("Its reply", &channel.receives),
+            ),
+            _ => (
+                "a plain",
+                ("What arrives", &channel.receives),
+                ("What you send", &channel.sends),
+            ),
+        };
         let _ = write!(
             text,
-            "\n- `runtime.channels[{:?}]`, a {} channel",
-            channel.name, channel.kind
+            "\n- `runtime.channels[{:?}]`, {what} channel",
+            channel.name
         );
         let description = channel.description.trim();
         if !description.is_empty() {
@@ -95,51 +113,95 @@ pub(crate) fn externals(channels: &[ExternalText], directive: bool) -> String {
         }
         let _ = write!(
             text,
-            "\n  What arrives: {}\n  What you send: {}\n  {}\n",
-            channel.receives,
-            channel.sends,
-            match channel.wake {
-                Wake::Wake => {
-                    "An arrival ends a `runtime.wait` with `runtime.MessageAvailable`, is \
-                     announced, and opens a round when you are at rest."
-                }
-                Wake::Announce => {
-                    "An arrival is announced, and opens a round when you are at rest; it does not \
-                     end a `runtime.wait`."
-                }
-                Wake::Silent => {
-                    "An arrival is not announced and opens no round: read it when your code \
-                     chooses, with `pending()` and `receive()`."
-                }
-            }
+            "\n  {first}: {first_says}\n  {second}: {second_says}\n"
         );
+        if let Some(arrival) = arrival(channel.kind, channel.wake) {
+            let _ = writeln!(text, "  {arrival}");
+        }
     }
-    text.push_str(
-        "\nWhat crosses them is messages, and a message owes no reply -- unlike a request, which \
-         you answer with `d.reply` or `d.fail`. Take one with `d = await \
-         runtime.channels[name].receive()`: `d.body` is it, `d.sender` who sent it, and `d.id` \
-         its id; receiving it tells the far end you have it, and an announcement says how many \
-         wait, never what they say. `await runtime.channels[name].send(value)` returns once the \
-         far end has taken it, not read it; it raises `outrig.SendNotAccepted` when the far end \
-         did not take it, so sending it again is safe, `outrig.SendUncertain` when it may have, \
-         so sending it again may deliver it twice, and `outrig.ChannelClosed` once the far end \
-         has closed the channel, after which `receive()` raises too once what waited is read.",
-    );
-    if directive {
+    let has = |kind: ChannelKind| channels.iter().any(|channel| channel.kind == kind);
+    text.push('\n');
+    if has(ChannelKind::Plain) {
         text.push_str(
-            " A message whose `d.skill` names one of the session's skills asks you to run it, \
-             with what the message says: for a skill with a package, `await \
-             outrig.skills.invoke(d.skill, text)`; for one without, follow \
-             `outrig.skills.read(d.skill)`.",
+            "On a plain channel what crosses is messages, and a message owes no reply -- unlike a \
+             request, which you answer with `d.reply` or `d.fail`. Take one with `d = await \
+             runtime.channels[name].receive()`: `d.body` is it, `d.sender` who sent it, and \
+             `d.id` its id; receiving it tells the far end you have it, and an announcement says \
+             how many wait, never what they say. `await runtime.channels[name].send(value)` \
+             returns once the far end has taken it, not read it; it raises \
+             `outrig.SendNotAccepted` when the far end did not take it, so sending it again is \
+             safe, `outrig.SendUncertain` when it may have, so sending it again may deliver it \
+             twice, and `outrig.ChannelClosed` once the far end has closed the channel, after \
+             which `receive()` raises too once what waited is read.",
+        );
+        if directive {
+            text.push_str(
+                " A message whose `d.skill` names one of the session's skills asks you to run it, \
+                 with what the message says: for a skill with a package, `await \
+                 outrig.skills.invoke(d.skill, text)`; for one without, follow \
+                 `outrig.skills.read(d.skill)`.",
+            );
+        }
+        text.push(' ');
+    }
+    if has(ChannelKind::Request(Direction::Inbound)) {
+        text.push_str(
+            "On an inbound request channel each item is a request, which owes a reply. Take one \
+             with `d = await runtime.channels[name].receive()`: `d.body` is it, `d.sender` who \
+             asked, and `d.id` its id. Answer it with `await d.reply(value)`, `value` of the \
+             reply's type or its JSON form, which returns once the reply is accepted and raises \
+             what is wrong with one that is not; or end it unanswered with `await \
+             d.fail(message)`, saying why. Only `d.reply` and `d.fail` answer: what you write \
+             yourself reaches no one. A request the far end gives up on, or one the far end's \
+             close ends, raises `outrig.RequestCancelled` at your answer. `receive()` waits on its \
+             own channel alone: take a request a round has said is waiting, and to wait for the \
+             next, stop writing -- a new round begins when one is waiting. ",
         );
     }
+    if has(ChannelKind::Request(Direction::Outbound)) {
+        text.push_str(
+            "On an outbound request channel you ask: `h = runtime.channels[name].request(body)` \
+             returns the request's handle at once. `await h` gives the reply, or raises how the \
+             request ended -- `outrig.AgentRequestFailed`, `outrig.RequestCancelled`, or what \
+             `send` raises when it was not sent; `runtime.wait` takes `h` as it takes a child's \
+             handle, and a wait that ends with it pending settles nothing. `h.status.state` is \
+             `sending` until the far end has taken it, then `waiting`; `h.cancel()` asks the far \
+             end, once, to withdraw it, and `h` settles on its answer, or reads `uncertain` with \
+             none. ",
+        );
+    }
+    let end = text.trim_end().len();
+    text.truncate(end);
     text.push_str("\n\n");
     text
 }
 
-/// Whether any of `channels` opens a round on an arrival.
+/// What an arrival on a channel of `kind` does, under `wake`, in the agent's
+/// terms: nothing arrives on an outbound request channel, and every request on
+/// an inbound one is announced, its policy deciding only whether it ends a wait.
+fn arrival(kind: ChannelKind, wake: Wake) -> Option<&'static str> {
+    Some(match (kind, wake) {
+        (ChannelKind::Request(Direction::Outbound), _) => return None,
+        (_, Wake::Wake) => {
+            "An arrival ends a `runtime.wait` with `runtime.MessageAvailable`, is announced, and \
+             opens a round when you are at rest."
+        }
+        (ChannelKind::Request(_), _) | (_, Wake::Announce) => {
+            "An arrival is announced, and opens a round when you are at rest; it does not end a \
+             `runtime.wait`."
+        }
+        _ => {
+            "An arrival is not announced and opens no round: read it when your code chooses, \
+             with `pending()` and `receive()`."
+        }
+    })
+}
+
+/// Whether any of `channels` opens a round on a message's arrival.
 fn announcing(channels: &[ExternalText]) -> bool {
-    channels.iter().any(|channel| channel.wake != Wake::Silent)
+    channels
+        .iter()
+        .any(|channel| channel.kind == ChannelKind::Plain && channel.wake != Wake::Silent)
 }
 
 /// The orientation, then `configured` after a blank line when there is one,
@@ -425,6 +487,10 @@ pub(crate) fn child_preamble(
         text.push_str(&externals(external, directive));
     }
     let messages = announcing(external);
+    // An inbound request channel of the session's owner brings requests, held to the same rule.
+    let asked = external
+        .iter()
+        .any(|channel| channel.kind == ChannelKind::Request(Direction::Inbound));
     let begins_owned;
     let begins = match brief {
         ChildBrief::Call {
@@ -469,26 +535,22 @@ pub(crate) fn child_preamble(
             text.push_str(WAIT);
             "each time a submission is given to you, or one stays open"
         }
-        // A root that declares no request channel has none to answer on, and says so.
-        ChildBrief::Instance {
-            root: true,
-            channels: [],
-            ..
-        } => {
-            let _ = write!(
-                text,
-                "Your class declares no request channel, so no request arrives and you have no \
-                 `runtime.complete`. {WAIT}{NOT_WAITING}\n\n"
-            );
-            if messages {
-                "as you are launched, to get ready in, then when a message arrives on one of \
-                 your channels"
+        // An agent that answers requests: on its own request channels, or -- a root whose class
+        // declares none -- on the inbound channels of the session's owner.
+        ChildBrief::Request(channels) | ChildBrief::Instance { channels, .. }
+            if !channels.is_empty() || asked =>
+        {
+            if channels.is_empty() {
+                let _ = write!(
+                    text,
+                    "Your class declares no request channel, so you have no `runtime.complete`: \
+                     the requests you answer arrive on the inbound request channels above. A \
+                     round's opening line says what waits, by channel and count, and never what \
+                     it holds. {WAIT}"
+                );
             } else {
-                "as you are launched"
+                text.push_str("You answer requests, which arrive on these channels:\n");
             }
-        }
-        ChildBrief::Request(channels) | ChildBrief::Instance { channels, .. } => {
-            text.push_str("You answer requests, which arrive on these channels:\n");
             for channel in *channels {
                 let _ = write!(text, "\n- `runtime.channels[{:?}]`", channel.name);
                 if let Some(doc) = &channel.doc {
@@ -503,7 +565,8 @@ pub(crate) fn child_preamble(
                     indented(&channel.reply)
                 );
             }
-            text.push_str(
+            if !channels.is_empty() {
+                text.push_str(
                 "\nTake a request with `d = await runtime.channels[name].receive()`: `d.body` is \
                  the request and `d.id` its id. `receive()` takes the next request on that channel \
                  only. With none queued there, it does not return until one arrives there; a \
@@ -523,7 +586,8 @@ pub(crate) fn child_preamble(
                  back, and a timeout that cancels nothing -- except that while a request waits \
                  unread, it raises `runtime.MessageAvailable`, which `except Exception` does not \
                  catch. The request stays queued and the tasks keep running.\n\n",
-            );
+                );
+            }
             text.push_str(
                 "For work you started, ending your round is not waiting: nothing opens a round \
                  when a task you started finishes, so wait for that inside the round, with \
@@ -544,6 +608,21 @@ pub(crate) fn child_preamble(
             };
             begins_owned = format!("{launched}when requests are waiting{open}");
             &begins_owned
+        }
+        // What is left answers nothing: a root that declares no request channel and holds no
+        // inbound one, which says so.
+        _ => {
+            let _ = write!(
+                text,
+                "Your class declares no request channel, so no request arrives and you have no \
+                 `runtime.complete`. {WAIT}{NOT_WAITING}\n\n"
+            );
+            if messages {
+                "as you are launched, to get ready in, then when a message arrives on one of \
+                 your channels"
+            } else {
+                "as you are launched"
+            }
         }
     };
     // A root the owner constructed is the application's primary, and is told the session's skills.

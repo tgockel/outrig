@@ -11,8 +11,9 @@ use super::*;
 use crate::agent::rig_json;
 use crate::harness::event::*;
 use crate::harness::{
-    BindingStop, ChannelClose, ClosedBy, ExecutionOutcome, ExecutionStatus, HostedCall,
-    RequestOutcome, SendAtClose, ServiceCall, ServiceErrorCategory, Stopped, Verdict,
+    BindingStop, ChannelClose, ChannelRequestAtClose, ClosedBy, Direction, ExecutionOutcome,
+    ExecutionStatus, HostedCall, RequestOutcome, SendAtClose, ServiceCall, ServiceErrorCategory,
+    Stopped, Verdict,
 };
 
 const SOURCE: &str = "/outrig/session/20260921T103000-a1b2";
@@ -276,6 +277,13 @@ fn each_event_has_exactly_its_data_fields() {
                         reason: Some(text("the session ended first")),
                     }],
                     unacknowledged: vec![text("m-1")],
+                    requests: vec![ChannelRequestAtClose {
+                        request: AgentRequestId::new(8),
+                        direction: Direction::Inbound,
+                        item: Some(text("q-1")),
+                        end: RequestEnd::Closed,
+                        acknowledged: false,
+                    }],
                 }],
                 verdict: Verdict::StoppedWithUnknown,
             },
@@ -940,10 +948,11 @@ fn each_event_has_exactly_its_data_fields() {
             Payload::AgentRequestCancelled {
                 request: AgentRequestId::new(7),
                 received: true,
+                by: text("sender"),
                 reason: None,
             },
             "agent.request.cancelled",
-            &["request", "received", "reason"],
+            &["request", "received", "by", "reason"],
         ),
         (
             Payload::AgentRequestProgress {
@@ -1177,13 +1186,61 @@ fn each_event_has_exactly_its_data_fields() {
             Payload::ChannelAttached {
                 channel: text("inbox"),
                 kind: text("plain"),
+                direction: None,
                 receives: text("str"),
                 sends: text("app.messages:Note"),
                 bound: 256,
                 wake: text("announce"),
             },
             "channel.attached",
-            &["channel", "kind", "receives", "sends", "bound", "wake"],
+            &[
+                "channel",
+                "kind",
+                "direction",
+                "receives",
+                "sends",
+                "bound",
+                "wake",
+            ],
+        ),
+        (
+            Payload::ChannelRequestSent {
+                channel: text("asks"),
+                request: AgentRequestId::new(5),
+                item: MessageId::new(6),
+                body: text("\"may I?\""),
+            },
+            "channel.request.sent",
+            &["channel", "request", "item", "body"],
+        ),
+        (
+            Payload::ChannelRequestEnded {
+                channel: text("asks"),
+                request: AgentRequestId::new(5),
+                outcome: RequestEnd::Failed,
+                reason: Some(text("no")),
+            },
+            "channel.request.ended",
+            &["channel", "request", "outcome", "reason"],
+        ),
+        (
+            Payload::ChannelRequestRefused {
+                channel: text("asks"),
+                request: AgentRequestId::new(5),
+                ended: RequestEnd::Cancelled,
+            },
+            "channel.request.refused",
+            &["channel", "request", "ended"],
+        ),
+        (
+            Payload::ChannelSettled {
+                channel: text("questions"),
+                request: AgentRequestId::new(7),
+                item: Some(text("q-1")),
+                refused: false,
+            },
+            "channel.settled",
+            &["channel", "request", "item", "refused"],
         ),
         (
             Payload::ChannelConsumed {
@@ -1366,6 +1423,13 @@ fn each_event_has_exactly_its_data_fields() {
                     "reason": "the session ended first",
                 }],
                 "unacknowledged": ["m-1"],
+                "requests": [{
+                    "request": 8,
+                    "direction": "inbound",
+                    "item": "q-1",
+                    "end": "closed",
+                    "acknowledged": false,
+                }],
             }],
             "verdict": "stopped_with_unknown",
         })

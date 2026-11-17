@@ -455,6 +455,9 @@ one of:
   the host cancelled it under the liveness rule (below); the backend receives which;
 - **closed** -- the session closed with it open (`lifecycle.md`, "Closing a session"); the backend
   receives `closed`;
+- **released** -- its holder was released with it open, unread or received: a request is owed by
+  the agent that held it, so it ends with that agent rather than waiting for the channel's next
+  holder, as an unread message does (`0003-52`); the backend receives `released`;
 - **suspended** -- a sleep's cut ended it in this session (`continuation.md`, "Open work at the
   cut"; `0003-65`); the backend receives `suspended` under the durable id and keeps the request, and
   the session that resumes from the save takes it up under that id, where it ends once more in one
@@ -520,7 +523,9 @@ handle. The endpoint is then failed as `messages.md`, "Failure", has it: `runtim
 failure once and not on a later wait, and a later `send` or `receive` raises. Every request
 outstanding on the channel ends `cancelled`, with the closure as its cause -- an outbound handle
 raises `RequestCancelled` naming it, an inbound request is withdrawn or its `reply` raises -- and
-each end is told to the backend as that request's one terminal outcome (OR-A7-5; CC-MSG-5).
+each end is told to the backend as that request's one terminal outcome (OR-A7-5; CC-MSG-5). An
+outbound request whose send the backend has not yet answered is told once it answers, and only if
+it took the request: the backend holds a request before it hears that the request ended.
 
 ### The liveness rule covers an inbound request channel on a runner-driven holder
 
@@ -655,13 +660,15 @@ pub trait ChannelBackend: Send + Sync {
     fn send(&self, item: &Outbound) -> Result<Accepted, SendError>;
     /// The agent's code received inbound `item`, by the owner's item id. 0003-51.
     fn consumed(&self, channel: &str, item: &ItemId) -> io::Result<()>;
-    /// An inbound request ended in this session, once, as `end` says -- replied, failed,
-    /// cancelled, closed or suspended (0003-65) -- or a late reply was refused. 0003-52.
-    fn settled(&self, channel: &str, request: &ItemId, end: &Settlement) -> io::Result<()>;
-    /// The agent's side ended outbound request `request`: `cancelled` by the agent, `released` by
-    /// the close, `suspended` by a cut. The backend answers `Withdrawn`, or `AlreadyReplied` /
-    /// `AlreadyFailed` with what it recorded, which settles the handle instead. 0003-52, 0003-65.
-    fn withdrawn(&self, channel: &str, request: MessageId, end: &Withdrawal) -> io::Result<Verdict>;
+    /// An inbound request ended in this session, once, as `notice.outcome` says -- replied,
+    /// failed, cancelled, closed, released, or suspended (0003-65) -- or a late reply was refused;
+    /// or an outbound one ended in a way the backend did not give. 0003-52.
+    fn settled(&self, notice: &Settled) -> io::Result<()>;
+    /// The agent's side ended outbound request `withdrawal.request`: `cancelled` by the agent,
+    /// `released` by its holder's release or the close, `suspended` by a cut. The backend answers
+    /// `Withdrawn`, or `Replied` / `Failed` with what it recorded, which settles the handle
+    /// instead. 0003-52, 0003-65.
+    fn withdrawn(&self, withdrawal: &Withdrawal) -> io::Result<WithdrawAnswer>;
     /// What became of an operation whose outcome is uncertain: for a `Send`, accepted with its
     /// reference, not accepted, or still uncertain; for a `Withdrawal`, withdrawn, replied or
     /// failed with what the backend recorded, or still uncertain. 0003-53.
@@ -731,13 +738,13 @@ its own events to `doc/reference/events.md`, in the categories `observability.md
   `not_accepted` or `uncertain`, with the reason and the backend's reference (integration audit).
 - `0003-52`: inbound requests under the request family `agent.request.*`, with `sender` the
   backend's identity, since an inbound external request is a request of the holder (above);
-  `channel.request.sent`, `channel.request.settled` and `channel.request.refused` for outbound
+  `channel.request.sent`, `channel.request.ended` and `channel.request.refused` for outbound
   requests, under the requesting agent's subject, since their recipient is not an agent;
   `channel.settled` -- the backend acknowledged a settlement notice.
 - `0003-53`: `channel.item.resolved` -- an uncertain item resolved by query, and to what.
 
 Every event carries the item's or the request's id, so a reader can follow one item from
-`message.sent` through `channel.item.outcome` to `channel.consumed` or `channel.request.settled`.
+`message.sent` through `channel.item.outcome` to `channel.consumed` or `channel.request.ended`.
 Bodies are recorded as the user channel's are, whole up to the channel's limit, since the
 category is integration audit and the file is its owner's alone. The owner's authoritative reads
 -- the per-round sends, the positions -- never come from these events (`A-06`); they come from
@@ -826,10 +833,9 @@ is given a facility of the application's making.
   request channels between agents; that they generalize to a host end other than the user is
   reasoned from `host.rs:2232-2262`, where the only host end today is the primary's outbox and
   every other channel's send is refused as "nothing on the host reads this channel".
-- That the runner's `Summary` can take external request records without a change to the rule is
-  reasoned from `children.rs:1012-1035`, which builds the summary from `state.requests` by
-  `record.child`; whether an id space shared between the host's `MessageId` and the interpreter's
-  request ids is needed, or two registries are unioned, is `0003-52`'s fork.
+- That the runner's `Summary` takes external request records without a change to the rule is
+  measured by `0003-52`'s tests: an inbound request is recorded in the children registry under an
+  id the interpreter mints, its fork 1, and the warning and the cancel reach it unchanged.
 - That `runtime.wait` over a child's handle and an external channel is one wait is reasoned from
   `_interpreter.py:4036-4130`, where handles are watched through their futures and channels through
   `_watch` in one loop; `0003-51`'s acceptance runs it.

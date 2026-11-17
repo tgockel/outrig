@@ -106,7 +106,6 @@ phase.
 
 | Task      | What it settles                                     |
 | --------- | ----------------------------------------------------|
-| `0003-52` | A request crosses an external channel               |
 | `0003-53` | A send is accepted, refused, or uncertain           |
 
 **MCP services**
