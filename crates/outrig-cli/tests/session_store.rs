@@ -1552,3 +1552,170 @@ fn explicit_dir_reached_through_a_cancelled_missing_segment_survives_a_failed_li
         "the write the failed link could not register should still be undone"
     );
 }
+
+/// #910: neither launch path may put the session root inside the directory
+/// that removal will later delete, even before either path exists.
+#[test]
+fn explicit_dir_containing_the_root_is_refused_before_writing() {
+    for existing in [false, true] {
+        for prepare_only in [false, true] {
+            for alias in [false, true] {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let dir = tmp.path().join("out");
+                if existing {
+                    std::fs::create_dir(&dir).expect("mkdir out");
+                }
+                let base = if alias {
+                    let link = tmp.path().join("alias");
+                    std::os::unix::fs::symlink(tmp.path(), &link).expect("symlink");
+                    link
+                } else {
+                    tmp.path().to_path_buf()
+                };
+                let root = base.join("out/sessions");
+                let store = SessionStore::new(root.clone());
+                let sid = SessionId("20261005T200230-5c0d".into());
+                let result = if prepare_only {
+                    // run-new prepares its directory before claiming an id.
+                    store.prepare_explicit_dir(&dir).map(|_| ())
+                } else {
+                    // run and mcp materialize through create.
+                    store
+                        .create(&sid, Some(&dir), &mut sample_session(&sid))
+                        .map(|_| ())
+                };
+                let err = result.expect_err("a session directory must not contain the root");
+                assert!(
+                    err.to_string().contains("contains the session root"),
+                    "{err}"
+                );
+                assert!(!root.exists(), "refusal must not create the root");
+                assert_eq!(
+                    dir.exists(),
+                    existing,
+                    "refusal must not create the directory"
+                );
+                if existing {
+                    assert_eq!(std::fs::read_dir(&dir).expect("read dir").count(), 0);
+                }
+            }
+        }
+    }
+}
+
+/// Old layouts may already have the root inside a session. All removal
+/// callers (discard by id/path and clean, including unreadable records) must
+/// refuse before deleting anything or unregistering the session.
+#[test]
+fn removal_refuses_a_directory_containing_the_resolved_root() {
+    for by_path in [false, true] {
+        for alias in [false, true] {
+            for equal in [false, true] {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let dir = tmp.path().join("out");
+                let root = if equal {
+                    dir.clone()
+                } else {
+                    dir.join("sessions")
+                };
+                std::fs::create_dir_all(&root).expect("mkdir root");
+                let store_root = if alias {
+                    let link = tmp.path().join("root-alias");
+                    std::os::unix::fs::symlink(&root, &link).expect("symlink root");
+                    link
+                } else {
+                    root.clone()
+                };
+                let store = SessionStore::new(store_root);
+                let sid = SessionId("20261005T200230-5c0d".into());
+                let mut session = sample_session(&sid);
+                session.session_dir = dir.clone();
+                let record = serde_json::to_vec(&session).expect("serialize");
+                std::fs::write(dir.join("session.json"), &record).expect("write record");
+                std::fs::write(dir.join("KEEP"), b"keep").expect("write file");
+                let entry = root.join(sid.as_str());
+                std::os::unix::fs::symlink(&dir, &entry).expect("symlink session");
+                let other = SessionId("20261005T200231-abcd".into());
+                let (other_dir, _owner) = store
+                    .create(&other, None, &mut sample_session(&other))
+                    .expect("create another live session");
+                let err = if by_path {
+                    // Also exercise a symlink argument to --session-dir.
+                    store.remove_by_path(if alias { &entry } else { &dir })
+                } else {
+                    store.remove_by_id(&sid)
+                }
+                .expect_err("must not remove the session root");
+                assert!(err.to_string().contains("session root"), "{err}");
+                assert_eq!(
+                    std::fs::read(dir.join("session.json")).expect("record"),
+                    record
+                );
+                assert_eq!(std::fs::read(dir.join("KEEP")).expect("file"), b"keep");
+                assert!(
+                    entry.is_symlink(),
+                    "refusal must not unregister the session"
+                );
+                assert!(
+                    other_dir.join("session.json").exists(),
+                    "other sessions survive"
+                );
+            }
+        }
+    }
+}
+
+/// Creating the leading directories activates the dangling alias before the
+/// kernel reaches it. Its target, not its spelling, determines the final path.
+#[test]
+fn explicit_dir_through_an_activated_dangling_alias_is_allowed() {
+    for prepare_only in [false, true] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("sessiondir/sessions");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        std::os::unix::fs::symlink("new/deep", tmp.path().join("alias")).expect("symlink");
+        let dir = tmp.path().join("new/deep/../../alias/../sessiondir");
+        let expected = tmp.path().join("new/sessiondir");
+        let store = SessionStore::new(root.clone());
+        let sid = SessionId("20261005T200230-5c0d".into());
+        if prepare_only {
+            let existing = store
+                .prepare_explicit_dir(&dir)
+                .expect("prepare disjoint directory");
+            assert_eq!(existing, tmp.path());
+        } else {
+            let (actual, _lock) = store
+                .create(&sid, Some(&dir), &mut sample_session(&sid))
+                .expect("create disjoint session");
+            assert_eq!(actual, expected);
+            store.remove_by_id(&sid).expect("remove disjoint session");
+            assert!(root.is_dir(), "the session root survives removal");
+        }
+    }
+}
+
+#[test]
+fn explicit_dir_containing_a_dangling_root_alias_is_refused_before_writing() {
+    for prepare_only in [false, true] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink("out", tmp.path().join("alias")).expect("symlink");
+        let root = tmp.path().join("alias/sessions");
+        let dir = tmp.path().join("out");
+        let store = SessionStore::new(root.clone());
+        let sid = SessionId("20261005T200230-5c0d".into());
+        let result = if prepare_only {
+            store.prepare_explicit_dir(&dir).map(|_| ())
+        } else {
+            store
+                .create(&sid, Some(&dir), &mut sample_session(&sid))
+                .map(|_| ())
+        };
+        let err = result.expect_err("the root alias must not hide containment");
+        assert!(
+            err.to_string().contains("contains the session root"),
+            "{err}"
+        );
+        assert!(!dir.exists(), "refusal creates nothing");
+        assert!(!root.exists(), "refusal creates no root");
+    }
+}

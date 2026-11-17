@@ -292,6 +292,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A session directory cannot contain the session root.** `run`, `run-new`, and `mcp` refuse
+  such an explicit directory before creating anything, even when the root does not exist yet.
+  Preflight follows dangling symlink targets too, including ones that directory creation activates,
+  so aliases neither hide containment nor make a disjoint directory look nested.
+  `discard` and `clean` also refuse to delete directories containing the resolved root, so
+  layouts from older versions cannot take other sessions' records and logs with them. (#910)
+
 - **Every symlink hop in the global config path is protected.** Default workspaces and
   repo-declared read-write mounts cannot cover an intermediate link in a chain or a dangling
   link's target directories. Path resolution follows links one component at a time and refuses

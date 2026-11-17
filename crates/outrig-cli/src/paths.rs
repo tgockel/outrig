@@ -517,7 +517,7 @@ fn implicit_workspace_origin(repo_root: &Path) -> String {
 /// to right, so a symlink is followed before any `..` after it is applied; a
 /// component that does not exist is kept as written, and a later `..` pops it.
 /// Loops and lookup errors other than a missing entry fail closed.
-fn canonical_or_normalized(p: &Path) -> Result<PathBuf> {
+pub(crate) fn canonical_or_normalized(p: &Path) -> Result<PathBuf> {
     Ok(resolve_lenient(p)?.0)
 }
 

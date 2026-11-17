@@ -102,6 +102,12 @@ reason, since the first run's `session.json` is still there: discard that sessio
 give each run its own path.
 `outrig run-new --session-dir` takes the same path on the same terms.
 
+The directory must be outside the session root and must not contain it, even if the root does
+not exist yet. For example, `--session-dir out --session-root out/sessions` is refused before
+either directory is created: discarding `out` would otherwise delete every session under it.
+`discard` and `clean` also refuse to remove a directory that contains the resolved session root,
+including layouts created by older versions.
+
 ## `outrig ls`
 
 List sessions newest-first:

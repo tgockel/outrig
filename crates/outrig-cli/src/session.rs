@@ -23,7 +23,7 @@
 
 use std::fs;
 use std::io::Write as _;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use nix::fcntl::{FcntlArg, fcntl};
@@ -381,8 +381,8 @@ impl SessionStore {
 
     /// Hold `dir`, a `--session-dir`, to what can be checked before anything is
     /// written, then create it, with any missing parents: it may be nothing but
-    /// a directory, and not at or under the session root. Returns the longest
-    /// prefix of `dir`, resolved, that was already there, for
+    /// a directory, neither containing nor at or under the session root. Returns
+    /// the longest prefix of `dir`, resolved, that was already there, for
     /// [`remove_created`] to stop at. Whether it is empty is
     /// [`refuse_unless_empty`]'s, which `run-new` asks under a lock.
     ///
@@ -390,7 +390,9 @@ impl SessionStore {
     /// under it would get its own entry there once the root exists, on top of
     /// the `<root>/<sid>` link made for it -- `list` reading the directory and
     /// the link as two sessions for the one record (#429). [`canonicalize_prefix`]
-    /// resolves each side as far as it exists, so neither has to yet.
+    /// resolves each side as far as it exists, so neither has to yet. The reverse
+    /// containment is refused too: removing the session would otherwise delete
+    /// the root and every session under it (#910).
     pub fn prepare_explicit_dir(&self, dir: &Path) -> Result<PathBuf> {
         if dir.exists() && !dir.is_dir() {
             return Err(OutrigError::Configuration(format!(
@@ -399,13 +401,22 @@ impl SessionStore {
             ))
             .into());
         }
-        let (logical, existing) = canonicalize_prefix(dir).path_ctx("resolve", dir)?;
-        let (root, _) = canonicalize_prefix(&self.root).path_ctx("resolve", &self.root)?;
+        let (logical, existing) = canonicalize_prefix(dir)?;
+        let (root, _) = canonicalize_prefix(&self.root)?;
         // By whole components, and true of the root itself.
         if logical.starts_with(&root) {
             return Err(OutrigError::Configuration(format!(
                 "--session-dir {} is inside the session root {}; omit --session-dir, \
                  or name a directory outside it",
+                dir.display(),
+                self.root.display(),
+            ))
+            .into());
+        }
+        if root.starts_with(&logical) {
+            return Err(OutrigError::Configuration(format!(
+                "--session-dir {} contains the session root {}; \
+                 name a directory outside it that does not contain it",
                 dir.display(),
                 self.root.display(),
             ))
@@ -593,12 +604,12 @@ impl SessionStore {
                 .root
                 .join(fs::read_link(&entry).path_ctx("read symlink", &entry)?);
             if target.exists() {
-                remove_record(&target)?;
+                remove_record(&target, &self.root)?;
             }
             fs::remove_file(&entry).path_ctx("remove", &entry)?;
             Ok(())
         } else {
-            remove_record(&entry)
+            remove_record(&entry, &self.root)
         }
     }
 
@@ -633,7 +644,7 @@ impl SessionStore {
         // record.
         let canon_dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         if canon_dir.exists() {
-            remove_record(&canon_dir)?;
+            remove_record(&canon_dir, &self.root)?;
         }
         let entries = match fs::read_dir(&self.root) {
             Ok(e) => e,
@@ -703,8 +714,20 @@ pub fn remove_created(dir: &Path, existing: &Path) {
 /// `report.html` `scripts/render-session.py` writes -- is as ephemeral as the
 /// session. `session.json` goes last, so a removal that fails partway leaves a
 /// record that can still be found and removed again. A symlink inside is
-/// unlinked, never followed.
-fn remove_record(dir: &Path) -> Result<()> {
+/// unlinked, never followed. Older layouts may contain the session root
+/// (#910); refuse those before removing any content, resolving both paths so
+/// symlink aliases and relative paths cannot hide containment.
+fn remove_record(dir: &Path, root: &Path) -> Result<()> {
+    let resolved_dir = fs::canonicalize(dir).path_ctx("resolve", dir)?;
+    let (resolved_root, _) = canonicalize_prefix(root)?;
+    if resolved_root.starts_with(&resolved_dir) {
+        return Err(OutrigError::Configuration(format!(
+            "refusing to remove session directory {}: it contains the session root {}",
+            dir.display(),
+            root.display(),
+        ))
+        .into());
+    }
     for entry in fs::read_dir(dir).path_ctx("read directory", dir)? {
         let entry = entry.path_ctx("read directory", dir)?;
         if entry.file_name() == SESSION_JSON {
@@ -745,96 +768,28 @@ fn dir_names(dir: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Canonicalize `path`, which may not exist yet: resolve the longest existing
-/// prefix, symlinks included, and apply whatever comes after it lexically.
-/// Returns `(logical, existing_prefix)`: `logical` is the full path -- the
-/// resolved prefix plus whatever of `path` is not there yet, applied as
-/// written -- and is what [`SessionStore::create`] compares against the
-/// session root for containment before either one is necessarily on disk
-/// (#429). `existing_prefix` is just the part of that confirmed against the
-/// real filesystem, equal to `logical` exactly when `path` names something
-/// already there -- including a `path` that only gets there by canceling a
-/// missing name with a later `..`, which a plain `path.exists()` cannot
-/// confirm, since the kernel refuses to resolve `..` past a name that is not
-/// there to begin with. `create` reads prior existence this way rather than
-/// with `path.exists()` so that undoing a directory it made itself, on a
-/// link that then fails, never takes a same-named directory that predates
-/// the call with it (#431).
+/// Resolve `path` even when it does not exist, then find its longest existing
+/// prefix. The logical path is used for containment before creation; the prefix
+/// is where [`remove_created`] stops on rollback (#431).
 ///
-/// A relative `path` is anchored to the current directory first, the same
-/// base `fs::create_dir_all` and friends resolve it against: without this, a
-/// bare name like `new-run` would have no existing ancestor of its own to
-/// climb to.
-///
-/// Walks `path`'s components forward, growing `resolved` -- always a real,
-/// fully symlink-resolved path -- one at a time for as long as each next
-/// name exists on disk (`fs::canonicalize` on `resolved` plus that one name,
-/// so a symlink is followed exactly as the kernel would). The first name
-/// that is not there ends that growth; from there on, `missing` holds the
-/// rest lexically, and a `..` among it cancels the pending name nearest to
-/// it -- the last one still in `missing`, or, once `missing` empties again,
-/// one already folded into `resolved` -- which is sound because nothing
-/// `missing` names can be a symlink sending `..` elsewhere, and `resolved`
-/// has no symlink left in it to do that either, every one already having
-/// been followed on the way there. A name is tried against the real
-/// filesystem again the moment `missing` empties, even after an earlier one
-/// did not exist: `missing/../alias/...` resolves `alias`, symlink and all,
-/// exactly as it would with no `missing` in front of it, and a `..` right
-/// after it goes to *its* real parent, not lexically back to where `missing`
-/// was (caught in review of #429, alongside a path with more than one
-/// trailing `..` landing outside the session root entirely, which an earlier
-/// version of this walk -- shrinking the whole suffix backward instead of
-/// growing `resolved` forward -- misjudged as inside it). `resolved` at the
-/// end of the walk, before `missing` -- empty or not -- is appended onto it
-/// for `logical`, is `existing_prefix`.
-fn canonicalize_prefix(path: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
-    let anchored;
-    let start: &Path = if path.is_absolute() {
-        path
-    } else {
-        anchored = std::env::current_dir()?.join(path);
-        &anchored
-    };
-
-    let mut parts = start.components();
-    let mut resolved = match parts.next() {
-        Some(root @ Component::RootDir) => PathBuf::from(root.as_os_str()),
-        _ => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{} has no root to resolve from", path.display()),
-            ));
-        }
-    };
-    let mut missing: Vec<std::ffi::OsString> = Vec::new();
-
-    for comp in parts {
-        match comp {
-            Component::CurDir => {}
-            Component::Normal(name) if missing.is_empty() => {
-                match fs::canonicalize(resolved.join(name)) {
-                    Ok(canon) => resolved = canon,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        missing.push(name.to_os_string());
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            Component::Normal(name) => missing.push(name.to_os_string()),
-            Component::ParentDir => {
-                if missing.pop().is_none() {
-                    resolved.pop();
-                }
-            }
-            Component::RootDir | Component::Prefix(_) => {}
+/// Share the mount guards' component walk: it expands even dangling symlinks
+/// before applying a following `..`. Creating an earlier component can activate
+/// such a link, so treating its name as an ordinary missing directory predicts
+/// the wrong destination (#910). Loops and lookup errors fail closed.
+fn canonicalize_prefix(path: &Path) -> Result<(PathBuf, PathBuf)> {
+    let logical = crate::paths::canonical_or_normalized(path)?;
+    for ancestor in logical.ancestors() {
+        match fs::canonicalize(ancestor) {
+            Ok(existing) => return Ok((logical.clone(), existing)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).path_ctx("resolve", ancestor).map_err(CliError::from),
         }
     }
-
-    let existing_prefix = resolved.clone();
-    for part in missing {
-        resolved.push(part);
-    }
-    Ok((resolved, existing_prefix))
+    Err(OutrigError::Configuration(format!(
+        "{} has no existing ancestor to resolve from",
+        path.display()
+    ))
+    .into())
 }
 
 /// Resolve a path under the session root. `Ok(None)` when the entry is
