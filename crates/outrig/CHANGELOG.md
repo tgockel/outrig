@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Running-state probes now propagate Podman query failures.** Only an explicit missing
+  container is treated as absent; engine errors and malformed responses no longer report
+  a stopped container. (#877)
+
 - **A poisoned network audit log now warns owners with earlier recoverable write failures.**
   If another owner's failed rollback poisons the shared writer, later refused records carry
   the integrity warning alongside the original write error, without double-counting losses.

@@ -998,21 +998,18 @@ impl Container {
         parse_container_inspect(name, &output.stdout)
     }
 
-    /// Lightweight running-state probe used by attach-mode monitoring.
-    /// A missing container is reported as `Ok(false)`; I/O failures still
-    /// propagate because the caller cannot distinguish them from a broken
-    /// podman environment.
+    /// Lightweight running-state probe used by attach-mode monitoring and discard.
+    /// A missing container is reported as `Ok(false)`; I/O and engine-query
+    /// failures propagate because a failed query does not establish that the
+    /// container is stopped.
     pub async fn is_running(name: &str) -> Result<bool> {
-        let output = process::try_capture(
-            Cmd::new("podman")
-                .args(["inspect", "--format", "{{.State.Running}}"])
-                .arg(name),
-        )
-        .await?;
-        if !output.status.success() {
-            return Ok(false);
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
+        // Inspect only containers: the generic inspect command tries other
+        // object types after a container-query error and can hide that error.
+        let cmd = Cmd::new("podman")
+            .args(["container", "inspect", "--format", "{{.State.Running}}"])
+            .arg(name);
+        let output = process::try_capture(cmd.clone()).await?;
+        parse_running_state(name, &cmd, &output)
     }
 
     pub fn name(&self) -> &str {
@@ -2826,9 +2823,94 @@ fn diff_lists_passwd(diff: &[u8]) -> bool {
     !text.trim_start().starts_with('{') || text.contains("\"/etc/passwd\"")
 }
 
+/// Fail closed: only Podman's specific missing-container diagnostic establishes
+/// absence. Unknown diagnostics (including new engine versions) remain errors.
+fn parse_running_state(name: &str, cmd: &Cmd, output: &Output) -> Result<bool> {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        // Podman 4.x prints the name bare; newer versions quote it.
+        let missing = [
+            format!("Error: no such container {name}"),
+            format!("Error: no such container {name:?}"),
+        ];
+        if output.status.code() == Some(125) && missing.iter().any(|msg| stderr.trim() == msg) {
+            return Ok(false);
+        }
+        return Err(cmd.process_error(output.status.code(), stderr.into_owned()));
+    }
+    match output.stdout.trim_ascii() {
+        b"true" => Ok(true),
+        b"false" => Ok(false),
+        _ => Err(OutrigError::Configuration(format!(
+            "podman returned an invalid running state for container {name:?}: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_probe_distinguishes_absence_from_failed_queries() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let cmd = Cmd::new("podman").args([
+            "container",
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+            "borrowed-db",
+        ]);
+        let missing = "Error: no such container \"borrowed-db\"\n";
+        let probe = |code, stdout: &str, stderr: &str| {
+            parse_running_state(
+                "borrowed-db",
+                &cmd,
+                &Output {
+                    status: std::process::ExitStatus::from_raw(code << 8),
+                    stdout: stdout.as_bytes().to_vec(),
+                    stderr: stderr.as_bytes().to_vec(),
+                },
+            )
+        };
+        assert!(probe(0, "true\n", "").unwrap());
+        assert!(!probe(0, "false\n", "").unwrap());
+        assert!(!probe(125, "", missing).unwrap());
+        assert!(!probe(125, "", "Error: no such container borrowed-db\n").unwrap());
+        for (code, stderr) in [
+            (
+                125,
+                "Error: unable to connect to Podman socket: connection refused",
+            ),
+            (125, "Error: permission denied"),
+            (125, "Error: context deadline exceeded"),
+            (1, missing),
+            (125, ""),
+            (125, "Error: no such container \"other-db\""),
+        ] {
+            let err = probe(code, "false\n", stderr).unwrap_err();
+            match err {
+                OutrigError::Process {
+                    program,
+                    argv,
+                    exit_code,
+                    stderr_tail,
+                } => {
+                    assert_eq!(program, "podman");
+                    assert!(argv.contains(&"borrowed-db".into()));
+                    assert_eq!(exit_code, Some(code));
+                    assert_eq!(stderr_tail, stderr);
+                }
+                other => panic!("expected process error, got {other}"),
+            }
+        }
+        // A successful but malformed response is not proof of a stopped container.
+        for stdout in ["", "<no value>\n", "TRUE\n"] {
+            assert!(probe(0, stdout, "").is_err());
+        }
+    }
 
     /// The release, like the stop, names the container the engine made: a
     /// `podman start <name>` could start whatever has taken the name since.
