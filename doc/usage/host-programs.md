@@ -171,9 +171,13 @@ asyncio.run(main())
   or no running loop, it raises. Each input must be data -- a str, number, bool, `None`, a list
   or str-keyed dict of these, or a dataclass instance -- and is a variable of that name in the
   agent's Python. The instance itself stays in your program: the agent's Python has no `self`,
-  and the methods not marked run here. The agent's first round, in which it reads its
-  instructions, follows: `await agent.ready()` waits for it, and `async with` waits for it on
-  entry and releases the agent on exit. A subclass's own `__init__` calls
+  and the methods not marked run here. The agent's first round is its time to explore and
+  prepare: read its instructions and the repository, import modules, and bind helpers for later
+  requests. It says it is ready by ending that round -- replying without calling `submit_python`.
+  `await agent.ready()` waits for that end, and `async with` waits for it on entry and releases
+  the agent on exit. A request in the block's body is sent only after the first round ends. An
+  empty `receive()` in that round raises at once, explaining how to end it; a request already
+  queued can still be received and answered there. A subclass's own `__init__` calls
   `super().__init__(**inputs, model=...)`. The agent starts only after that `__init__` returns and
   after `__outrig_attach__(self)`, a method the class may define to finish its setup, so either
   can raise without starting anything.

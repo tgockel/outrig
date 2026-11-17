@@ -932,6 +932,21 @@ async fn the_system_prompt_is_the_orientation_then_the_configured_preamble() {
     );
 }
 
+/// An instance must end its preparation round before an owner waiting at ready() can send.
+#[test]
+fn an_instances_opening_explains_how_to_become_ready() {
+    let opening = super::orientation::orienting(false, "");
+    for instruction in [
+        "this round is for getting ready",
+        "Requests are taken in the rounds after this one, unless one is already queued",
+        "reply without calling `submit_python`",
+        "Your owner may send nothing until this round ends",
+        "the next round begins when a request is waiting",
+    ] {
+        assert!(opening.contains(instruction), "{opening}");
+    }
+}
+
 /// A `coding` agent over a host-run interpreter whose workspace is
 /// `workspace`, recording to `events`, and the requests its mock model
 /// receives. `agent_keys` is config the agent has beside its `max-tokens`.

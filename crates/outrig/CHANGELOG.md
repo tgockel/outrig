@@ -1123,6 +1123,11 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Fixed
 
+- An agent class instance cannot hang its first round on an empty request-channel `receive()`,
+  leaving its owner waiting forever at `ready()` or `async with` entry. The receive now raises
+  with instructions to end the round; queued requests still work. The opening message explains
+  that the first round is for preparation and ending it signals readiness.
+
 - **A failed round's error says what became of your messages.** The advice it carried was written
   from the agent's side -- "The messages it was told of are still waiting; send another to try
   again" -- where "it" was the agent and "told of" meant the model had been told how many messages

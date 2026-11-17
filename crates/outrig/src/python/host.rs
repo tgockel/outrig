@@ -2491,7 +2491,10 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
         && kind.starts_with("agent.")
     {
         let agent = agent.to_string();
-        match lock(table).children.clone() {
+        // A callback can take the children's lock, whose holder may call tell() and need
+        // the table. Drop this guard first, as for skill and channel callbacks below.
+        let children = lock(table).children.clone();
+        match children {
             Some(children) => children(&agent, value),
             None => tracing::warn!("ignored a {kind} line from agent {agent:?}: nothing reads it"),
         }
@@ -2979,6 +2982,32 @@ pub(crate) async fn next_line<R: AsyncBufRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child callback may take the children's lock while another task holds it and calls
+    /// Interpreter::tell. Keeping the table locked across the callback reverses that order.
+    #[test]
+    fn child_dispatch_releases_the_table_before_calling_the_hook() {
+        let table = Arc::new(Mutex::new(Table::default()));
+        let weak = Arc::downgrade(&table);
+        let (called, calls) = std::sync::mpsc::channel();
+        lock(&table).children = Some(Arc::new(move |agent, message| {
+            let table = weak.upgrade().expect("the table still exists");
+            assert!(
+                table.try_lock().is_ok(),
+                "child callbacks must not hold the interpreter table lock"
+            );
+            called
+                .send((agent.to_string(), message))
+                .expect("received below");
+        }));
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let request = json!({"t": "agent.request", "agent": "other", "id": 1});
+        dispatch(&table, &Lines::Open(sender), request.to_string().as_bytes());
+        assert_eq!(
+            calls.try_recv().expect("the hook ran"),
+            ("other".to_string(), request)
+        );
+    }
 
     /// A line past the bound is cut, and the stream stays in step: the next
     /// line starts where the long one's newline was.

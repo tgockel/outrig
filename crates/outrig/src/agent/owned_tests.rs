@@ -138,6 +138,77 @@ class ProjectReader(outrig.Agent):
         ...
 "#;
 
+/// An empty first-round receive is an execution error, not a wait that deadlocks async-with
+/// entry. Ending the round then makes the instance ready, and the body can send its request.
+#[tokio::test]
+async fn an_empty_receive_during_preparation_does_not_hold_async_with_entry() {
+    let script = format!(
+        r#"
+import asyncio, json
+import outrig
+{READER}
+async def main():
+    async with outrig.Session():
+        async with ProjectReader() as agent:
+            print(json.dumps(await agent.explain("hello")), flush=True)
+asyncio.run(main())
+"#
+    );
+    let run = owned(
+        "OUTRIG_TEST_OWNED_ORIENTING_RECEIVE",
+        "",
+        &script,
+        vec![(
+            "ROLE reader",
+            scripted(vec![
+                submit("empty", "await runtime.channels['explain'].receive()"),
+                text_reply("ready"),
+                submit(
+                    "answer",
+                    &py(r#"
+                        d = await runtime.channels['explain'].receive()
+                        waiting = asyncio.create_task(runtime.channels['explain'].receive())
+                        await asyncio.sleep(0)
+                        assert not waiting.done(), "empty receive must wait after preparation"
+                        waiting.cancel()
+                        try:
+                            await waiting
+                        except asyncio.CancelledError:
+                            pass
+                        await d.reply(d.body)
+                        "#),
+                ),
+                text_reply("answered"),
+            ]),
+        )],
+    )
+    .await;
+    let (ran, records, requests) = run.finish().await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    assert_eq!(ran.json(), [json!("hello")], "{}", ran.stderr);
+    let calls = of_agent(&requests, "ROLE reader");
+    let error = super::agent_tests::tool_result(calls[1], "empty");
+    for expected in [
+        "RuntimeError:",
+        "no request queued in your first round",
+        "Your owner may send nothing until this round ends",
+        "replying without calling `submit_python`",
+        "the next round begins when a request is waiting",
+    ] {
+        assert!(error.contains(expected), "{error}");
+    }
+    let ready = records
+        .iter()
+        .position(|e| e["type"] == "org.outrig.agent.instance.ready");
+    let sent = records
+        .iter()
+        .position(|e| e["type"] == "org.outrig.agent.request.sent");
+    assert!(
+        matches!((ready, sent), (Some(ready), Some(sent)) if ready < sent),
+        "ready before the body sends: {records:?}"
+    );
+}
+
 /// A host program's class that defines `__outrig_instructions__`: the hook runs once, in the
 /// program, and its sections cross with the declaration, appear in the child's instructions after
 /// the docstring as returned, and are listed by the start event; a class whose hook returns a

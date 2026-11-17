@@ -7136,7 +7136,8 @@ class FooAgent(outrig.Agent):
 /// what is asked of it before its child exists is held, up to the session's `requests-max`, and
 /// sent in order once the spawn is answered. The spawn names the class, its docstring as written,
 /// each channel's docstring and the generated message type; `ready()` waits for the host's word;
-/// and a release ends the child, naming the requests it ended.
+/// and a release ends the child, naming the requests it ended. An empty receive raises in the
+/// first round, queued requests are still taken, and after the host's word an empty receive waits.
 #[test]
 fn an_instance_holds_what_is_asked_of_it_until_its_child_exists() {
     let mut k = Interpreter::start();
@@ -7195,6 +7196,16 @@ fn an_instance_holds_what_is_asked_of_it_until_its_child_exists() {
         "t": "open", "agent": "c1", "main": false,
         "child": {"kind": "request", "spawn": asked["id"], "requests_max": 2},
     }));
+    let (empty, _) = k.exec_collecting("c1", 30, "await runtime.channels['fizz'].receive()");
+    let error = text(&empty["error"]);
+    assert!(
+        error.contains("RuntimeError:") && error.contains("first round"),
+        "{empty}"
+    );
+    assert!(
+        error.contains("replying without calling `submit_python`"),
+        "{empty}"
+    );
     k.send(json!({
         "t": "spawned", "agent": PRIMARY, "id": asked["id"], "child": "c1", "requests_max": 2,
     }));
@@ -7227,12 +7238,32 @@ fn an_instance_holds_what_is_asked_of_it_until_its_child_exists() {
 
     k.send(json!({"t": "exec", "agent": PRIMARY, "id": 5,
                   "src": "await foo.ready()\nprint('ready')"}));
+    k.send(json!({"t": "oriented", "agent": "c1", "id": instance["id"], "self": true}));
     k.send(json!({"t": "oriented", "agent": PRIMARY, "id": instance["id"], "error": null}));
     let ready = k.recv();
     assert_eq!(
         (&ready["id"], &ready["output"]),
         (&json!(5), &json!("ready\n")),
         "{ready}"
+    );
+
+    let (said, _) = k.noted(
+        "c1",
+        31,
+        &py(r#"
+        waiting = asyncio.create_task(runtime.channels['fizz'].receive())
+        await asyncio.sleep(0)
+        print(waiting.done())
+        waiting.cancel()
+        try:
+            await waiting
+        except asyncio.CancelledError:
+            print("cancelled")
+        "#),
+    );
+    assert_eq!(
+        said, "False\ncancelled\n",
+        "an empty receive waits after orientation"
     );
 
     k.send(json!({"t": "exec", "agent": PRIMARY, "id": 6,

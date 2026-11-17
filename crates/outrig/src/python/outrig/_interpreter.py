@@ -5131,6 +5131,9 @@ class _Child:
         # instance's child before it exists, which `_Instance` sends once it does.
         self.queue = collections.deque()
         self.holding = False
+        # An instance ends its first round to say it is ready; until the host says so, an
+        # empty receive must not wait for an owner that may itself be waiting for ready().
+        self.orienting = False
         self.last = None  # the submission given to it last
         self.kernel = None
         self.released = False
@@ -5879,7 +5882,7 @@ class _Instance(_Attached):
         self.model_requests_line = model_requests
         self.record = _Child(None, f"{cls.__name__[:48]}-{self.id}", "request", self.kernel,
                              self.channels, _requests_max)
-        self.record.holding = True
+        self.record.holding = self.record.orienting = True
         # Each settled once, from any thread, and awaited from any loop: running, so that a
         # waiter that is cancelled cancels neither.
         self.oriented, self.released = concurrent.futures.Future(), concurrent.futures.Future()
@@ -6157,7 +6160,9 @@ class RequestEndpoint(Endpoint):
 
     async def receive(self):
         """Take the next request on this channel, waiting until there is one, as a
-        `RequestDelivery`; see `help(type(delivery))` for answering it."""
+        `RequestDelivery`; see `help(type(delivery))` for answering it. In an instance's first
+        round, raises `RuntimeError` if none is queued: end that round to say you are ready,
+        and requests can arrive in later rounds."""
         work = await self._when(self._receivers, self._take)
         with work.lock:
             if work.state == "waiting":
@@ -6170,6 +6175,16 @@ class RequestEndpoint(Endpoint):
         raise TypeError(f"channel {self._name!r} carries requests to you, and nothing back: answer "
                         f"a request with `await delivery.reply(value)` on the delivery receive() "
                         f"gave you")
+
+    def _take(self):
+        if not self._queue and _kernels[self._agent].child.orienting:
+            raise RuntimeError(
+                f"channel {self._name!r} has no request queued in your first round. "
+                "Your owner may send nothing until this round ends. When you are ready, end "
+                "this round by replying without calling `submit_python`; the next round begins "
+                "when a request is waiting."
+            )
+        return super()._take()
 
     def _put(self, work):
         """Queue `work` for a receive, from its sender's thread. Whether it was: not once this
@@ -6318,6 +6333,7 @@ class Kernel:
         self._offer_view()
         self.bind(instance.inputs, instance.classes, instance.boot())
         record.constructing = False
+        record.orienting = True
 
     def bind(self, inputs, classes, boot):
         """Bind what a child is given in this kernel's namespace: each input, each class under its
@@ -7713,7 +7729,7 @@ def _rooted(agent, root):
                 for name, (rq, rp, doc) in channels.items()}
     record = _Child(agent, root["name"], "request", _OWNER, channels, 1)
     record.instance = next(_ids)  # among the ids every instance here takes, so none shares it
-    record.owner_judges = True
+    record.owner_judges = record.orienting = True
     return {"inputs": inputs, "classes": classes, "record": record}
 
 
@@ -8100,7 +8116,12 @@ def _settle_work(kernel, work_id, message):
 
 def _oriented(kernel, instance_id, message):
     """The orienting round of agent class instance `instance_id`'s child has ended, or, as its
-    `error` says, the child cannot have it -- its budget spent, or its model failing for good."""
+    `error` says, the child cannot have it -- its budget spent, or its model failing for good.
+    With `self`, it is this kernel's own first round, not one of its children's. The host sends
+    that before telling the owner, so a receive in a later round may wait for a request."""
+    if message.get("self") is True:
+        kernel.child.orienting = False
+        return
     instance, error = _instances.get(instance_id), message.get("error")
     if instance is None:
         return

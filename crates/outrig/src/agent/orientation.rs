@@ -826,7 +826,11 @@ pub(crate) fn child_opening(
 /// What an agent class instance's child is told as its first round opens, as
 /// it launches: the round is for getting ready.
 const ORIENTING: &str = "you have just been launched, and this round is for getting ready: read \
-                         your instructions, and prepare what answering requests will need";
+                         your instructions, and prepare what answering requests will need. \
+                         Requests are taken in the rounds after this one, unless one is already \
+                         queued. When you are ready, end this round by stopping -- reply without \
+                         calling `submit_python`. Your owner may send nothing until this round \
+                         ends; the next round begins when a request is waiting";
 
 /// What a root whose class contributed sections is told besides: its task is
 /// in its instructions, and this round is where it begins.

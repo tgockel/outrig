@@ -2210,7 +2210,8 @@ impl Inner {
 
     /// The orienting round of `child`, agent class instance `instance`'s,
     /// has ended; or, with `error`, it cannot be had -- `budget` or `failed`,
-    /// and why. The instance's `ready()` hears so from its parent's kernel.
+    /// and why. The child's kernel hears that it may now wait for requests before the
+    /// instance's `ready()` hears so from its parent's kernel or its owner on the host.
     pub(crate) fn oriented(&self, child: &str, instance: u64, error: Option<(&str, &str)>) {
         let state = self.state();
         let node = state.agents.get(child);
@@ -2225,6 +2226,10 @@ impl Inner {
             error: error.map(|(_, why)| why.to_string()),
         });
         let error = error.map(|(kind, message)| json!({"kind": kind, "message": message}));
+        // Tell the child before its owner can send a request in response to ready(): from
+        // now on an empty receive may wait, rather than holding the orienting round open.
+        self.interpreter
+            .tell(json!({"t": "oriented", "agent": child, "id": instance, "self": true}));
         match parent.as_deref() {
             Some(OWNER) => {
                 // Named by the program's number for the instance.

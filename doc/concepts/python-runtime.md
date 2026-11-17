@@ -337,8 +337,12 @@ async with Reviewer() as reviewer:
 ```
 
 Constructing one returns at once and launches its child in the background, whose first round is
-for getting ready; `await reviewer.ready()` waits for it, and `async with` waits on entry. A call
-of a marked method sends a request and returns its handle. The child keeps its names and its
+for getting ready: reading the repository, importing modules, and binding helpers. Ending that
+round by replying without calling `submit_python` signals readiness. `await reviewer.ready()`
+waits for that end, and `async with` waits on entry before its body can send a request. An empty
+request-channel `receive()` raises `RuntimeError` in that round rather than waiting for an owner
+that may be waiting for readiness; a request already queued can be received as usual. A call of
+a marked method sends a request and returns its handle. The child keeps its names and its
 conversation from one request to the next, so the second review can use what the first one read.
 `await reviewer.release()`, or leaving `async with`, ends it. A host program declares and drives
 agent classes the same way, its replies decoded into its own classes: see
