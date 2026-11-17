@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A poisoned network audit log now warns owners with earlier recoverable write failures.**
+  If another owner's failed rollback poisons the shared writer, later refused records carry
+  the integrity warning alongside the original write error, without double-counting losses.
+  (#832)
+
 - **A failed transcript write no longer silences live build or pull output.** If the `-v`
   transcript cannot be written (for example, because the disk is full), later lines still
   reach stderr, including through the transcript's mirror. The warning remains once per

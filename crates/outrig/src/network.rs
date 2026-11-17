@@ -2246,6 +2246,7 @@ async fn audit_writer(
 
         if let Some(why) = &poisoned {
             AuditSink::remember_unwritten(&unwritten, &who, std::io::Error::other(why.clone()));
+            AuditSink::remember_integrity(&unwritten, &who, why);
             AuditSink::leave_pending(&pending, &who);
             let _ = done.send(());
             continue;
@@ -6033,6 +6034,64 @@ mod tests {
         assert!(
             source.to_string().contains("space") || source.to_string().contains("full"),
             "and not in place of what broke the append: {source}"
+        );
+    }
+
+    /// A prior, recoverable loss must not hide a later integrity failure on
+    /// the shared file when this owner has another record refused.
+    #[tokio::test]
+    async fn a_poisoned_writer_adds_integrity_to_an_owners_prior_loss() {
+        let sink = AuditSink::open(PathBuf::from("/dev/full"), "sid-1".to_string())
+            .await
+            .expect("open sink");
+        let a = sink.for_attachment("outrig-a", 1);
+        let b = sink.for_attachment("outrig-b", 2);
+
+        // Seed the state left by A's failed append and successful rollback.
+        // /dev/full then gives B a real write failure whose rollback fails,
+        // without needing filesystem fault injection for the first failure.
+        AuditSink::remember_unwritten(
+            &a.unwritten,
+            &a.owner(),
+            io::Error::other("A's recoverable write failure"),
+        );
+        assert!(
+            a.unwritten.lock().expect("losses")[&a.owner()]
+                .integrity
+                .is_none()
+        );
+        write_audit(&b, audit_event()).await;
+        write_audit(&a, audit_event()).await;
+
+        let a_losses = a.take_unwritten();
+        assert_eq!(a_losses.len(), 1, "{a_losses:#?}");
+        let OutrigError::NetworkAuditUnwritten {
+            records,
+            source,
+            integrity,
+            ..
+        } = &a_losses[0]
+        else {
+            panic!("expected an audit loss, got {a_losses:#?}");
+        };
+        assert_eq!(*records, 2, "the refused record is counted exactly once");
+        assert_eq!(source.to_string(), "A's recoverable write failure");
+        assert!(
+            integrity.is_some(),
+            "the earlier loss must not hide the file's integrity failure: {a_losses:#?}"
+        );
+
+        let b_losses = b.take_unwritten();
+        assert!(
+            matches!(
+                b_losses.as_slice(),
+                [OutrigError::NetworkAuditUnwritten {
+                    records: 1,
+                    integrity: Some(_),
+                    ..
+                }]
+            ),
+            "A's refused record must not change B's losses: {b_losses:#?}"
         );
     }
 
