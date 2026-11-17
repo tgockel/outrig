@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Oversized IPv6 DNS answers now give IPv4 clients a TCP-retry signal.** When a
+  resolver's UDP answer exceeds the client's IP-family datagram limit, the interceptor
+  returns a matching header and question with TC set instead of silently losing the
+  reply. The discarded answer installs no name bindings. (#885)
+
 - **Running-state probes now propagate Podman query failures.** Only an explicit missing
   container is treated as absent; engine errors and malformed responses no longer report
   a stopped container. (#877)

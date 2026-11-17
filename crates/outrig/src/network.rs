@@ -3515,6 +3515,18 @@ async fn resolve_dns(
     };
     match forwarded {
         Ok(response) => {
+            // The resolver may be reached over IPv6 even when the client uses
+            // IPv4, whose UDP payload limit is 20 bytes smaller. Check before
+            // binding: an answer the client cannot receive authorizes nothing.
+            // Dual-stack listeners report IPv4 clients as v4-mapped IPv6.
+            let udp_limit = if canonical(peer).is_ipv4() {
+                65535 - 8 - 20
+            } else {
+                65535 - 8
+            };
+            if matches!(transport, DnsTransport::Udp) && response.len() > udp_limit {
+                return (dns_truncated_reply(raw, query.as_ref()), None);
+            }
             if let Some(query) = &query
                 && dns_response_is_bindable(&response)
             {
@@ -4817,6 +4829,15 @@ fn opt_record_framing(bytes: &[u8]) -> Option<()> {
 /// declined rather than that the resolvers failed.
 fn dns_servfail(raw: &[u8], query: Option<&DnsQuery>) -> Option<Vec<u8>> {
     dns_error_reply(raw, query, DNS_RCODE_SERVFAIL)
+}
+
+/// A matching header and question with TC set, so a client whose downstream
+/// UDP transport cannot carry the answer can retry over TCP. No records from
+/// the discarded answer are echoed or bound.
+fn dns_truncated_reply(raw: &[u8], query: Option<&DnsQuery>) -> Option<Vec<u8>> {
+    let mut reply = dns_error_reply(raw, query, 0)?;
+    reply[2] |= 0x02;
+    Some(reply)
 }
 
 /// An answer to `raw` that carries only `rcode`. It echoes the transaction id
@@ -9405,6 +9426,87 @@ mod tests {
         cancel.cancel();
         let failures = stop_tasks(&mut tasks).await;
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// #885: an IPv6 resolver can send 20 bytes more than an IPv4 client
+    /// can receive. The client needs TC to retry over TCP, and the discarded
+    /// answer must not authorize any connections. A native IPv6 client can
+    /// still receive the same answers whole.
+    #[tokio::test]
+    async fn resolver_answers_are_limited_by_the_clients_ip_family() {
+        if !kernel_has_ipv6() {
+            return;
+        }
+        for client_ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            for size in [65507, 65508, 65527] {
+                let resolver = UdpSocket::bind("[::1]:0").await.expect("bind resolver");
+                let bindings = empty_bindings();
+                let (listener, cancel, mut tasks) = spawned_dns_loop(
+                    vec![resolver.local_addr().expect("resolver addr")],
+                    bindings.clone(),
+                )
+                .await;
+                let client = UdpSocket::bind(SocketAddr::new(client_ip, 0))
+                    .await
+                    .expect("bind client");
+                let listener = SocketAddr::new(client_ip, listener.port());
+                let mut raw = dns_packet(0x885, DNS_QUERY_FLAGS, "limit.test", &[]);
+                // OPT advertises the maximum UDP payload, with no options.
+                raw[11] = 1;
+                raw.extend_from_slice(&[0, 0, 41, 0xff, 0xff, 0, 0, 0, 0, 0, 0]);
+                client.send_to(&raw, listener).await.expect("send query");
+                let (query, from) = forwarded_query(&resolver, DNS_TIMEOUT)
+                    .await
+                    .expect("the query should reach the resolver");
+                let mut answer = dns_packet(
+                    query.txid,
+                    DNS_RESPONSE_FLAGS,
+                    "limit.test",
+                    &[Rr::A("limit.test", [198, 51, 100, 11], 60)],
+                );
+                // A valid OPT with one EDNS Padding option fills the datagram.
+                let rdlen = (size - answer.len() - 11) as u16;
+                answer[11] = 1;
+                answer.extend_from_slice(&[0, 0, 41, 0xff, 0xff, 0, 0, 0, 0]);
+                answer.extend_from_slice(&rdlen.to_be_bytes());
+                answer.extend_from_slice(&12u16.to_be_bytes());
+                answer.extend_from_slice(&(rdlen - 4).to_be_bytes());
+                answer.resize(size, 0);
+                resolver.send_to(&answer, from).await.expect("send answer");
+
+                let mut reply = vec![0u8; DNS_UDP_MAX_DATAGRAM];
+                let n = tokio::time::timeout(Duration::from_secs(1), client.recv(&mut reply))
+                    .await
+                    .expect("no reply arrived")
+                    .expect("receive reply");
+                if client_ip.is_ipv4() && size > 65507 {
+                    let query = dns_query(&raw).expect("query parses");
+                    assert!(
+                        query.answered_by(listener, listener, &reply[..n]),
+                        "id and question must match"
+                    );
+                    assert_eq!(dns_flags(&reply[..n]).unwrap() & 0x0200, 0x0200);
+                    assert_eq!(n, query.question.end, "only header and question");
+                    assert_eq!(&reply[4..12], &[0, 1, 0, 0, 0, 0, 0, 0]);
+                    assert_eq!(
+                        resolved_names(&bindings, ip("198.51.100.11")),
+                        resolved(&[])
+                    );
+                } else {
+                    assert_eq!(&reply[..n], &answer);
+                    assert_eq!(
+                        resolved_names(&bindings, ip("198.51.100.11")),
+                        resolved(&["limit.test"])
+                    );
+                }
+                cancel.cancel();
+                let failures = stop_tasks(&mut tasks).await;
+                assert!(failures.is_empty(), "{failures:#?}");
+            }
+        }
     }
 
     /// An IPv4 client reaches the dual-stack listener as a v4-mapped IPv6
