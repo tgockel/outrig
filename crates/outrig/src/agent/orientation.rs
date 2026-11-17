@@ -209,8 +209,8 @@ pub(crate) fn preamble(
 const WAIT: &str = "`runtime.wait` is `asyncio.wait`: the same arguments, the same `(done, pending)` \
                     back, and a timeout that cancels nothing.\n\n";
 
-/// What every child is told of ending a round, which no request outlives
-/// for long.
+/// What a submission child, or a root with no request channels, is told of
+/// ending a round. Request children instead distinguish requests from tasks.
 const NOT_WAITING: &str = "Ending your round is not waiting: nothing opens a round when what you \
                            waited on finishes, so wait inside the round, with `runtime.wait`.";
 
@@ -505,9 +505,14 @@ pub(crate) fn child_preamble(
             }
             text.push_str(
                 "\nTake a request with `d = await runtime.channels[name].receive()`: `d.body` is \
-                 the request and `d.id` its id. A round's opening line says what waits, by channel \
-                 and count, and never what it holds: you read each request in code, with \
-                 `receive()`. Answer it with `await d.reply(value)`, `value` an \
+                 the request and `d.id` its id. `receive()` takes the next request on that channel \
+                 only. With none queued there, it does not return until one arrives there; a \
+                 request on another channel does not end it, and the `submit_python` call that \
+                 awaits it does not finish until then. To wait for the next request, stop \
+                 writing -- reply without calling `submit_python` -- and a new round begins \
+                 when a request is waiting, its opening line naming the channel and count, never \
+                 what it holds. Use `receive()` for a request the round has said is waiting. \
+                 Answer it with `await d.reply(value)`, `value` an \
                  instance of the reply type -- bound under its name, with every dataclass it \
                  uses -- or its JSON form. It returns once the reply is accepted; one that is not \
                  raises what is wrong, each problem with its path, so correct it and reply again. \
@@ -519,12 +524,13 @@ pub(crate) fn child_preamble(
                  unread, it raises `runtime.MessageAvailable`, which `except Exception` does not \
                  catch. The request stays queued and the tasks keep running.\n\n",
             );
-            let _ = write!(
-                text,
-                "{NOT_WAITING} Code you leave running when you stop writing keeps no request \
+            text.push_str(
+                "For work you started, ending your round is not waiting: nothing opens a round \
+                 when a task you started finishes, so wait for that inside the round, with \
+                 `runtime.wait`. Code you leave running when you stop writing keeps no request \
                  open. A round that ends with a request unread or unanswered is followed by up to \
                  two more, the last warning that the requests are cancelled if it ends the same \
-                 way, and each sender then gets an exception.\n\n"
+                 way, and each sender then gets an exception.\n\n",
             );
             let launched = match brief {
                 ChildBrief::Instance { .. } => "as you are launched, to get ready in, then ",
@@ -1595,7 +1601,7 @@ mod tests {
     }
 
     /// Every child's preamble states the rule: up to two more rounds, the last a warning, then the
-    /// cancel, and that ending a round is not waiting. A request child is also told that only
+    /// cancel, and that ending a round does not wait for work. A request child is also told that only
     /// `d.reply` and `d.fail` answer, and that code left running keeps no request open; a work
     /// child, and a call's, how to fail what it cannot complete.
     #[test]
@@ -1621,13 +1627,18 @@ mod tests {
             instance(&channels, Some(("Reviewer", &[]))),
         ] {
             let text = preamble(&brief, &[]);
+            let request = matches!(brief, ChildBrief::Request(_) | ChildBrief::Instance { .. });
+            let waiting = if request {
+                "For work you started, ending your round is not waiting"
+            } else {
+                NOT_WAITING
+            };
             assert!(
                 text.contains("followed by up to two more, the last warning that")
                     && text.contains("cancelled if it ends the same way")
-                    && text.contains("Ending your round is not waiting"),
+                    && text.contains(waiting),
                 "{text}"
             );
-            let request = matches!(brief, ChildBrief::Request(_) | ChildBrief::Instance { .. });
             assert_eq!(
                 text.contains("what you write yourself is not delivered"),
                 request,

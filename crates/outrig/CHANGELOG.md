@@ -1123,6 +1123,12 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Fixed
 
+- Request children, including agent class instances, are told to end their round to wait for the
+  next request, rather than block in `receive()` on one channel while another has work waiting.
+  Their instructions explain that receives wait only on their own channel and distinguish
+  waiting for requests from waiting for tasks they started. A child's `submit_python` description
+  names its owner's release or the session's close, not a user's Ctrl-C. (#856)
+
 - An agent class instance cannot hang its first round on an empty request-channel `receive()`,
   leaving its owner waiting forever at `ready()` or `async with` entry. The receive now raises
   with instructions to end the round; queued requests still work. The opening message explains

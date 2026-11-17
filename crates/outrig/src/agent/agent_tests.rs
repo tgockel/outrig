@@ -911,7 +911,8 @@ async fn the_system_prompt_is_the_orientation_then_the_configured_preamble() {
     assert!(
         description.contains("asyncio.create_task(asyncio.to_thread(...))")
             && description.contains("`await runtime.wait({t}, timeout=...)`")
-            && !description.contains("`await asyncio.to_thread("),
+            && !description.contains("`await asyncio.to_thread(")
+            && description.contains("only the user's Ctrl-C ends a bare `await`"),
         "{description}"
     );
 
@@ -944,6 +945,98 @@ fn an_instances_opening_explains_how_to_become_ready() {
         "the next round begins when a request is waiting",
     ] {
         assert!(opening.contains(instruction), "{opening}");
+    }
+}
+
+/// Receiving is channel-local; a request child rests between requests, not
+/// inside a receive on the channel it last answered (#856).
+#[test]
+fn request_briefs_explain_how_to_wait_for_the_next_request() {
+    use super::orientation::{ChannelText, ChildBrief, View, child_preamble};
+
+    let channels: Vec<_> = ["A", "B"]
+        .into_iter()
+        .map(|name| ChannelText {
+            name: name.into(),
+            doc: None,
+            request_type: "str".into(),
+            reply_type: "str".into(),
+            request: r#"{"type":"string"}"#.into(),
+            reply: r#"{"type":"string"}"#.into(),
+        })
+        .collect();
+    for brief in [
+        ChildBrief::Request(&channels),
+        ChildBrief::Instance {
+            channels: &channels,
+            own: None,
+            sections: &[],
+            root: false,
+            skills: &[],
+        },
+        ChildBrief::Instance {
+            channels: &channels,
+            own: None,
+            sections: &[],
+            root: true,
+            skills: &[],
+        },
+    ] {
+        let text = child_preamble(
+            None,
+            View::Session {
+                bindings: &[],
+                services: &[],
+            },
+            Window::DEFAULT,
+            "Answer requests.",
+            &[],
+            &brief,
+            &[],
+        );
+        for instruction in [
+            "`receive()` takes the next request on that channel only",
+            "With none queued there, it does not return until one arrives there",
+            "a request on another channel does not end it",
+            "the `submit_python` call that awaits it does not finish until then",
+            "To wait for the next request, stop writing -- reply without calling `submit_python`",
+            "a new round begins when a request is waiting, its opening line naming the channel",
+            "Use `receive()` for a request the round has said is waiting",
+            "For work you started, ending your round is not waiting",
+            "nothing opens a round when a task you started finishes",
+            "wait for that inside the round, with `runtime.wait`",
+        ] {
+            assert!(
+                text.contains(instruction),
+                "missing {instruction:?}: {text}"
+            );
+        }
+        assert!(
+            !text.contains("Ending your round is not waiting:"),
+            "{text}"
+        );
+    }
+}
+
+/// Children have no user to interrupt a stuck await (#856).
+#[tokio::test]
+async fn a_childs_tool_description_names_its_owner_not_ctrl_c() {
+    let interpreter = start_on_host().await;
+    let tool = SubmitPython::new(
+        interpreter.clone(),
+        1024,
+        Announcer::new(interpreter),
+        None,
+        Default::default(),
+    );
+    let description = tool.description();
+    assert!(!description.contains("Ctrl-C"), "{description}");
+    for instruction in [
+        "only your owner's release or the session's close ends a bare `await`",
+        "asyncio.create_task(asyncio.to_thread(...))",
+        "`await runtime.wait({t}, timeout=...)`",
+    ] {
+        assert!(description.contains(instruction), "{description}");
     }
 }
 

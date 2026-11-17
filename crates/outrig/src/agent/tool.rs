@@ -198,20 +198,28 @@ impl Tool for SubmitPython {
     type Error = SubmitError;
 
     fn description(&self) -> String {
-        "Run Python in this session's persistent interpreter, inside the project's container. \
-         Top-level `await` is supported. Names you bind stay bound for later calls, and a \
-         trailing expression echoes its repr. Code that raises comes back as its traceback \
-         rather than as a tool failure, so read it and carry on. Nothing is rolled back: \
-         whatever ran before an error happened. The ordinary standard library is here -- \
-         pathlib, open(), subprocess, asyncio, json -- operating on the container. Output is \
-         bounded, but the values behind it are not: keep a large value bound to a name and print \
-         the part you need. Code that keeps the event loop from \
-         turning while it keeps a CPU busy is taken for a runaway after about half a minute \
-         and interrupted. Waiting on a subprocess or a sleep is not one, and only the user's \
-         Ctrl-C ends a bare `await` of it: run long work -- a test suite, a build, a network \
-         call -- as a task, `t = asyncio.create_task(asyncio.to_thread(...))`, and wait with \
-         `await runtime.wait({t}, timeout=...)`."
-            .to_string()
+        // Only the primary has a user who can interrupt it, just as only its
+        // calls move the session's lifecycle.
+        let interrupt = if self.lifecycle.is_some() {
+            "only the user's Ctrl-C ends a bare `await` of it"
+        } else {
+            "only your owner's release or the session's close ends a bare `await` of it"
+        };
+        format!(
+            "Run Python in this session's persistent interpreter, inside the project's container. \
+             Top-level `await` is supported. Names you bind stay bound for later calls, and a \
+             trailing expression echoes its repr. Code that raises comes back as its traceback \
+             rather than as a tool failure, so read it and carry on. Nothing is rolled back: \
+             whatever ran before an error happened. The ordinary standard library is here -- \
+             pathlib, open(), subprocess, asyncio, json -- operating on the container. Output is \
+             bounded, but the values behind it are not: keep a large value bound to a name and print \
+             the part you need. Code that keeps the event loop from \
+             turning while it keeps a CPU busy is taken for a runaway after about half a minute \
+             and interrupted. Waiting on a subprocess or a sleep is not one, and {interrupt}: \
+             run long work -- a test suite, a build, a network \
+             call -- as a task, `t = asyncio.create_task(asyncio.to_thread(...))`, and wait with \
+             `await runtime.wait({{t}}, timeout=...)`."
+        )
     }
 
     fn parameters(&self) -> Value {
