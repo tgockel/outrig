@@ -1318,7 +1318,7 @@ where
     // -- see the drain in [`run_streamed`]. Nor is it this function's error:
     // the captured bytes are the command's, and a record that came up short
     // does not take them back; see [`warn_transcript_failed`].
-    let mut tee_failed = false;
+    let mut transcript_warned = false;
     loop {
         line.clear();
         let n = reader.read_until(b'\n', &mut line).await?;
@@ -1331,13 +1331,15 @@ where
                 captured.drain(..captured.len() - limit);
             }
         }
-        if !tee_failed {
-            let rendered = String::from_utf8_lossy(&line);
-            let rendered = rendered.trim_end_matches(['\r', '\n']);
-            if let Err(e) = tee.line(prefix, rendered).await {
-                warn_transcript_failed(prefix, &e);
-                tee_failed = true;
-            }
+        // Keep calling the tee after a transcript error: the live sink (or
+        // the transcript's stderr mirror) still needs every line.
+        let rendered = String::from_utf8_lossy(&line);
+        let rendered = rendered.trim_end_matches(['\r', '\n']);
+        if let Err(e) = tee.line(prefix, rendered).await
+            && !transcript_warned
+        {
+            warn_transcript_failed(prefix, &e);
+            transcript_warned = true;
         }
     }
     if let Some(limit) = retain.filter(|limit| captured.len() > *limit) {

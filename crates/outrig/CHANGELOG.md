@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed transcript write no longer silences live build or pull output.** If the `-v`
+  transcript cannot be written (for example, because the disk is full), later lines still
+  reach stderr, including through the transcript's mirror. The warning remains once per
+  stream, and the command's own result is unchanged. (#787)
+
 - **Git build-context cache keys no longer rehash subtrees through ancestor symlinks.**
   Ordinary directory descent shares cycle detection and content hashes with symlink
   resolution, so nested links to parent directories read each file only once per listing

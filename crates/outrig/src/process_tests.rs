@@ -1348,6 +1348,82 @@ async fn a_tee_writes_live_only_when_the_transcript_does_not_already() {
     assert!(!Tee::new(Some(mirroring), false).live_stderr);
 }
 
+/// A failed transcript must not silence later lines, whether stderr is
+/// written by the live sink or by the transcript's mirror (#787). Re-run
+/// this test in a subprocess to observe tokio's real fd 2 without redirecting
+/// the test runner's shared stderr.
+#[test]
+fn a_failing_transcript_keeps_showing_output() {
+    const CHILD: &str = "OUTRIG_TEST_FAILING_TRANSCRIPT_MIRROR";
+
+    if let Ok(mirror) = std::env::var(CHILD) {
+        let (outcome, warned) = with_captured_tracing_at(tracing::Level::WARN, async {
+            let transcript = Transcript::create(Path::new("/dev/full"), mirror == "true")
+                .await
+                .expect("a transcript whose every write fails");
+            super::run_capture_shown(
+                Cmd::new("/bin/sh").args([
+                    "-c",
+                    "printf 'out-first\nout-next\nout-last'; \
+                     printf 'err-first\nerr-next\nerr-last' >&2; exit 3",
+                ]),
+                "test",
+                Some(&transcript),
+                Termination::Kill,
+            )
+            .await
+        });
+        let OutrigError::Process {
+            exit_code,
+            stderr_tail,
+            ..
+        } = outcome.expect_err("the command failed")
+        else {
+            panic!("expected the command's own failure");
+        };
+        assert_eq!(exit_code, Some(3));
+        assert_eq!(stderr_tail, "", "shown failures do not repeat their output");
+        assert_eq!(
+            warned
+                .matches("the transcript could not be written")
+                .count(),
+            3,
+            "warn once for the echo and once per stream: {warned}"
+        );
+        return;
+    }
+
+    for mirror in [false, true] {
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("a_failing_transcript_keeps_showing_output")
+            .env(CHILD, mirror.to_string())
+            .output()
+            .expect("run the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "mirror={mirror}: child failed ({:?}): {stdout}{stderr}",
+            out.status
+        );
+        for line in [
+            "out-first",
+            "out-next",
+            "out-last",
+            "err-first",
+            "err-next",
+            "err-last",
+        ] {
+            let expected = format!("[test] {line}");
+            assert_eq!(
+                stderr.lines().filter(|line| *line == expected).count(),
+                1,
+                "mirror={mirror}: expected {expected:?} exactly once: {stderr}"
+            );
+        }
+    }
+}
+
 /// A shown command's lines were on stderr as they arrived, so its failure
 /// carries nothing to repeat them with -- the `Process` error has the exit
 /// code and an empty tail, as a streamed failure does.
