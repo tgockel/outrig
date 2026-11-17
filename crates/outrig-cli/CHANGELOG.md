@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `clean` now checks the store-resolved session directory for a live launch, both
+  before the preview and before removal. Records with a stale relative `session_dir`
+  no longer lose their files when cleaned from another working directory. (#876)
+
 - `image init` now refuses dangling `Dockerfile` and `image.toml` symlinks unless
   `--force` is set, and reports existence-probe errors instead of treating the paths
   as absent. (#812)

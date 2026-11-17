@@ -1543,6 +1543,109 @@ async fn clean_skips_running_sessions() {
     );
 }
 
+/// #876: old records can contain a session_dir relative to another cwd.
+/// Exercise ordinary entries and relative registry symlinks without changing
+/// the process cwd (the tests run in parallel).
+async fn clean_stale_session_dir(claim_before_preview: bool, claim_before_removal: bool) {
+    for linked in [false, true] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(tmp.path().join("store"));
+        let now = clean_now();
+        let sid = SessionId("20260501T134412-3f2a".into());
+        let mut session = session_with_age(&sid, now, days(40), None);
+        let (dir, _) = store.create(&sid, None, &mut session).expect("create");
+        let dir = if linked {
+            let external = tmp.path().join("external");
+            std::fs::rename(&dir, &external).expect("move session");
+            std::os::unix::fs::symlink("../external", &dir).expect("registry link");
+            external
+        } else {
+            dir
+        };
+        // Guaranteed not to exist from this cwd, like ./s/<id> recorded by a
+        // launch elsewhere. Leave the on-disk field stale throughout clean.
+        session.session_dir = PathBuf::from("missing-launch-cwd").join(sid.as_str());
+        assert!(!session.session_dir.exists());
+        std::fs::write(
+            dir.join("session.json"),
+            serde_json::to_vec(&session).expect("serialize"),
+        )
+        .expect("write stale record");
+        write_outrig_entries(&dir);
+        let resolved_dir = store.get_by_id(&sid).expect("resolve entry").0;
+        let mut owner = claim_before_preview
+            .then(|| outrig_cli::session::claim_owner(&dir).expect("claim before preview"));
+        let (mut ew, stderr_r) = duplex(8192);
+        let rc = clean::execute_with(
+            &mut ew,
+            tokio::io::BufReader::new(tokio::io::empty()),
+            &store,
+            &clean_args(clean::DEFAULT_OLDER_THAN, true),
+            now,
+            BTreeSet::new(),
+            Vec::new(),
+            Vec::new(),
+            no_removals,
+            no_build_removals,
+            || {
+                if claim_before_removal {
+                    owner =
+                        Some(outrig_cli::session::claim_owner(&dir).expect("claim before removal"));
+                }
+                std::future::ready(Ok(BTreeSet::new()))
+            },
+        )
+        .await
+        .expect("clean");
+        drop(ew);
+        let err = drain(stderr_r).await;
+        assert_eq!(rc, 0, "{err}");
+        if claim_before_preview || claim_before_removal {
+            assert!(dir.join("session.json").exists(), "live record lost: {err}");
+            assert_eq!(
+                std::fs::read(dir.join("logs/fs.stderr")).unwrap(),
+                b"server stderr\n"
+            );
+            assert_eq!(std::fs::read(dir.join("outrig-enter")).unwrap(), b"\x7fELF");
+            assert!(
+                store.symlink_path(&sid).exists(),
+                "registry entry lost: {err}"
+            );
+            assert!(!err.contains("[outrig] removed"), "{err}");
+            if claim_before_preview {
+                assert!(err.contains("skipped running sessions"), "{err}");
+            } else {
+                assert!(err.contains("kept (container is now running)"), "{err}");
+            }
+        } else {
+            assert!(
+                !dir.join("session.json").exists(),
+                "ownerless record retained: {err}"
+            );
+            assert!(
+                err.contains(&format!("[outrig] removed {}", resolved_dir.display())),
+                "{err}"
+            );
+        }
+        drop(owner);
+    }
+}
+
+#[tokio::test]
+async fn clean_stale_session_dir_skips_live_owner_at_preview() {
+    clean_stale_session_dir(true, false).await;
+}
+
+#[tokio::test]
+async fn clean_stale_session_dir_keeps_owner_claimed_before_removal() {
+    clean_stale_session_dir(false, true).await;
+}
+
+#[tokio::test]
+async fn clean_stale_session_dir_removes_ownerless_record() {
+    clean_stale_session_dir(false, false).await;
+}
+
 /// #869: a session whose container was stopped at the preview's listing but
 /// is running by the time the removal would run -- someone (or something)
 /// started it while `clean` sat at its prompt -- keeps its record. The first

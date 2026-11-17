@@ -230,19 +230,21 @@ where
         if !older_than(session, args.older_than, now) {
             continue;
         }
+        // Probe the directory the store will remove, not session_dir from the
+        // record: older launches may have persisted it relative to another cwd
+        // (#876). This also follows registry symlinks to external directories.
+        let (dir, _) = store.get_by_id(&session.id)?;
         // Either answer means live. `owner_is_live` is what covers a launch
         // whose container does not exist yet -- a cold image build takes
         // minutes, and a cutoff shorter than one used to sweep the record out
         // from under it (#366); `running` covers the record whose owner died
         // without finalizing and left its container up.
-        if session::owner_is_live(&session.session_dir)
-            || running.contains(&session.container_name)
-        {
+        if session::owner_is_live(&dir) || running.contains(&session.container_name) {
             skipped_running.push(session.clone());
             continue;
         }
         targets.push(CleanTarget {
-            dir: session.session_dir.clone(),
+            dir,
             session: session.clone(),
         });
     }
