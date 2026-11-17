@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Git build-context cache keys no longer rehash subtrees through ancestor symlinks.**
+  Ordinary directory descent shares cycle detection and content hashes with symlink
+  resolution, so nested links to parent directories read each file only once per listing
+  pass. Payload edits still invalidate the cache; contexts with directory cycles may rebuild
+  once because their keys change. Acyclic contexts retain their keys. (#747)
+
 - **Git build-context cache keys now distinguish hard links from independent copies.**
   Replacing identical regular files with a hard-linked pair invalidates the image cache,
   including pairs split across nested repositories, submodules, or subtrees hashed whole.

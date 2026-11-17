@@ -4,6 +4,7 @@
 //! otherwise.
 
 use std::collections::BTreeMap;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
@@ -1003,6 +1004,108 @@ async fn symlink_target_is_cleaned_before_it_is_resolved() {
             "`revision -> {target}` copies ./stamp.txt, so editing it must change the key"
         );
     }
+}
+
+/// Exercise the same sorted listing pass as `hash_git_tree`, counting actual
+/// file reads rather than elapsed time or distinct stamp paths.
+#[tokio::test]
+async fn git_walk_hashes_nested_ancestor_referents_once() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let mut deepest = ctx.path().to_path_buf();
+    for _ in 0..20 {
+        deepest.push("d");
+        std::fs::create_dir(&deepest).unwrap();
+        std::os::unix::fs::symlink("..", deepest.join("up")).unwrap();
+    }
+    let payload = deepest.join("payload");
+    std::fs::write(&payload, "v1").unwrap();
+    git_init(ctx.path());
+
+    let paths = super::ls_files(ctx.path(), &["--cached", "--others", "--exclude-standard"])
+        .await
+        .unwrap();
+    let mut tree = TreeHasher::new(ctx.path());
+    for rel in paths {
+        tree.listed(Path::new(std::ffi::OsStr::from_bytes(&rel)))
+            .unwrap();
+    }
+    assert_eq!(
+        tree.file_reads[payload.strip_prefix(ctx.path()).unwrap()],
+        1
+    );
+    assert!(
+        tree.dir_reads.values().all(|&reads| reads == 1),
+        "{:?}",
+        tree.dir_reads
+    );
+    assert!(tree.active.is_empty());
+
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+    assert_eq!(before, key(&dockerfile, &args, ctx.path()).await);
+    std::fs::write(payload, "v2").unwrap();
+    assert_ne!(before, key(&dockerfile, &args, ctx.path()).await);
+}
+
+/// A link can read a listed file before its own turn in git's name order.
+/// Its earlier digest must not be paired with the rewritten file's stamp.
+#[test]
+fn git_listed_file_rehashes_a_changed_referent() {
+    let ctx = make_ctx(&[("z-payload", "old")]);
+    std::os::unix::fs::symlink("z-payload", ctx.path().join("a-link")).unwrap();
+    let mut tree = TreeHasher::new(ctx.path());
+    tree.listed(Path::new("a-link")).unwrap();
+
+    // A different size guarantees a distinct stamp without sleeps or relying
+    // on the filesystem's timestamp resolution.
+    std::fs::write(ctx.path().join("z-payload"), "new payload").unwrap();
+    let (_, super::ContextEntry::File(digest, _)) =
+        tree.listed(Path::new("z-payload")).unwrap().unwrap()
+    else {
+        panic!("expected a regular file");
+    };
+    assert_eq!(digest, blake3::hash(b"new payload"));
+    assert_eq!(tree.file_reads[Path::new("z-payload")], 2);
+
+    // Re-entering through a link must also check the cached metadata.
+    std::fs::write(ctx.path().join("z-payload"), "third").unwrap();
+    let (_, digest) = tree.referent("z-payload".into()).unwrap().unwrap();
+    assert_eq!(digest, blake3::hash(b"third"));
+    assert_eq!(tree.file_reads[Path::new("z-payload")], 3);
+}
+
+#[tokio::test]
+async fn git_acyclic_symlinks_keep_their_key() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        ("d/payload", "v1"),
+        (".gitignore", "ignored/\n"),
+        ("ignored/sub/payload", "hidden"),
+    ]);
+    std::os::unix::fs::symlink("d", ctx.path().join("alias")).unwrap();
+    std::os::unix::fs::symlink("ignored", ctx.path().join("hidden")).unwrap();
+    std::os::unix::fs::symlink("sub", ctx.path().join("ignored/link")).unwrap();
+    // Pin modes so the expected key is independent of the test runner's umask.
+    for rel in ["", "d", "ignored", "ignored/sub"] {
+        std::fs::set_permissions(ctx.path().join(rel), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    for rel in [
+        "Dockerfile",
+        "d/payload",
+        ".gitignore",
+        "ignored/sub/payload",
+    ] {
+        std::fs::set_permissions(ctx.path().join(rel), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+    }
+    git_init(ctx.path());
+    // Computed before #747's traversal change, with these same fixed modes.
+    assert_eq!(
+        key(&ctx.path().join("Dockerfile"), &BTreeMap::new(), ctx.path()).await,
+        "6bf2d452cc5b8f14"
+    );
 }
 
 /// A link that leads back into what is already being hashed -- a pair naming

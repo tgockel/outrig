@@ -2354,18 +2354,20 @@ enum ContextEntry {
 ///
 /// `COPY <link>` copies a link's referent, which git may never list (ignored,
 /// or under `.git`) and which may hold more links, so every link is followed
-/// wherever it is met. A referent is hashed once; a link back into one still
-/// being hashed is a loop, and counts by its text alone.
+/// wherever it is met. Content is hashed once whether reached through a link
+/// or ordinary descent; a link back into a directory still being hashed is a
+/// loop, and counts by its text alone. Ordinary descent closing a cycle
+/// contributes only the directory's mode.
 ///
 /// A walk of the whole context, [`Self::whole`], follows no link: it meets the
 /// referent in its own place anyway, and following into it from every link
 /// that points at an ancestor would hash a subtree again for each.
 struct TreeHasher<'a> {
     ctx: &'a Path,
-    /// Mode and digest of each referent hashed so far, by context-relative
-    /// path.
-    done: HashMap<PathBuf, (u32, blake3::Hash)>,
-    /// Referents being hashed now.
+    /// Metadata and content digest of each entry hashed so far, by
+    /// context-relative path. Never stores hard-link topology digests.
+    done: HashMap<PathBuf, (Stamp, blake3::Hash)>,
+    /// Directories and other referents being hashed now, by either route.
     active: HashSet<PathBuf>,
     /// First admitted path per multiply linked regular file. Shared across
     /// git recursion and whole-subtree walks; never used for symlink referents.
@@ -2374,6 +2376,10 @@ struct TreeHasher<'a> {
     follow_links: bool,
     /// Every path met, as [`Self::entry`] met it.
     stamps: Stamps,
+    #[cfg(test)]
+    file_reads: HashMap<PathBuf, usize>,
+    #[cfg(test)]
+    dir_reads: HashMap<PathBuf, usize>,
 }
 
 impl<'a> TreeHasher<'a> {
@@ -2385,6 +2391,10 @@ impl<'a> TreeHasher<'a> {
             hard_links: None,
             follow_links: true,
             stamps: Stamps::default(),
+            #[cfg(test)]
+            file_reads: HashMap::new(),
+            #[cfg(test)]
+            dir_reads: HashMap::new(),
         }
     }
 
@@ -2432,7 +2442,27 @@ impl<'a> TreeHasher<'a> {
         if file_type.is_file() {
             match self.earlier_link(rel, meta) {
                 Some(first) => Ok(hard_link_digest(&first)),
-                None => hash_file(&self.ctx.join(rel)),
+                None => {
+                    // A listed file can also be met under a directory referent.
+                    // Only content digests are reusable, not topology records.
+                    // A newer stamp must not be paired with older content.
+                    if self.hard_links.is_none()
+                        && let Some((stamp, digest)) = self.done.get(rel)
+                        && *stamp == Stamp::of(meta)
+                    {
+                        return Ok(*digest);
+                    }
+                    #[cfg(test)]
+                    {
+                        *self.file_reads.entry(rel.to_path_buf()).or_default() += 1;
+                    }
+                    let digest = hash_file(&self.ctx.join(rel))?;
+                    if self.hard_links.is_none() {
+                        self.done
+                            .insert(rel.to_path_buf(), (Stamp::of(meta), digest));
+                    }
+                    Ok(digest)
+                }
             }
         } else if file_type.is_symlink() {
             self.link(rel)
@@ -2456,6 +2486,37 @@ impl<'a> TreeHasher<'a> {
 
     /// Each entry of the directory `ctx/rel`, by name, mode, and digest.
     fn dir(&mut self, rel: &Path) -> Result<blake3::Hash> {
+        if !self.follow_links {
+            return self.dir_entries(rel);
+        }
+        if self.hard_links.is_none()
+            && let Some((_, digest)) = self.done.get(rel)
+        {
+            return Ok(*digest);
+        }
+        // A link can enter an ancestor that ordinary descent has not met yet.
+        // Its walk back down then closes the cycle at an active directory;
+        // that entry contributes its mode alone, not another subtree walk.
+        if !self.active.insert(rel.to_path_buf()) {
+            return Ok(NO_CONTENT);
+        }
+        let result = self.dir_entries(rel);
+        self.active.remove(rel);
+        let digest = result?;
+        if self.hard_links.is_none() {
+            let path = self.ctx.join(rel);
+            let meta = std::fs::symlink_metadata(&path).path_ctx("stat", &path)?;
+            self.done
+                .insert(rel.to_path_buf(), (Stamp::of(&meta), digest));
+        }
+        Ok(digest)
+    }
+
+    fn dir_entries(&mut self, rel: &Path) -> Result<blake3::Hash> {
+        #[cfg(test)]
+        {
+            *self.dir_reads.entry(rel.to_path_buf()).or_default() += 1;
+        }
         let path = self.ctx.join(rel);
         let mut names = std::fs::read_dir(&path)
             .and_then(|entries| {
@@ -2498,14 +2559,20 @@ impl<'a> TreeHasher<'a> {
     /// Mode and digest of `ctx/rel`, which a link resolved to. `None` when
     /// nothing is there, or when it is still being hashed -- a loop.
     fn referent(&mut self, rel: PathBuf) -> Result<Option<(u32, blake3::Hash)>> {
-        if let Some(done) = self.done.get(&rel) {
-            return Ok(Some(*done));
+        if self.active.contains(&rel) {
+            return Ok(None);
         }
         let Ok(meta) = std::fs::symlink_metadata(self.ctx.join(&rel)) else {
             return Ok(None);
         };
-        if !self.active.insert(rel.clone()) {
-            return Ok(None);
+        if let Some((stamp, digest)) = self.done.get(&rel)
+            && *stamp == Stamp::of(&meta)
+        {
+            return Ok(Some((stamp.mode, *digest)));
+        }
+        // Directories register themselves, including on ordinary descent.
+        if !meta.is_dir() {
+            self.active.insert(rel.clone());
         }
         // A referent is not another entry in COPY .; it must neither consume
         // a first-link slot nor be keyed as a later link to itself.
@@ -2513,9 +2580,9 @@ impl<'a> TreeHasher<'a> {
         let digest = self.entry(&rel, &meta);
         self.hard_links = links;
         self.active.remove(&rel);
-        let done = (meta.mode(), digest?);
-        self.done.insert(rel, done);
-        Ok(Some(done))
+        let digest = digest?;
+        self.done.insert(rel, (Stamp::of(&meta), digest));
+        Ok(Some((meta.mode(), digest)))
     }
 }
 
