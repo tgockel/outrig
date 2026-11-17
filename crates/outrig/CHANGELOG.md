@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Network interception now refuses borrowed containers with bounding-only `CAP_NET_ADMIN`.**
+  Both effective and bounding capabilities are inspected, preventing a non-root process from
+  regaining the capability through a setuid-root helper and removing the redirect rules. (#887)
+
 - **Oversized IPv6 DNS answers now give IPv4 clients a TCP-retry signal.** When a
   resolver's UDP answer exceeds the client's IP-family datagram limit, the interceptor
   returns a matching header and question with TC set instead of silently losing the

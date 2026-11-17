@@ -2311,6 +2311,61 @@ async fn a_borrowed_privileged_container_is_refused() {
     );
 }
 
+/// A privileged non-root container can have an empty effective set while
+/// retaining NET_ADMIN in its bounding set. A setuid-root helper could regain
+/// it, so interception must refuse before changing the netns or resolver (#887).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_borrowed_privileged_non_root_container_is_refused() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let context = dir.path().join("image");
+    std::fs::create_dir_all(&context).expect("image context dir");
+    write_curl_image_context(&context);
+    let image = ensure_curl_image(&context).await;
+    let log_dir = dir.path().join("logs");
+
+    let raw = RawContainer::start(&image, &["--privileged", "--user=1000"]);
+    let caps = Command::new("podman")
+        .args([
+            "inspect",
+            "--format",
+            "{{.EffectiveCaps}}\n{{.BoundingCaps}}",
+            &raw.name,
+        ])
+        .output()
+        .expect("inspect capability sets");
+    assert!(caps.status.success(), "inspect failed: {caps:?}");
+    let caps = String::from_utf8(caps.stdout).expect("capabilities are UTF-8");
+    let (effective, bounding) = caps.trim().split_once('\n').expect("two capability sets");
+    assert!(
+        !effective.contains("CAP_NET_ADMIN") && bounding.contains("CAP_NET_ADMIN"),
+        "regression requires bounding-only NET_ADMIN: {caps}"
+    );
+
+    let container = Container::attach(raw.name.clone(), image.clone(), None, None);
+    let pid = container_root_pid(&container);
+    let before = read_resolv_conf(&container);
+    let refused = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect_err("a borrowed container with bounding-only NET_ADMIN is not attached");
+    let message = refused.to_string();
+    assert!(
+        message.contains("CAP_NET_ADMIN") && message.contains("podman"),
+        "the refusal names the capability and how it was found: {message}"
+    );
+    assert!(
+        !netns_has_outrig_table(pid),
+        "a refused attach installs no table"
+    );
+    assert_eq!(
+        read_resolv_conf(&container),
+        before,
+        "a refused attach leaves the resolver alone"
+    );
+}
+
 /// `SYS_ADMIN` is not `NET_ADMIN` for a borrowed container either, so the
 /// nested-runtime recipe keeps working when the container holding it is one
 /// outrig only attached to (#549; see `a_container_holding_sys_admin_is_still_attached`

@@ -971,18 +971,23 @@ impl Container {
         container
     }
 
-    /// A *borrowed* handle wired to answer `podman inspect --format
-    /// {{.EffectiveCaps}}` with `caps` -- e.g. `"[CAP_CHOWN CAP_NET_ADMIN]"`
-    /// -- for tests of [`NetworkInterceptor::attach`](crate::network::NetworkInterceptor::attach)'s
-    /// #549 refusal, which a borrowed handle's `net_admin` field cannot carry
-    /// (there is no launch to have set it from).
+    /// A borrowed handle reporting both capability sets, for interceptor tests.
+    /// Match the requested format so a check that reads only EffectiveCaps
+    /// cannot accidentally see the bounding set in the stand-in's answer.
     #[cfg(test)]
-    pub(crate) fn attached_reporting_effective_caps(caps: &str) -> Self {
+    pub(crate) fn attached_reporting_caps(effective: &str, bounding: &str) -> Self {
         let mut container = Self::stops_cleanly();
-        container.engine_override = vec![(
-            "inspect",
-            Cmd::new("/bin/echo").arg(format!("the-container {caps}")),
-        )];
+        container.engine_override = vec![
+            (
+                "{{.EffectiveCaps}} {{.BoundingCaps}}",
+                Cmd::new("/bin/echo").arg(format!("the-container {effective} {bounding}")),
+            ),
+            (
+                "{{.EffectiveCaps}}",
+                Cmd::new("/bin/echo").arg(format!("the-container {effective}")),
+            ),
+            ("inspect", Cmd::new("/bin/echo").arg("the-container []")),
+        ];
         container
     }
 
@@ -1172,27 +1177,24 @@ impl Container {
         self.net_admin
     }
 
-    /// Whether a *borrowed* container (`Container::attach`) currently holds
-    /// `CAP_NET_ADMIN`, read from the engine rather than a launch outrig had
-    /// no part in. Always `Ok(false)` for an owned container: its launch is
-    /// known exactly through [`holds_net_admin`](Self::holds_net_admin), so
-    /// nothing here is worth an extra round trip.
+    /// Whether a *borrowed* container (`Container::attach`) holds or could
+    /// acquire `CAP_NET_ADMIN`, read from the engine rather than a launch
+    /// outrig had no part in. Always `Ok(false)` for an owned container: its
+    /// launch is known through [`holds_net_admin`](Self::holds_net_admin).
     ///
-    /// `podman inspect --format {{.EffectiveCaps}}` is what it asks: unlike
-    /// the launch-derived flag, it is exact for a borrowed container
-    /// whichever way its capabilities arrived -- an explicit `--cap-add`,
-    /// `--privileged`, or a `containers.conf` `default_capabilities` entry
-    /// outrig never saw. See
-    /// [`NetworkInterceptor::attach`](crate::network::NetworkInterceptor::attach),
-    /// the only caller: a borrowed container used to bypass the #363 refusal
-    /// entirely, because `Container::attach` records no launch and so no
-    /// `LaunchFacts` to read it from (#549).
+    /// Read both EffectiveCaps and BoundingCaps in one inspect. Checking only
+    /// the effective set misses a non-root process that could regain the
+    /// capability via a setuid-root helper (#887). Refuse either set, regardless
+    /// of how the capability arrived: `--cap-add`, `--privileged`, or an engine
+    /// default outrig never saw (#549).
     pub(crate) async fn attached_holds_net_admin(&self) -> Result<bool> {
         if self.ownership != ContainerOwnership::Attached {
             return Ok(false);
         }
-        let caps = self.inspect_format("{{.EffectiveCaps}}").await?;
-        Ok(effective_caps_grant_net_admin(&caps))
+        let caps = self
+            .inspect_format("{{.EffectiveCaps}} {{.BoundingCaps}}")
+            .await?;
+        Ok(caps_grant_net_admin(&caps))
     }
 
     /// The image this container was asked for.
@@ -2737,7 +2739,7 @@ fn runtime_id() -> String {
 }
 
 /// Whether `caps`, the trimmed output of `podman inspect --format
-/// {{.EffectiveCaps}}`, lists `CAP_NET_ADMIN`.
+/// {{.EffectiveCaps}} {{.BoundingCaps}}`, lists `CAP_NET_ADMIN` in either set.
 ///
 /// Podman prints a `[]string` as a Go template renders one: bracketed and
 /// space-separated, e.g. `[CAP_CHOWN CAP_NET_ADMIN CAP_SYS_CHROOT]`. Tokenized
@@ -2745,7 +2747,7 @@ fn runtime_id() -> String {
 /// substring, so a name this never sees cannot coincide with one that
 /// contains `NET_ADMIN` as a piece of something longer -- there is none today,
 /// but the parse does not depend on that staying true.
-fn effective_caps_grant_net_admin(caps: &str) -> bool {
+fn caps_grant_net_admin(caps: &str) -> bool {
     caps.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .any(|token| token == "CAP_NET_ADMIN")
 }
@@ -4325,25 +4327,21 @@ mod tests {
     }
 
     /// What podman's Go template prints for a `[]string`, bracketed and
-    /// space-separated, is what `effective_caps_grant_net_admin` tokenizes --
+    /// space-separated, is what `caps_grant_net_admin` tokenizes --
     /// not a substring search, so a name it has never seen cannot false-match
     /// by containing `NET_ADMIN` as a piece of something longer (#549).
     #[test]
-    fn effective_caps_grant_net_admin_reads_podmans_bracketed_list() {
-        assert!(effective_caps_grant_net_admin(
+    fn caps_grant_net_admin_reads_podmans_bracketed_list() {
+        assert!(caps_grant_net_admin(
             "[CAP_CHOWN CAP_NET_ADMIN CAP_SYS_CHROOT]"
         ));
-        assert!(effective_caps_grant_net_admin("[CAP_NET_ADMIN]"));
-        assert!(!effective_caps_grant_net_admin(
-            "[CAP_CHOWN CAP_SYS_CHROOT]"
-        ));
-        assert!(!effective_caps_grant_net_admin("[]"));
-        assert!(!effective_caps_grant_net_admin(""));
+        assert!(caps_grant_net_admin("[CAP_NET_ADMIN]"));
+        assert!(!caps_grant_net_admin("[CAP_CHOWN CAP_SYS_CHROOT]"));
+        assert!(!caps_grant_net_admin("[]"));
+        assert!(!caps_grant_net_admin(""));
         // Not a substring match: a name that merely contains the text is not
         // the capability itself.
-        assert!(!effective_caps_grant_net_admin(
-            "[CAP_NET_ADMIN_SOMETHING_ELSE]"
-        ));
+        assert!(!caps_grant_net_admin("[CAP_NET_ADMIN_SOMETHING_ELSE]"));
     }
 
     /// An owned container answers from the launch-derived flag alone: no
@@ -4364,47 +4362,38 @@ mod tests {
         assert!(!holds, "an owned container's launch said no NET_ADMIN");
     }
 
-    /// A borrowed container with no launch of its own is asked directly:
-    /// `podman inspect --format {{.EffectiveCaps}}`, and a `CAP_NET_ADMIN` in
-    /// the answer is what `NetworkInterceptor::attach` refuses on (#549).
+    /// Both sets matter: a bounding-only capability can be regained even
+    /// when the effective set is empty (#887). The stand-in only returns these
+    /// sets when the engine query requests both.
     #[tokio::test]
-    async fn a_borrowed_container_asks_the_engine_for_its_effective_capabilities() {
+    async fn a_borrowed_container_checks_effective_and_bounding_capabilities() {
         let _emitting = crate::process::process_tests::emitting().await;
-        let mut container = Container::stops_cleanly();
-        // `inspect_format` prefixes the id podman would answer with; a
-        // borrowed handle has none of its own to check it against, so
-        // whatever comes first is discarded and the rest is read.
-        container.engine_override = vec![(
-            "inspect",
-            Cmd::new("/bin/echo").arg("the-container [CAP_CHOWN CAP_NET_ADMIN]"),
-        )];
-
-        let holds = container
-            .attached_holds_net_admin()
-            .await
-            .expect("the stand-in engine answered");
-
-        assert!(holds, "CAP_NET_ADMIN was in the engine's answer");
+        for (effective, bounding, expected) in [
+            ("[CAP_CHOWN CAP_NET_ADMIN]", "[]", true),
+            ("[]", "[CAP_CHOWN CAP_NET_ADMIN]", true),
+            ("[CAP_NET_ADMIN]", "[CAP_NET_ADMIN]", true),
+            ("[CAP_CHOWN]", "[CAP_CHOWN CAP_SYS_CHROOT]", false),
+            ("[]", "[]", false),
+            ("[]", "[CAP_NET_ADMIN_SOMETHING_ELSE]", false),
+        ] {
+            let container = Container::attached_reporting_caps(effective, bounding);
+            let holds = container
+                .attached_holds_net_admin()
+                .await
+                .expect("the stand-in engine answered");
+            assert_eq!(
+                holds, expected,
+                "effective={effective}, bounding={bounding}"
+            );
+        }
     }
 
-    /// The same borrowed container, asked when the engine reports no
-    /// `CAP_NET_ADMIN`: attaches, as a borrowed container with nothing
-    /// outrig need refuse always could before #549.
     #[tokio::test]
-    async fn a_borrowed_container_without_net_admin_is_not_flagged() {
+    async fn a_borrowed_container_propagates_capability_inspect_failure() {
         let _emitting = crate::process::process_tests::emitting().await;
         let mut container = Container::stops_cleanly();
-        container.engine_override = vec![(
-            "inspect",
-            Cmd::new("/bin/echo").arg("the-container [CAP_CHOWN CAP_SYS_CHROOT]"),
-        )];
-
-        let holds = container
-            .attached_holds_net_admin()
-            .await
-            .expect("the stand-in engine answered");
-
-        assert!(!holds);
+        container.engine_override = vec![("inspect", Cmd::new("/bin/false"))];
+        assert!(container.attached_holds_net_admin().await.is_err());
     }
 
     /// Podman reads a capability flag value as CSV -- measured against 5.7,
