@@ -736,10 +736,17 @@ context = "{context}"
     );
     std::fs::write(agents_dir.join("config.toml"), config_toml).expect("write config");
 
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
     let global = common::EmptyGlobalConfig::new();
     let bin = env!("CARGO_BIN_EXE_outrig");
     let mut child = Command::new(bin)
-        .args(["--global-config", common::utf8(global.path()), "mcp"])
+        .args([
+            "--global-config",
+            common::utf8(global.path()),
+            "--session-root",
+            common::utf8(sessions.path()),
+            "mcp",
+        ])
         .current_dir(repo_dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
