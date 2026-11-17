@@ -145,6 +145,29 @@ pub(crate) fn write_atomic_noclobber(path: &Path, contents: &str) -> Result<()> 
     Ok(())
 }
 
+/// Exclusively create a file, returning `true` if written or `false` if an
+/// existing directory entry (including a dangling symlink) was kept.
+///
+/// Unlike atomic publication through a temp file, this needs neither
+/// no-replace rename nor hard links, which some shared filesystems lack.
+/// The contents are written in place: readers can see an incomplete file,
+/// and a failed write can leave one behind. Use for optional scaffolding,
+/// not for configuration that requires complete-file publication.
+pub(crate) fn write_if_absent(path: &Path, contents: &str) -> Result<bool> {
+    let parent = path.parent().ok_or_else(|| {
+        OutrigError::Configuration(format!("path has no parent: {}", path.display()))
+    })?;
+    fs::create_dir_all(parent).path_ctx("create directory", parent)?;
+    let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => return Ok(false),
+        Err(err) => return Err(err).path_ctx("create file", path),
+    };
+    file.write_all(contents.as_bytes()).path_ctx("write", path)?;
+    file.sync_all().path_ctx("sync", path)?;
+    Ok(true)
+}
+
 /// Writes each file atomically, in order, after staging every one in a temp
 /// file beside its target: creating, writing, or syncing any of them fails
 /// before a single target changes. Only a failed rename can leave the
@@ -1103,6 +1126,88 @@ mod tests {
         let config = agents.join("config.toml");
         fs::write(&config, b"# fixture\n").unwrap();
         config
+    }
+
+    #[test]
+    fn write_if_absent_writes_a_missing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("README.md");
+
+        assert!(write_if_absent(&path, "generated").unwrap());
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "generated");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    // Call the writer directly, with no existence probe, to exercise a
+    // destination created after the caller's early check would have passed.
+    #[test]
+    fn write_if_absent_keeps_an_existing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("README.md");
+        let original = b"hand-written notes\n\xff";
+        fs::write(&path, original).unwrap();
+
+        assert!(!write_if_absent(&path, "generated").unwrap());
+
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn write_if_absent_keeps_a_dangling_symlink() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("README.md");
+        let missing = dir.path().join("notes.md");
+        std::os::unix::fs::symlink(&missing, &path).unwrap();
+
+        assert!(!write_if_absent(&path, "generated").unwrap());
+
+        assert_eq!(fs::read_link(&path).unwrap(), missing);
+        assert!(!missing.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn write_if_absent_keeps_an_existing_symlink_and_its_target() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("README.md");
+        let notes = dir.path().join("notes.md");
+        fs::write(&notes, "hand-written notes").unwrap();
+        std::os::unix::fs::symlink(&notes, &path).unwrap();
+
+        assert!(!write_if_absent(&path, "generated").unwrap());
+
+        assert_eq!(fs::read_link(&path).unwrap(), notes);
+        assert_eq!(fs::read_to_string(&notes).unwrap(), "hand-written notes");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn write_if_absent_does_not_need_to_read_or_copy_existing_attributes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("README.md");
+        fs::write(&path, "private notes").unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(0o000)).unwrap();
+
+        assert!(!write_if_absent(&path, "generated").unwrap());
+
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0);
+        fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "private notes");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn write_if_absent_propagates_creation_errors() {
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        fs::write(&blocker, "keep me").unwrap();
+
+        assert!(write_if_absent(&blocker.join("README.md"), "generated").is_err());
+
+        assert_eq!(fs::read_to_string(&blocker).unwrap(), "keep me");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

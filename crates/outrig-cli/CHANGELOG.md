@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `image init` now exclusively creates its optional README, preserving a README that appears
+  after the existence check, even with `--force`. This also works on shared filesystems without
+  no-replace rename or hard links. (#811)
+
 - Non-forced global config initialization now refuses a config created while the wizard
   is prompting instead of silently replacing it. `--force` still permits overwrites. (#793)
 

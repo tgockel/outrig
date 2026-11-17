@@ -15,7 +15,7 @@ use std::path::Path;
 
 use crate::error::{OutrigError, Result};
 use crate::image_setup::render::{self, BaseImage, McpServer};
-use crate::paths::write_atomic;
+use crate::paths::{write_atomic, write_if_absent};
 use outrig::config::check_build_image_name;
 
 /// Scaffold a standalone image project in `dir` (relative to `cwd`, or `cwd`
@@ -50,10 +50,16 @@ pub fn run(cwd: &Path, dir: Option<&Path>, force: bool) -> Result<()> {
 
     write_and_report(&dockerfile_path, &render_dockerfile(), cwd)?;
     write_and_report(&image_toml_path, &render_image_toml(&name), cwd)?;
-    if readme_path.exists() || readme_path.is_symlink() {
+    // Keep the probe for the common "already present" case. Exclusive creation
+    // also preserves a README created after the probe, even with --force, and
+    // works on shared filesystems without no-replace rename or hard links.
+    if readme_path.exists()
+        || readme_path.is_symlink()
+        || !write_if_absent(&readme_path, &render_readme(&name))?
+    {
         eprintln!("[outrig] keeping existing {}", display_rel(&readme_path, cwd));
     } else {
-        write_and_report(&readme_path, &render_readme(&name), cwd)?;
+        eprintln!("[outrig] wrote {}", display_rel(&readme_path, cwd));
     }
 
     eprintln!("[outrig] next: build this image with `outrig image build`");
