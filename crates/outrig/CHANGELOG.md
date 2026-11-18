@@ -19,6 +19,27 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **An uncertain send is resolved by its identity, and the session keeps a registry of its
+  channels.** `ChannelBackend` gains three required methods, each answering from the backend's
+  durable record: `resolve_send(Query)`, what became of an item whose send was uncertain, as a
+  `SendAnswer`; `resolve_withdrawal(Query)`, what became of an outbound request's withdrawal that
+  `withdrawn` did not answer, as a `WithdrawAnswer`, an error leaving it uncertain; and
+  `positions(Positions)`, which hands it a channel's consumed and acknowledged watermarks and its
+  unread items, each an `InboundItem` with both ids and the backend's reference, for a cut to
+  call. A send answered uncertain, or past its call timeout, is asked about once before its
+  sender is told, so one the backend stored is `accepted` and was sent once; the holder's code asks
+  again with `await runtime.channels[name].resolve(item)`, or `resolve(h.id, "withdrawal")` on an
+  outbound request channel, which returns an `outrig.Resolution` and moves the request's handle as
+  it says. OutRig never sends an item again. `send` returns the item's id, on the user channel as
+  on an external one. `Session::channels()` returns a `ChannelSnapshot` per channel, read under
+  one lock from host state: its descriptor (with `ChannelDefinition::reference`), the items unread
+  and consumed but unacknowledged, the two watermarks, the inbound requests received and
+  unanswered (`ReceivedRequest`), the outbound ones outstanding with an `OutboundState`
+  (`OutstandingRequest`), the messages whose send is uncertain (`UncertainItem`), and each
+  holder's sends in its latest 16 rounds (`SentInRound`). Each message still uncertain when
+  admission closes is listed in `ChannelClose::uncertain` (`UncertainAtClose`) with the first
+  answer since that says what became of it, the drain asking once of each no answer has settled;
+  it leaves the verdict as it is. New event: `channel.item.resolved`.
 - **Inbound request liveness on an owner-driven primary.** `Session::round` now nudges and warns
   about inbound external requests left unanswered, then host-cancels requests unchanged by the
   warning round and notifies their backends. Owners drive the rule by calling until `NothingNew`;

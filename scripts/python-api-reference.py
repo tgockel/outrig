@@ -165,6 +165,7 @@ KERNEL_ONLY = {
     "SendRefused": "what an external channel's `send` raises, which only a kernel holds.",
     "SendNotAccepted": "what an external channel's `send` raises, which only a kernel holds.",
     "SendUncertain": "what an external channel's `send` raises, which only a kernel holds.",
+    "Resolution": "what an external channel's `resolve` returns, which only a kernel holds.",
     "UnreadableDelivery": "what an external channel's `receive` may raise, only in a kernel.",
 }
 

@@ -204,6 +204,13 @@ def key(value: object) -> int | str:
     return n if n is not None else text(value)
 
 
+def backend_why(d: dict) -> str:
+    """What a channel's backend said with an outcome: why, and its reference, each in brackets."""
+    return "".join(
+        f" ({text(d.get(k))})" for k in ("reason", "reference") if d.get(k) is not None
+    )
+
+
 class Read(dict):
     """An event's `data`, noting each field a handler reads through `get`, so the ones it never
     read are still shown."""
@@ -1019,6 +1026,11 @@ class Builder:
                 for s in objs(c.get("sends"))
             )
             + "".join(
+                f"; uncertain at the close, item {text(u.get('item'))} by {text(u.get('agent'))}: "
+                f"{text(u.get('outcome'))}" + backend_why(u)
+                for u in objs(c.get("uncertain"))
+            )
+            + "".join(
                 f"; {text(r.get('direction'))} request {text(r.get('request'))}"
                 + (f" (item {text(r.get('item'))})" if r.get("item") is not None else "")
                 + f": {text(r.get('end'))}"
@@ -1479,10 +1491,7 @@ class Builder:
         )
 
     def on_channel_item_outcome(self, d: dict) -> None:
-        why = "".join(
-            f" ({text(d.get(k))})" for k in ("reason", "reference") if d.get(k) is not None
-        )
-        outcome = f"{text(d.get('outcome'))} at the backend{why}"
+        outcome = f"{text(d.get('outcome'))} at the backend{backend_why(d)}"
         req = self.request_items.get(key(d.get("item")))
         if req is not None:
             req.sent = outcome
@@ -1491,6 +1500,26 @@ class Builder:
                 href=link(req.anchor),
             )
             return
+        self.item_outcome(d, outcome)
+
+    def on_channel_item_resolved(self, d: dict) -> None:
+        # Asked after an uncertain outcome: what the backend said is the item's outcome now.
+        operation = text(d.get("operation"))
+        outcome = f"{text(d.get('answer'))} at the backend, its {operation} resolved"
+        outcome += backend_why(d)
+        if d.get("request") is not None:
+            req = self.request(d.get("request"))
+            if operation == "send":
+                req.sent = outcome
+            self.add(
+                f"request {req.id} on {text(d.get('channel'))}: {outcome}",
+                href=link(req.anchor),
+            )
+            return
+        self.item_outcome(d, outcome)
+
+    def item_outcome(self, d: dict, outcome: str) -> None:
+        """What became of the message an agent sent as `d`'s item, at the backend."""
         m = self.message(d.get("item"), d)
         m.outcome = outcome
         m.outcome_at = f"{self.time}, {self.here().title}"

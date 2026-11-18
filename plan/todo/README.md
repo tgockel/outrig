@@ -102,12 +102,6 @@ was built from the phase's exit criteria instead and silently omitted discovery,
 observability -- the exit criteria describe the first milestone, the deliverables describe the
 phase.
 
-**External channels**
-
-| Task      | What it settles                                     |
-| --------- | ----------------------------------------------------|
-| `0003-53` | A send is accepted, refused, or uncertain           |
-
 **MCP services**
 
 | Task      | What it settles                                     |

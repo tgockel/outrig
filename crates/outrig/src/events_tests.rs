@@ -11,9 +11,9 @@ use super::*;
 use crate::agent::rig_json;
 use crate::harness::event::*;
 use crate::harness::{
-    BindingStop, ChannelClose, ChannelRequestAtClose, ClosedBy, Direction, ExecutionOutcome,
-    ExecutionStatus, HostedCall, RequestOutcome, SendAtClose, ServiceCall, ServiceErrorCategory,
-    Stopped, Verdict,
+    BindingStop, ChannelClose, ChannelOperation, ChannelRequestAtClose, ClosedBy, Direction,
+    ExecutionOutcome, ExecutionStatus, HostedCall, RequestOutcome, SendAtClose, ServiceCall,
+    ServiceErrorCategory, Stopped, UncertainAtClose, Verdict,
 };
 
 const SOURCE: &str = "/outrig/session/20260921T103000-a1b2";
@@ -283,6 +283,13 @@ fn each_event_has_exactly_its_data_fields() {
                         item: Some(text("q-1")),
                         end: RequestEnd::Closed,
                         acknowledged: false,
+                    }],
+                    uncertain: vec![UncertainAtClose {
+                        item: MessageId::new(10),
+                        agent: text("c2"),
+                        outcome: ItemOutcome::Accepted,
+                        reason: None,
+                        reference: Some(text("row-3")),
                     }],
                 }],
                 verdict: Verdict::StoppedWithUnknown,
@@ -1271,6 +1278,27 @@ fn each_event_has_exactly_its_data_fields() {
             &["channel", "item", "outcome", "reason", "reference"],
         ),
         (
+            Payload::ChannelItemResolved {
+                channel: text("asks"),
+                item: MessageId::new(5),
+                request: Some(AgentRequestId::new(6)),
+                operation: ChannelOperation::Withdrawal,
+                answer: Resolved::Replied,
+                reason: None,
+                reference: Some(text("row-9")),
+            },
+            "channel.item.resolved",
+            &[
+                "channel",
+                "item",
+                "request",
+                "operation",
+                "answer",
+                "reason",
+                "reference",
+            ],
+        ),
+        (
             Payload::MessageRefused {
                 message: MessageId::new(3),
                 channel: text("user"),
@@ -1429,6 +1457,13 @@ fn each_event_has_exactly_its_data_fields() {
                     "item": "q-1",
                     "end": "closed",
                     "acknowledged": false,
+                }],
+                "uncertain": [{
+                    "item": 10,
+                    "agent": "c2",
+                    "outcome": "accepted",
+                    "reason": null,
+                    "reference": "row-3",
                 }],
             }],
             "verdict": "stopped_with_unknown",

@@ -382,6 +382,26 @@ session.
   settle is answered that it had ended, `channel.request.refused` is recorded, and nothing
   changes. Invoked: no. Effects: none.
 
+**Uncertain sends on external channels** (`0003-53`)
+
+- *A message whose send was uncertain* -- the backend's `send` answered uncertain or ran past
+  its bound, and its `resolve_send`, asked once then, could not tell either, so the holder's
+  `send` raised `outrig.SendUncertain`. Outcome: its `resolve_send` is asked once more, within the
+  drain, by the item id, unless the holder's own question answered first; the report's channel
+  lists it in `uncertain` with what was answered -- `accepted` with its reference,
+  `not_accepted`, or still `uncertain` with its id -- and nothing is sent again. The verdict is
+  left as it is: the holder was told. Invoked: yes, `resolve_send`, at most once. Effects: none;
+  the backend's record is read, not changed.
+- *A send that answers uncertain during the drain.* Outcome: its `resolve_send` is asked once,
+  as for any uncertain send, and its outcome is that answer, listed in the report's `sends` -- one
+  still `uncertain` making the verdict `stopped_with_unknown`, as `0003-51`'s row has it.
+  Invoked: yes, `send` and `resolve_send`. Effects: as that row's.
+- *A resolution the holder's code asked for, unanswered.* Outcome: the drain waits for it within
+  the channel's call timeout; its answer settles what it names as it would mid-session. For a
+  message uncertain when admission closed, an answer of `accepted` or `not_accepted` settles its
+  row in the report, whether it comes before the drain asks or after the drain's answer.
+  Invoked: yes. Effects: none.
+
 **The host program** (`0003-29`)
 
 - *Alive, with the session open.* Outcome: the program's session exit runs this sequence and

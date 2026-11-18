@@ -192,6 +192,14 @@ pub struct ChannelClose {
     /// Each request on it -- inbound or outbound -- that ended after admission
     /// closed, or that nothing ended, and how, in the order each ended.
     pub requests: Vec<ChannelRequestAtClose>,
+    /// Each message whose send was uncertain when admission closed, in the
+    /// order each was sent, and the first answer since that says whether its
+    /// backend took it: to its holder's own question, still running at the
+    /// close, or to the one the drain asks, with
+    /// [`ChannelBackend::resolve_send`](super::ChannelBackend::resolve_send),
+    /// of each no answer has settled. Its holder was told it was uncertain,
+    /// so one still uncertain leaves the verdict as it is.
+    pub uncertain: Vec<UncertainAtClose>,
 }
 
 /// A request on an external channel that ended after admission closed: an
@@ -229,6 +237,23 @@ pub struct SendAtClose {
     pub outcome: ItemOutcome,
     /// Why, for any outcome but `accepted`.
     pub reason: Option<String>,
+}
+
+/// A message whose send on an external channel was uncertain when admission
+/// closed, and what its backend has said of it since.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct UncertainAtClose {
+    /// The id OutRig gave the item, which its backend was given.
+    pub item: MessageId,
+    /// The agent that sent it, as the interpreter's protocol names it.
+    pub agent: String,
+    /// What became of it: `accepted`, `not_accepted`, or still `uncertain`.
+    pub outcome: ItemOutcome,
+    /// Why, for any outcome but `accepted`.
+    pub reason: Option<String>,
+    /// The backend's reference for it, when it accepted it and gave one.
+    pub reference: Option<String>,
 }
 
 /// A request an agent made of a child -- a submission, or a request on one of

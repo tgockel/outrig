@@ -12,6 +12,7 @@ use super::builder::{self, SessionBuilder};
 use super::channels::{Channel, Channels};
 use super::event::{AgentInstanceId, Payload, SessionState};
 use super::lifecycle::Lifecycle;
+use super::registry::ChannelSnapshot;
 use super::report::{
     self, EventDelivery, ExecutionOutcome, ExecutionStatus, ShutdownReport, Stopped,
 };
@@ -326,6 +327,17 @@ impl Session {
     /// channel. `None` for a name the session does not declare.
     pub fn channel(&self, name: &str) -> Option<Channel> {
         self.channels.handle(name)
+    }
+
+    /// Each external channel [`SessionBuilder::channel`] declared, as the
+    /// session's registry holds it now, in the order they were declared: who
+    /// holds it, what waits unread, what its holder consumed and its backend
+    /// acknowledged, the requests received and outstanding, the sends whose
+    /// outcome is uncertain, and what each agent sent in its latest rounds.
+    /// Read from what the session keeps as items cross, never from its
+    /// events, and of one moment: each id is in one place in it.
+    pub fn channels(&self) -> Vec<ChannelSnapshot> {
+        self.channels.snapshot()
     }
 
     /// A function that stops the Python the current round is waiting on --
@@ -685,6 +697,9 @@ impl Session {
         // No child makes another model call; their requests end as the
         // interpreter hears of the close.
         children.stop();
+        // Each message uncertain at the close has its backend asked once, in
+        // the drain, what became of it.
+        channels.resolve_uncertain();
         let until = tokio::time::Instant::now() + deadline;
         let events = lifecycle.events();
         let gate = interpreter.gate();

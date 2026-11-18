@@ -3864,22 +3864,25 @@ class Endpoint:
                 self._receivers.remove(waiter)
 
     async def send(self, message):
-        """Send `message` to the other end.
+        """Send `message` to the other end, and return the id OutRig gave it.
 
         It returns once the message is on its way: accepted for delivery, not yet read. At most
         `SEND_WINDOW` messages are on their way unreceived, and a send past that waits until the
         other end receives one. Sending does not end anything -- not the round, and not the code
         that sends.
         """
-        line = self._encoded(message, {"t": "send", "agent": self._agent, "channel": self._name})
+        line = {"t": "send", "agent": self._agent, "channel": self._name, "id": next(_ids)}
+        encoded = self._encoded(message, line)
         await self._when(self._senders, self._take_room)
         try:
-            _write_line(line)
+            # The host answers with the id it gives the message.
+            answer = _kernels[self._agent].ask(line, encoded)
         except BaseException:
             # Not sent, so it takes no room -- on the reserve if it has to be, since room that is
             # never given back is lost to the channel for good.
             _with_room(self._received)
             raise
+        return (await asyncio.shield(answer)).get("message")
 
     def _encoded(self, message, line, encode=_encode):
         """`line`, the protocol line sending `message` from here, its `body` the message's JSON
@@ -4073,13 +4076,14 @@ class _External(Endpoint):
             return False
 
     async def send(self, message):
-        """Send `message` to the channel's far end, and return once it has taken it: accepted,
-        not yet read.
+        """Send `message` to the channel's far end, and return the id OutRig gave it once the far
+        end has taken it: accepted, not yet read.
 
         Raises `outrig.SendNotAccepted` when the far end said it did not take it, so sending it
-        again is safe; `outrig.SendUncertain`, carrying the id OutRig gave it, when it may have,
-        so sending it again may deliver it twice; `outrig.SendRefused` when it was refused before
-        anything was sent; `outrig.ChannelClosed` once the far end closed the channel; and
+        again is safe; `outrig.SendUncertain`, carrying the id OutRig gave it, when it may have and,
+        asked once already, could not say -- `await resolve(e.item)` asks again, and sending it
+        again may deliver it twice; `outrig.SendRefused` when it was refused before anything was
+        sent; `outrig.ChannelClosed` once the far end closed the channel; and
         `outrig.SessionClosing` once the session has closed. At most `SEND_WINDOW` messages wait
         for an answer at once; a send past that waits for one. Sending ends nothing -- not the
         round, and not the code that sends.
@@ -4105,12 +4109,38 @@ class _External(Endpoint):
         answer = await asyncio.shield(future)
         outcome, reason, item = answer.get("outcome"), answer.get("reason") or "", answer.get("item")
         if outcome == "accepted":
-            return None
+            return item
         if outcome == "uncertain":
             raise _agents.SendUncertain(
-                f"channel {self._name!r}'s far end may have taken message {item}, or not; sending "
-                f"it again may deliver it twice: {reason}", item, reason)
+                f"channel {self._name!r}'s far end may have taken message {item}, or not, and "
+                f"could not say when asked; `await runtime.channels[{self._name!r}].resolve({item})` "
+                f"asks again, and sending it again may deliver it twice: {reason}", item, reason)
         raise _unsent(self._name, f"message {item}", outcome, reason)
+
+    # What a resolution names its item by, on this kind of channel.
+    _resolved_by = "item"
+
+    async def resolve(self, item, operation="send"):
+        """Ask the far end what became of the message `item` -- the id a `send` returned, or an
+        `outrig.SendUncertain`'s `item` -- whose send was uncertain, and return what it said, as
+        an `outrig.Resolution`: `accepted`, `not_accepted` -- so sending it again is safe -- or
+        still `uncertain`. Nothing is sent again. Raises `ValueError` for a message that is not
+        uncertain: taken, not taken, resolved already, or never sent here.
+        """
+        kernel = self._here()
+        _refuse_closing()
+        if type(item) is not int:
+            raise TypeError(f"resolve names its {self._resolved_by} by its id, an int, not "
+                            f"{_type_name(type(item))}")
+        if operation not in ("send", "withdrawal"):
+            raise ValueError(f"resolve asks of a send or a withdrawal, not {operation!r}")
+        line = {"t": "channel.resolve", "agent": kernel.agent, "id": next(_ids),
+                "channel": self._name, self._resolved_by: item, "operation": operation}
+        answer = await asyncio.shield(kernel.ask(line))
+        if answer.get("error"):
+            raise ValueError(answer["error"])
+        return _agents.Resolution(answer.get("outcome"), answer.get("reference"),
+                                  answer.get("reason"))
 
     def _room_or_closed(self):
         """Room for one more send, as the holder it was taken by; or `_CLOSED`. Under the
@@ -4320,6 +4350,9 @@ class _Inbound(_RequestChannel):
     async def send(self, message):
         raise _answered_not_sent(self._name)
 
+    async def resolve(self, item, operation="send"):
+        raise _answered_not_sent(self._name)
+
     def _ask(self, body, sender, item, reference, correlation):
         """Queue a request of `body` from `sender`, the owner's `item` with the far end's
         `reference`, following `correlation` when given, and return how many requests then wait
@@ -4404,6 +4437,20 @@ class _Outbound(_RequestChannel):
     async def send(self, message):
         raise TypeError(f"channel {self._name!r} carries requests: ask with "
                         f"`runtime.channels[{self._name!r}].request(body)`, which returns a handle")
+
+    _resolved_by = "request"
+
+    async def resolve(self, request, operation="send"):
+        """Ask the far end what became of request `request` -- its handle's `id` -- and return
+        what it said, as an `outrig.Resolution`; the handle has moved as it says before this
+        returns. `operation="send"` asks whether it took the request, for a handle `uncertain`
+        since its send: `accepted` moves it to `waiting`, and `not_accepted` ends it so that
+        awaiting it raises `outrig.SendNotAccepted`. `operation="withdrawal"` asks what became of
+        a `cancel()` the far end did not answer: `withdrawn`, `replied` or `failed` settles the
+        handle so. `uncertain` changes nothing. Nothing is sent again. Raises `ValueError` for a
+        request not outstanding, or with nothing of that operation to resolve.
+        """
+        return await super().resolve(request, operation)
 
     def request(self, body):
         """Ask the channel's far end `body`, and return the request's handle at once.
@@ -6588,7 +6635,8 @@ class _ProgressOut(Endpoint):
         self._child = child
 
     async def send(self, message):
-        """Report `message`, a str, on the submission you are working on."""
+        """Report `message`, a str, on the submission you are working on, and return the id it
+        is delivered under."""
         if type(message) is not str:
             raise TypeError(f"channel 'progress' sends str, not {_type_name(type(message))}")
         work = self._child.last
@@ -6601,6 +6649,7 @@ class _ProgressOut(Endpoint):
             work.progress._deliver(message, self._agent, number)
         except _Refused as e:
             raise RuntimeError(f"progress was not delivered: {e}") from None
+        return number
 
 
 class RequestEndpoint(Endpoint):
@@ -6999,9 +7048,9 @@ class Kernel:
 
     def ask(self, line, encoded=None):
         """Send `line` -- already `encoded`, when it is given -- which the host answers under its
-        `id`, and return the future of this kernel's loop the answer settles. Called on that
-        loop."""
-        future = self.loop.create_future()
+        `id`, and return the future the answer settles, of the loop this is called on: this
+        kernel's, but for a send on its user channel made from another."""
+        future = asyncio.get_running_loop().create_future()
         self.asks[line["id"]] = future
         try:
             _write_line(_encode(line) if encoded is None else encoded)
@@ -8497,10 +8546,11 @@ def _tasks(kernel, request_id, _message):
 
 
 def _answer_ask(kernel, ask_id, message):
-    """The host's answer to what `kernel`'s code asked under `ask_id`, handed to its loop."""
+    """The host's answer to what `kernel`'s code asked under `ask_id`, handed to the loop that
+    waits for it."""
     future = kernel.asks.pop(ask_id, None)
     if future is not None:
-        kernel.loop.call_soon_threadsafe(_resolve, future, message)
+        future.get_loop().call_soon_threadsafe(_resolve, future, message)
 
 
 def _resolve(future, message):
@@ -8820,7 +8870,9 @@ _ROUTES = {
     ),
     "spawned": _answer_ask,
     "released": _answer_ask,
+    "sent": _answer_ask,
     "channel.sent": _answer_ask,
+    "channel.resolved": _answer_ask,
     "channel.requested": _channel_request,
     "channel.settle": _channel_settle,
     "assign": _assign,

@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::config::RoleAlternation;
+use crate::harness::channels::ChannelOperation;
 use crate::harness::stop::RoundStop;
 
 /// How many events a subscription holds for its reader before it starts
@@ -1324,6 +1325,28 @@ pub enum Payload {
         /// one.
         reference: Option<String>,
     },
+    /// An operation on an item the event's subject sent on an external channel,
+    /// whose outcome OutRig could not tell, was resolved by asking its backend:
+    /// what the backend answered.
+    #[non_exhaustive]
+    ChannelItemResolved {
+        /// The channel.
+        channel: String,
+        /// The id OutRig gave the item, which its backend was given.
+        item: MessageId,
+        /// For an outbound request, the request.
+        request: Option<AgentRequestId>,
+        /// What was asked about: the item's `send`, or the request's
+        /// `withdrawal`.
+        operation: ChannelOperation,
+        /// What the backend answered.
+        answer: Resolved,
+        /// Why, for a failure or an answer still uncertain.
+        reason: Option<String>,
+        /// The backend's reference for the item, when it accepted it and gave
+        /// one.
+        reference: Option<String>,
+    },
     /// The host program injected a live object it holds, which every kernel
     /// reaches as `outrig.bindings[binding]`: `type` is the qualified name of
     /// its type.
@@ -1630,6 +1653,7 @@ impl Payload {
             Payload::ChannelConsumed { .. } => "channel.consumed",
             Payload::ChannelClosed { .. } => "channel.closed",
             Payload::ChannelItemOutcome { .. } => "channel.item.outcome",
+            Payload::ChannelItemResolved { .. } => "channel.item.resolved",
             Payload::ChannelRequestSent { .. } => "channel.request.sent",
             Payload::ChannelRequestEnded { .. } => "channel.request.ended",
             Payload::ChannelRequestRefused { .. } => "channel.request.refused",
@@ -1859,6 +1883,26 @@ pub enum ItemOutcome {
     NotAccepted,
     /// The backend may have taken it, or not: it did not answer within its
     /// bound, said it could not tell, or the session ended first.
+    Uncertain,
+}
+
+/// What a channel's backend answered when asked what became of an operation
+/// whose outcome OutRig could not tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Resolved {
+    /// The item was taken: a send that returned, or a request now waiting.
+    Accepted,
+    /// The item was not taken, so sending it again is safe.
+    NotAccepted,
+    /// The request was withdrawn.
+    Withdrawn,
+    /// The request had been answered.
+    Replied,
+    /// The request had failed.
+    Failed,
+    /// The backend could not tell either, or did not answer in time.
     Uncertain,
 }
 

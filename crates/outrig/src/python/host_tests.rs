@@ -601,6 +601,21 @@ async fn sends_reach_the_subscriber_in_order_until_the_interpreter_exits() {
     );
 }
 
+/// A send that waits under an id is answered with the id the host gave its
+/// message, which its `message.sent` carries.
+#[tokio::test]
+async fn a_send_is_answered_with_its_messages_id() {
+    let (interpreter, mut fake) = Fake::connected().await;
+    let mut sent = interpreter.subscribe();
+    fake.send(json!({"t": "send", "agent": PRIMARY, "channel": "user", "id": 7, "body": "one"}))
+        .await;
+    let answer = fake.expect("sent").await;
+    assert_eq!(answer["agent"], PRIMARY);
+    assert_eq!(answer["id"], 7);
+    assert!(answer["message"].is_u64(), "{answer}");
+    assert_eq!(within(sent.recv()).await.as_deref(), Some("one"));
+}
+
 /// A message the agent sent is acknowledged when the user receives it, not
 /// when it arrives: the acknowledgment is what lets the agent send past its
 /// window, so what the host holds is bounded by the user keeping up.

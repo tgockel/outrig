@@ -2834,6 +2834,19 @@ impl Interpreter {
     fn pending_in(&mut self, agent: &str, id: u64) -> Value {
         self.ask(json!({"t": "pending", "agent": agent, "id": id}))["channels"].take()
     }
+
+    /// The next line, a send, answered as the host answers it -- with `message`, the id it gives
+    /// the message -- and returned without the ask id its `send` waits under.
+    fn sent(&mut self, message: u64) -> Value {
+        let mut line = self.recv();
+        assert_eq!(line["t"], "send", "{line}");
+        let ask = line
+            .as_object_mut()
+            .and_then(|fields| fields.remove("id"))
+            .unwrap_or_else(|| panic!("a send waits under an id: {line}"));
+        self.send(json!({"t": "sent", "agent": line["agent"], "id": ask, "message": message}));
+        line
+    }
 }
 
 /// A posted message is counted from the moment it is answered, stays counted
@@ -2928,15 +2941,17 @@ fn a_receive_waits_and_a_cancelled_one_takes_nothing() {
 }
 
 /// What the agent sends reaches the host as text, one line per message, in
-/// the order it was sent and ahead of the result of the code that sent it.
+/// the order it was sent and ahead of the result of the code that sent it, and
+/// each `send` returns the id the host gave its message.
 #[test]
 fn sends_reach_the_host_in_order_ahead_of_the_result() {
     let mut k = Interpreter::start();
     k.send(json!({"t": "exec", "agent": PRIMARY, "id": 1, "src":
-        "for word in ['one', 'two', 'three']:\n    await runtime.channels['user'].send(word)"}));
-    for word in ["one", "two", "three"] {
+        "ids = [await runtime.channels['user'].send(w) for w in ['one', 'two', 'three']]\n\
+         print(ids)"}));
+    for (n, word) in ["one", "two", "three"].into_iter().enumerate() {
         assert_eq!(
-            k.recv(),
+            k.sent(100 + n as u64),
             json!({"t": "send", "agent": PRIMARY, "channel": "user", "body": word})
         );
     }
@@ -2945,6 +2960,7 @@ fn sends_reach_the_host_in_order_ahead_of_the_result() {
         result["t"] == "result" && result["status"] == "ok",
         "{result}"
     );
+    assert_eq!(result["output"], "[100, 101, 102]\n", "{result}");
 }
 
 /// The user channel carries text both ways. A message of any other type is
@@ -3016,13 +3032,13 @@ fn a_send_waits_once_the_user_is_a_window_behind() {
     k.send(json!({"t": "exec", "agent": PRIMARY, "id": 1, "src":
         format!("for i in range({total}):\n    await runtime.channels['user'].send(str(i))")}));
     for n in 0..SEND_WINDOW {
-        assert_eq!(k.recv()["body"], n.to_string());
+        assert_eq!(k.sent(n as u64)["body"], n.to_string());
     }
     // The next send waits, and the loop, not waiting, answers first.
     k.inventory(2);
     for n in SEND_WINDOW..total {
         k.send(json!({"t": "received", "agent": PRIMARY, "id": 100 + n, "channel": "user"}));
-        assert_eq!(k.recv()["body"], n.to_string());
+        assert_eq!(k.sent(n as u64)["body"], n.to_string());
     }
     let result = k.recv();
     assert!(
@@ -3057,11 +3073,11 @@ fn memory_running_out_before_an_acknowledgment_counts_loses_no_room() {
     );
     k.send(json!({"t": "exec", "agent": PRIMARY, "id": 1, "src": source}));
     for n in 0..SEND_WINDOW {
-        assert_eq!(k.recv()["body"], n.to_string());
+        assert_eq!(k.sent(n as u64)["body"], n.to_string());
     }
     k.inventory(2);
     k.send(json!({"t": "received", "agent": PRIMARY, "id": 3, "channel": "user"}));
-    assert_eq!(k.recv()["body"], SEND_WINDOW.to_string());
+    assert_eq!(k.sent(99)["body"], SEND_WINDOW.to_string());
     let result = k.recv();
     assert!(
         result["t"] == "result" && result["status"] == "ok",
@@ -3239,7 +3255,7 @@ fn a_contract_takes_literal_and_annotated_fields() {
     k.send(json!({"t": "exec", "agent": PRIMARY, "id": 2, "src":
         "await runtime.channels['typed'].send(Verdict('approve', None))"}));
     assert_eq!(
-        k.recv(),
+        k.sent(1),
         json!({"t": "send", "agent": PRIMARY, "channel": "typed",
                "body": {"status": "approve", "next-step": null}})
     );

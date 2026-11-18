@@ -218,13 +218,30 @@ class SendNotAccepted(ChannelError):
 
 
 class SendUncertain(ChannelError):
-    """Whether the message was taken is not known: it may have been. `item` is the id OutRig gave
-    it, which the far end knows it by; sending it again may deliver it twice. `reason` says what
-    went wrong."""
+    """Whether the message was taken is not known: it may have been, and the far end, asked once
+    already, could not say. `item` is the id OutRig gave it, which the far end knows it by:
+    `await runtime.channels[name].resolve(item)` asks again, and sending it again may deliver it
+    twice. `reason` says what went wrong."""
 
     def __init__(self, message, item, reason):
         super().__init__(message, reason)
         self.item = item
+
+
+@dataclasses.dataclass(frozen=True)
+class Resolution:
+    """What a channel's far end said became of a send, or of a request's withdrawal, whose outcome
+    was not known: what `await runtime.channels[name].resolve(...)` returns.
+
+    `outcome` is, for a send, `accepted` -- it was taken, under the far end's `reference` -- or
+    `not_accepted`, so sending it again is safe; for a withdrawal, `withdrawn`, `replied` or
+    `failed`, which its handle then settles with; and `uncertain` when the far end still cannot
+    tell, for `reason`. A request's handle has moved as the outcome says before this returns.
+    """
+
+    outcome: str
+    reference: object = None
+    reason: object = None
 
 
 class UnreadableDelivery(ChannelError):

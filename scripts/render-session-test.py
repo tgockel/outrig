@@ -607,6 +607,19 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             a,
         ),
         (
+            "channel.item.resolved",
+            {
+                "channel": "inbox",
+                "item": 9,
+                "request": None,
+                "operation": "send",
+                "answer": "not_accepted",
+                "reason": "no room",
+                "reference": None,
+            },
+            a,
+        ),
+        (
             "channel.attached",
             {
                 "channel": "asks",
@@ -1139,6 +1152,15 @@ def every_event() -> list[tuple[str, dict, str | None]]:
                         "sends": [
                             {"item": 9, "agent": "c2", "outcome": "uncertain", "reason": "r"},
                         ],
+                        "uncertain": [
+                            {
+                                "item": 7,
+                                "agent": "c2",
+                                "outcome": "accepted",
+                                "reason": "the ack was lost",
+                                "reference": "found-late",
+                            },
+                        ],
                         "unacknowledged": ["m-1"],
                         "requests": [
                             {
@@ -1515,6 +1537,37 @@ class RenderSession(unittest.TestCase):
         self.assertNotIn('id="msg-31"', html)
         self.assertNotIn("message 31", html)
 
+    def test_a_resolution_is_the_items_outcome(self) -> None:
+        """An item uncertain at the backend and then resolved by asking it reads as what the
+        backend answered: a message's outcome, on its row; an outbound request's send, or its
+        withdrawal, on the request's."""
+        a = "agent/primary"
+        attached = {"channel": "asks", "kind": "request", "direction": "outbound",
+                    "receives": "str", "sends": "str", "bound": 8, "wake": "wake"}
+        uncertain = {"outcome": "uncertain", "reason": "lost", "reference": None}
+        resolved = [
+            ("message.sent", {"message": 30, "channel": "inbox", "from": a, "to": "backend",
+                              "sender": None, "body": '"x"'}, a),
+            ("channel.item.outcome", {"channel": "inbox", "item": 30, **uncertain}, a),
+            ("channel.item.resolved",
+             {"channel": "inbox", "item": 30, "request": None, "operation": "send",
+              "answer": "accepted", "reason": None, "reference": "row-3"}, a),
+            ("channel.attached", attached, a),
+            ("channel.request.sent",
+             {"request": 5, "channel": "asks", "item": 31, "body": '"may I?"'}, a),
+            ("channel.item.outcome", {"channel": "asks", "item": 31, **uncertain}, a),
+            ("channel.item.resolved",
+             {"channel": "asks", "item": 31, "request": 5, "operation": "withdrawal",
+              "answer": "replied", "reason": None, "reference": None}, a),
+        ]
+        events = ordinary()
+        html = self.page(events[:4] + resolved + events[4:])
+        self.assertIn("message 30: accepted at the backend, its send resolved (row-3)", html)
+        self.assertIn(
+            "request 5 on asks: replied at the backend, its withdrawal resolved", html
+        )
+        self.assertNotIn('id="msg-31"', html)
+
     def test_a_session_with_no_primary_titles_its_shared_section_session(self) -> None:
         """`no_primary()` means `agent/primary` never names a real agent, so the section a
         shared, subjectless event joins must not claim to be one -- and, since neither that
@@ -1562,6 +1615,45 @@ class RenderSession(unittest.TestCase):
         session_section = html[html.index('id="agent-0"') : html.index('id="agent-1"')]
         self.assertIn("backend (from alice) -&gt; none on inbox: first", session_section)
         self.assertIn("channel inbox closed: peer gone", session_section)
+
+    def test_a_message_uncertain_at_the_close_is_in_the_shutdown_summary(self) -> None:
+        """A message whose send was uncertain when admission closed is not one of the close's
+        sends: the summary lists it apart, with what its backend said since -- the outcome, and
+        its reference or why it is still uncertain."""
+        report = {
+            "closed_by": {"by": "owner"},
+            "stopped": {"state": "proven"},
+            "executions": [],
+            "hosted": [],
+            "bindings": None,
+            "channels": [
+                {
+                    "channel": "inbox",
+                    "holder": "c2",
+                    "uncertain": [
+                        {
+                            "item": 7,
+                            "agent": "c2",
+                            "outcome": "accepted",
+                            "reason": None,
+                            "reference": "found-late",
+                        },
+                        {
+                            "item": 8,
+                            "agent": "c2",
+                            "outcome": "uncertain",
+                            "reason": "the store is down",
+                            "reference": None,
+                        },
+                    ],
+                },
+            ],
+            "verdict": "clean",
+        }
+        events = [(kind, report if kind == "session.report" else data) for kind, data in ordinary()]
+        html = self.page(events)
+        self.assertIn("uncertain at the close, item 7 by c2: accepted (found-late)", html)
+        self.assertIn("uncertain at the close, item 8 by c2: uncertain (the store is down)", html)
 
     def test_shared_events_with_no_subject_join_the_primary_section(self) -> None:
         """`session.state`, `session.report`, and the rest of what the schema gives no subject

@@ -273,17 +273,22 @@ three times for one call before the rejection ends it.
     child, channel, outcome}`: `channel` is `null` for a submission, and `outcome` is how it
     ended -- `closed` by the close, or `terminated` when the interpreter died first.
   - `channels`: each external channel the session declared, as `{channel, holder, unread, sends,
-    unacknowledged, requests}`: the agent holding it at the close, or `null`; the items left
-    unread in its window, by the owner's item id, none of them consumed by the close; each send
+    unacknowledged, requests, uncertain}`: the agent holding it at the close, or `null`; the items
+    left unread in its window, by the owner's item id, none of them consumed by the close; each send
     whose outcome came after the close, as `{item, agent, outcome, reason}`, from its
     `channel.item.outcome` or `uncertain` when the drain ended first; each item received whose
-    consumed notice the backend had not acknowledged; and each request on it that ended after
+    consumed notice the backend had not acknowledged; each request on it that ended after
     the close, or that nothing ended, as `{request, direction, item, end, acknowledged}`:
     `direction`, `inbound` or `outbound`; `item`, the owner's id for an inbound one, else
     `null`; `end`, how it ended -- `closed` by the close, or `terminated` when the interpreter
     died first; and `acknowledged`, whether its backend answered what it was told of the end --
-    an inbound request's settlement notice, an outbound one's withdrawal. One send ended
-    `uncertain` makes the verdict `stopped_with_unknown`.
+    an inbound request's settlement notice, an outbound one's withdrawal; and each message whose
+    send was uncertain at the close, as `{item, agent, outcome, reason, reference}`, in the order
+    sent: `outcome` is the first answer since the close that says whether its backend took it --
+    to the agent's own question still running, or to the one the drain asks of each item no
+    answer has settled, `channel.item.resolved` -- `accepted`, with its `reference`,
+    `not_accepted`, or still `uncertain`. One send in `sends` ended `uncertain` makes the verdict
+    `stopped_with_unknown`; one in `uncertain` does not, its sender having been told.
   - `verdict`: `clean`, `stopped_with_unknown`, or `not_proven_stopped`.
 - `channel.attached` -- an external channel the session's owner declared was attached to the
   subject's kernel, which holds it from then on as `runtime.channels[channel]`: `channel`;
@@ -669,7 +674,8 @@ between a child's failed rounds is in that read and has no event of its own.
   the far end says sent it -- `user` on the user channel, the backend's own identity for an item
   its owner pushed -- or `null` for a message an agent sent; and `body`, which on an external
   channel is the item as JSON text. An item pushed on an external channel is given its delivery
-  id here; one an agent sends there, the item id its backend is given.
+  id here; one an agent sends there, the item id its backend is given. An agent's `send` returns
+  the id, on the user channel as on an external one.
 - `message.refused` -- a message the other end did not take: `message`, `channel`, `from`, `to`,
   and `reason`. On an external channel, an item the window refused: full, outside its contract
   with the problems, or the channel closed.
@@ -691,7 +697,7 @@ between a child's failed rounds is in that read and has no event of its own.
   `reason`, for any outcome but `accepted`, else `null`; and `reference`, the backend's own
   reference for an item it accepted, when it gave one, else `null`. `outcome` is:
   - `accepted` -- the backend took it durably: on its way, not yet processed. The holder's
-    `send` returned.
+    `send` returned the item's id.
   - `refused` -- it was never given to the backend: the channel was closed, or closed while
     the send waited for one of its backend's eight calls; the session was closing; the subject
     gave the channel up while the send waited; or the channel is not the subject's. `send`
@@ -699,13 +705,29 @@ between a child's failed rounds is in that read and has no event of its own.
   - `not_accepted` -- the backend said it did not take it, so sending it again is safe. `send`
     raised `outrig.SendNotAccepted`.
   - `uncertain` -- the backend may have taken it: it said it could not tell, did not answer
-    within the channel's call timeout, or the session's drain ended first. `send` raised
-    `outrig.SendUncertain`, carrying the item id.
+    within the channel's call timeout, or the session's drain ended first. Unless the drain had
+    ended, the backend is then asked once, by the item id, what became of it, and
+    `channel.item.resolved` follows: `send` does what that answer says -- returns, raises
+    `outrig.SendNotAccepted`, or raises `outrig.SendUncertain`, carrying the item id.
+- `channel.item.resolved` -- an operation on an item the subject sent on an external channel,
+  whose outcome OutRig could not tell, was resolved by asking its backend: `channel`; `item`, the
+  id its `message.sent` gave; `request`, an outbound request's id, else `null`; `operation`,
+  `send` -- whether the backend took the item -- or `withdrawal` -- what became of a request's
+  withdrawal its backend did not answer; `answer`, what the backend said: `accepted`,
+  `not_accepted`, `withdrawn`, `replied`, `failed`, or `uncertain` when it still could not tell or
+  did not answer within the call timeout; `reason`, for
+  a failure or an answer still uncertain, else `null`; and `reference`, the backend's own for an
+  item it accepted, else `null`. OutRig asks once as a send answers uncertain, before the
+  subject's code is told; again each time that code asks with `resolve`; and once in the drain
+  for a message still uncertain at the close. It never sends the item again. An outbound request
+  whose send is resolved `accepted` moves to `waiting`, and `not_accepted` ends it; one whose
+  withdrawal is resolved settles as the answer says.
 - `channel.request.sent` -- the subject asked an outbound request channel's far end: `channel`;
   `request`, its handle's `id`, by which the owner settles it; `item`, the id its send was
   given, which its backend was given beside `request`; and `body`, the request as JSON text. Its
-  send's outcome is the `channel.item.outcome` of `item`: `accepted` moves its handle from
-  `sending` to `waiting`, `uncertain` leaves it `uncertain`, and any other ends it.
+  send's outcome is the `channel.item.outcome` of `item`, and the `channel.item.resolved` that
+  follows an uncertain one: `accepted` moves its handle from `sending` to `waiting`, `uncertain`
+  leaves it `uncertain`, and any other ends it.
 - `channel.request.ended` -- an outbound request the subject made ended, once: `channel`,
   `request`, `outcome`, and `reason`, why, or `null`. `outcome` is `accepted` for a reply --
   the owner's, or what its backend had recorded when asked to withdraw it -- `failed` for a

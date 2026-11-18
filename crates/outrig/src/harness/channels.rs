@@ -25,17 +25,23 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use super::event::{AgentRequestId, ItemOutcome, MessageId, Payload, RequestEnd, Subject};
+use super::event::{
+    AgentRequestId, ItemOutcome, MessageId, Payload, RequestEnd, Resolved, Subject,
+};
 use super::lifecycle::Lifecycle;
-use super::report::{ChannelClose, ChannelRequestAtClose, SendAtClose};
+use super::registry::{
+    ChannelSnapshot, InboundItem, OutboundState, OutstandingRequest, Positions, ReceivedRequest,
+    SentInRound, UncertainItem,
+};
+use super::report::{ChannelClose, ChannelRequestAtClose, SendAtClose, UncertainAtClose};
 use super::skills::Catalog;
-use super::stop::RoundSend;
+use super::stop::{ROUNDS_KEPT, RoundSend};
 use crate::agent::orientation::ExternalText;
 use crate::events::Events;
 use crate::python::host::{
@@ -96,6 +102,37 @@ pub trait ChannelBackend: Send + Sync + 'static {
     /// channel's [`ChannelDefinition::call_timeout`] leaves the request
     /// `uncertain`, and is not made again.
     fn withdrawn(&self, withdrawal: Withdrawal) -> BackendFuture<'_, io::Result<WithdrawAnswer>>;
+
+    /// What became of the item `query` names, whose send answered uncertain or
+    /// ran past its bound: answer from the backend's durable record --
+    /// [`SendAnswer::Accepted`], with the reference it took the item under,
+    /// [`SendAnswer::NotAccepted`], or [`SendAnswer::Uncertain`] when it cannot
+    /// tell either.
+    ///
+    /// OutRig asks once as a send answers uncertain, before the holder's code
+    /// is told; again each time that code asks with `resolve`; and once in the
+    /// session's drain for a message still uncertain at the close. It never
+    /// sends the item again: an uncertain item is resolved by its identity. A
+    /// call that does not answer within the channel's
+    /// [`ChannelDefinition::call_timeout`] leaves it uncertain.
+    fn resolve_send(&self, query: Query) -> BackendFuture<'_, SendAnswer>;
+
+    /// What became of the withdrawal of the outbound request `query` names,
+    /// which [`withdrawn`](Self::withdrawn) did not answer in time: answer from
+    /// the backend's durable record as `withdrawn` would have --
+    /// [`WithdrawAnswer::Withdrawn`], or the reply or failure it recorded --
+    /// which the request then settles with. An error, or no answer within the
+    /// channel's [`ChannelDefinition::call_timeout`], leaves it uncertain.
+    /// Asked only when the holder's code asks with `resolve`.
+    fn resolve_withdrawal(&self, query: Query) -> BackendFuture<'_, io::Result<WithdrawAnswer>>;
+
+    /// The channel's positions, as `positions` gives them: the last item its
+    /// holder's code consumed, the last whose consumption the backend
+    /// acknowledged, and those waiting unread, in order. Handed over at a cut,
+    /// so the backend knows which items to deliver again, by item id, once the
+    /// session resumes -- those unread, and those consumed and never
+    /// acknowledged -- and which it may discard.
+    fn positions(&self, positions: Positions) -> BackendFuture<'_, io::Result<()>>;
 }
 
 /// What an external channel is, fixed for the session: given with its backend
@@ -111,6 +148,7 @@ pub struct ChannelDefinition {
     description: String,
     call_timeout: Duration,
     initial: Vec<Inbound>,
+    reference: Option<String>,
 }
 
 /// The most items a channel holds unread, and its default bound.
@@ -136,6 +174,9 @@ const NOTICE_RETRY_MAX: Duration = Duration::from_secs(5);
 /// How the event log names an external channel's far end.
 const BACKEND_END: &str = "backend";
 
+/// Why a call of a backend has no answer once the session's drain has ended.
+const DRAINED: &str = "the session's drain ended before the backend answered";
+
 impl ChannelDefinition {
     /// A channel named `name` -- the holder's `runtime.channels` key -- that
     /// carries text both ways, holds up to [`CHANNEL_BOUND_MAX`] items unread,
@@ -151,6 +192,7 @@ impl ChannelDefinition {
             description: String::new(),
             call_timeout: DEFAULT_CALL_TIMEOUT,
             initial: Vec::new(),
+            reference: None,
         }
     }
 
@@ -232,6 +274,14 @@ impl ChannelDefinition {
     #[must_use]
     pub fn deliver(mut self, item: Inbound) -> Self {
         self.initial.push(item);
+        self
+    }
+
+    /// The backend's own reference for the channel, which OutRig never reads
+    /// and gives back in the channel's [`ChannelSnapshot`].
+    #[must_use]
+    pub fn reference(mut self, reference: impl Into<String>) -> Self {
+        self.reference = Some(reference.into());
         self
     }
 
@@ -673,6 +723,17 @@ pub struct Consumed {
     pub reference: Option<String>,
 }
 
+impl Consumed {
+    /// The item it is of, as the registry lists it.
+    fn inbound(&self) -> InboundItem {
+        InboundItem {
+            item: self.item.clone(),
+            delivery: DeliveryId::Message(self.delivery),
+            reference: self.reference.clone(),
+        }
+    }
+}
+
 /// The notice that a request on a channel ended, or that an answer to one
 /// that had ended was refused, as its backend is given it.
 #[derive(Debug, Clone, PartialEq)]
@@ -773,6 +834,110 @@ pub enum WithdrawAnswer {
     Replied(Value),
     /// It had failed already, saying why.
     Failed(String),
+}
+
+/// An operation on an item whose outcome OutRig could not tell, and so the
+/// query that resolves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum ChannelOperation {
+    /// The item's [`ChannelBackend::send`]: did the backend take it? Resolved
+    /// with [`ChannelBackend::resolve_send`].
+    Send,
+    /// An outbound request's [`ChannelBackend::withdrawn`]: was it withdrawn,
+    /// or had it been answered? Resolved with
+    /// [`ChannelBackend::resolve_withdrawal`].
+    Withdrawal,
+}
+
+impl fmt::Display for ChannelOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Send => "send",
+            Self::Withdrawal => "withdrawal",
+        })
+    }
+}
+
+/// An item, or an outbound request, whose outcome OutRig could not tell, as
+/// its backend is asked to resolve it with [`ChannelBackend::resolve_send`]
+/// or [`ChannelBackend::resolve_withdrawal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Query {
+    /// The channel.
+    pub channel: String,
+    /// The id OutRig gave the item, as its [`Outbound::item`].
+    pub item: MessageId,
+    /// For a request, the session's id for it, as its [`Outbound::request`].
+    pub request: Option<AgentRequestId>,
+    /// The backend's reference for it, if one is known.
+    pub reference: Option<String>,
+}
+
+/// What a backend said became of an operation OutRig asked it to resolve: a
+/// send's answer, a withdrawal's, or neither.
+#[derive(Debug, Clone, PartialEq)]
+enum Resolution {
+    /// A send: the backend took the item, under its own `reference` if it
+    /// gives one.
+    Accepted { reference: Option<String> },
+    /// A send: the backend did not take the item, so sending it again is safe.
+    NotAccepted { reason: String },
+    /// A withdrawal: the request is withdrawn.
+    Withdrawn,
+    /// A withdrawal: the request had been answered, with this reply, as JSON.
+    Replied(Value),
+    /// A withdrawal: the request had failed, saying why.
+    Failed(String),
+    /// The backend cannot tell either, for `reason`.
+    Uncertain { reason: String },
+}
+
+impl From<SendAnswer> for Resolution {
+    fn from(answer: SendAnswer) -> Self {
+        match answer {
+            SendAnswer::Accepted { reference } => Self::Accepted { reference },
+            SendAnswer::NotAccepted { reason } => Self::NotAccepted { reason },
+            SendAnswer::Uncertain { reason } => Self::Uncertain { reason },
+        }
+    }
+}
+
+impl From<WithdrawAnswer> for Resolution {
+    fn from(answer: WithdrawAnswer) -> Self {
+        match answer {
+            WithdrawAnswer::Withdrawn => Self::Withdrawn,
+            WithdrawAnswer::Replied(value) => Self::Replied(value),
+            WithdrawAnswer::Failed(message) => Self::Failed(message),
+        }
+    }
+}
+
+impl Resolution {
+    /// What it says, as its event and the holder's code are told it: the
+    /// answer, why, and the backend's reference.
+    fn parts(&self) -> (Resolved, Option<&str>, Option<&str>) {
+        match self {
+            Self::Accepted { reference } => (Resolved::Accepted, None, reference.as_deref()),
+            Self::NotAccepted { reason } => (Resolved::NotAccepted, Some(reason), None),
+            Self::Withdrawn => (Resolved::Withdrawn, None, None),
+            Self::Replied(_) => (Resolved::Replied, None, None),
+            Self::Failed(message) => (Resolved::Failed, Some(message), None),
+            Self::Uncertain { reason } => (Resolved::Uncertain, Some(reason), None),
+        }
+    }
+
+    /// It as the answer to a withdrawal it is, if it is one.
+    fn withdraw_answer(&self) -> Option<WithdrawAnswer> {
+        match self {
+            Self::Withdrawn => Some(WithdrawAnswer::Withdrawn),
+            Self::Replied(value) => Some(WithdrawAnswer::Replied(value.clone())),
+            Self::Failed(message) => Some(WithdrawAnswer::Failed(message.clone())),
+            _ => None,
+        }
+    }
 }
 
 /// How the session's owner settles an outbound request, with
@@ -933,6 +1098,23 @@ impl Channel {
         }
     }
 
+    /// Hand the channel's backend its positions, as the registry holds them
+    /// now: what a cut gives it, so the backend knows what to deliver again by
+    /// item id after a resume. `Err` says why the backend did not take them.
+    #[cfg_attr(not(test), allow(dead_code, reason = "a cut hands them over, 0003-65"))]
+    pub(crate) async fn hand_over(&self) -> Result<(), String> {
+        let (positions, calls) = {
+            let state = self.table.state.borrow();
+            let chan = state
+                .find(&self.name)
+                .ok_or_else(|| format!("the session declares no channel {:?}", self.name))?;
+            (chan.positions(), chan.calls())
+        };
+        self.table
+            .call(&calls, || calls.backend.positions(positions))
+            .await
+    }
+
     /// The agent holding the channel, as the interpreter's protocol names it --
     /// a root's [`RootHandle::agent`](super::RootHandle::agent) -- or `None`
     /// while no agent does.
@@ -942,30 +1124,6 @@ impl Channel {
             .borrow()
             .find(&self.name)
             .and_then(|chan| chan.holder.clone())
-    }
-
-    /// Each outbound request outstanding on the channel, with its state:
-    /// `sending`, `waiting`, `withdrawing`, `withdrawn` -- its backend's answer
-    /// on its way to its holder -- or `uncertain`.
-    #[cfg(test)]
-    pub(crate) fn outstanding(&self) -> Vec<(AgentRequestId, &'static str)> {
-        let state = self.table.state.borrow();
-        let Some(chan) = state.find(&self.name) else {
-            return Vec::new();
-        };
-        chan.outgoing
-            .iter()
-            .map(|(id, outgoing)| {
-                let state = match outgoing.state {
-                    Out::Sending { .. } => "sending",
-                    Out::Waiting => "waiting",
-                    Out::Withdrawing => "withdrawing",
-                    Out::Withdrawn { answered: true } => "withdrawn",
-                    Out::Uncertain | Out::Withdrawn { answered: false } => "uncertain",
-                };
-                (AgentRequestId::new(*id), state)
-            })
-            .collect()
     }
 }
 
@@ -1049,6 +1207,10 @@ struct Table {
 struct State {
     /// Each channel, in the order the owner declared them.
     channels: Vec<Chan>,
+    /// Whether admission has closed, as the table heard it: set in the one
+    /// step that lists each message whose send is uncertain in the close's
+    /// report, so what is decided under this lock has one close to go by.
+    closed: bool,
 }
 
 impl State {
@@ -1081,10 +1243,9 @@ struct Chan {
     /// Each item the owner pushed that the channel took, or is taking, by the
     /// owner's id for it.
     items: HashMap<String, Taken>,
-    /// The owner's id of each inbound request the channel took, by the
-    /// request's id, until its backend has acknowledged how it ended: where
-    /// it is, `items` says.
-    asked: BTreeMap<u64, String>,
+    /// Each inbound request the channel took, by the request's id, until its
+    /// backend has acknowledged how it ended: where it is, `items` says.
+    asked: BTreeMap<u64, Asked>,
     /// Each outbound request outstanding, by its id.
     outgoing: BTreeMap<u64, Outgoing>,
     /// How each request on the channel ended, by its id: what a later settle
@@ -1097,16 +1258,28 @@ struct Chan {
     /// The owner's id of each item not yet acknowledged, and the backend's
     /// reference for it, by the id it was delivered under, in that order.
     deliveries: BTreeMap<MessageId, (String, Option<String>)>,
+    /// The last message its holder's code received, and the last whose
+    /// consumption its backend acknowledged: its two watermarks.
+    consumed: Option<InboundItem>,
+    acknowledged: Option<InboundItem>,
     /// Every item ever queued, and those unread.
     delivered: u64,
     unread: usize,
     /// Each send its backend has not answered, by its item id.
     flights: BTreeMap<MessageId, Flight>,
-    /// The items each agent sent in each of its rounds, until the round's
-    /// facts read them.
-    sent: HashMap<(String, u32), Vec<MessageId>>,
+    /// Each message whose send is uncertain, by its item id, until it is
+    /// resolved.
+    uncertain: BTreeMap<MessageId, Doubt>,
+    /// How many of its backend's resolutions have not answered.
+    resolving: usize,
+    /// The items each agent sent in each of its latest rounds.
+    sent: BTreeMap<(String, u32), Vec<MessageId>>,
     /// Each send whose outcome came after admission closed.
     after_close: Vec<SendAtClose>,
+    /// Each message uncertain when admission closed: listed as uncertain once
+    /// an answer comes after the close, or the drain asks of it, and resolved
+    /// by whichever answer since said more.
+    uncertain_at_close: Vec<UncertainAtClose>,
     /// What its backend has not acknowledged being told, in the order it
     /// happened, and whether a task is telling it.
     notices: VecDeque<Notice>,
@@ -1136,16 +1309,32 @@ impl Chan {
 
     /// Whether inbound request `id` has yet to end: unread, or received.
     fn open(&self, id: u64) -> bool {
-        let taken = self.asked.get(&id).and_then(|item| self.items.get(item));
         matches!(
-            taken,
-            Some(Taken::Queued(_, Position::Unread | Position::Consumed))
+            self.position_of(id),
+            Some(Position::Unread | Position::Consumed)
         )
     }
 
-    /// Inbound request `id`, the owner's `item`, is now at `position`.
-    fn place(&mut self, id: u64, item: &str, position: Position) {
-        self.asked.insert(id, item.to_string());
+    /// Where inbound request `id` is, while the channel keeps it.
+    fn position_of(&self, id: u64) -> Option<Position> {
+        let asked = self.asked.get(&id)?;
+        match self.items.get(&asked.item)? {
+            Taken::Queued(_, position) => Some(*position),
+            Taken::Pushing => None,
+        }
+    }
+
+    /// Inbound request `id`, the owner's `item` with the backend's
+    /// `reference`, is now at `position`.
+    fn place(&mut self, id: u64, item: &str, reference: Option<String>, position: Position) {
+        let asked = self.asked.entry(id).or_insert_with(|| Asked {
+            item: item.to_string(),
+            reference,
+            received: None,
+        });
+        if position == Position::Consumed {
+            asked.received.get_or_insert_with(Instant::now);
+        }
         let delivery = DeliveryId::Request(AgentRequestId::new(id));
         self.items
             .insert(item.to_string(), Taken::Queued(delivery, position));
@@ -1192,6 +1381,265 @@ impl Chan {
         }
     }
 
+    /// Each message not yet acknowledged that is at `position`, in order: one
+    /// being pushed counts as unread, in the window once the interpreter says
+    /// so, perhaps already.
+    fn messages_at(&self, position: Position) -> impl Iterator<Item = InboundItem> + '_ {
+        self.deliveries
+            .iter()
+            .filter(move |(_, (item, _))| {
+                let at = match self.items.get(item) {
+                    Some(Taken::Queued(_, at)) => Some(*at),
+                    Some(Taken::Pushing) => Some(Position::Unread),
+                    None => None,
+                };
+                at == Some(position)
+            })
+            .map(|(delivery, (item, reference))| InboundItem {
+                item: item.clone(),
+                delivery: DeliveryId::Message(*delivery),
+                reference: reference.clone(),
+            })
+    }
+
+    /// Each item waiting unread in its window, in order. A channel carries
+    /// messages or requests, never both: each kind in the order of its ids.
+    fn unread(&self) -> Vec<InboundItem> {
+        self.messages_at(Position::Unread)
+            .chain(
+                self.asked
+                    .iter()
+                    .filter(|(id, _)| self.position_of(**id) == Some(Position::Unread))
+                    .map(|(id, asked)| asked.inbound(*id)),
+            )
+            .collect()
+    }
+
+    /// Its positions, as its backend is handed them at a cut.
+    fn positions(&self) -> Positions {
+        Positions {
+            channel: self.definition.name.clone(),
+            consumed: self.consumed.clone(),
+            acknowledged: self.acknowledged.clone(),
+            unread: self.unread(),
+        }
+    }
+
+    /// What its registry holds now, as the owner reads it.
+    fn snapshot(&self) -> ChannelSnapshot {
+        let definition = &self.definition;
+        ChannelSnapshot {
+            name: definition.name.clone(),
+            kind: definition.kind,
+            receives: definition.receives.clone(),
+            receives_schema: self.schemas.0.clone(),
+            sends: definition.sends.clone(),
+            sends_schema: self.schemas.1.clone(),
+            bound: definition.bound,
+            wake: definition.wake,
+            holder: self.holder.clone(),
+            reference: definition.reference.clone(),
+            closed: self.closed.clone(),
+            unread: self.unread(),
+            unacknowledged: self.messages_at(Position::Consumed).collect(),
+            consumed: self.consumed.clone(),
+            acknowledged: self.acknowledged.clone(),
+            received: self
+                .asked
+                .iter()
+                .filter(|(id, _)| self.position_of(**id) == Some(Position::Consumed))
+                .map(|(id, asked)| ReceivedRequest {
+                    request: AgentRequestId::new(*id),
+                    item: asked.item.clone(),
+                    reference: asked.reference.clone(),
+                    waited: asked.received.map(|at| at.elapsed()).unwrap_or_default(),
+                })
+                .collect(),
+            outstanding: self
+                .outgoing
+                .iter()
+                .map(|(id, outgoing)| OutstandingRequest {
+                    request: AgentRequestId::new(*id),
+                    item: outgoing.item,
+                    agent: outgoing.agent.clone(),
+                    state: outgoing.state.public(),
+                    reference: outgoing.reference.clone(),
+                })
+                .collect(),
+            // Listed in the close's report or not, each still uncertain.
+            uncertain: self
+                .uncertain
+                .iter()
+                .map(|(item, doubt)| UncertainItem {
+                    item: *item,
+                    agent: doubt.agent.clone(),
+                    reason: doubt.reason.clone(),
+                })
+                .chain(
+                    self.uncertain_at_close
+                        .iter()
+                        .filter(|row| row.outcome == ItemOutcome::Uncertain)
+                        .map(|row| UncertainItem {
+                            item: row.item,
+                            agent: row.agent.clone(),
+                            reason: row.reason.clone().unwrap_or_default(),
+                        }),
+                )
+                .collect(),
+            rounds: self
+                .sent
+                .iter()
+                .map(|((agent, round), items)| SentInRound {
+                    agent: agent.clone(),
+                    round: *round,
+                    items: items.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// What `agent`'s code asks its backend to resolve, as `line` names it --
+    /// an uncertain message's send, by its item id; an outbound request's send
+    /// or uncertain withdrawal, by its id -- or why nothing is asked.
+    fn query(
+        &self,
+        agent: &str,
+        operation: ChannelOperation,
+        line: &Value,
+    ) -> Result<Query, String> {
+        let name = &self.definition.name;
+        if self.holder.as_deref() != Some(agent) {
+            return Err(format!("channel {name:?} is not held by agent {agent:?}"));
+        }
+        let query = |item, request, reference| Query {
+            channel: name.clone(),
+            item,
+            request,
+            reference,
+        };
+        match self.definition.kind {
+            ChannelKind::Plain => {
+                let item = line["item"].as_u64().map(MessageId::new);
+                let doubt = item.and_then(|item| self.uncertain.get(&item));
+                match (operation, item, doubt) {
+                    (ChannelOperation::Withdrawal, ..) => Err(format!(
+                        "channel {name:?} carries messages, which have no withdrawal to resolve"
+                    )),
+                    (_, Some(item), Some(doubt)) if doubt.agent == agent => {
+                        Ok(query(item, None, None))
+                    }
+                    (_, item, _) => Err(format!(
+                        "no message {} sent on channel {name:?} is uncertain: it was taken, not \
+                         taken, resolved already, or never sent there",
+                        item.map_or_else(|| line["item"].to_string(), |item| item.to_string())
+                    )),
+                }
+            }
+            ChannelKind::Request(Direction::Outbound) => {
+                let id = line["request"].as_u64().unwrap_or_default();
+                let Some(outgoing) = self
+                    .outgoing
+                    .get(&id)
+                    .filter(|outgoing| outgoing.agent == agent)
+                else {
+                    return Err(format!(
+                        "no request {id} on channel {name:?} is outstanding: it has ended, or \
+                         was never made there"
+                    ));
+                };
+                match (operation, outgoing.state) {
+                    (ChannelOperation::Send, Out::Sending { .. }) => Err(format!(
+                        "request {id}'s send on channel {name:?} has not been answered yet"
+                    )),
+                    (ChannelOperation::Withdrawal, state) if state != Out::Doubtful => Err(
+                        format!("no withdrawal of request {id} on channel {name:?} is uncertain"),
+                    ),
+                    _ => Ok(query(
+                        outgoing.item,
+                        Some(AgentRequestId::new(id)),
+                        outgoing.reference.clone(),
+                    )),
+                }
+            }
+            ChannelKind::Request(Direction::Inbound) => Err(format!(
+                "channel {name:?} carries requests to its holder, and nothing is sent on it"
+            )),
+        }
+    }
+
+    /// Its backend answered `query` with `resolution`: what that settles --
+    /// a message no longer uncertain, or its row in the close's report; an
+    /// outbound request now waiting, or ended as the backend says, which its
+    /// holder's kernel is told, as the line returned. An answer that changes
+    /// nothing -- the request moved on meanwhile, or still uncertain --
+    /// settles nothing.
+    fn settle_by(
+        &mut self,
+        query: &Query,
+        resolution: &Resolution,
+    ) -> Option<(&'static str, Value)> {
+        let Some(request) = query.request else {
+            self.settle_doubt(query.item, resolution);
+            return None;
+        };
+        let outgoing = self.outgoing.get_mut(&request.get())?;
+        match (outgoing.state, resolution) {
+            (Out::Uncertain, Resolution::Accepted { reference }) => {
+                outgoing.state = Out::Waiting;
+                outgoing.reference.clone_from(reference);
+                Some(("channel.requested", json!({"state": "waiting"})))
+            }
+            (Out::Uncertain, Resolution::NotAccepted { reason }) => {
+                outgoing.state = Out::Ending;
+                Some((
+                    "channel.settle",
+                    json!({"outcome": "not_accepted", "message": reason}),
+                ))
+            }
+            (Out::Doubtful, resolution) => {
+                let answer = resolution.withdraw_answer()?;
+                outgoing.state = Out::Ending;
+                Some(("channel.settle", withdrawn_line(answer)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Its backend answered `resolution` of message `item`, whose send was
+    /// uncertain: a doubt no more, unless still uncertain. Once admission has
+    /// closed -- which listed it, in the step the table heard it -- its row in
+    /// the close's report says what the answer says, whoever asked and in
+    /// whatever order the answers came, unless an earlier answer already said
+    /// whether its backend took it.
+    fn settle_doubt(&mut self, item: MessageId, resolution: &Resolution) {
+        if let Some(doubt) = self.uncertain.get_mut(&item) {
+            match resolution {
+                Resolution::Uncertain { reason } => doubt.reason.clone_from(reason),
+                _ => {
+                    self.uncertain.remove(&item);
+                }
+            }
+            return;
+        }
+        let Some(row) = self
+            .uncertain_at_close
+            .iter_mut()
+            .find(|row| row.item == item && row.outcome == ItemOutcome::Uncertain)
+        else {
+            return;
+        };
+        let ended = Ended::resolved(resolution.clone());
+        (row.outcome, row.reason, row.reference) = (ended.outcome, ended.reason, ended.reference);
+    }
+
+    /// List each message whose send is uncertain in the close's report, as
+    /// uncertain: a doubt no more, but a row an answer settles.
+    fn list_doubts(&mut self) {
+        for (item, doubt) in std::mem::take(&mut self.uncertain) {
+            self.uncertain_at_close.push(doubt.at_close(item));
+        }
+    }
+
     /// Count `withdrawal` toward the drain, as its backend is asked it.
     fn ask_withdrawal(&mut self, withdrawal: Withdrawal) -> Asking {
         self.withdrawing += 1;
@@ -1211,7 +1659,7 @@ impl Chan {
                 outgoing.state = Out::Sending { withdraw: true };
                 None
             }
-            Out::Withdrawing | Out::Withdrawn { .. } => None,
+            Out::Withdrawing | Out::Doubtful | Out::Ending => None,
             Out::Waiting | Out::Uncertain => {
                 outgoing.state = Out::Withdrawing;
                 let withdrawal =
@@ -1337,10 +1785,68 @@ enum Out {
     Uncertain,
     /// Its backend is asked to withdraw it, and has not answered.
     Withdrawing,
-    /// Its backend was asked to withdraw it, and answered -- the request ends
-    /// as it said -- or did not within the call's bound, which leaves the
-    /// request uncertain. It is asked no more.
-    Withdrawn { answered: bool },
+    /// Its backend was asked to withdraw it, and did not answer within the
+    /// call's bound: what became of the withdrawal is not known until a
+    /// resolution says. It is asked to withdraw it no more.
+    Doubtful,
+    /// Its backend said how it ended -- answering its withdrawal, or a
+    /// resolution -- and its holder is being told.
+    Ending,
+}
+
+impl Out {
+    /// As the registry's snapshot says it.
+    fn public(self) -> OutboundState {
+        match self {
+            Self::Sending { .. } => OutboundState::Sending,
+            Self::Waiting => OutboundState::Waiting,
+            Self::Uncertain => OutboundState::Uncertain(ChannelOperation::Send),
+            Self::Withdrawing => OutboundState::Withdrawing,
+            Self::Doubtful => OutboundState::Uncertain(ChannelOperation::Withdrawal),
+            Self::Ending => OutboundState::Ending,
+        }
+    }
+}
+
+/// An inbound request a channel took.
+struct Asked {
+    /// The id the session's owner gave it, and the backend's reference.
+    item: String,
+    reference: Option<String>,
+    /// When its holder's code received it.
+    received: Option<Instant>,
+}
+
+impl Asked {
+    /// It, request `id`, as the registry lists it.
+    fn inbound(&self, id: u64) -> InboundItem {
+        InboundItem {
+            item: self.item.clone(),
+            delivery: DeliveryId::Request(AgentRequestId::new(id)),
+            reference: self.reference.clone(),
+        }
+    }
+}
+
+/// A message whose send is uncertain.
+struct Doubt {
+    /// The agent that sent it.
+    agent: String,
+    /// Why, as its backend or OutRig last said.
+    reason: String,
+}
+
+impl Doubt {
+    /// Message `item`'s row in the close's report, as uncertain as this.
+    fn at_close(self, item: MessageId) -> UncertainAtClose {
+        UncertainAtClose {
+            item,
+            agent: self.agent,
+            outcome: ItemOutcome::Uncertain,
+            reason: Some(self.reason),
+            reference: None,
+        }
+    }
 }
 
 /// How a request on a channel ended.
@@ -1386,6 +1892,7 @@ struct Asking {
 
 /// How a channel's backend is called: no more calls at once than it has
 /// permits, each given up on past its bound.
+#[derive(Clone)]
 struct Calls {
     backend: Arc<dyn ChannelBackend>,
     permits: Arc<Semaphore>,
@@ -1460,29 +1967,42 @@ impl Channels {
                 requests_after_close: Vec::new(),
                 withdrawing: 0,
                 deliveries: BTreeMap::new(),
+                consumed: None,
+                acknowledged: None,
                 delivered: 0,
                 unread: 0,
                 flights: BTreeMap::new(),
-                sent: HashMap::new(),
+                uncertain: BTreeMap::new(),
+                resolving: 0,
+                sent: BTreeMap::new(),
                 after_close: Vec::new(),
+                uncertain_at_close: Vec::new(),
                 notices: VecDeque::new(),
                 notifying: false,
             })
             .collect();
-        let closing = CancellationToken::new();
         let table = Arc::new(Table {
             events: lifecycle.events().clone(),
             lifecycle: Arc::clone(lifecycle),
             catalog,
             interpreter: interpreter.downgrade(),
             to_interpreter: interpreter.relay_line(),
-            state: watch::Sender::new(State { channels }),
+            state: watch::Sender::new(State {
+                channels,
+                closed: false,
+            }),
             rounds: OnceLock::new(),
-            closing: closing.clone(),
+            closing: CancellationToken::new(),
             stopping: CancellationToken::new(),
             settles: std::sync::atomic::AtomicU64::new(0),
         });
-        lifecycle.on_close(Arc::new(move |_| closing.cancel()));
+        // Weak: the lifecycle keeps its closers, and the table keeps it.
+        let weak = Arc::downgrade(&table);
+        lifecycle.on_close(Arc::new(move |_| {
+            if let Some(table) = weak.upgrade() {
+                table.admission_closed();
+            }
+        }));
         Self(table)
     }
 
@@ -1637,16 +2157,20 @@ impl Channels {
     }
 
     /// Each channel `agent` sent on in its round `round`, with the items it
-    /// sent, in order: the round's deliberate sends, read once, as the round
-    /// ends.
+    /// sent, in order: the round's deliberate sends, read as the round ends.
+    /// The registry keeps them for the agent's latest [`ROUNDS_KEPT`] rounds,
+    /// as its handle keeps their facts, and drops what is older.
     pub(crate) fn sends_in(&self, agent: &str, round: u32) -> Vec<RoundSend> {
+        let oldest = round.saturating_sub(ROUNDS_KEPT as u32 - 1);
         let key = (agent.to_string(), round);
         self.0.changing(|state| {
             let sends: Vec<RoundSend> = state
                 .channels
                 .iter_mut()
                 .filter_map(|chan| {
-                    let items = chan.sent.remove(&key)?;
+                    chan.sent
+                        .retain(|(sender, kept), _| sender != agent || *kept >= oldest);
+                    let items = chan.sent.get(&key)?.clone();
                     Some(RoundSend::new(&chan.definition.name, items))
                 })
                 .collect();
@@ -1654,9 +2178,28 @@ impl Channels {
         })
     }
 
-    /// Resolves once no send or withdrawal is waiting on a backend, every
-    /// request on a channel has ended, and every notice has been
-    /// acknowledged.
+    /// Each channel as the registry holds it now, in the order the owner
+    /// declared them.
+    pub(crate) fn snapshot(&self) -> Vec<ChannelSnapshot> {
+        self.0
+            .state
+            .borrow()
+            .channels
+            .iter()
+            .map(Chan::snapshot)
+            .collect()
+    }
+
+    /// Admission has closed: ask, once, what became of each message whose
+    /// send is uncertain, for the close's report. [`Channels::drained`] waits
+    /// for the answers.
+    pub(crate) fn resolve_uncertain(&self) {
+        self.0.resolve_uncertain();
+    }
+
+    /// Resolves once no send, withdrawal or resolution is waiting on a
+    /// backend, every request on a channel has ended, and every notice has
+    /// been acknowledged.
     pub(crate) fn drained(&self) -> impl Future<Output = ()> + Send + 'static {
         let mut state = self.0.state.subscribe();
         async move {
@@ -1666,6 +2209,7 @@ impl Channels {
                         chan.flights.is_empty()
                             && chan.notices.is_empty()
                             && chan.withdrawing == 0
+                            && chan.resolving == 0
                             && !chan.requests_open()
                     })
                 })
@@ -1694,15 +2238,8 @@ impl Channels {
         self.0.state.send_modify(|state| {
             for chan in &mut state.channels {
                 let unread = chan
-                    .deliveries
-                    .values()
-                    .filter(|(item, _)| {
-                        matches!(
-                            chan.items.get(item),
-                            Some(Taken::Queued(_, Position::Unread) | Taken::Pushing)
-                        )
-                    })
-                    .map(|(item, _)| item.clone())
+                    .messages_at(Position::Unread)
+                    .map(|unread| unread.item)
                     .collect();
                 let mut sends = std::mem::take(&mut chan.after_close);
                 for (item, Flight { agent, .. }) in std::mem::take(&mut chan.flights) {
@@ -1723,11 +2260,11 @@ impl Channels {
                     .collect();
                 let mut requests = std::mem::take(&mut chan.requests_after_close);
                 // Nothing ended these: the interpreter was gone first.
-                for (id, item) in chan.asked.iter().filter(|(id, _)| chan.open(**id)) {
+                for (id, asked) in chan.asked.iter().filter(|(id, _)| chan.open(**id)) {
                     requests.push(ChannelRequestAtClose {
                         request: AgentRequestId::new(*id),
                         direction: Direction::Inbound,
-                        item: Some(item.clone()),
+                        item: Some(asked.item.clone()),
                         end: RequestEnd::Terminated,
                         acknowledged: false,
                     });
@@ -1741,6 +2278,11 @@ impl Channels {
                         acknowledged: false,
                     });
                 }
+                // None is left once the table has heard the close; listed all the same, so none
+                // is lost.
+                chan.list_doubts();
+                let mut uncertain = std::mem::take(&mut chan.uncertain_at_close);
+                uncertain.sort_by_key(|row| row.item);
                 report.push(ChannelClose {
                     channel: chan.definition.name.clone(),
                     holder: chan.holder.clone(),
@@ -1748,6 +2290,7 @@ impl Channels {
                     sends,
                     unacknowledged,
                     requests,
+                    uncertain,
                 });
             }
         });
@@ -1814,6 +2357,10 @@ impl Table {
             "channel.ended" => match line["request"].as_u64() {
                 Some(id) => self.outbound_ended(&agent, &channel, id, &line),
                 None => tracing::warn!("ignored an end naming no request: {line}"),
+            },
+            "channel.resolve" => match line["id"].as_u64() {
+                Some(ask) => self.resolve_asked(&agent, ask, &channel, &line),
+                None => tracing::warn!("ignored a resolution with no id: {line}"),
             },
             _ => tracing::warn!("ignored a {kind} line, which nothing reads"),
         }
@@ -2006,19 +2553,21 @@ impl Table {
         let delivery = delivery.expect("given as the line was sent");
         let (answered, waiting) = oneshot::channel();
         let table = Arc::clone(self);
-        let (name, id) = (name.to_string(), item.item.clone());
+        let (name, id, reference) = (name.to_string(), item.item.clone(), item.reference.clone());
         tokio::spawn(async move {
             let posted = answer.await;
-            let _ = answered.send(table.posted(&name, &id, delivery, posted));
+            let _ = answered.send(table.posted(&name, &id, reference, delivery, posted));
         });
         Ok(waiting)
     }
 
-    /// The interpreter answered for item `id`, pushed on `name` as `delivery`.
+    /// The interpreter answered for item `id`, pushed on `name` with the
+    /// backend's `reference` as `delivery`.
     fn posted(
         &self,
         name: &str,
         id: &str,
+        reference: Option<String>,
         delivery: MessageId,
         posted: Result<Result<Posted, PostRefusal>, InterpreterError>,
     ) -> Result<Delivered, DeliverError> {
@@ -2037,7 +2586,7 @@ impl Table {
             } else if let Some(request) = request {
                 // Its holder may have taken it, or it may have ended, before this answer came.
                 if chan.items.get(id) == Some(&Taken::Pushing) {
-                    chan.place(request, id, Position::Unread);
+                    chan.place(request, id, reference, Position::Unread);
                 }
                 // The children registry wakes its holder, as it records the request.
                 return (chan.holder.clone(), false);
@@ -2109,6 +2658,8 @@ impl Table {
                 }
                 Taken::Queued(..) => return None,
             }
+            // Received in order, so the last received is the watermark.
+            chan.consumed = Some(notice.inbound());
             Some(chan.push_notice(Notice::Consumed(notice, agent.to_string())))
         });
         let Some(start) = start else {
@@ -2220,6 +2771,8 @@ impl Table {
                     if let Some(Taken::Queued(_, position)) = chan.items.get_mut(&notice.item) {
                         *position = Position::Acknowledged;
                     }
+                    // Told in the order received, so the last acknowledged is the watermark.
+                    chan.acknowledged = Some(notice.inbound());
                 }
                 Notice::Settled(notice, _) => {
                     let request = notice.request.get();
@@ -2228,8 +2781,8 @@ impl Table {
                     }
                     // An end, and not a refused answer after it: the request is done with.
                     if !matches!(notice.outcome, Settlement::Refused { .. })
-                        && let Some(item) = chan.asked.remove(&request)
-                        && let Some(Taken::Queued(_, position)) = chan.items.get_mut(&item)
+                        && let Some(asked) = chan.asked.remove(&request)
+                        && let Some(Taken::Queued(_, position)) = chan.items.get_mut(&asked.item)
                     {
                         *position = Position::Acknowledged;
                     }
@@ -2380,16 +2933,24 @@ impl Table {
         let table = Arc::clone(self);
         let (agent, channel) = (agent.to_string(), channel.to_string());
         tokio::spawn(async move {
-            let ended = table.handed(&calls, &unsent, outbound).await;
+            let ended = table.handed(&agent, &calls, &unsent, outbound).await;
             table.finish(&agent, waiter, &channel, item, ended, true);
         });
     }
 
     /// Hand `outbound` to its backend once one of the permits `calls` holds
     /// is free, unless the session closes, or the channel closes or its
-    /// sender gives it up -- `unsent` -- first, and say what became of it.
-    async fn handed(&self, calls: &Calls, unsent: &CancellationToken, outbound: Outbound) -> Ended {
-        let bound = calls.bound;
+    /// sender gives it up -- `unsent` -- first, and say what became of it. A
+    /// send that may have been taken is evented so, and its backend asked
+    /// once, holding the same permit, what became of it: its answer is what
+    /// the sender is told.
+    async fn handed(
+        &self,
+        agent: &str,
+        calls: &Calls,
+        unsent: &CancellationToken,
+        outbound: Outbound,
+    ) -> Ended {
         let permit = tokio::select! {
             biased;
             () = self.closing.cancelled() => {
@@ -2406,28 +2967,117 @@ impl Table {
         if unsent.is_cancelled() {
             return self.unsent(&outbound.channel);
         }
-        let answered = tokio::select! {
-            answered = tokio::time::timeout(bound, calls.backend.send(outbound)) => answered,
-            () = self.stopping.cancelled() => {
-                return Ended::uncertain("the session's drain ended before the backend answered");
-            }
+        let query = Query {
+            channel: outbound.channel.clone(),
+            item: outbound.item,
+            request: outbound.request,
+            reference: None,
         };
-        match answered {
-            Ok(SendAnswer::Accepted { reference }) => Ended {
-                outcome: ItemOutcome::Accepted,
-                wire: "accepted",
-                reason: None,
-                reference,
-            },
-            Ok(SendAnswer::NotAccepted { reason }) => Ended {
-                outcome: ItemOutcome::NotAccepted,
-                wire: "not_accepted",
-                reason: Some(reason),
+        let doubt = match self
+            .bounded(calls.bound, calls.backend.send(outbound))
+            .await
+        {
+            Ok(SendAnswer::Accepted { reference }) => return Ended::accepted(reference),
+            Ok(SendAnswer::NotAccepted { reason }) => return Ended::not_accepted(reason),
+            Ok(SendAnswer::Uncertain { reason }) => reason,
+            // The drain has ended: nothing more is asked.
+            Err(why) if self.stopping.is_cancelled() => return Ended::uncertain(&why),
+            Err(why) => why,
+        };
+        // Evented as it is, before the backend is asked: the resolution follows it.
+        self.events
+            .for_agent(agent)
+            .emit(Payload::ChannelItemOutcome {
+                channel: query.channel.clone(),
+                item: query.item,
+                outcome: ItemOutcome::Uncertain,
+                reason: Some(doubt.clone()),
                 reference: None,
-            },
-            Ok(SendAnswer::Uncertain { reason }) => Ended::uncertain(&reason),
-            Err(_) => Ended::uncertain(&format!("the backend did not answer within {bound:?}")),
+            });
+        let resolution = self.resolution(calls, &query, ChannelOperation::Send).await;
+        self.resolved(agent, &query, ChannelOperation::Send, &resolution);
+        let mut ended = Ended::resolved(resolution);
+        if let Some(reason) = ended
+            .reason
+            .as_mut()
+            .filter(|_| ended.outcome == ItemOutcome::Uncertain)
+        {
+            *reason =
+                format!("{doubt}; asked what became of it, the backend could not tell: {reason}");
         }
+        ended.evented = true;
+        ended
+    }
+
+    /// Ask the backend `calls` names to resolve `operation` on `query`, within
+    /// its bound and the drain, the caller holding one of its permits: its
+    /// answer, or uncertain when there is none.
+    async fn resolution(
+        &self,
+        calls: &Calls,
+        query: &Query,
+        operation: ChannelOperation,
+    ) -> Resolution {
+        let (backend, query) = (&calls.backend, query.clone());
+        let answered = match operation {
+            ChannelOperation::Send => self
+                .bounded(calls.bound, backend.resolve_send(query))
+                .await
+                .map(Resolution::from),
+            ChannelOperation::Withdrawal => self
+                .bounded(calls.bound, backend.resolve_withdrawal(query))
+                .await
+                .and_then(|answer| answer.map(Resolution::from).map_err(|e| e.to_string())),
+        };
+        answered.unwrap_or_else(|reason| Resolution::Uncertain { reason })
+    }
+
+    /// Ask the backend `calls` names to resolve `operation` on `query`,
+    /// `agent`'s, once one
+    /// of its permits is free; event its answer; and settle what it settles,
+    /// counted off the drain in the same step. The answer, and what the
+    /// request's kernel is to be told of it.
+    async fn resolve(
+        &self,
+        agent: &str,
+        calls: &Calls,
+        query: &Query,
+        operation: ChannelOperation,
+    ) -> (Resolution, Option<(&'static str, Value)>) {
+        let resolution = match self.permit(calls).await {
+            Ok(_permit) => self.resolution(calls, query, operation).await,
+            Err(reason) => Resolution::Uncertain { reason },
+        };
+        self.resolved(agent, query, operation, &resolution);
+        let told = self.with(|state| {
+            let chan = state.find_mut(&query.channel)?;
+            chan.resolving -= 1;
+            chan.settle_by(query, &resolution)
+        });
+        (resolution, told)
+    }
+
+    /// The backend answered `operation` on `query`, of `agent`'s item, with
+    /// `resolution`: evented under that agent.
+    fn resolved(
+        &self,
+        agent: &str,
+        query: &Query,
+        operation: ChannelOperation,
+        resolution: &Resolution,
+    ) {
+        let (answer, reason, reference) = resolution.parts();
+        self.events
+            .for_agent(agent)
+            .emit(Payload::ChannelItemResolved {
+                channel: query.channel.clone(),
+                item: query.item,
+                request: query.request,
+                operation,
+                answer,
+                reason: reason.map(str::to_string),
+                reference: reference.map(str::to_string),
+            });
     }
 
     /// Why a send on `channel` was never handed to its backend, once its
@@ -2461,10 +3111,12 @@ impl Table {
         ended: Ended,
         in_flight: bool,
     ) {
-        let closed = self.lifecycle.closed().is_some();
         // What a request's send leaves to do is decided in the step that ends its flight, so the
         // drain never finds the flight gone and what its backend is owed not yet counted.
         let next = self.with(|state| {
+            // The close the doubts were listed by: one that ends uncertain is a doubt before it,
+            // and the close's send after.
+            let closed = state.closed;
             let Some(chan) = state.find_mut(channel) else {
                 return (!in_flight).then_some((Sent::Told, None));
             };
@@ -2478,6 +3130,15 @@ impl Table {
                     outcome: ended.outcome,
                     reason: ended.reason.clone(),
                 });
+            } else if waiter.request().is_none() && ended.outcome == ItemOutcome::Uncertain {
+                // Its sender is told it is uncertain, with its id, by which it is resolved.
+                chan.uncertain.insert(
+                    item,
+                    Doubt {
+                        agent: agent.to_string(),
+                        reason: ended.reason.clone().unwrap_or_default(),
+                    },
+                );
             }
             Some(match waiter.request() {
                 Some(id) => chan.request_sent(id, ended.wire, (item, ended.reference.clone())),
@@ -2488,15 +3149,17 @@ impl Table {
             return;
         };
         let reason = ended.reason.unwrap_or_default();
-        self.events
-            .for_agent(agent)
-            .emit(Payload::ChannelItemOutcome {
-                channel: channel.to_string(),
-                item,
-                outcome: ended.outcome,
-                reason: (!reason.is_empty()).then(|| reason.clone()),
-                reference: ended.reference,
-            });
+        if !ended.evented {
+            self.events
+                .for_agent(agent)
+                .emit(Payload::ChannelItemOutcome {
+                    channel: channel.to_string(),
+                    item,
+                    outcome: ended.outcome,
+                    reason: (!reason.is_empty()).then(|| reason.clone()),
+                    reference: ended.reference,
+                });
+        }
         match (waiter, sent) {
             (Waiter::Send(ask), _) => (self.to_interpreter)(json!({
                 "t": "channel.sent",
@@ -2581,8 +3244,10 @@ impl Table {
                     return false;
                 };
                 if outgoing.state == Out::Withdrawing {
-                    outgoing.state = Out::Withdrawn {
-                        answered: answer.is_ok(),
+                    outgoing.state = if answer.is_ok() {
+                        Out::Ending
+                    } else {
+                        Out::Doubtful
                     };
                 }
                 true
@@ -2596,16 +3261,7 @@ impl Table {
                 // Ended meanwhile -- released, closed, settled -- so the answer changes nothing.
                 (_, Ok(_)) if !outstanding => {}
                 (_, Ok(answer)) => {
-                    let settle = match answer {
-                        WithdrawAnswer::Withdrawn => {
-                            Settle::Cancel("its far end withdrew it".to_string())
-                        }
-                        WithdrawAnswer::Replied(value) => Settle::Reply(value),
-                        WithdrawAnswer::Failed(message) => Settle::Fail(message),
-                    };
-                    let mut line = settle_line(settle);
-                    line["by"] = json!("backend");
-                    table.tell("channel.settle", &agent, id, line);
+                    table.tell("channel.settle", &agent, id, withdrawn_line(answer));
                 }
                 (_, Err(why)) => {
                     tracing::warn!(
@@ -2663,8 +3319,8 @@ impl Table {
                 (_, None) => (None, true),
                 // Asked to withdraw it already, by its holder's cancel: that withdrawal stands for
                 // this one, and its answer is the one the close waits on.
-                (Some(Owed::Withdrawn), Some(Out::Withdrawing)) => (None, false),
-                (Some(Owed::Withdrawn), Some(Out::Withdrawn { answered })) => (None, answered),
+                (Some(Owed::Withdrawn), Some(Out::Withdrawing | Out::Doubtful)) => (None, false),
+                (Some(Owed::Withdrawn), Some(Out::Ending)) => (None, true),
                 (owed, Some(_)) => {
                     let acknowledged = owed.is_none();
                     (owed, acknowledged)
@@ -2731,18 +3387,19 @@ impl Table {
             .filter(|agent| !agent.is_empty())
             .map(str::to_string);
         let request = AgentRequestId::new(id);
+        let reference = || external["reference"].as_str().map(str::to_string);
         let notice = |outcome| Settled {
             channel: channel.to_string(),
             request,
             item: Some(item.to_string()),
-            reference: external["reference"].as_str().map(str::to_string),
+            reference: reference(),
             outcome,
         };
         match line["t"].as_str().unwrap_or_default() {
             "agent.received" => self.changing(|state| match state.find_mut(channel) {
                 // Received is as open as unread: no waiter is woken for it.
                 Some(chan) if !chan.finished.contains_key(&id) => {
-                    chan.place(id, item, Position::Consumed);
+                    chan.place(id, item, reference(), Position::Consumed);
                     ((), false)
                 }
                 _ => ((), false),
@@ -2792,7 +3449,7 @@ impl Table {
                     if !chan.end_request(id, finished, at_close) {
                         return None;
                     }
-                    chan.place(id, item, Position::Settled);
+                    chan.place(id, item, reference(), Position::Settled);
                     // Queued in the step that ends it, so the drain never finds it ended and its
                     // notice not yet queued.
                     Some(chan.push_notice(Notice::Settled(notice(outcome), agent)))
@@ -2807,6 +3464,107 @@ impl Table {
                 self.queue(channel, Notice::Settled(notice, agent));
             }
             _ => {}
+        }
+    }
+
+    /// `agent`'s code asked, under `ask`, what became of the operation `line`
+    /// names on `channel`: a message's send, by its item id, or an outbound
+    /// request's send or withdrawal, by its id. Its backend is asked, and the
+    /// answer settles what it can -- a message no longer uncertain, a request
+    /// now waiting or ended as the backend says -- before the code is told
+    /// it. One that names nothing uncertain is refused, the backend not
+    /// asked.
+    fn resolve_asked(self: &Arc<Self>, agent: &str, ask: u64, channel: &str, line: &Value) {
+        let operation = match line["operation"].as_str() {
+            Some("withdrawal") => ChannelOperation::Withdrawal,
+            _ => ChannelOperation::Send,
+        };
+        let decided = self.changing(|state| {
+            let Some(chan) = state.find_mut(channel) else {
+                return (
+                    Err(format!("the session declares no channel {channel:?}")),
+                    false,
+                );
+            };
+            let query = chan.query(agent, operation, line);
+            if query.is_ok() {
+                chan.resolving += 1;
+            }
+            (query.map(|query| (query, chan.calls())), false)
+        });
+        let (query, calls) = match decided {
+            Ok(decided) => decided,
+            Err(why) => return self.tell("channel.resolved", agent, ask, json!({"error": why})),
+        };
+        let table = Arc::clone(self);
+        let agent = agent.to_string();
+        tokio::spawn(async move {
+            let (resolution, told) = table.resolve(&agent, &calls, &query, operation).await;
+            // What the answer settles is told the request's kernel before the code hears the
+            // answer, so a status read after it has moved.
+            if let (Some((kind, line)), Some(id)) = (told, query.request) {
+                table.tell(kind, &agent, id.get(), line);
+            }
+            let (outcome, reason, reference) = resolution.parts();
+            table.tell(
+                "channel.resolved",
+                &agent,
+                ask,
+                json!({"outcome": outcome, "reason": reason, "reference": reference}),
+            );
+        });
+    }
+
+    /// Admission has closed, as each of the lifecycle's closers hears: in one
+    /// step, the table says so and lists each message whose send is uncertain
+    /// in the close's report, so an answer that comes after -- to the agent's
+    /// own question still running, or to the drain's -- settles its row; and a
+    /// send still waiting for its turn at the backend is refused.
+    fn admission_closed(&self) {
+        self.with(|state| {
+            state.closed = true;
+            for chan in &mut state.channels {
+                chan.list_doubts();
+            }
+        });
+        self.closing.cancel();
+    }
+
+    /// The drain has begun: ask each message's backend, once, what became of
+    /// each message uncertain at the close that no answer since has settled.
+    /// The drain waits for the answers.
+    fn resolve_uncertain(self: &Arc<Self>) {
+        // Admission has closed, but the lifecycle may not have told the table yet: an exit's
+        // hook still to run, or another caller's close still telling its closers. Hearing it
+        // twice changes nothing.
+        self.admission_closed();
+        let asked: Vec<(String, Query, Calls)> = self.with(|state| {
+            let mut asked = Vec::new();
+            for chan in &mut state.channels {
+                let calls = chan.calls();
+                let before = asked.len();
+                for row in &chan.uncertain_at_close {
+                    if row.outcome == ItemOutcome::Uncertain {
+                        let query = Query {
+                            channel: chan.definition.name.clone(),
+                            item: row.item,
+                            request: None,
+                            reference: None,
+                        };
+                        asked.push((row.agent.clone(), query, calls.clone()));
+                    }
+                }
+                chan.resolving += asked.len() - before;
+            }
+            asked
+        });
+        for (agent, query, calls) in asked {
+            let table = Arc::clone(self);
+            tokio::spawn(async move {
+                table
+                    .resolve(&agent, &calls, &query, ChannelOperation::Send)
+                    .await
+            });
         }
     }
 
@@ -2902,19 +3660,36 @@ impl Table {
         calls: &Calls,
         call: impl FnOnce() -> BackendFuture<'a, io::Result<T>>,
     ) -> Result<T, String> {
-        const DRAINED: &str = "the session's drain ended before it answered";
-        let permit = tokio::select! {
-            permit = calls.permits.acquire() => permit,
-            () = self.stopping.cancelled() => return Err(DRAINED.to_string()),
-        };
-        // Held while the call runs; the permits are never closed.
-        let _permit = permit.map_err(|e| e.to_string())?;
+        let _permit = self.permit(calls).await?;
+        self.bounded(calls.bound, call())
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// One of the permits `calls` holds, once it is free, held while the
+    /// call it is for runs; or why none came: the drain ended first.
+    async fn permit<'a>(
+        &self,
+        calls: &'a Calls,
+    ) -> Result<tokio::sync::SemaphorePermit<'a>, String> {
         tokio::select! {
-            answer = tokio::time::timeout(calls.bound, call()) => match answer {
-                Ok(Ok(answer)) => Ok(answer),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(_) => Err(format!("it did not answer within {:?}", calls.bound)),
-            },
+            // The permits are never closed.
+            permit = calls.permits.acquire() => permit.map_err(|e| e.to_string()),
+            () = self.stopping.cancelled() => Err(DRAINED.to_string()),
+        }
+    }
+
+    /// `call`, a call of a channel's backend, given up on past `bound` or
+    /// once the session's drain has ended: its answer, or why there is none.
+    async fn bounded<T>(
+        &self,
+        bound: Duration,
+        call: impl Future<Output = T>,
+    ) -> Result<T, String> {
+        tokio::select! {
+            answer = tokio::time::timeout(bound, call) => {
+                answer.map_err(|_| format!("the backend did not answer within {bound:?}"))
+            }
             () = self.stopping.cancelled() => Err(DRAINED.to_string()),
         }
     }
@@ -2997,15 +3772,49 @@ struct Ended {
     wire: &'static str,
     reason: Option<String>,
     reference: Option<String>,
+    /// Whether its `channel.item.outcome` was evented already: an uncertain
+    /// send's is, before its backend is asked to resolve it.
+    evented: bool,
 }
 
 impl Ended {
+    /// What a send's `resolution` makes of it.
+    fn resolved(resolution: Resolution) -> Self {
+        match resolution {
+            Resolution::Accepted { reference } => Self::accepted(reference),
+            Resolution::NotAccepted { reason } => Self::not_accepted(reason),
+            // A send's resolution is one of the three a send answers.
+            other => Self::uncertain(other.parts().1.unwrap_or_default()),
+        }
+    }
+
+    fn accepted(reference: Option<String>) -> Self {
+        Self {
+            outcome: ItemOutcome::Accepted,
+            wire: "accepted",
+            reason: None,
+            reference,
+            evented: false,
+        }
+    }
+
+    fn not_accepted(reason: String) -> Self {
+        Self {
+            outcome: ItemOutcome::NotAccepted,
+            wire: "not_accepted",
+            reason: Some(reason),
+            reference: None,
+            evented: false,
+        }
+    }
+
     fn refused(wire: &'static str, reason: &str) -> Self {
         Self {
             outcome: ItemOutcome::Refused,
             wire,
             reason: Some(reason.to_string()),
             reference: None,
+            evented: false,
         }
     }
 
@@ -3015,6 +3824,7 @@ impl Ended {
             wire: "uncertain",
             reason: Some(reason.to_string()),
             reference: None,
+            evented: false,
         }
     }
 }
@@ -3102,6 +3912,19 @@ fn settle_line(settle: Settle) -> Value {
         Settle::Fail(message) => json!({"outcome": "failed", "message": message}),
         Settle::Cancel(reason) => json!({"outcome": "cancelled", "message": reason}),
     }
+}
+
+/// The `channel.settle` line ending an outbound request as its backend's
+/// `answer` to its withdrawal says.
+fn withdrawn_line(answer: WithdrawAnswer) -> Value {
+    let settle = match answer {
+        WithdrawAnswer::Withdrawn => Settle::Cancel("its far end withdrew it".to_string()),
+        WithdrawAnswer::Replied(value) => Settle::Reply(value),
+        WithdrawAnswer::Failed(message) => Settle::Fail(message),
+    };
+    let mut line = settle_line(settle);
+    line["by"] = json!("backend");
+    line
 }
 
 /// What the interpreter's `refusal` of an item pushed on `name` is to its

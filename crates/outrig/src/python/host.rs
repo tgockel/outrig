@@ -669,11 +669,14 @@ enum Reply {
         file: Option<FileText>,
         error: Option<String>,
     },
-    /// A message the agent sent, which nothing asked for.
+    /// A message the agent sent, which nothing asked for; its `send` waits
+    /// under `id` for the id the host gives it.
     #[serde(rename = "send")]
     Sent {
         channel: String,
         body: String,
+        #[serde(default)]
+        id: Option<u64>,
     },
     /// Turns the agent promoted, which nothing asked for either.
     Promote {
@@ -2748,9 +2751,18 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
             }
             _ => tracing::warn!("ignored the answer about a file {id}, which nothing asked for"),
         },
-        Reply::Sent { channel, body } => {
+        Reply::Sent {
+            channel,
+            body,
+            id: ask,
+        } => {
             let mut table = lock(table);
             let id = table.next_id();
+            // The agent's `send` returns the id its `message.sent` carries.
+            if let Some(ask) = ask {
+                let sent = json!({"t": "sent", "agent": agent, "id": ask, "message": id.message()});
+                lines.send(format!("{sent}\n"));
+            }
             let events = table.events.for_agent(&agent);
             events.emit_with(|| Payload::MessageSent {
                 message: id.message(),

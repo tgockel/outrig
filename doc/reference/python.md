@@ -1155,4 +1155,5 @@ describes; a program on the host has no use for them. What a program meets if it
 - `outrig.SendRefused` -- what an external channel's `send` raises, which only a kernel holds.
 - `outrig.SendNotAccepted` -- what an external channel's `send` raises, which only a kernel holds.
 - `outrig.SendUncertain` -- what an external channel's `send` raises, which only a kernel holds.
+- `outrig.Resolution` -- what an external channel's `resolve` returns, which only a kernel holds.
 - `outrig.UnreadableDelivery` -- what an external channel's `receive` may raise, only in a kernel.

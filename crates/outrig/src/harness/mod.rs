@@ -65,6 +65,7 @@ pub(crate) mod channels;
 mod error;
 pub mod event;
 pub(crate) mod lifecycle;
+mod registry;
 mod report;
 mod root;
 pub(crate) mod roster;
@@ -82,15 +83,19 @@ pub(crate) use self::builder::chosen_repo_root;
 pub use self::builder::{ContainerSpec, Progress, SessionBuilder, Step, container_spec};
 pub use self::channels::{
     BackendFuture, CHANNEL_BOUND_MAX, CancelledBy, Channel, ChannelBackend, ChannelDefinition,
-    ChannelKind, Consumed, Contract, DEFAULT_CALL_TIMEOUT, DeliverError, Delivered, DeliveryId,
-    Direction, Inbound, ItemKind, Outbound, Position, SendAnswer, Settle, SettleError, Settled,
-    Settlement, Wake, WithdrawAnswer, WithdrawEnd, Withdrawal,
+    ChannelKind, ChannelOperation, Consumed, Contract, DEFAULT_CALL_TIMEOUT, DeliverError,
+    Delivered, DeliveryId, Direction, Inbound, ItemKind, Outbound, Position, Query, SendAnswer,
+    Settle, SettleError, Settled, Settlement, Wake, WithdrawAnswer, WithdrawEnd, Withdrawal,
 };
 pub use self::error::{Closed, ClosedBy, Failure, SessionError};
+pub use self::registry::{
+    ChannelSnapshot, InboundItem, OutboundState, OutstandingRequest, Positions, ReceivedRequest,
+    SentInRound, UncertainItem,
+};
 pub use self::report::{
     BindingStop, ChannelClose, ChannelRequestAtClose, EventDelivery, ExecutionOutcome,
     ExecutionStatus, HostedCall, LogLoss, RequestOutcome, SendAtClose, ServiceCall, ShutdownReport,
-    Stopped, Verdict,
+    Stopped, UncertainAtClose, Verdict,
 };
 pub use self::root::{
     Argument, ConstructSpec, Facility, Problem, RequestChannel, RequestHandle, RootError,

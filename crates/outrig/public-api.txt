@@ -1469,6 +1469,14 @@ pub outrig::harness::event::Payload::ChannelItemOutcome::item: outrig::harness::
 pub outrig::harness::event::Payload::ChannelItemOutcome::outcome: outrig::harness::event::ItemOutcome
 pub outrig::harness::event::Payload::ChannelItemOutcome::reason: core::option::Option<alloc::string::String>
 pub outrig::harness::event::Payload::ChannelItemOutcome::reference: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub outrig::harness::event::Payload::ChannelItemResolved
+pub outrig::harness::event::Payload::ChannelItemResolved::answer: outrig::harness::event::Resolved
+pub outrig::harness::event::Payload::ChannelItemResolved::channel: alloc::string::String
+pub outrig::harness::event::Payload::ChannelItemResolved::item: outrig::harness::event::MessageId
+pub outrig::harness::event::Payload::ChannelItemResolved::operation: outrig::harness::ChannelOperation
+pub outrig::harness::event::Payload::ChannelItemResolved::reason: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::ChannelItemResolved::reference: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::ChannelItemResolved::request: core::option::Option<outrig::harness::event::AgentRequestId>
 #[non_exhaustive] pub outrig::harness::event::Payload::ChannelRequestEnded
 pub outrig::harness::event::Payload::ChannelRequestEnded::channel: alloc::string::String
 pub outrig::harness::event::Payload::ChannelRequestEnded::outcome: outrig::harness::event::RequestEnd
@@ -1805,6 +1813,13 @@ pub outrig::harness::event::RequestEnd::Limit
 pub outrig::harness::event::RequestEnd::Rejected
 pub outrig::harness::event::RequestEnd::Released
 pub outrig::harness::event::RequestEnd::Terminated
+#[non_exhaustive] pub enum outrig::harness::event::Resolved
+pub outrig::harness::event::Resolved::Accepted
+pub outrig::harness::event::Resolved::Failed
+pub outrig::harness::event::Resolved::NotAccepted
+pub outrig::harness::event::Resolved::Replied
+pub outrig::harness::event::Resolved::Uncertain
+pub outrig::harness::event::Resolved::Withdrawn
 #[non_exhaustive] pub enum outrig::harness::event::ReturnWhen
 pub outrig::harness::event::ReturnWhen::AllCompleted
 pub outrig::harness::event::ReturnWhen::FirstCompleted
@@ -2085,6 +2100,11 @@ impl outrig::harness::ChannelKind
 pub fn outrig::harness::ChannelKind::direction(self) -> core::option::Option<outrig::harness::Direction>
 impl core::fmt::Display for outrig::harness::ChannelKind
 pub fn outrig::harness::ChannelKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum outrig::harness::ChannelOperation
+pub outrig::harness::ChannelOperation::Send
+pub outrig::harness::ChannelOperation::Withdrawal
+impl core::fmt::Display for outrig::harness::ChannelOperation
+pub fn outrig::harness::ChannelOperation::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub enum outrig::harness::ClosedBy
 #[non_exhaustive] pub outrig::harness::ClosedBy::InterpreterExited
 pub outrig::harness::ClosedBy::InterpreterExited::cause: alloc::string::String
@@ -2145,6 +2165,12 @@ pub outrig::harness::ItemKind::Message
 pub outrig::harness::ItemKind::Request
 impl core::fmt::Display for outrig::harness::ItemKind
 pub fn outrig::harness::ItemKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum outrig::harness::OutboundState
+pub outrig::harness::OutboundState::Ending
+pub outrig::harness::OutboundState::Sending
+pub outrig::harness::OutboundState::Uncertain(outrig::harness::ChannelOperation)
+pub outrig::harness::OutboundState::Waiting
+pub outrig::harness::OutboundState::Withdrawing
 #[non_exhaustive] pub enum outrig::harness::Parent
 pub outrig::harness::Parent::Agent(alloc::string::String)
 pub outrig::harness::Parent::Owner
@@ -2342,6 +2368,7 @@ pub outrig::harness::ChannelClose::holder: core::option::Option<alloc::string::S
 pub outrig::harness::ChannelClose::requests: alloc::vec::Vec<outrig::harness::ChannelRequestAtClose>
 pub outrig::harness::ChannelClose::sends: alloc::vec::Vec<outrig::harness::SendAtClose>
 pub outrig::harness::ChannelClose::unacknowledged: alloc::vec::Vec<alloc::string::String>
+pub outrig::harness::ChannelClose::uncertain: alloc::vec::Vec<outrig::harness::UncertainAtClose>
 pub outrig::harness::ChannelClose::unread: alloc::vec::Vec<alloc::string::String>
 pub struct outrig::harness::ChannelDefinition
 impl outrig::harness::ChannelDefinition
@@ -2352,6 +2379,7 @@ pub fn outrig::harness::ChannelDefinition::description(self, impl core::convert:
 pub fn outrig::harness::ChannelDefinition::kind(self, outrig::harness::ChannelKind) -> Self
 pub fn outrig::harness::ChannelDefinition::new(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::harness::ChannelDefinition::receives(self, outrig::harness::Contract) -> Self
+pub fn outrig::harness::ChannelDefinition::reference(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::harness::ChannelDefinition::sends(self, outrig::harness::Contract) -> Self
 pub fn outrig::harness::ChannelDefinition::wake(self, outrig::harness::Wake) -> Self
 #[non_exhaustive] pub struct outrig::harness::ChannelRequestAtClose
@@ -2360,6 +2388,26 @@ pub outrig::harness::ChannelRequestAtClose::direction: outrig::harness::Directio
 pub outrig::harness::ChannelRequestAtClose::end: outrig::harness::event::RequestEnd
 pub outrig::harness::ChannelRequestAtClose::item: core::option::Option<alloc::string::String>
 pub outrig::harness::ChannelRequestAtClose::request: outrig::harness::event::AgentRequestId
+#[non_exhaustive] pub struct outrig::harness::ChannelSnapshot
+pub outrig::harness::ChannelSnapshot::acknowledged: core::option::Option<outrig::harness::InboundItem>
+pub outrig::harness::ChannelSnapshot::bound: usize
+pub outrig::harness::ChannelSnapshot::closed: core::option::Option<alloc::string::String>
+pub outrig::harness::ChannelSnapshot::consumed: core::option::Option<outrig::harness::InboundItem>
+pub outrig::harness::ChannelSnapshot::holder: core::option::Option<alloc::string::String>
+pub outrig::harness::ChannelSnapshot::kind: outrig::harness::ChannelKind
+pub outrig::harness::ChannelSnapshot::name: alloc::string::String
+pub outrig::harness::ChannelSnapshot::outstanding: alloc::vec::Vec<outrig::harness::OutstandingRequest>
+pub outrig::harness::ChannelSnapshot::received: alloc::vec::Vec<outrig::harness::ReceivedRequest>
+pub outrig::harness::ChannelSnapshot::receives: outrig::harness::Contract
+pub outrig::harness::ChannelSnapshot::receives_schema: core::option::Option<alloc::string::String>
+pub outrig::harness::ChannelSnapshot::reference: core::option::Option<alloc::string::String>
+pub outrig::harness::ChannelSnapshot::rounds: alloc::vec::Vec<outrig::harness::SentInRound>
+pub outrig::harness::ChannelSnapshot::sends: outrig::harness::Contract
+pub outrig::harness::ChannelSnapshot::sends_schema: core::option::Option<alloc::string::String>
+pub outrig::harness::ChannelSnapshot::unacknowledged: alloc::vec::Vec<outrig::harness::InboundItem>
+pub outrig::harness::ChannelSnapshot::uncertain: alloc::vec::Vec<outrig::harness::UncertainItem>
+pub outrig::harness::ChannelSnapshot::unread: alloc::vec::Vec<outrig::harness::InboundItem>
+pub outrig::harness::ChannelSnapshot::wake: outrig::harness::Wake
 pub struct outrig::harness::Closed
 impl outrig::harness::Closed
 pub fn outrig::harness::Closed::by(&self) -> &outrig::harness::ClosedBy
@@ -2433,6 +2481,10 @@ pub fn outrig::harness::Inbound::message(impl core::convert::Into<alloc::string:
 pub fn outrig::harness::Inbound::reference(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::harness::Inbound::request(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, serde_json::value::Value) -> Self
 pub fn outrig::harness::Inbound::skill(self, impl core::convert::Into<alloc::string::String>) -> Self
+#[non_exhaustive] pub struct outrig::harness::InboundItem
+pub outrig::harness::InboundItem::delivery: outrig::harness::DeliveryId
+pub outrig::harness::InboundItem::item: alloc::string::String
+pub outrig::harness::InboundItem::reference: core::option::Option<alloc::string::String>
 #[non_exhaustive] pub struct outrig::harness::LeftOpen
 pub outrig::harness::LeftOpen::end: outrig::harness::SessionEnd
 pub outrig::harness::LeftOpen::id: alloc::string::String
@@ -2480,6 +2532,17 @@ pub outrig::harness::Outbound::sender: alloc::string::String
 pub outrig::harness::Outstanding::queued: usize
 pub outrig::harness::Outstanding::taken: usize
 pub outrig::harness::Outstanding::unread: usize
+#[non_exhaustive] pub struct outrig::harness::OutstandingRequest
+pub outrig::harness::OutstandingRequest::agent: alloc::string::String
+pub outrig::harness::OutstandingRequest::item: outrig::harness::event::MessageId
+pub outrig::harness::OutstandingRequest::reference: core::option::Option<alloc::string::String>
+pub outrig::harness::OutstandingRequest::request: outrig::harness::event::AgentRequestId
+pub outrig::harness::OutstandingRequest::state: outrig::harness::OutboundState
+#[non_exhaustive] pub struct outrig::harness::Positions
+pub outrig::harness::Positions::acknowledged: core::option::Option<outrig::harness::InboundItem>
+pub outrig::harness::Positions::channel: alloc::string::String
+pub outrig::harness::Positions::consumed: core::option::Option<outrig::harness::InboundItem>
+pub outrig::harness::Positions::unread: alloc::vec::Vec<outrig::harness::InboundItem>
 #[non_exhaustive] pub struct outrig::harness::Problem
 pub outrig::harness::Problem::message: alloc::string::String
 pub outrig::harness::Problem::path: alloc::string::String
@@ -2488,6 +2551,16 @@ impl outrig::harness::ProgramExit
 pub fn outrig::harness::ProgramExit::code(&self) -> i32
 pub fn outrig::harness::ProgramExit::left_open(&self) -> &[outrig::harness::LeftOpen]
 pub fn outrig::harness::ProgramExit::status(&self) -> std::process::ExitStatus
+#[non_exhaustive] pub struct outrig::harness::Query
+pub outrig::harness::Query::channel: alloc::string::String
+pub outrig::harness::Query::item: outrig::harness::event::MessageId
+pub outrig::harness::Query::reference: core::option::Option<alloc::string::String>
+pub outrig::harness::Query::request: core::option::Option<outrig::harness::event::AgentRequestId>
+#[non_exhaustive] pub struct outrig::harness::ReceivedRequest
+pub outrig::harness::ReceivedRequest::item: alloc::string::String
+pub outrig::harness::ReceivedRequest::reference: core::option::Option<alloc::string::String>
+pub outrig::harness::ReceivedRequest::request: outrig::harness::event::AgentRequestId
+pub outrig::harness::ReceivedRequest::waited: core::time::Duration
 #[non_exhaustive] pub struct outrig::harness::RequestChannel
 pub outrig::harness::RequestChannel::doc: core::option::Option<alloc::string::String>
 pub outrig::harness::RequestChannel::name: alloc::string::String
@@ -2553,6 +2626,10 @@ pub outrig::harness::SendAtClose::agent: alloc::string::String
 pub outrig::harness::SendAtClose::item: outrig::harness::event::MessageId
 pub outrig::harness::SendAtClose::outcome: outrig::harness::event::ItemOutcome
 pub outrig::harness::SendAtClose::reason: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub struct outrig::harness::SentInRound
+pub outrig::harness::SentInRound::agent: alloc::string::String
+pub outrig::harness::SentInRound::items: alloc::vec::Vec<outrig::harness::event::MessageId>
+pub outrig::harness::SentInRound::round: u32
 #[non_exhaustive] pub struct outrig::harness::ServiceCall
 pub outrig::harness::ServiceCall::agent: alloc::string::String
 pub outrig::harness::ServiceCall::call: outrig::harness::event::ServiceCallId
@@ -2588,6 +2665,7 @@ pub struct outrig::harness::Session
 impl outrig::harness::Session
 pub fn outrig::harness::Session::application(&self) -> core::option::Option<&outrig::harness::ApplicationIdentity>
 pub fn outrig::harness::Session::channel(&self, &str) -> core::option::Option<outrig::harness::Channel>
+pub fn outrig::harness::Session::channels(&self) -> alloc::vec::Vec<outrig::harness::ChannelSnapshot>
 pub fn outrig::harness::Session::close_admission(&self)
 pub fn outrig::harness::Session::closer(&self) -> outrig::harness::Closer
 pub async fn outrig::harness::Session::construct(&self, outrig::harness::ConstructSpec) -> core::result::Result<outrig::harness::RootHandle, outrig::harness::SessionError>
@@ -2661,6 +2739,16 @@ pub outrig::harness::Status::state: outrig::harness::AgentState
 pub outrig::harness::StillRunning::tasks: outrig::harness::Tasks
 impl outrig::harness::StillRunning
 pub fn outrig::harness::StillRunning::is_empty(&self) -> bool
+#[non_exhaustive] pub struct outrig::harness::UncertainAtClose
+pub outrig::harness::UncertainAtClose::agent: alloc::string::String
+pub outrig::harness::UncertainAtClose::item: outrig::harness::event::MessageId
+pub outrig::harness::UncertainAtClose::outcome: outrig::harness::event::ItemOutcome
+pub outrig::harness::UncertainAtClose::reason: core::option::Option<alloc::string::String>
+pub outrig::harness::UncertainAtClose::reference: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub struct outrig::harness::UncertainItem
+pub outrig::harness::UncertainItem::agent: alloc::string::String
+pub outrig::harness::UncertainItem::item: outrig::harness::event::MessageId
+pub outrig::harness::UncertainItem::reason: alloc::string::String
 pub struct outrig::harness::UserChannel
 impl outrig::harness::UserChannel
 pub async fn outrig::harness::UserChannel::receive(&self) -> core::option::Option<alloc::string::String>
@@ -2685,6 +2773,9 @@ impl<F> outrig::harness::Approver for F where F: core::ops::function::Fn(&outrig
 pub fn F::approve(&self, &outrig::harness::ApprovalRequest) -> outrig::harness::Approval
 pub trait outrig::harness::ChannelBackend: core::marker::Send + core::marker::Sync + 'static
 pub fn outrig::harness::ChannelBackend::consumed(&self, outrig::harness::Consumed) -> outrig::harness::BackendFuture<'_, std::io::error::Result<()>>
+pub fn outrig::harness::ChannelBackend::positions(&self, outrig::harness::Positions) -> outrig::harness::BackendFuture<'_, std::io::error::Result<()>>
+pub fn outrig::harness::ChannelBackend::resolve_send(&self, outrig::harness::Query) -> outrig::harness::BackendFuture<'_, outrig::harness::SendAnswer>
+pub fn outrig::harness::ChannelBackend::resolve_withdrawal(&self, outrig::harness::Query) -> outrig::harness::BackendFuture<'_, std::io::error::Result<outrig::harness::WithdrawAnswer>>
 pub fn outrig::harness::ChannelBackend::send(&self, outrig::harness::Outbound) -> outrig::harness::BackendFuture<'_, outrig::harness::SendAnswer>
 pub fn outrig::harness::ChannelBackend::settled(&self, outrig::harness::Settled) -> outrig::harness::BackendFuture<'_, std::io::error::Result<()>>
 pub fn outrig::harness::ChannelBackend::withdrawn(&self, outrig::harness::Withdrawal) -> outrig::harness::BackendFuture<'_, std::io::error::Result<outrig::harness::WithdrawAnswer>>

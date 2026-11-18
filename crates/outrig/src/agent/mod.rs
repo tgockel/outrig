@@ -573,6 +573,10 @@ mod external_tests;
 mod external_request_tests;
 
 #[cfg(test)]
+#[path = "external_positions_tests.rs"]
+mod external_positions_tests;
+
+#[cfg(test)]
 #[path = "stop_tests.rs"]
 mod stop_tests;
 

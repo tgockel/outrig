@@ -128,11 +128,12 @@ pub(crate) fn externals(channels: &[ExternalText], directive: bool) -> String {
              runtime.channels[name].receive()`: `d.body` is it, `d.sender` who sent it, and \
              `d.id` its id; receiving it tells the far end you have it, and an announcement says \
              how many wait, never what they say. `await runtime.channels[name].send(value)` \
-             returns once the far end has taken it, not read it; it raises \
+             returns the message's id once the far end has taken it, not read it; it raises \
              `outrig.SendNotAccepted` when the far end did not take it, so sending it again is \
-             safe, `outrig.SendUncertain` when it may have, so sending it again may deliver it \
-             twice, and `outrig.ChannelClosed` once the far end has closed the channel, after \
-             which `receive()` raises too once what waited is read.",
+             safe, `outrig.SendUncertain` when it may have and could not say -- `await \
+             runtime.channels[name].resolve(e.item)` asks it again, and sending it again may \
+             deliver it twice -- and `outrig.ChannelClosed` once the far end has closed the \
+             channel, after which `receive()` raises too once what waited is read.",
         );
         if directive {
             text.push_str(

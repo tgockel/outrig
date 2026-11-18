@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::children_tests::{
-    Watch, after_result, data_of, exec_outputs, kind, serving, tree_watched,
+    Tree, Watch, after_result, data_of, exec_outputs, kind, serving, tree_watched,
 };
 use super::external_tests::{
     Answer, Backend, constructed, from_launch, holder, holding, inbox, openings, ready, running,
@@ -21,30 +21,35 @@ use super::external_tests::{
 use super::mock_http;
 use super::mock_http::{RecordedRequest, Responder, submit, text_reply};
 use super::root_tests::agent_of;
-use crate::harness::event::RequestEnd;
+use crate::harness::event::{AgentRequestId, RequestEnd};
 use crate::harness::{
-    AgentState, CancelledBy, ChannelBackend, ChannelDefinition, ChannelKind, Contract,
-    DeliverError, Delivered, DeliveryId, Direction, Inbound, RosterState, Settle, SettleError,
-    Settled, Settlement, Verdict, WithdrawAnswer, WithdrawEnd,
+    AgentState, CancelledBy, ChannelBackend, ChannelDefinition, ChannelKind, ChannelOperation,
+    Contract, DeliverError, Delivered, DeliveryId, Direction, Inbound, OutboundState, RosterState,
+    Settle, SettleError, Settled, Settlement, Verdict, WithdrawAnswer, WithdrawEnd,
 };
 use crate::python::testing::{Flag, py, within};
 
 /// `questions`: an inbound request channel, text both ways.
-fn questions() -> ChannelDefinition {
+pub(super) fn questions() -> ChannelDefinition {
     ChannelDefinition::new("questions")
         .kind(ChannelKind::Request(Direction::Inbound))
         .description("Questions the task's user asks.")
 }
 
 /// `asks`: an outbound request channel, text both ways.
-fn asks() -> ChannelDefinition {
+pub(super) fn asks() -> ChannelDefinition {
     ChannelDefinition::new("asks")
         .kind(ChannelKind::Request(Direction::Outbound))
         .description("Permission you ask for.")
 }
 
 /// Push request `item` of `body` from `sender` on `channel`, and the request's id.
-async fn ask(tree_channel: &crate::harness::Channel, item: &str, sender: &str, body: Value) -> u64 {
+pub(super) async fn ask(
+    tree_channel: &crate::harness::Channel,
+    item: &str,
+    sender: &str,
+    body: Value,
+) -> u64 {
     let delivered = within(tree_channel.deliver(Inbound::request(item, sender, body)))
         .await
         .expect("queued");
@@ -55,6 +60,18 @@ async fn ask(tree_channel: &crate::harness::Channel, item: &str, sender: &str, b
         panic!("{delivered:?}");
     };
     request.get()
+}
+
+/// Each outbound request outstanding on `tree`'s channel `name`, with its state, as the
+/// session's registry holds it.
+pub(super) fn outstanding(tree: &Tree, name: &str) -> Vec<(AgentRequestId, OutboundState)> {
+    tree.session
+        .channels()
+        .into_iter()
+        .filter(|channel| channel.name == name)
+        .flat_map(|channel| channel.outstanding)
+        .map(|request| (request.request, request.state))
+        .collect()
 }
 
 /// The settlement each notice the backend was given says, in order.
@@ -68,7 +85,7 @@ fn outcomes(settlements: &[Settled]) -> Vec<Settlement> {
 /// A responder for an agent's rounds, its orienting round among them: the first round runs
 /// `source`, and every later round's model call is never answered, so no round after it does
 /// anything, and nothing the first left open is warned about or cancelled before the close.
-fn once_then_silent(source: &str) -> Responder {
+pub(super) fn once_then_silent(source: &str) -> Responder {
     let serving = serving(source);
     let rounds = Arc::new(AtomicUsize::new(0));
     Arc::new(move |request: &RecordedRequest| {
@@ -548,7 +565,7 @@ async fn asked(
     assert_eq!(sent[0].kind, crate::harness::ItemKind::Request);
     let channel = tree.session.channel("asks").expect("declared");
     until("the acceptance", || {
-        channel.outstanding().first().map(|(_, state)| *state) == Some("waiting")
+        outstanding(&tree, "asks").first().map(|(_, state)| *state) == Some(OutboundState::Waiting)
     })
     .await;
     let answer = within(channel.settle(request, settle)).await;
@@ -790,18 +807,18 @@ async fn an_unanswered_withdrawal_leaves_the_request_uncertain() {
     .await;
     let root = constructed(&tree, holder(&["asks"])).await;
     let channel = tree.session.channel("asks").expect("declared");
+    let withdrawal = OutboundState::Uncertain(ChannelOperation::Withdrawal);
     until("the uncertainty", || {
-        channel
-            .outstanding()
+        outstanding(&tree, "asks")
             .iter()
-            .any(|(_, state)| *state == "uncertain")
+            .any(|(_, state)| *state == withdrawal)
     })
     .await;
     let sent = backend.sent();
     let (one, two) = (sent[0].request.expect("one"), sent[1].request.expect("two"));
     assert_eq!(
-        channel.outstanding(),
-        [(one, "uncertain"), (two, "waiting")]
+        outstanding(&tree, "asks"),
+        [(one, withdrawal), (two, OutboundState::Waiting)]
     );
     // The timed-out wait told the backend nothing about the second.
     assert!(backend.withdrawals().iter().all(|w| w.request != two));
@@ -853,7 +870,7 @@ async fn a_peer_s_close_ends_the_requests_on_its_channel() {
     tree.seen("agent.request.received", 1).await;
     let asked = tree.session.channel("asks").expect("declared");
     until("the request", || {
-        asked.outstanding().first().map(|(_, state)| *state) == Some("waiting")
+        outstanding(&tree, "asks").first().map(|(_, state)| *state) == Some(OutboundState::Waiting)
     })
     .await;
     questioned.close("peer gone");
@@ -955,10 +972,12 @@ async fn withdrawals_wait_their_turn_at_the_backend() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(backend.withdrawals().len(), 8, "the ninth waits its turn");
     until("all ten", || backend.withdrawals().len() == 10).await;
-    let channel = tree.session.channel("asks").expect("declared");
     until("every one uncertain", || {
-        let outstanding = channel.outstanding();
-        outstanding.len() == 10 && outstanding.iter().all(|(_, state)| *state == "uncertain")
+        let outstanding = outstanding(&tree, "asks");
+        outstanding.len() == 10
+            && outstanding
+                .iter()
+                .all(|(_, state)| *state == OutboundState::Uncertain(ChannelOperation::Withdrawal))
     })
     .await;
     tree.end().await;

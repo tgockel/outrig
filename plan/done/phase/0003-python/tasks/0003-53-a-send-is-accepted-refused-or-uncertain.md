@@ -66,10 +66,12 @@ outstanding, and what each round sent, and hands the backend its positions at a 
   `str` (fork 3); the owner's push may carry one. OutRig keeps each beside the item's ids, returns
   it with every later notice about the item -- `consumed`, `settled`, `withdrawn`, `resolve`,
   `positions` -- and in the registry and the events, and never parses it.
-- **Resolution by identity.** A new trait method `resolve(channel, item, operation)` answers from
-  the backend's durable record for the operation named: for a `send`, `accepted` with its reference,
-  `not accepted`, or still `uncertain`; for a `withdrawal` (`0003-52`'s `withdrawn`), `withdrawn`,
-  `replied` or `failed` with what the backend recorded, or still `uncertain`. When a `send` is
+- **Resolution by identity.** Two new trait methods answer from the backend's durable record
+  (revised on review: one per operation, each answering only what fits its question):
+  `resolve_send(query)`, for a `send`, `accepted` with its reference, `not accepted`, or still
+  `uncertain`; and `resolve_withdrawal(query)`, for a `withdrawal` (`0003-52`'s `withdrawn`),
+  `withdrawn`, `replied` or `failed` with what the backend recorded, or an error, still
+  `uncertain`. When a `send` is
   uncertain -- the backend said so, its call ran past its bound -- OutRig asks once, by the item id,
   before the agent is told: accepted makes `send` return as accepted, not accepted raises the
   not-accepted exception, and still uncertain raises the uncertain exception carrying the item id,
@@ -223,3 +225,120 @@ Each is a mock-driven test unless it says otherwise.
 - `crates/outrig/src/python/host.rs` (`posting`, `Reply::Sent`), `crates/outrig/src/agent/
   children.rs` (`counts`, `report`), `crates/outrig/src/harness/report.rs`,
   `crates/outrig/src/python/outrig/_interpreter.py` (`Endpoint.send`, `Delivery`, `_pending`).
+
+## Decisions
+
+Every fork was taken as recommended: 1 `send` returns the item's id, on the user channel too; 2
+an uncertain item is resolved by query, once by OutRig before the agent is told and again on the
+agent's asking; 3 references are `str`; 4 a public snapshot, `Session::channels()`; 5 the consumed
+notice retried until acknowledged, which `0003-51` had built already, so its acceptance tests it.
+
+- **Spellings.** Rust: `ChannelBackend::resolve_send(Query) -> SendAnswer`,
+  `ChannelBackend::resolve_withdrawal(Query) -> io::Result<WithdrawAnswer>` and
+  `ChannelBackend::positions(Positions) -> io::Result<()>`, all required, as `0003-52` made its
+  two (the trait is unreleased); `Query { channel, item, request, reference }`;
+  `ChannelOperation::{Send, Withdrawal}`, which names the uncertain operation in the snapshot and
+  the event -- not `Operation`, which `event::Operation` already names for a hosted call;
+  `Positions { channel, consumed, acknowledged, unread }`, each item an
+  `InboundItem { item, delivery, reference }`, so the watermarks carry both ids and the reference;
+  `ChannelSnapshot` and its `ReceivedRequest`, `OutstandingRequest` with an `OutboundState::
+  {Sending, Waiting, Withdrawing, Uncertain(ChannelOperation), Ending}`, `UncertainItem` and
+  `SentInRound`, in a module of their own, `harness::registry`; `ChannelDefinition::reference`,
+  the backend's reference for the channel; the report's `ChannelClose::uncertain` of
+  `UncertainAtClose`; the event `channel.item.resolved` with an `event::Resolved` answer. Python:
+  `await endpoint.resolve(id, operation="send")` on a plain or outbound request channel, an inbound
+  one raising `TypeError`, returning `outrig.Resolution(outcome, reference, reason)`. Lines:
+  `channel.resolve`, answered `channel.resolved`; `send` gains an ask id, answered `sent`.
+- **Two typed resolution methods, not one.** Planned as the deliverable had it, one
+  `resolve(Query) -> Resolution` serving both queries, whose answer enum joined a send's three
+  answers to a withdrawal's three, so a backend could answer a send's query with `Withdrawn` and
+  OutRig had to check every answer against the question at run time. Changed on review, the
+  maintainer's call: `resolve_send` answers a `SendAnswer` and `resolve_withdrawal` a
+  `WithdrawAnswer`, the types `send` and `withdrawn` already answer, so an answer that does not
+  fit its question no longer compiles, and no third answer type is public. A withdrawal's still
+  uncertain is an error, as `withdrawn`'s is; a call past its bound is uncertain either way.
+- **The ask before the agent is told holds the send's permit.** The send and its one resolution
+  run under one of the channel's eight permits: asking for a second could leave eight uncertain
+  sends each waiting for a permit another holds. `channel.item.outcome` is evented `uncertain` as
+  the send answers, before the backend is asked, and `channel.item.resolved` after; the outcome is
+  not evented again.
+- **What resolving may ask.** A plain message must be the asker's and uncertain; anything else is
+  refused with `ValueError` and the backend is not asked, so a resolved item is not asked about
+  again. An outbound request may be asked about its send unless the send is still unanswered --
+  an answer then changes only a request uncertain since its send, so `accepted` on a request
+  whose withdrawal is uncertain changes nothing, as the acceptance asks -- and about its
+  withdrawal only while that is uncertain. Resolution moves a request under the channels' lock
+  to `Ending` before its holder is told, so a second answer racing it settles nothing twice; the
+  move is told before the answer, so the handle's status has moved once `resolve` returns.
+- **Two uncertainties kept apart.** `Out::Withdrawn { answered }` became `Doubtful` (the
+  withdrawal went unanswered) and `Ending` (an end the backend gave, on its way to the holder),
+  so the registry says which query resolves a request and a not-accepted resolution reuses the
+  ending state.
+- **The per-round sends are kept for each holder's latest 16 rounds** (`ROUNDS_KEPT`, the bound
+  `RootHandle::rounds()` keeps) rather than dropped as the round's facts read them, `0003-51`'s
+  simplification, which left the registry nothing to list once a round ended. `sends_in` reads
+  without removing and prunes that holder's older rounds.
+- **The user channel's `send` waits for the host's answer**, since the host's ids and the
+  interpreter's come from separate counters; the round trip is one line each way. The answer
+  settles a future on whatever loop the send ran on (`Kernel.ask` makes its future on the
+  running loop, and `_answer_ask` settles it there; for every other ask that is the kernel's), so
+  a send from another loop still works. A progress send returns the number it already minted.
+- **Items still uncertain at the close leave the verdict as it is.** Their sender was told,
+  which is why `0003-51` kept mid-session uncertain sends out of the verdict; they are listed in
+  `ChannelClose::uncertain` with what the drain's one `resolve_send` answered. A send that answers
+  uncertain during the drain is resolved as any is, and stays in `sends`, where `uncertain` makes
+  the verdict `StoppedWithUnknown` as before. The close's resolutions start as `shutdown` closes
+  admission, beside the drain, which waits for them through the `resolving` count; one asked for
+  by the holder's code is counted the same way. Only plain messages are asked about at the
+  close: an outbound request outstanding then is withdrawn, which settles its send's doubt as
+  well.
+- **The close is a step in the channels' state.** "The close" is admission's, as for every
+  other list in the report, but the channels' lock cannot read it: the host's table, which holds
+  it, is locked before the channels' state, never after. So the table hears it as each of the
+  lifecycle's closers does -- synchronously, within `close_admission`, `shutdown`'s close, or
+  the interpreter's exit -- and in one locked step marks its state closed and moves every doubt
+  into the report's rows, as uncertain. A settlement then never reads the close: a doubt still a
+  doubt is before it, a row after. An answer to a row -- the agent's own question still running,
+  or the drain's -- settles it; once a row says accepted or not accepted, no later answer
+  changes it. The drain asks only of rows still uncertain, so an item the agent's own question
+  settled after the close is not asked again. `finish` decides by the same flag whether a send
+  that ends uncertain is a doubt or the close's send, so the two lists split at one point. The
+  drain takes the same step before it chooses what to ask, since admission has closed by then
+  but its closers may not have been told: an exit's hook still to run, or another caller's close
+  still telling them. Taking it twice changes nothing. The registry still lists a row uncertain
+  until an answer settles it. The rows are in the order the items were sent. (Review, four
+  times: the first version read the close before the lock and let the first answer to a listed
+  doubt fix its row; the second listed doubts only when the drain began; the third still read
+  the close before the lock, so an answer read open as admission closed could settle a doubt
+  after it; the fourth let a drain that began before the closers were told ask of nothing.)
+- **The snapshot lists only what the backend has not settled.** An acknowledged message drops out
+  of the lists, kept as the acknowledged watermark; an item being pushed is listed unread, as the
+  report lists it. A channel carries messages or requests, never both, so its unread items are in
+  the order of one kind's ids. Inbound requests keep their reference and when they were
+  received, which the registry lists; an ended request's notice still owed is not listed.
+- **`Channel::hand_over` is crate-private**, on the owner's handle so the cut has the channel by
+  name, and allowed dead outside the tests until `0003-65` calls it.
+- **Identities across a resume are `0003-64`'s.** Nothing here seeds the registry from a save.
+- **`/simplify`** adopted: `Table::call` split into `permit` and `bounded`, which a send, its
+  resolution and every notice share, so the bound and the drain have one wording; one `resolve`
+  body for the agent's asking and the close's, settling through `settle_by` and `settle_doubt`;
+  one `Resolution::parts` for the event and the agent's answer, `Ended::resolved` for a send's
+  answer, `Resolution::withdraw_answer` for a withdrawal's; one `Chan::messages_at` and `unread`
+  for the snapshot, the hand-over and the report; `Kernel.ask` making its future on the running
+  loop, so the user channel's `send` asks as every other ask does; the test-only
+  `Channel::outstanding` replaced by the snapshot, whose `OutboundState` keeps which operation is
+  uncertain; the renderer's two outcome handlers sharing their tail. Taken after it, as above:
+  the two typed resolution methods. Not taken: one key for the id a
+  resolution names, `item` or `request`, and one counter for `withdrawing` and `resolving`, each
+  saving a line; building the acknowledged watermark from the removed delivery record rather than
+  the notice, two small clones.
+- **Testing.** `agent/external_positions_tests.rs`, one or more per acceptance item. The
+  four-positions test checks what the model was sent as well as what the execution recorded.
+  The refusal test closes admission with `Session::closer` while the code waits at a flag, rather
+  than racing a send against shutdown.
+  The close-row races are tested by holding the agent's own resolution in the test backend:
+  released once the drain's has answered uncertain, then answering accepted; and released
+  between admission's close and the drain, answering accepted, the drain then asking nothing,
+  the registry listing the item uncertain across the close until the answer. The drain before
+  the closers are told is tested by replacing the interpreter's exit hook with one that tells
+  nobody, then having the agent's code exit after its send.

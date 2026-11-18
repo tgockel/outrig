@@ -23,12 +23,13 @@ use super::mock_http::{
 };
 use super::root_tests::agent_of;
 use crate::harness::event::ItemOutcome;
+use crate::harness::event::MessageId;
 use crate::harness::skills::DirectorySource;
 use crate::harness::{
     AgentState, ApplicationSpec, Argument, BackendFuture, ChannelBackend, ChannelDefinition,
-    ConstructSpec, Consumed, Contract, DeliverError, Delivered, DeliveryId, Facility, Inbound,
-    ItemKind, Outbound, Position, RootHandle, SendAnswer, SessionBuilder, SessionError, Settled,
-    Verdict, Wake, WithdrawAnswer, Withdrawal,
+    ChannelOperation, ConstructSpec, Consumed, Contract, DeliverError, Delivered, DeliveryId,
+    Facility, Inbound, ItemKind, Outbound, Position, Positions, Query, RootHandle, SendAnswer,
+    SessionBuilder, SessionError, Settled, Verdict, Wake, WithdrawAnswer, Withdrawal,
 };
 use crate::python::testing::{Flag, py, within};
 
@@ -94,9 +95,14 @@ pub(super) enum Answer {
     /// Accepted, once the test lets it be.
     After(Arc<tokio::sync::Notify>),
     NotAccept(&'static str),
+    /// Uncertain, the item lost before it was stored.
     Uncertain(&'static str),
-    /// Never: the call runs past its bound.
+    /// Uncertain, the item stored: its answer was what was lost.
+    UncertainKept(&'static str),
+    /// Never: the call runs past its bound, the item never stored.
     Never,
+    /// Never, the item stored before the call stalled.
+    NeverKept,
 }
 
 /// The test's far end of every channel: what it was sent and told, and how it answers.
@@ -122,6 +128,23 @@ pub(super) struct Backend {
     /// How many of its calls are running, and the most that ever ran at once.
     running: AtomicUsize,
     most: AtomicUsize,
+    /// Each item it stored, by OutRig's id, with its reference: its durable
+    /// record, which a durable backend resolves from.
+    kept: Mutex<BTreeMap<MessageId, String>>,
+    /// Whether it resolves from its record; otherwise it cannot tell.
+    durable: bool,
+    /// How each next send's resolution is answered, before its record is read.
+    resolutions: Mutex<VecDeque<SendAnswer>>,
+    /// What each next send's resolution waits for before it answers -- `None`
+    /// nothing -- and once these run out, nothing.
+    pub(super) held: Mutex<VecDeque<Option<Arc<tokio::sync::Notify>>>>,
+    /// How each next withdrawal's resolution is answered -- `None` with an
+    /// error -- and once these run out, withdrawn.
+    pub(super) withdrawal_resolutions: Mutex<VecDeque<Option<WithdrawAnswer>>>,
+    /// Each resolution it was asked for, of which operation, and each
+    /// hand-over of positions.
+    queries: Mutex<Vec<(ChannelOperation, Query)>>,
+    positions: Mutex<Vec<Positions>>,
 }
 
 /// One call of the backend's, running until it answers or is dropped.
@@ -138,6 +161,34 @@ impl Backend {
         let backend = Self::default();
         backend.answers.lock().unwrap().extend(answers);
         Arc::new(backend)
+    }
+
+    /// One answering as `answers` says that resolves what it is asked from its record of what
+    /// it stored, once `resolutions` run out.
+    pub(super) fn durable(
+        answers: impl IntoIterator<Item = Answer>,
+        resolutions: impl IntoIterator<Item = SendAnswer>,
+    ) -> Arc<Self> {
+        let backend = Self {
+            durable: true,
+            ..Self::default()
+        };
+        backend.answers.lock().unwrap().extend(answers);
+        backend.resolutions.lock().unwrap().extend(resolutions);
+        Arc::new(backend)
+    }
+
+    /// What it stored, by OutRig's id.
+    pub(super) fn kept(&self) -> Vec<MessageId> {
+        self.kept.lock().unwrap().keys().copied().collect()
+    }
+
+    pub(super) fn queries(&self) -> Vec<(ChannelOperation, Query)> {
+        self.queries.lock().unwrap().clone()
+    }
+
+    pub(super) fn positions(&self) -> Vec<Positions> {
+        self.positions.lock().unwrap().clone()
     }
 
     pub(super) fn sent(&self) -> Vec<Outbound> {
@@ -178,13 +229,22 @@ impl Backend {
 impl ChannelBackend for Backend {
     fn send(&self, item: Outbound) -> BackendFuture<'_, SendAnswer> {
         let running = self.run();
-        self.sent.lock().unwrap().push(item);
         let answer = self
             .answers
             .lock()
             .unwrap()
             .pop_front()
             .unwrap_or(Answer::Accept);
+        if matches!(
+            answer,
+            Answer::Accept | Answer::After(_) | Answer::UncertainKept(_) | Answer::NeverKept
+        ) {
+            self.kept
+                .lock()
+                .unwrap()
+                .insert(item.item, format!("ref-{}", item.item));
+        }
+        self.sent.lock().unwrap().push(item);
         Box::pin(async move {
             let _running = running;
             match answer {
@@ -200,11 +260,70 @@ impl ChannelBackend for Backend {
                 Answer::NotAccept(reason) => SendAnswer::NotAccepted {
                     reason: reason.to_string(),
                 },
-                Answer::Uncertain(reason) => SendAnswer::Uncertain {
-                    reason: reason.to_string(),
-                },
-                Answer::Never => std::future::pending().await,
+                Answer::Uncertain(reason) | Answer::UncertainKept(reason) => {
+                    SendAnswer::Uncertain {
+                        reason: reason.to_string(),
+                    }
+                }
+                Answer::Never | Answer::NeverKept => std::future::pending().await,
             }
+        })
+    }
+
+    fn resolve_send(&self, query: Query) -> BackendFuture<'_, SendAnswer> {
+        let running = self.run();
+        let scripted = self.resolutions.lock().unwrap().pop_front();
+        let held = self.held.lock().unwrap().pop_front().flatten();
+        let kept = self.kept.lock().unwrap().get(&query.item).cloned();
+        let durable = self.durable;
+        self.queries
+            .lock()
+            .unwrap()
+            .push((ChannelOperation::Send, query));
+        Box::pin(async move {
+            let _running = running;
+            if let Some(held) = held {
+                held.notified().await;
+            }
+            match (scripted, kept) {
+                (Some(scripted), _) => scripted,
+                (None, _) if !durable => SendAnswer::Uncertain {
+                    reason: "it keeps no record".to_string(),
+                },
+                (None, Some(reference)) => SendAnswer::Accepted {
+                    reference: Some(reference),
+                },
+                (None, None) => SendAnswer::NotAccepted {
+                    reason: "it never stored the item".to_string(),
+                },
+            }
+        })
+    }
+
+    fn resolve_withdrawal(&self, query: Query) -> BackendFuture<'_, io::Result<WithdrawAnswer>> {
+        let running = self.run();
+        let scripted = self
+            .withdrawal_resolutions
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Some(WithdrawAnswer::Withdrawn));
+        self.queries
+            .lock()
+            .unwrap()
+            .push((ChannelOperation::Withdrawal, query));
+        Box::pin(async move {
+            let _running = running;
+            scripted.ok_or_else(|| io::Error::other("the store is unreachable"))
+        })
+    }
+
+    fn positions(&self, positions: Positions) -> BackendFuture<'_, io::Result<()>> {
+        let running = self.run();
+        self.positions.lock().unwrap().push(positions);
+        Box::pin(async move {
+            let _running = running;
+            Ok(())
         })
     }
 
@@ -564,11 +683,11 @@ async fn a_repeat_is_answered_and_queues_nothing() {
     assert_eq!(data_of(&events, "message.sent", &subject).len(), 1);
 }
 
-/// A send reaches the backend with the item's id and returns once it is accepted; one the
-/// backend did not take raises saying a retry is safe; one it cannot vouch for, or that runs
-/// past its bound, raises with the item's id; one outside the contract or past the size limit
-/// raises before anything reaches the backend. Each outcome is evented, and the round's facts
-/// list what it sent.
+/// A send reaches the backend with the item's id and returns that id once it is accepted; one
+/// the backend did not take raises saying a retry is safe; one it cannot vouch for, or that runs
+/// past its bound, raises with the item's id once the backend, asked, cannot tell either; one
+/// outside the contract or past the size limit raises before anything reaches the backend. Each
+/// outcome is evented, and the round's facts list what it sent.
 #[tokio::test]
 async fn a_send_uses_the_backend_and_its_answers_are_told_apart() {
     let backend = Backend::answering([
@@ -581,7 +700,7 @@ async fn a_send_uses_the_backend_and_its_answers_are_told_apart() {
     let code = "import outrig\nch = runtime.channels['inbox']\nd = await ch.receive()\n\
                 print(await ch.send('hi'))\n\
                 try:\n    await ch.send('no')\nexcept outrig.SendNotAccepted as e:\n    print('not', 'safe' in str(e), e.reason)\n\
-                try:\n    await ch.send('maybe')\nexcept outrig.SendUncertain as e:\n    print('uncertain', type(e.item).__name__, e.reason)\n\
+                try:\n    await ch.send('maybe')\nexcept outrig.SendUncertain as e:\n    print('uncertain', type(e.item).__name__, e.reason.split(';')[0])\n\
                 try:\n    await ch.send('never')\nexcept outrig.SendUncertain as e:\n    print('late', 'within' in e.reason)\n\
                 try:\n    await ch.send(1)\nexcept TypeError as e:\n    print('type')\n\
                 try:\n    await ch.send('x' * (1 << 20))\nexcept ValueError as e:\n    print('value')";
@@ -632,9 +751,11 @@ async fn a_send_uses_the_backend_and_its_answers_are_told_apart() {
     assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
     assert_eq!(
         exec_outputs(&events, &subject),
-        [
-            "None\nnot True no room in the thread\nuncertain int the store timed out\nlate True\ntype\nvalue\n"
-        ]
+        [format!(
+            "{}\nnot True no room in the thread\nuncertain int the store timed out\nlate True\n\
+             type\nvalue\n",
+            items[0].get()
+        )]
     );
     let outcomes: Vec<Value> = data_of(&events, "channel.item.outcome", &subject)
         .into_iter()
@@ -756,7 +877,8 @@ async fn the_seventeenth_unanswered_send_waits() {
     let (report, events, _) = tree.end().await;
     assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
     let outputs = exec_outputs(&events, &subject);
-    assert!(outputs[0].contains("'NoneType'"), "{outputs:?}");
+    // The seventeenth was taken, and its send returned the id it was given.
+    assert!(outputs[0].contains("'int'"), "{outputs:?}");
     assert_eq!(
         outputs[0].matches("SendUncertain").count(),
         16,
@@ -1660,8 +1782,9 @@ async fn a_released_holders_sends_leave_the_next_holder_room() {
     let second = ready(&tree, holder(&["inbox"])).await;
     let next = format!("agent/{}", agent_of(&second));
     let (_, events, _) = tree.end().await;
-    assert_eq!(exec_outputs(&events, &next), ["None\n"]);
     let sent = backend.sent();
+    let hi = sent.last().expect("the second holder's send").item;
+    assert_eq!(exec_outputs(&events, &next), [format!("{}\n", hi.get())]);
     assert_eq!(
         sent.len(),
         9,
