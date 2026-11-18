@@ -119,6 +119,8 @@ pub(crate) struct Inner {
     lifecycle: Arc<Lifecycle>,
     settings: Settings,
     state: Mutex<State>,
+    /// Wakes the owner-driven primary when a request end is heard.
+    primary_ended: Notify,
     /// Where what the program on the host that owns the session hears goes,
     /// while it listens.
     owner: Mutex<Option<mpsc::UnboundedSender<Value>>>,
@@ -393,6 +395,7 @@ impl Children {
             lifecycle: Arc::clone(&lifecycle),
             settings,
             state: Mutex::default(),
+            primary_ended: Notify::new(),
             owner: Mutex::default(),
             owner_tasks: Mutex::default(),
             telling: Mutex::default(),
@@ -417,6 +420,11 @@ impl Children {
             }
         }));
         Self(inner)
+    }
+
+    /// A weak reference for the owner-driven primary's request policy.
+    pub(crate) fn registry(&self) -> Registry {
+        Arc::downgrade(&self.0)
     }
 
     /// What the session's channels are lent of this registry: how to wake an agent's runner, as
@@ -1853,6 +1861,14 @@ impl Inner {
             rounds,
             cause: line["cause"].as_str().map(str::to_string),
         });
+        if child == crate::python::host::PRIMARY {
+            self.primary_ended.notify_one();
+        }
+    }
+
+    /// Wait for a request end, with the runner's retry bound supplied by its caller.
+    pub(crate) async fn primary_ended(&self) {
+        self.primary_ended.notified().await;
     }
 
     fn refused(&self, line: &Value) {
@@ -1946,7 +1962,26 @@ impl Inner {
                     })
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                // A harness-built primary has no ChildNode to count deliveries in.
+                // Its external requests have the same records, retained after their ends.
+                let mut channels = Counted::new();
+                for record in state
+                    .requests
+                    .values()
+                    .filter(|record| record.child == child)
+                {
+                    if let Some(channel) = &record.channel {
+                        let counts = channels.entry(channel.clone()).or_insert(Counts {
+                            pending: 0,
+                            delivered: 0,
+                            requests: true,
+                        });
+                        counts.delivered += 1;
+                    }
+                }
+                channels
+            });
         for record in state
             .requests
             .values()

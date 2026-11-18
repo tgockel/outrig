@@ -12,14 +12,14 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::children_tests::{
-    Watch, after_result, data_of, exec_outputs, kind, opening, primary_runs, serving, tree_watched,
+    Watch, after_result, data_of, exec_outputs, kind, serving, tree_watched,
 };
 use super::external_tests::{
     Answer, Backend, constructed, from_launch, holder, holding, inbox, openings, ready, running,
     until,
 };
 use super::mock_http;
-use super::mock_http::{RecordedRequest, Responder, submit, system_text, text_reply};
+use super::mock_http::{RecordedRequest, Responder, submit, text_reply};
 use super::root_tests::agent_of;
 use crate::harness::event::RequestEnd;
 use crate::harness::{
@@ -1058,23 +1058,97 @@ async fn the_bound_counts_requests_unsettled() {
     tree.end().await;
 }
 
-/// A primary the harness builds and the owner drives through `Session::round` is announced the
-/// request, which its rounds leave open with nothing cancelled; it is listed open until the close,
-/// which ends it `closed`, as its backend hears.
+/// Owner-driven primaries obey the same rule as runner-driven holders. Taking the request
+/// earns a nudge before the warning; leaving it unread earns just the arrival and warning.
 #[tokio::test]
-async fn a_harness_built_primary_is_announced_its_requests() {
+async fn a_harness_built_primary_warns_then_cancels_its_requests() {
+    for taken in [false, true] {
+        let backend = Arc::new(Backend::default());
+        let given: Arc<dyn ChannelBackend> = backend.clone();
+        let first = if taken {
+            "d = await runtime.channels['questions'].receive()\nprint(d.body)"
+        } else {
+            "pass"
+        };
+        let mock = mock_http::routed(vec![("", from_launch(&[first, "pass"]))], None).await;
+        let mut tree = tree_watched(
+            if taken {
+                "OUTRIG_TEST_PRIMARY_TAKEN_KEY"
+            } else {
+                "OUTRIG_TEST_PRIMARY_UNREAD_KEY"
+            },
+            "",
+            mock,
+            Watch::Gathered,
+            |builder| builder.channel(questions(), given),
+        )
+        .await;
+        let channel = tree.session.channel("questions").expect("declared");
+        assert_eq!(channel.holder().as_deref(), Some("primary"));
+        let request = ask(&channel, "q-1", "bob", json!("for the primary")).await;
+        let rounds = if taken { 3 } else { 2 };
+        for _ in 0..rounds {
+            assert!(matches!(
+                within(tree.session.round()).await.expect("a round"),
+                crate::harness::RoundOutcome::Ended(_)
+            ));
+        }
+        // No model call is spent cancelling after the warning. The end is heard before
+        // NothingNew, and remains terminal when the owner asks again or closes.
+        for _ in 0..2 {
+            assert!(matches!(
+                within(tree.session.round()).await.expect("idle"),
+                crate::harness::RoundOutcome::NothingNew
+            ));
+        }
+        tree.seen("channel.settled", 1).await;
+        let (_, events, requests) = tree.end().await;
+        let opened = openings(&requests, "");
+        assert_eq!(opened.len(), rounds, "{opened:#?}");
+        assert!(opened[0].contains("1 request is waiting on runtime.channels[\"questions\"]"));
+        assert!(opened[rounds - 1].contains("your last round ended with requests unanswered"));
+        if taken {
+            assert!(opened[1].contains(&format!(
+                "you took request {request} from runtime.channels[\"questions\"]"
+            )));
+            assert_eq!(
+                exec_outputs(&events, "agent/primary"),
+                ["for the primary\n", "", ""]
+            );
+        }
+        let settlements = backend.settlements();
+        assert_eq!(settlements.len(), 1, "{settlements:?}");
+        assert!(matches!(&settlements[0].outcome,
+            Settlement::Cancelled { by: CancelledBy::Host, reason }
+                if reason.contains(if taken { "without answering it" } else { "without reading it" })));
+        let cancelled = data_of(&events, "agent.request.cancelled", "agent/primary");
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0]["request"], request);
+        assert_eq!(cancelled[0]["by"], "host");
+    }
+}
+
+/// A warning is a real opportunity to answer, not an unconditional deferred cancel. A later
+/// request starts with a fresh arrival, not the previous request's warning.
+#[tokio::test]
+async fn a_harness_built_primary_can_reply_in_the_warning_round() {
     let backend = Arc::new(Backend::default());
     let given: Arc<dyn ChannelBackend> = backend.clone();
     let mock = mock_http::routed(
         vec![(
             "",
-            primary_runs("d = await runtime.channels['questions'].receive()\nprint(d.body)"),
+            from_launch(&[
+                "d = await runtime.channels['questions'].receive()",
+                "pass",
+                "await d.reply('4')",
+                "d = await runtime.channels['questions'].receive()\nawait d.fail('no')",
+            ]),
         )],
         None,
     )
     .await;
     let mut tree = tree_watched(
-        "OUTRIG_TEST_REQUEST_PRIMARY_KEY",
+        "OUTRIG_TEST_PRIMARY_WARNING_REPLY_KEY",
         "",
         mock,
         Watch::Gathered,
@@ -1082,33 +1156,108 @@ async fn a_harness_built_primary_is_announced_its_requests() {
     )
     .await;
     let channel = tree.session.channel("questions").expect("declared");
-    assert_eq!(channel.holder().as_deref(), Some("primary"));
-    let request = ask(&channel, "q-1", "bob", json!("for the primary")).await;
-    within(tree.session.round()).await.expect("a round");
-    within(tree.session.round()).await.expect("nothing new");
-    let (report, events, requests) = tree.end().await;
-    assert_eq!(
-        exec_outputs(&events, "agent/primary"),
-        ["for the primary\n"]
-    );
-    assert!(
-        opening(&requests[0]).contains("1 request is waiting on runtime.channels[\"questions\"]"),
-        "{}",
-        opening(&requests[0])
-    );
-    assert!(
-        system_text(&requests[0].body)
-            .contains("`runtime.channels[\"questions\"]`, an inbound request channel")
-    );
+    ask(&channel, "q-1", "bob", json!("2+2?")).await;
+    for _ in 0..3 {
+        within(tree.session.round()).await.expect("a round");
+    }
+    assert!(matches!(
+        within(tree.session.round()).await.expect("idle"),
+        crate::harness::RoundOutcome::NothingNew
+    ));
+    ask(&channel, "q-2", "bob", json!("another")).await;
+    within(tree.session.round()).await.expect("a fresh round");
+    tree.seen("channel.settled", 2).await;
+    let (_, events, requests) = tree.end().await;
+    let opened = openings(&requests, "");
+    assert_eq!(opened.len(), 4);
+    assert!(!opened[3].contains("your last round ended with requests unanswered"));
     assert!(kind(&events, "agent.request.cancelled", None).is_empty());
-    let open: Vec<_> = report
-        .requests
-        .iter()
-        .filter(|outcome| outcome.request.get() == request)
-        .collect();
-    assert_eq!(open.len(), 1, "{:?}", report.requests);
-    assert_eq!(open[0].outcome, RequestEnd::Closed);
-    assert_eq!(outcomes(&backend.settlements()), [Settlement::Closed]);
+    assert_eq!(
+        outcomes(&backend.settlements()),
+        [
+            Settlement::Replied(json!("4")),
+            Settlement::Failed("no".into())
+        ]
+    );
+}
+
+/// A failed or abandoned warning is not a warning the model has necessarily read. The owner
+/// may retry it, and a plain channel's unread item never joins the requests being cancelled.
+#[tokio::test]
+async fn a_harness_built_primary_does_not_spend_a_failed_or_dropped_warning() {
+    let backend = Arc::new(Backend::default());
+    let given: Arc<dyn ChannelBackend> = backend.clone();
+    let plain: Arc<dyn ChannelBackend> = Arc::new(Backend::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(tokio::sync::Notify::new());
+    let responder: Responder = {
+        let calls = calls.clone();
+        let seen = seen.clone();
+        Arc::new(move |_| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            let seen = seen.clone();
+            Box::pin(async move {
+                match call {
+                    1 => mock_http::failure(400),
+                    2 => {
+                        seen.notify_one();
+                        std::future::pending().await
+                    }
+                    _ => text_reply("ended"),
+                }
+            })
+        })
+    };
+    let mock = mock_http::routed(vec![("", responder)], None).await;
+    let mut tree = tree_watched(
+        "OUTRIG_TEST_PRIMARY_FAILED_WARNING_KEY",
+        "",
+        mock,
+        Watch::Gathered,
+        |builder| builder.channel(questions(), given).channel(inbox(), plain),
+    )
+    .await;
+    let channel = tree.session.channel("questions").expect("declared");
+    let messages = tree.session.channel("inbox").expect("declared");
+    ask(&channel, "q-1", "bob", json!("question")).await;
+    within(messages.deliver(Inbound::message("m-1", "alice", json!("plain"))))
+        .await
+        .expect("queued");
+    within(tree.session.round()).await.expect("arrival");
+    within(tree.session.round())
+        .await
+        .expect_err("the first warning failed");
+    {
+        let abandoned = tree.session.round();
+        tokio::pin!(abandoned);
+        tokio::select! {
+            _ = within(seen.notified()) => {},
+            _ = &mut abandoned => panic!("the second warning should be held at the provider"),
+        }
+    }
+    assert!(backend.settlements().is_empty());
+    within(tree.session.round()).await.expect("warning again");
+    assert!(matches!(
+        within(tree.session.round()).await.expect("cancel and idle"),
+        crate::harness::RoundOutcome::NothingNew
+    ));
+    tree.seen("channel.settled", 1).await;
+    let (_, events, requests) = tree.end().await;
+    let opened = openings(&requests, "");
+    assert_eq!(opened.len(), 4, "{opened:#?}");
+    for warning in &opened[1..] {
+        assert!(
+            warning.contains("your last round ended with requests unanswered"),
+            "{warning}"
+        );
+        assert!(warning.contains("runtime.channels[\"questions\"]"));
+    }
+    assert_eq!(
+        data_of(&events, "agent.request.cancelled", "agent/primary").len(),
+        1
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(backend.settlements().len(), 1);
 }
 
 /// At the close, an inbound request unread and one received and unanswered end `closed`, which

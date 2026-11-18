@@ -19,6 +19,11 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **Inbound request liveness on an owner-driven primary.** `Session::round` now nudges and warns
+  about inbound external requests left unanswered, then host-cancels requests unchanged by the
+  warning round and notifies their backends. Owners drive the rule by calling until `NothingNew`;
+  failed or dropped rounds do not spend a warning, and plain messages remain exempt. (#772)
+
 - **A request crosses an external channel.** `ChannelDefinition::kind(ChannelKind::Request(
   Direction::Inbound | Direction::Outbound))` declares a request channel, each request owing one
   reply. Inbound, the owner pushes `Inbound::request(item, sender, body)`, answered

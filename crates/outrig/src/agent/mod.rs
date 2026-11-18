@@ -32,6 +32,7 @@ mod history;
 mod instructions;
 pub(crate) mod ledger;
 pub(crate) mod orientation;
+mod primary;
 pub(crate) mod request_limit;
 mod resolve;
 mod retry;
@@ -108,9 +109,16 @@ pub(crate) struct Agent {
     /// For a child, whether it has nothing left for a round to do, which
     /// ends the round before its next model call.
     quiet: Option<Quiet>,
+    /// Liveness of inbound requests on an owner-driven primary.
+    requests: Option<primary::Requests>,
 }
 
 impl Agent {
+    /// Apply request liveness to this owner-driven primary.
+    pub(crate) fn watch_requests(&mut self, registry: children::Registry) {
+        self.requests = Some(primary::Requests::new(registry));
+    }
+
     /// The session's model calls and attempts.
     #[cfg(test)]
     pub(crate) fn ledger(&self) -> &ledger::Ledger {
@@ -194,19 +202,23 @@ impl Agent {
         ended
     }
 
-    /// Drive one round, if anything was sent on the user channel since the
-    /// model was last told what waits there; `None`, without calling the
-    /// model, when nothing was. See [`crate::harness::Session::round`]. With
-    /// it, the tasks the agent's code left running when it ended, or `None`
+    /// Drive one round for new messages or open inbound requests; `None`,
+    /// without calling the model, when nothing needs a round. See
+    /// [`crate::harness::Session::round`]. With it, the tasks the agent's code
+    /// left running when it ended, or `None`
     /// when the interpreter could not say.
     ///
     /// At the agent's model-request limit no round opens: the limit's stop is
     /// the outcome, nothing is sent, and what waits is announced again once
     /// the limit is lifted.
     pub(crate) async fn round(&mut self) -> Result<Option<(Finished, Option<Tasks>)>, AgentError> {
-        let Some(announcement) = self.announcer.opening().await? else {
-            return Ok(None);
+        let (announcement, request_opening) = match &mut self.requests {
+            Some(requests) => (None, requests.opening(&self.announcer).await?),
+            None => (self.announcer.opening().await?, None),
         };
+        if announcement.is_none() && request_opening.is_none() {
+            return Ok(None);
+        }
         // Before the session moves to a round running, since none opens.
         let latest = Some(self.history.round()).filter(|round| *round > 0);
         if let Some(reached) = self.slot().reached(latest, &[]) {
@@ -227,8 +239,14 @@ impl Agent {
             .map_err(|by| AgentError::Closed(by.into()))?;
         let finished = self
             .run_round(
-                |omitted, notices| {
-                    orientation::told(orientation::opening(&announcement, omitted), notices)
+                |omitted, notices| match &request_opening {
+                    Some(opening) => {
+                        orientation::child_opening(&opening.lead, &opening.detail, omitted, notices)
+                    }
+                    None => orientation::told(
+                        orientation::opening(announcement.as_deref().unwrap_or_default(), omitted),
+                        notices,
+                    ),
                 },
                 None,
             )
@@ -239,6 +257,9 @@ impl Agent {
         // Only now: a round that failed or was dropped may have left the
         // model unaware of what it announced, and the next one says it again.
         self.announcer.keep();
+        if let (Some(requests), Some(opening)) = (&mut self.requests, request_opening) {
+            requests.ended(opening);
+        }
         // The model has yielded; what its code left running has not.
         drop(running);
         Ok(Some((finished, self.tasks().await)))
@@ -392,6 +413,7 @@ impl Agent {
             interpreter,
             lifecycle,
             quiet,
+            requests: None,
         })
     }
 }

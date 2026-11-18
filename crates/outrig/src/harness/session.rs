@@ -196,7 +196,7 @@ impl Session {
         // After the kernel is open, so a start that fails before it asks
         // nothing; the session goes on whatever the provider says.
         self.children.windows().fill(&mut resolved.candidates).await;
-        let agent = Agent::build(
+        let mut agent = Agent::build(
             resolved,
             self.interpreter.clone(),
             &self.container_name,
@@ -215,6 +215,7 @@ impl Session {
         .await?;
         self.children
             .root(PRIMARY, 1, &resolved.model, agent.slot().clone());
+        agent.watch_requests(self.children.registry());
         self.agent = Some(agent);
         Ok(())
     }
@@ -562,11 +563,23 @@ impl Session {
         self.children.clone()
     }
 
-    /// Drive one round, if anything was sent on the user channel since the
-    /// model was last told what waits there: the model, told how many messages
-    /// wait -- never what they say -- and whatever Python it submits, then its
-    /// reply. [`RoundOutcome::NothingNew`], without calling the model, when
-    /// nothing new arrived or the agent's code has already read what did.
+    /// Drive one round for newly arrived messages or outstanding inbound
+    /// external requests: the model, told how many items wait -- never what
+    /// they say -- and whatever Python it submits, then its reply.
+    /// [`RoundOutcome::NothingNew`], without calling the model, when no
+    /// unannounced message or open request needs a round.
+    ///
+    /// Inbound requests follow the runner's warning-then-cancel rule: a request
+    /// taken and left unanswered earns a round naming it, and an unchanged
+    /// set of open requests earns a warning round. On the next call, requests
+    /// unchanged by that warning are host-cancelled, their ends heard before
+    /// another round opens, and their backends notified. A reply in the warning
+    /// round stands. Plain messages (including `user`) are never cancelled.
+    /// Failed or dropped rounds do not advance the warning. Cancellation ends
+    /// the request, not the agent's execution.
+    ///
+    /// The owner must keep calling until `NothingNew` to drive this rule; no
+    /// background task opens rounds or enforces it while the owner is away.
     ///
     /// A message arriving while the round runs is announced in the next result
     /// the model reads, and ends a `runtime.wait` the round's code is in: that
@@ -873,8 +886,9 @@ impl Closer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RoundOutcome {
-    /// Nothing new had arrived on the user channel, so the model was not
-    /// called.
+    /// No unannounced message or open inbound request needed a round, so
+    /// the model was not called. Requests unchanged after their warning may
+    /// have been cancelled by this call.
     NothingNew,
     /// The round ran, and ended.
     Ended(RoundEnd),

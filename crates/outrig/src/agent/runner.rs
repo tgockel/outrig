@@ -115,7 +115,7 @@ const RETRY_MAX: Duration = Duration::from_secs(60);
 /// How long an end the runner sent may go unheard before it is sent again.
 /// Out of memory, the interpreter can lose the settle, or its notice of the
 /// end it made, which it sends again when settled again.
-const SETTLE_WAIT: Duration = Duration::from_secs(1);
+pub(super) const SETTLE_WAIT: Duration = Duration::from_secs(1);
 /// How many rounds in a row may fail before their code ran. A round is opened
 /// again with what it opened with, so the model is sent the same request each
 /// time, and one that refuses it refuses it again.

@@ -560,9 +560,13 @@ untouched. Two things it does not cover, each on purpose:
 
 A primary the harness builds for `run-new` is not runner-driven: the CLI drives its rounds with
 `Session::round`, and it declares no external channel today. An inbound request channel on such a
-primary, should a Rust embedder that drives `Session::round` declare one, is announced and listed
-in the registry, and that owner is its policy; the warning-then-cancel does not run there, and
-`0003-52` says so. It is the one holder the rule does not reach.
+primary, should a Rust embedder that drives `Session::round` declare one, follows the same
+warning-then-cancel rule through that method (#772). The owner keeps calling until `NothingNew`:
+a taken request earns a nudge, an unchanged set earns a warning, and the next call cancels what
+that warning left unchanged. The host waits to hear those ends before opening another round;
+the backend hears each cancellation through `settled`. Failed or dropped rounds do not advance
+the warning. Plain messages, including `user`, remain exempt. No background runner enforces the
+rule while the owner is not calling `round`. This supersedes `0003-52`'s fork 4 limitation.
 
 ## Positions, the registry and the close
 
