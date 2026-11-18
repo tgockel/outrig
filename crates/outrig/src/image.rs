@@ -623,6 +623,43 @@ pub async fn refuse_session_dir_in_build_context(
     session_dir: &Path,
     session_dir_logical: &Path,
 ) -> Result<()> {
+    refuse_session_path_in_build_context(
+        image,
+        cfg,
+        repo_root,
+        session_dir,
+        session_dir_logical,
+        true,
+    )
+    .await
+}
+
+/// Refuse a fresh session's registry symlink inside an unignored build context.
+///
+/// Like [`refuse_session_dir_in_build_context`], but probes a file-shaped entry:
+/// directory-only ignore rules for the final component do not exclude a symlink.
+/// `entry_logical` must resolve the entry's parent, not follow an existing entry
+/// to its target. Missing parents are temporarily created to query their owning
+/// repository's ignore rules and removed even if the future is canceled.
+/// Call before [`compute_tag_for`] and before creating the session record.
+pub async fn refuse_session_registry_entry_in_build_context(
+    image: &str,
+    cfg: &ImageConfig,
+    repo_root: &Path,
+    entry: &Path,
+    entry_logical: &Path,
+) -> Result<()> {
+    refuse_session_path_in_build_context(image, cfg, repo_root, entry, entry_logical, false).await
+}
+
+async fn refuse_session_path_in_build_context(
+    image: &str,
+    cfg: &ImageConfig,
+    repo_root: &Path,
+    session_path: &Path,
+    session_path_logical: &Path,
+    directory: bool,
+) -> Result<()> {
     let ImageSourceRef::Build { .. } = cfg.source() else {
         return Ok(());
     };
@@ -630,18 +667,33 @@ pub async fn refuse_session_dir_in_build_context(
     let Ok(context_canon) = tokio::fs::canonicalize(&context).await else {
         return Ok(());
     };
-    if session_dir_logical != context_canon && !session_dir_logical.starts_with(&context_canon) {
+    if session_path_logical != context_canon && !session_path_logical.starts_with(&context_canon) {
         return Ok(());
     }
     // The context root itself: nothing excludes a context from its own
     // build, so there is no rule to even ask about.
-    if session_dir_logical != context_canon && directory_is_ignored(session_dir_logical).await? {
+    let ignored = if session_path_logical == context_canon {
+        false
+    } else if directory {
+        directory_is_ignored(session_path_logical).await?
+    } else {
+        registry_entry_is_ignored(session_path_logical).await?
+    };
+    if ignored {
         return Ok(());
     }
-    Err(OutrigError::SessionDirInBuildContext {
-        image: image.to_string(),
-        dir: session_dir.to_path_buf(),
-        context,
+    Err(if directory {
+        OutrigError::SessionDirInBuildContext {
+            image: image.to_string(),
+            dir: session_path.to_path_buf(),
+            context,
+        }
+    } else {
+        OutrigError::SessionRegistryEntryInBuildContext {
+            image: image.to_string(),
+            entry: session_path.to_path_buf(),
+            context,
+        }
     })
 }
 
@@ -680,6 +732,25 @@ async fn directory_is_ignored(dir: &Path) -> Result<bool> {
         None
     };
     check_ignore_at(dir).await
+}
+
+// Only the parent needs to exist: creating the leaf as a directory would
+// wrongly let a directory-only ignore rule hide the future registry symlink.
+async fn registry_entry_is_ignored(entry: &Path) -> Result<bool> {
+    let Some(parent) = entry.parent() else {
+        return Ok(false);
+    };
+    let boundary = deepest_existing_ancestor(parent);
+    let _guard = if boundary != parent {
+        std::fs::create_dir_all(parent).path_ctx("create directory", parent)?;
+        Some(CreatedDirGuard {
+            dir: parent.to_path_buf(),
+            boundary,
+        })
+    } else {
+        None
+    };
+    check_ignore_at(entry).await
 }
 
 /// `dir` itself, or the nearest ancestor already on disk. Always returns
@@ -757,9 +828,9 @@ impl Drop for CreatedDirGuard {
 ///   if any is on, this call's own `./` included. Pinned off here so this
 ///   probe's own answer does not depend on what the caller's shell exported.
 ///
-/// `dir` must already exist for any of this to work: unlike its parent, a
-/// directory-only rule (`/sessions/`) cannot be told a path that is not
-/// there would have been one. See [`directory_is_ignored`].
+/// The parent must exist. A directory-shaped leaf must also exist so a
+/// directory-only rule (`/sessions/`) can match it; a future file or symlink
+/// leaf need not. See [`directory_is_ignored`] and [`registry_entry_is_ignored`].
 async fn check_ignore_at(dir: &Path) -> Result<bool> {
     let Some(cmd) = check_ignore_cmd(dir) else {
         return Ok(false);

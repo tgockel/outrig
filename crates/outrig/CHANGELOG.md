@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Registry-entry build-context errors now advise moving `--session-root` or ignoring
+  its file-shaped entries, rather than suggesting the ineffective `--session-dir` remedy. (#919)
+
+- The session build-context guard now supports file-shaped registry entries,
+  without treating directory-only ignore rules as excluding symlinks. (#919)
+
 - **Canceled builds retain their cleanup retries after the CLI exits.** The detached
   working-container and temporary-tag removals retry in order in their own process,
   with bounded per-removal budgets and no backoff for an already absent target.

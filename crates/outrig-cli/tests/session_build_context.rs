@@ -1,0 +1,105 @@
+//! #919: an external explicit session still writes a registry symlink under
+//! the root. Refuse that write before creating a record or starting a build.
+
+mod common;
+
+use common::{GLOBAL_WITH_MODEL, run_outrig, utf8};
+
+#[tokio::test]
+async fn external_session_checks_the_registry_entry_before_creation() {
+    for (git, ignore, external_root, linked_root, collision) in [
+        (false, "", false, false, true),
+        (true, "", false, false, true),
+        (true, "/roots/*/\n", false, false, true),
+        (true, "", false, true, true),
+        (true, "/roots/*\n", false, false, false),
+        (true, "/roots/\n", false, false, false),
+        (false, "", true, false, false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let agents = repo.join(".agents/outrig");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("config.toml"),
+            "default-image = \"tool\"\n[images.tool]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n"
+        ).unwrap();
+        std::fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), ignore).unwrap();
+        if git {
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(&repo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let global = tmp.path().join("global.toml");
+        std::fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+        let explicit = tmp.path().join("external-session");
+        let actual_root = if external_root {
+            tmp.path().join("roots")
+        } else {
+            repo.join("roots")
+        };
+        let root = if linked_root {
+            std::fs::create_dir(&actual_root).unwrap();
+            let link = tmp.path().join("root-link");
+            std::os::unix::fs::symlink(&actual_root, &link).unwrap();
+            link
+        } else {
+            actual_root.clone()
+        };
+        let (ok, stderr) = run_outrig(
+            &repo,
+            &[
+                "--global-config",
+                utf8(&global),
+                "--session-root",
+                utf8(&root),
+                "run",
+                "--session-dir",
+                utf8(&explicit),
+            ],
+        )
+        .await;
+        assert!(!ok, "the stub runtime stops an allowed run too: {stderr}");
+        assert_eq!(
+            stderr.contains("inside the build context"),
+            collision,
+            "{stderr}"
+        );
+        if collision {
+            assert!(stderr.contains("session registry entry"), "{stderr}");
+            assert!(stderr.contains("pass --session-root outside"), "{stderr}");
+            assert!(
+                stderr.contains("file-shaped entries in .gitignore"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("--session-dir"), "{stderr}");
+            assert!(stderr.contains(&format!("{}/", root.display())), "{stderr}");
+            assert!(!stderr.contains("computing image tag"), "{stderr}");
+            if linked_root {
+                assert_eq!(std::fs::read_dir(&actual_root).unwrap().count(), 0);
+            } else {
+                assert!(
+                    !root.exists(),
+                    "no registry entry or probe parent left behind"
+                );
+            }
+            assert!(
+                !explicit.exists(),
+                "refuse before creating the session record"
+            );
+        } else {
+            assert!(explicit.join("session.json").exists(), "{stderr}");
+            let entries = std::fs::read_dir(&root)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert!(entries[0].path().is_symlink());
+        }
+    }
+}

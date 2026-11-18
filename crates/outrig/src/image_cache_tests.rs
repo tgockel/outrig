@@ -2122,3 +2122,106 @@ async fn check_ignore_cmd_still_answers_under_an_inherited_pathspec_mode() {
         );
     }
 }
+
+/// #919: the registry entry is a symlink, not a directory, even though its
+/// target holds the session. Probe missing parents without leaving them behind.
+#[tokio::test]
+async fn refuse_session_registry_entry_obeys_file_shaped_ignore_rules() {
+    for (rule, allowed) in [
+        ("", false),
+        ("/roots/\n", true),
+        ("/roots/*\n", true),
+        ("/roots/*/\n", false),
+    ] {
+        let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n"), (".gitignore", rule)]);
+        git_init(ctx.path());
+        let root = std::fs::canonicalize(ctx.path()).unwrap();
+        let entry = root.join("roots/auto123");
+        let result = super::refuse_session_registry_entry_in_build_context(
+            "tool",
+            &session_dir_test_cfg(&root),
+            Path::new("/"),
+            &entry,
+            &entry,
+        )
+        .await;
+        assert_eq!(result.is_ok(), allowed, "rule {rule:?}: {result:?}");
+        if let Err(err) = result {
+            assert!(
+                matches!(err, OutrigError::SessionRegistryEntryInBuildContext { entry: path, .. } if path == entry)
+            );
+        }
+        assert!(
+            !root.join("roots").exists(),
+            "probe must remove missing parents"
+        );
+    }
+}
+
+#[tokio::test]
+async fn refuse_session_registry_entry_checks_the_owning_nested_repo() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        (".gitignore", "/nested/roots/\n"),
+    ]);
+    git_init(ctx.path());
+    let root = std::fs::canonicalize(ctx.path()).unwrap();
+    let nested = root.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    git_init(&nested);
+    let entry = nested.join("roots/auto123");
+    let cfg = session_dir_test_cfg(&root);
+    for (rule, allowed) in [("", false), ("/roots/*\n", true)] {
+        std::fs::write(nested.join(".gitignore"), rule).unwrap();
+        let result = super::refuse_session_registry_entry_in_build_context(
+            "tool",
+            &cfg,
+            Path::new("/"),
+            &entry,
+            &entry,
+        )
+        .await;
+        assert_eq!(result.is_ok(), allowed, "rule {rule:?}: {result:?}");
+        assert!(!nested.join("roots").exists());
+    }
+}
+
+#[tokio::test]
+async fn refuse_session_registry_entry_skips_external_and_non_build_sources() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let root = std::fs::canonicalize(ctx.path()).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let outside = elsewhere.path().join("roots/auto123");
+    super::refuse_session_registry_entry_in_build_context(
+        "tool",
+        &session_dir_test_cfg(&root),
+        Path::new("/"),
+        &outside,
+        &outside,
+    )
+    .await
+    .unwrap();
+    let entry = root.join("roots/auto123");
+    super::refuse_session_registry_entry_in_build_context(
+        "tool",
+        &ImageConfig::from_image_name("alpine"),
+        Path::new("/"),
+        &entry,
+        &entry,
+    )
+    .await
+    .unwrap();
+    let err = super::refuse_session_registry_entry_in_build_context(
+        "tool",
+        &session_dir_test_cfg(&root),
+        Path::new("/"),
+        &entry,
+        &entry,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, OutrigError::SessionRegistryEntryInBuildContext { entry: path, .. } if path == entry)
+    );
+    assert!(!root.join("roots").exists());
+}

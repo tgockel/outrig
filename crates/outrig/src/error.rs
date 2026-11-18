@@ -206,14 +206,8 @@ pub enum OutrigError {
     #[non_exhaustive]
     BuildContextChanged { image: String, tag: String },
 
-    /// A fresh session's directory -- explicit (`--session-dir`), or an
-    /// auto-allocated one under `--session-root` -- lies inside the build
-    /// context an image-config's `[images.<name>]` build would hash and send
-    /// to buildah, and no ignore rule takes it out. Refused before anything is
-    /// hashed: the directory is about to receive `session.json`, `logs/`, and
-    /// (with `-v`) a transcript buildah can still read mid-build, each of
-    /// which [`OutrigError::BuildContextChanged`] would catch only after a
-    /// full build was thrown away (#909).
+    /// A fresh session's directory lies inside an unignored build context.
+    /// Refused before hashing or creating the session record (#909).
     #[error(
         "session directory {} is inside the build context {} for image-config {image:?}, and \
          nothing excludes it there\n\
@@ -226,6 +220,23 @@ pub enum OutrigError {
     SessionDirInBuildContext {
         image: String,
         dir: PathBuf,
+        context: PathBuf,
+    },
+
+    /// An explicit session's registry symlink lies inside an unignored build
+    /// context. Moving only `--session-dir` cannot avoid this write (#919).
+    #[error(
+        "session registry entry {} is inside the build context {} for image-config {image:?}, \
+         and nothing excludes it there\n\
+         help: pass --session-root outside the build context, or ignore its file-shaped \
+         entries in .gitignore (a directory-only rule does not exclude registry symlinks)",
+        entry.display(),
+        context.display()
+    )]
+    #[non_exhaustive]
+    SessionRegistryEntryInBuildContext {
+        image: String,
+        entry: PathBuf,
         context: PathBuf,
     },
 

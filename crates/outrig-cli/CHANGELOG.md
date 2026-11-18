@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Registry-entry build-context errors now advise moving `--session-root` or ignoring
+  its file-shaped entries, rather than suggesting the ineffective `--session-dir` remedy. (#919)
+
+- `run` and `mcp` refuse an unignored session registry entry inside the build
+  context, even when `--session-dir` points outside it. The error names the entry
+  before the image is keyed or built and before a session record is created. (#919)
+
 - `run` and `mcp` no longer panic when stderr rejects a workspace note, startup
   banner, warning, or final error (for example, a broken pipe or `/dev/full`).
   Failed diagnostics are dropped without changing the command's exit status. (#907)

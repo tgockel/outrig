@@ -562,35 +562,6 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         span.done(format!("container resolved: {image_cfg_name}"));
     }
 
-    let image_tag = if let Some(attach) = &attach {
-        let span = ProgressSpan::start(format!(
-            "inspecting attached container {}",
-            attach.container_name
-        ));
-        let inspect = Container::inspect_existing(&attach.container_name, None).await?;
-        if !inspect.running {
-            return Err(OutrigError::Configuration(format!(
-                "attached container {:?} is not running",
-                attach.container_name
-            ))
-            .into());
-        }
-        span.done(format!(
-            "attached container ready: {}",
-            attach.container_name
-        ));
-        inspect.image_tag
-    } else {
-        let span = ProgressSpan::start("computing image tag");
-        let image_tag = if raw_local_image {
-            ImageTag::new(image_cfg_name.clone())
-        } else {
-            image::compute_tag_for(&image_cfg_name, &image_cfg, &repo_root).await?
-        };
-        span.done(format!("image tag computed: {image_tag}"));
-        image_tag
-    };
-
     let host_workspace = cfg.workspace.resolved_host_path(&repo_root);
     let container_workspace = cfg.workspace.container_path().to_path_buf();
     let mut launch =
@@ -628,7 +599,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     // `SIGHUP` queued (`Signals::install` has already turned the default
     // disposition off) rather than ending the wait.
     let mut draws = 1;
-    let (mut session, session_dir, session_lock) = loop {
+    let (mut session, session_dir, session_lock, image_tag) = loop {
         let sid = SessionId::new();
         if attach.is_none() {
             let candidate = args
@@ -646,7 +617,58 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
                     &candidate_logical,
                 ))
                 .await?;
+            if args.explicit_session_dir.is_some() {
+                // The explicit directory is also registered by a symlink under
+                // the root. Check the entry itself, not its external target or
+                // the root (whose ignore status can differ from a child's).
+                let entry = session_root.join(&sid.0);
+                let (root_logical, _) = session::canonicalize_prefix(&session_root)
+                    .path_ctx("resolve", &session_root)?;
+                signals
+                    .race(image::refuse_session_registry_entry_in_build_context(
+                        &image_cfg_name,
+                        &image_cfg,
+                        &repo_root,
+                        &entry,
+                        &root_logical.join(&sid.0),
+                    ))
+                    .await?;
+            }
         }
+        // All session writes must be checked before even keying the build.
+        let image_tag = signals
+            .race(async {
+                let image_tag = if let Some(attach) = &attach {
+                    let span = ProgressSpan::start(format!(
+                        "inspecting attached container {}",
+                        attach.container_name
+                    ));
+                    let inspect = Container::inspect_existing(&attach.container_name, None).await?;
+                    if !inspect.running {
+                        return Err(OutrigError::Configuration(format!(
+                            "attached container {:?} is not running",
+                            attach.container_name
+                        ))
+                        .into());
+                    }
+                    span.done(format!(
+                        "attached container ready: {}",
+                        attach.container_name
+                    ));
+                    inspect.image_tag
+                } else {
+                    let span = ProgressSpan::start("computing image tag");
+                    let image_tag = if raw_local_image {
+                        ImageTag::new(image_cfg_name.clone())
+                    } else {
+                        image::compute_tag_for(&image_cfg_name, &image_cfg, &repo_root).await?
+                    };
+                    span.done(format!("image tag computed: {image_tag}"));
+                    image_tag
+                };
+                Ok::<_, CliError>(image_tag)
+            })
+            .await?;
         let mut session = Session {
             id: sid.clone(),
             started_at: SystemTime::now(),
@@ -668,7 +690,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             Err(CliError::SessionIdTaken(_)) if draws < session::SESSION_ID_DRAWS => {
                 draws += 1;
             }
-            created => break created.map(|(dir, lock)| (session, dir, lock))?,
+            created => break created.map(|(dir, lock)| (session, dir, lock, image_tag))?,
         }
     };
     // Set after the claim, so the label carries the id the record has.
