@@ -333,6 +333,16 @@ println!("delivered as {}", delivered.delivery());
 # }
 ```
 
+Each channel gives its backend at most eight calls at once, counting sends, notices and
+withdrawals together. Even channels sharing a backend have separate call slots. Each call has
+30 seconds to answer by default; `ChannelDefinition::call_timeout(Duration)` changes that
+channel's timeout, independently of skill sources. Waiting for a call slot does not spend the
+timeout. Choose it to allow the backend's durable writes to finish: a send that times out is
+`uncertain`, not known to be safe to retry. Notices are retried; a withdrawal that times out
+leaves its request uncertain. The session's close drain may cut a call short regardless of its
+timeout. The eight-call cap stays fixed; changing a slow store's timeout does not increase its
+concurrency.
+
 ## The container facade beside `harness`
 
 An application can run an engine of its own over the container facade beside one over `harness`,

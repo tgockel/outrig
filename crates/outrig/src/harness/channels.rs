@@ -117,6 +117,7 @@ pub struct ChannelDefinition {
 pub const CHANNEL_BOUND_MAX: usize = 256;
 
 /// How long a backend's method has to answer, unless the definition says.
+/// This is a channel default, independent of the skill-source call bounds.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many of one channel's calls its backend is given at once: its sends,
@@ -205,7 +206,17 @@ impl ChannelDefinition {
         self
     }
 
-    /// How long a call of the backend may run before OutRig gives up on it.
+    /// How long each call of this channel's backend may run before OutRig gives
+    /// up on it, [`DEFAULT_CALL_TIMEOUT`] by default. The wait for one of the
+    /// channel's eight concurrent calls is not counted. Sends, consumed and
+    /// settled notices, and withdrawals all use this timeout.
+    ///
+    /// Choose a bound that allows the backend's durable writes to finish: a
+    /// timed-out send is uncertain, not safely retryable. Timing out a notice
+    /// retries it; timing out a withdrawal leaves the request uncertain. The
+    /// session's close drain may end a call sooner. Other channels keep their
+    /// own bounds even when they share this backend; skill-source bounds are
+    /// independent.
     #[must_use]
     pub fn call_timeout(mut self, timeout: Duration) -> Self {
         self.call_timeout = timeout;

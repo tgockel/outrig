@@ -662,6 +662,62 @@ async fn a_send_uses_the_backend_and_its_answers_are_told_apart() {
     );
 }
 
+/// Two channels sharing a backend have separate call slots and timeouts. A slow
+/// store can keep eight calls running beyond another channel's shorter bound.
+#[tokio::test]
+async fn backend_call_bounds_belong_to_each_channel() {
+    let go = Arc::new(tokio::sync::Notify::new());
+    let backend = Backend::answering(std::iter::repeat_n(Answer::After(go.clone()), 9));
+    let slow: Arc<dyn ChannelBackend> = backend.clone();
+    let fast: Arc<dyn ChannelBackend> = backend.clone();
+    let code = "import outrig\n\
+                slow = [asyncio.create_task(runtime.channels['slow'].send(str(i))) for i in range(8)]\n\
+                try:\n    await runtime.channels['fast'].send('fast')\nexcept outrig.SendUncertain:\n    print('fast uncertain')\n\
+                await asyncio.gather(*slow)\nprint('slow accepted')";
+    let (tree, _app) = holding(
+        "OUTRIG_TEST_CHANNEL_BOUNDS_KEY",
+        vec![("ROLE inbox", from_launch(&[code]))],
+        |builder| {
+            builder
+                .channel(
+                    ChannelDefinition::new("slow").call_timeout(Duration::from_secs(60)),
+                    slow,
+                )
+                .channel(
+                    ChannelDefinition::new("fast").call_timeout(Duration::from_secs(2)),
+                    fast,
+                )
+        },
+    )
+    .await;
+    let root = constructed(&tree, holder(&["slow", "fast"])).await;
+    until("nine calls sharing a backend", || backend.sent().len() == 9).await;
+    tree.seen("channel.item.outcome", 1).await;
+    assert_eq!(backend.most(), 9, "each channel has its own call slots");
+    assert_eq!(
+        backend.running.load(Ordering::SeqCst),
+        8,
+        "slow calls still running"
+    );
+    go.notify_waiters();
+    tree.seen("exec.completed", 1).await;
+    let subject = format!("agent/{}", agent_of(&root));
+    let (report, events, _) = tree.end().await;
+    assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
+    assert_eq!(
+        exec_outputs(&events, &subject),
+        ["fast uncertain\nslow accepted\n"]
+    );
+    let outcomes = data_of(&events, "channel.item.outcome", &subject);
+    assert_eq!(outcomes.len(), 9);
+    assert_eq!(outcomes[0]["channel"], "fast");
+    assert_eq!(outcomes[0]["outcome"], "uncertain");
+    for outcome in &outcomes[1..] {
+        assert_eq!(outcome["channel"], "slow");
+        assert_eq!(outcome["outcome"], "accepted");
+    }
+}
+
 /// With 16 sends unanswered, the 17th waits until one is answered.
 #[tokio::test]
 async fn the_seventeenth_unanswered_send_waits() {
