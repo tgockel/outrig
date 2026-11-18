@@ -558,7 +558,11 @@ A session's owner -- a Rust program embedding OutRig, through `SessionBuilder::a
 host program, through `outrig.Session(application=outrig.Application(...))` -- may give it
 application code: the package its agent classes are in, and what they import. It is a directory
 whose top-level entries are packages and modules, as a project's `src/` is, or, from Rust, the
-bytes of a tar of one.
+bytes of a tar of one; or a pure-Python wheel (`py3-none-any`), a file or, from Rust, its bytes.
+A wheel is laid out as an installer lays one out, its `.dist-info` with it, so
+`importlib.metadata` finds it. One whose tags name an ABI or a platform fails the start. The
+`Requires-Dist` in its metadata is not read: what the code requires is declared beside it, as for
+a directory.
 
 As the session starts, OutRig reads the code on the host, with no Python run and no link followed,
 skipping names that begin `.` and `__pycache__`. A compiled extension module (`.so`, `.pyd`) in it

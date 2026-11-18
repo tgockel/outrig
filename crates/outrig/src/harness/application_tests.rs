@@ -1,7 +1,7 @@
-//! A session's application code, end to end on the host: read from a directory or an archive,
-//! copied to its snapshot, its requirement set installed from local wheels, its modules imported
-//! as the session starts, and imported from in a kernel. No model is called: the provider is at
-//! an address nothing answers. The e2e module at the end runs it in a container.
+//! A session's application code, end to end on the host: read from a directory, an archive or a
+//! wheel, copied to its snapshot, its requirement set installed from local wheels, its modules
+//! imported as the session starts, and imported from in a kernel. No model is called: the
+//! provider is at an address nothing answers. The e2e module at the end runs it in a container.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use crate::harness::bindings_tests::{output, taken, wheels};
 use crate::harness::event::Event;
 use crate::harness::{DEFAULT_DRAIN, Session, SessionBuilder, SessionError};
 use crate::python::testing::{pip_env, within};
+use crate::python::zip::testing::{CENTRAL_HEADER, M, m, zip};
 
 const VAR: &str = "OUTRIG_TEST_APPLICATION_KEY";
 
@@ -195,6 +196,65 @@ fn tar_holding(files: &[(&str, &str)]) -> tar::Builder<Vec<u8>> {
     tar
 }
 
+/// A wheel of the application's package, as a build backend writes one: `FILES`, a `.dist-info`
+/// whose `WHEEL` reads `wheel` and whose `RECORD` lists every member, and `more` members after
+/// them. Its metadata requires what no session installs.
+fn wheel_reading(wheel: &str, more: Vec<M>) -> Vec<u8> {
+    let mut members = package();
+    members.extend([
+        m(
+            "review-1.0.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: review\nVersion: 1.0\nRequires-Dist: absent>=1\n",
+        ),
+        m("review-1.0.dist-info/WHEEL", wheel),
+    ]);
+    let record = record_of(members.iter().chain(&more));
+    members.push(m("review-1.0.dist-info/RECORD", record));
+    members.extend(more);
+    zip(&members)
+}
+
+/// The `RECORD` of a wheel holding `members` and it, as the `csv` module writes one: a path that
+/// holds a comma or a quote quoted, and each row ending `\r\n`.
+fn record_of<'a>(members: impl IntoIterator<Item = &'a M>) -> String {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let mut record = String::new();
+    for M { name, data, .. } in members {
+        let hash =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(data));
+        let path = if name.contains([',', '"']) {
+            format!("\"{}\"", name.replace('"', "\"\""))
+        } else {
+            name.clone()
+        };
+        record += &format!("{path},sha256={hash},{}\r\n", data.len());
+    }
+    record + "review-1.0.dist-info/RECORD,,\r\n"
+}
+
+/// `FILES`, as a wheel's members.
+fn package() -> Vec<M> {
+    FILES.iter().map(|(path, source)| m(path, source)).collect()
+}
+
+/// [`wheel_reading`] a version 1 `WHEEL` tagged `tag`.
+fn wheel_of(tag: &str, more: Vec<M>) -> Vec<u8> {
+    let wheel = format!("Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: {tag}\n");
+    wheel_reading(&wheel, more)
+}
+
+/// Why the snapshot of the wheel `wheel` was not taken.
+fn refusal(wheel: Vec<u8>) -> String {
+    refusal_of(&Artifact::Wheel(wheel.into()))
+}
+
+/// Why the snapshot of `artifact` was not taken.
+fn refusal_of(artifact: &Artifact) -> String {
+    let root = tempfile::tempdir().expect("tempdir");
+    snapshot_of(artifact, root.path()).unwrap_err().to_string()
+}
+
 #[tokio::test]
 async fn the_application_imports_in_a_kernel_from_its_snapshot() {
     let bed = Bed::new();
@@ -287,6 +347,67 @@ async fn an_archive_of_the_same_files_is_the_same_code() {
         "Reviewer\n"
     );
     stop(session).await;
+}
+
+/// A wheel's files and its `.dist-info` are the snapshot, whether it is given as a file or as its
+/// bytes, and its metadata finds a file installed from `purelib` where it is; the `Requires-Dist`
+/// in its metadata installs nothing.
+#[tokio::test]
+async fn a_wheel_imports_in_a_kernel_with_its_metadata() {
+    let bed = Bed::new();
+    let file = bed.app.with_file_name("review-1.0-py3-none-any.whl");
+    let extra = m(
+        "review-1.0.data/purelib/review/data/extra.txt",
+        "extra notes\n",
+    );
+    std::fs::write(&file, wheel_of("py3-none-any", vec![extra])).expect("write the wheel");
+    let spec = ApplicationSpec::wheel(&file).imports(["review.agents"]);
+    let (session, events) = start(bed.builder().application(spec)).await;
+    let digest = digest_of(&events);
+    let Payload::ApplicationProvisioned {
+        path,
+        mount,
+        requires,
+        packages,
+        ..
+    } = provisioned(&events)
+    else {
+        unreachable!()
+    };
+    assert_eq!(path.as_deref(), Some(file.as_path()));
+    assert!(requires.is_empty() && packages.is_none());
+    assert_eq!(imported(&events), [("review.agents".to_string(), None)]);
+    assert_eq!(
+        output(
+            &session,
+            &format!(
+                "import importlib.metadata, importlib.resources, review.agents\n\
+                 print(review.agents.__file__.startswith({mount:?} + '/'))\n\
+                 print(importlib.metadata.version('review'))\n\
+                 print((importlib.resources.files('review') / 'data' / 'notes.txt').read_text())\n\
+                 [extra] = [f for f in importlib.metadata.files('review') if f.stem == 'extra']\n\
+                 print(extra, extra.read_text())"
+            )
+        )
+        .await,
+        "True\n1.0\nnotes for the reviewer\n\nreview/data/extra.txt extra notes\n\n"
+    );
+    stop(session).await;
+
+    let bytes = std::fs::read(&file).expect("the wheel");
+    let spec = ApplicationSpec::wheel_bytes(bytes).imports(["review.agents"]);
+    let (session, events) = start(bed.builder().application(spec)).await;
+    let Payload::ApplicationProvisioned { path, .. } = provisioned(&events) else {
+        unreachable!()
+    };
+    assert_eq!((path, digest_of(&events)), (&None, digest.clone()));
+    stop(session).await;
+
+    // Its `.dist-info` is code the session runs, which the directory of its packages lacks.
+    let root = tempfile::tempdir().expect("tempdir");
+    let (directory, _) =
+        snapshot_of(&Artifact::Directory(bed.app.clone()), root.path()).expect("the snapshot");
+    assert_ne!(directory, digest);
 }
 
 #[tokio::test]
@@ -489,6 +610,168 @@ fn compiled_code_and_links_are_refused_before_anything_is_copied() {
     );
     let empty: Vec<_> = std::fs::read_dir(root.path()).expect("the root").collect();
     assert!(empty.is_empty(), "{empty:?}");
+}
+
+/// What a wheel installs at the top is in the snapshot there: what it holds under `purelib` or
+/// `platlib` beside the rest, and the rest of its `.data` where it is. Its `RECORD` names each
+/// file where it is. Two members installed at one path are refused.
+#[test]
+fn a_wheel_is_laid_out_as_an_installer_lays_it_out() {
+    let root = tempfile::tempdir().expect("tempdir");
+    // Each member, where it is installed, and what it holds.
+    let members = [
+        (
+            "review-1.0.data/purelib/extra.py",
+            "extra.py",
+            "EXTRA = 1\n",
+        ),
+        (
+            "review-1.0.data/platlib/review/more.py",
+            "review/more.py",
+            "MORE = 1\n",
+        ),
+        (
+            "review-1.0.data/purelib/review/a,\"b\".txt",
+            "review/a,\"b\".txt",
+            "quoted\n",
+        ),
+        (
+            "review-1.0.data/scripts/review",
+            "review-1.0.data/scripts/review",
+            "#!/bin/sh\n",
+        ),
+    ];
+    let more = members
+        .iter()
+        .map(|(name, _, data)| m(name, data))
+        .collect();
+    let wheel = wheel_of("py2.py3-none-any", more);
+    let (_, dir) = snapshot_of(&Artifact::Wheel(wheel.into()), root.path()).expect("the snapshot");
+    for (_, path, _) in members {
+        assert!(dir.join(path).is_file(), "{path}");
+    }
+    for path in ["review-1.0.data/purelib", "review-1.0.data/platlib"] {
+        assert!(!dir.join(path).exists(), "{path}");
+    }
+    let record = std::fs::read_to_string(dir.join("review-1.0.dist-info/RECORD")).expect("RECORD");
+    let installed: Vec<M> = members
+        .iter()
+        .map(|(_, path, data)| m(path, data))
+        .collect();
+    let rows: Vec<&str> = record.split_inclusive('\n').collect();
+    for row in record_of(&installed).split_inclusive('\n') {
+        assert!(rows.contains(&row), "{row:?} in {record:?}");
+    }
+    assert!(
+        !record.contains("purelib/") && !record.contains("platlib/"),
+        "{record}"
+    );
+
+    let wheel = wheel_of(
+        "py3-none-any",
+        vec![m("review-1.0.data/purelib/review/agents.py", "")],
+    );
+    let error = refusal(wheel);
+    assert!(
+        error.contains("two of its members are installed at review/agents.py"),
+        "{error}"
+    );
+}
+
+/// A `RECORD` row is rewritten only where its path moves, quoted as its new path needs and its line
+/// ending kept; what cannot be read is kept as it is written.
+#[test]
+fn a_record_moves_only_the_paths_that_move() {
+    let record = "x-1.data/purelib/a.py,sha256=A,1\n\
+                  \"x-1.data/platlib/b,c.py\",sha256=B,2\r\n\
+                  \"x-1.data/purelib/d.py\",sha256=D,3\n\
+                  \"kept.py\",sha256=K,4\n\
+                  x-1.data/scripts/s,,\n\
+                  x-1.data/purelib/last.py,,";
+    assert_eq!(
+        installed_record(record),
+        "a.py,sha256=A,1\n\
+         \"b,c.py\",sha256=B,2\r\n\
+         d.py,sha256=D,3\n\
+         \"kept.py\",sha256=K,4\n\
+         x-1.data/scripts/s,,\n\
+         last.py,,"
+    );
+    let open = "a.py,,\n\"x-1.data/purelib/never closed,,\n";
+    assert_eq!(installed_record(open), open);
+}
+
+/// A wheel tagged for an ABI or a platform, or holding compiled code under a pure tag, is refused
+/// as compiled code is; so are bytes that are no wheel, and a wheel of a version this does not
+/// read.
+#[test]
+fn a_wheel_that_is_compiled_or_no_wheel_is_refused() {
+    let error = refusal(wheel_of("cp313-cp313-manylinux_2_17_x86_64", Vec::new()));
+    assert!(
+        error.contains(
+            "(not-pure-python): its wheel review-1.0 is tagged cp313-cp313-manylinux_2_17_x86_64"
+        ),
+        "{error}"
+    );
+    let compiled = m("review/_speedups.cpython-313-x86_64-linux-gnu.so", "");
+    let error = refusal(wheel_of("py3-none-any", vec![compiled]));
+    assert!(
+        error.contains("(not-pure-python): review/_speedups.cpython-313-x86_64-linux-gnu.so is"),
+        "{error}"
+    );
+    let error = refusal(wheel_reading(
+        "Wheel-Version: 2.0\nTag: py3-none-any\n",
+        Vec::new(),
+    ));
+    assert!(
+        error.contains("its Wheel-Version is 2.0, and only a wheel of version 1 is read"),
+        "{error}"
+    );
+
+    let error = refusal(zip(&package()));
+    assert!(error.contains("it holds no `.dist-info`"), "{error}");
+    let other = m(
+        "other-1.0.dist-info/WHEEL",
+        "Wheel-Version: 1.0\nTag: py3-none-any\n",
+    );
+    let error = refusal(wheel_of("py3-none-any", vec![other]));
+    assert!(
+        error.contains("2 `.dist-info` directories, other-1.0.dist-info and review-1.0.dist-info"),
+        "{error}"
+    );
+    let error = refusal(b"PK, and then not a zip at all".to_vec());
+    assert!(
+        error.contains("the application's wheel cannot be read: no end-of-central-directory"),
+        "{error}"
+    );
+
+    let missing = Path::new("/nonexistent/absent-1.0-py3-none-any.whl");
+    let error = refusal_of(&Artifact::WheelFile(missing.to_path_buf()));
+    assert!(
+        error.contains(&format!(
+            "the application's wheel {} cannot be read",
+            missing.display()
+        )),
+        "{error}"
+    );
+}
+
+/// A wheel member larger than a file may be is refused by the size its zip declares, before any of
+/// it is inflated: here a member of one byte declared nine MiB long.
+#[test]
+fn a_wheel_member_too_large_is_refused_before_it_is_inflated() {
+    let mut wheel = wheel_of("py3-none-any", vec![m("review/model.bin", "x")]);
+    // The last central directory entry is the member's; its uncompressed size is 24 bytes in.
+    let entry = wheel
+        .windows(4)
+        .rposition(|window| window == CENTRAL_HEADER)
+        .expect("a central directory entry");
+    wheel[entry + 24..entry + 28].copy_from_slice(&(9u32 << 20).to_le_bytes());
+    let error = refusal(wheel);
+    assert!(
+        error.contains("\"review/model.bin\" is larger than the 8 MiB"),
+        "{error}"
+    );
 }
 
 /// An archive member whose path leads out of the archive is refused.

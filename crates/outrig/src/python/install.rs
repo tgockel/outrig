@@ -354,22 +354,7 @@ fn check_pure(stage: &Path, dists: &[Dist], set: &[String]) -> Result<()> {
     for dist in dists {
         let wheel = dist.dir.join("WHEEL");
         let text = std::fs::read_to_string(&wheel).path_ctx("read", &wheel)?;
-        let tags: Vec<&str> = text
-            .lines()
-            .filter_map(|line| line.strip_prefix("Tag:"))
-            .map(str::trim)
-            .collect();
-        // `bdist_wheel` writes a compressed tag such as `py2.py3-none-any` as one `Tag:` line
-        // per Python tag, so a wheel's lines are judged together: every one for no ABI and
-        // any platform, and one of them for Python 3.
-        let pure_wheel = !tags.is_empty()
-            && tags.iter().all(|tag| tag.ends_with("-none-any"))
-            && tags.iter().any(|tag| pure(tag));
-        if !pure_wheel {
-            let what = match tags.iter().find(|tag| !pure(tag)) {
-                Some(tag) => format!("is tagged {tag}"),
-                None => "declares no tag".to_string(),
-            };
+        if let Some(what) = impure_tags(&text) {
             return Err(not_pure(set, dist, &what));
         }
     }
@@ -389,6 +374,29 @@ fn check_pure(stage: &Path, dists: &[Dist], set: &[String]) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// What the `Tag:` lines of the `WHEEL` file `text` say that is not pure Python -- `is tagged
+/// <tag>`, or `declares no tag` -- or `None` when they describe a pure-Python wheel.
+pub(crate) fn impure_tags(text: &str) -> Option<String> {
+    let tags: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("Tag:"))
+        .map(str::trim)
+        .collect();
+    // `bdist_wheel` writes a compressed tag such as `py2.py3-none-any` as one `Tag:` line per
+    // Python tag, so a wheel's lines are judged together: every one for no ABI and any
+    // platform, and one of them for Python 3.
+    let pure_wheel = !tags.is_empty()
+        && tags.iter().all(|tag| tag.ends_with("-none-any"))
+        && tags.iter().any(|tag| pure(tag));
+    if pure_wheel {
+        return None;
+    }
+    Some(match tags.iter().find(|tag| !pure(tag)) {
+        Some(tag) => format!("is tagged {tag}"),
+        None => "declares no tag".to_string(),
+    })
 }
 
 /// Whether `path` names a compiled extension module, which the payload's interpreter cannot load.

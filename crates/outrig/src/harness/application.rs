@@ -7,8 +7,8 @@
 //! The snapshot, not the owner's directory, is what every kernel imports: an edit made while the
 //! session runs changes nothing until the next session, and the digest says which files the
 //! session ran. Only pure Python can load in the interpreter, so a compiled file in the artifact
-//! is refused before anything is copied, and the requirement set installs as a binding's does,
-//! wheels only and each one checked pure.
+//! is refused before anything is copied, as is a wheel whose tags say it is compiled, and the
+//! requirement set installs as a binding's does, wheels only and each one checked pure.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -28,6 +28,7 @@ use crate::events::Events;
 use crate::python::host::{ImportFailure, Interpreter, InterpreterError};
 use crate::python::install::{self, Install};
 use crate::python::payload::{self, APPLICATION_MOUNT};
+use crate::python::zip;
 use crate::supervise;
 
 /// What [`SessionBuilder::application`](super::SessionBuilder::application) takes: where a
@@ -41,11 +42,14 @@ pub struct ApplicationSpec {
     label: Option<String>,
 }
 
-/// Where application code is: the two forms read to the same files.
+/// Where application code is: a directory and an archive of its files read to the same files, and
+/// a wheel to its files and its `.dist-info`.
 #[derive(Clone)]
 enum Artifact {
     Directory(PathBuf),
     Archive(Cow<'static, [u8]>),
+    WheelFile(PathBuf),
+    Wheel(Cow<'static, [u8]>),
 }
 
 impl fmt::Debug for Artifact {
@@ -53,6 +57,8 @@ impl fmt::Debug for Artifact {
         match self {
             Self::Directory(path) => f.debug_tuple("Directory").field(path).finish(),
             Self::Archive(bytes) => write!(f, "Archive({} bytes)", bytes.len()),
+            Self::WheelFile(path) => f.debug_tuple("WheelFile").field(path).finish(),
+            Self::Wheel(bytes) => write!(f, "Wheel({} bytes)", bytes.len()),
         }
     }
 }
@@ -77,6 +83,29 @@ impl ApplicationSpec {
     /// the start too. An archive of a directory's files has the directory's digest.
     pub fn archive(archive: impl Into<Cow<'static, [u8]>>) -> Self {
         Self::of(Artifact::Archive(archive.into()))
+    }
+
+    /// The code in the wheel file `path` -- `review-1.4-py3-none-any.whl`, as a build backend
+    /// writes one -- read as the session starts.
+    ///
+    /// Its members are read as [`ApplicationSpec::directory`]'s files are, held to the same rules
+    /// before any of them is inflated, and laid out as an installer lays out a pure-Python wheel:
+    /// what it holds under `<name>.data/purelib/` or `<name>.data/platlib/` beside the rest, and
+    /// its `.dist-info` kept, its `RECORD` naming each file where it lands, so `importlib.metadata`
+    /// finds it and its files. It must be a wheel -- one `.dist-info` with a `WHEEL` of
+    /// version 1 -- whose tags say pure Python, `py3-none-any` or `py2.py3-none-any`; one tagged
+    /// for an ABI or a platform fails the start. Its digest covers its `.dist-info`, so it is not
+    /// a directory's of its packages alone. The `Requires-Dist` in its metadata is not read: what
+    /// the code imports beyond the standard library and `outrig` is
+    /// [`ApplicationSpec::requires`], as for any application.
+    pub fn wheel(path: impl Into<PathBuf>) -> Self {
+        Self::of(Artifact::WheelFile(path.into()))
+    }
+
+    /// The code in the wheel `wheel`, held to [`ApplicationSpec::wheel`]'s rules: the bytes of
+    /// the file -- `include_bytes!` of one an embedder built, which is not copied, say.
+    pub fn wheel_bytes(wheel: impl Into<Cow<'static, [u8]>>) -> Self {
+        Self::of(Artifact::Wheel(wheel.into()))
     }
 
     fn of(artifact: Artifact) -> Self {
@@ -128,7 +157,8 @@ impl ApplicationSpec {
 #[non_exhaustive]
 pub struct ApplicationIdentity {
     /// The first 16 hex digits of a BLAKE3 digest of the code's files' paths and contents, the
-    /// same for a directory and for an archive holding the same files.
+    /// same for a directory and for an archive holding the same files, and for a wheel given as a
+    /// file and as its bytes. A wheel's covers its `.dist-info`.
     pub digest: String,
     /// What the owner calls it, which nothing compares.
     pub label: Option<String>,
@@ -164,7 +194,7 @@ pub(crate) fn check(spec: Option<&ApplicationSpec>) -> Result<()> {
 /// ready to mount and to tell the interpreter of.
 #[derive(Debug)]
 pub(crate) struct Prepared {
-    /// The directory the owner gave, or `None` for an archive.
+    /// The directory or the wheel file the owner gave, or `None` for bytes.
     path: Option<PathBuf>,
     identity: ApplicationIdentity,
     /// The snapshot on the host.
@@ -185,8 +215,8 @@ pub(crate) async fn prepare(spec: ApplicationSpec, places: &Places) -> Result<Pr
     } = spec;
     let requires = install::requirement_set(&requires)?;
     let path = match &artifact {
-        Artifact::Directory(path) => Some(path.clone()),
-        Artifact::Archive(_) => None,
+        Artifact::Directory(path) | Artifact::WheelFile(path) => Some(path.clone()),
+        Artifact::Archive(_) | Artifact::Wheel(_) => None,
     };
     // Beside the requirement sets' installs: `~/.cache/outrig/applications/` by default.
     let root = payload::cache_dir("application code")?.join("outrig/applications");
@@ -234,16 +264,20 @@ fn snapshot_of(artifact: &Artifact, root: &Path) -> Result<(String, PathBuf)> {
                 path.display()
             ))
         })?,
-        Artifact::Archive(archive) => read_archive(archive, root)?,
+        Artifact::Archive(archive) => read_archive(archive, root, "archive")?,
+        Artifact::WheelFile(path) => {
+            let what = format!("wheel {}", path.display());
+            let wheel = std::fs::read(path).map_err(|e| unreadable(&what, e))?;
+            read_wheel(&wheel, root, &what)?
+        }
+        Artifact::Wheel(wheel) => read_wheel(wheel, root, "wheel")?,
     };
     if let Some((path, _)) = files
         .iter()
         .find(|(path, _)| install::extension_module(Path::new(path)))
     {
-        return Err(OutrigError::Configuration(format!(
-            "the application is refused (not-pure-python): {path} is a compiled extension module, \
-             and the session's interpreter loads no compiled code, so application code is pure \
-             Python only"
+        return Err(not_pure_python(format!(
+            "{path} is a compiled extension module"
         )));
     }
     let digest = payload::digest(&files);
@@ -257,11 +291,9 @@ fn snapshot_of(artifact: &Artifact, root: &Path) -> Result<(String, PathBuf)> {
 /// The files of the tar `archive`: unpacked into a directory of its own under `root`, where a
 /// member that would land outside it is refused, as the payload's archive is unpacked, and read
 /// from there as a directory of code is read. A member that reading would skip or refuse by its
-/// name, depth, size or number is never written.
-fn read_archive(archive: &[u8], root: &Path) -> Result<Vec<(String, Vec<u8>)>> {
-    let refused = |e: &dyn fmt::Display| {
-        OutrigError::Configuration(format!("the application's archive cannot be read: {e}"))
-    };
+/// name, depth, size or number is never written. `what` names the artifact in a refusal.
+fn read_archive(archive: &[u8], root: &Path, what: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    let refused = |e: &dyn fmt::Display| unreadable(what, e);
     std::fs::create_dir_all(root).path_ctx("create", root)?;
     let stage = tempfile::Builder::new()
         .prefix(".unpack-")
@@ -283,6 +315,163 @@ fn read_archive(archive: &[u8], root: &Path) -> Result<Vec<(String, Vec<u8>)>> {
         }
     }
     skills::read_tree(stage.path()).map_err(|e| refused(&e))
+}
+
+/// The files of the wheel `wheel`, laid out as an installer lays out a pure-Python wheel, and
+/// refused unless it is one. Each member is put to the rules a directory of code is read by
+/// before any of it is inflated, at the path it is installed at, and the archive they make is
+/// read as an archive is. `what` names the wheel in a refusal.
+fn read_wheel(wheel: &[u8], root: &Path, what: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    // The paths admitted so far, which a member's path is as `admits` keeps it: the reader
+    // refuses an empty, `.` or `..` part.
+    let mut seen = HashSet::new();
+    let archive = zip::zip_to_tar(wheel, |name, size| {
+        let path = installed(name);
+        if seen.contains(path) {
+            return Err(format!("two of its members are installed at {path}"));
+        }
+        let admitted =
+            skills::admits(Path::new(path), size, &mut seen).map_err(|e| e.to_string())?;
+        Ok(admitted.then(|| path.to_string()))
+    })
+    .map_err(|e| unreadable(what, e))?;
+    let mut files = read_archive(&archive, root, what)?;
+    let record = format!("{}/RECORD", check_wheel(&files, what)?);
+    // `importlib.metadata` finds a file by the path `RECORD` gives it, which is the installed
+    // one only once rewritten. One that is not UTF-8 text is no `RECORD` it reads anyway.
+    if let Some((_, text)) = files.iter_mut().find(|(path, _)| *path == record)
+        && let Ok(rows) = std::str::from_utf8(text)
+    {
+        *text = installed_record(rows).into_bytes();
+    }
+    Ok(files)
+}
+
+/// The wheel's `RECORD`, `record`, as an installer records the wheel installed: each row's path
+/// where [`installed`] puts its file, its hash and size as they were. It is CSV, whose first
+/// field, the path, is quoted when it holds a comma, a quote or a line end, a `""` within it
+/// standing for one `"`, and whose other two hold none of those. A row whose path stays where it
+/// is, or that cannot be read, is kept as it is written.
+fn installed_record(record: &str) -> String {
+    let mut out = String::with_capacity(record.len());
+    let mut rest = record;
+    while !rest.is_empty() {
+        let Some((path, tail)) = record_path(rest) else {
+            out.push_str(rest);
+            break;
+        };
+        let (fields, next) = tail.split_at(tail.find('\n').map_or(tail.len(), |at| at + 1));
+        let moved = installed(&path);
+        if moved.len() == path.len() {
+            out.push_str(&rest[..rest.len() - next.len()]);
+        } else if moved.contains([',', '"', '\r', '\n']) {
+            out.push('"');
+            out.push_str(&moved.replace('"', "\"\""));
+            out.push('"');
+            out.push_str(fields);
+        } else {
+            out.push_str(moved);
+            out.push_str(fields);
+        }
+        rest = next;
+    }
+    out
+}
+
+/// The path the `RECORD` row `row` begins with, unquoted, and the rest of the row after it, or
+/// `None` when its quote is never closed.
+fn record_path(row: &str) -> Option<(Cow<'_, str>, &str)> {
+    let Some(quoted) = row.strip_prefix('"') else {
+        let end = row.find([',', '\r', '\n']).unwrap_or(row.len());
+        return Some((Cow::Borrowed(&row[..end]), &row[end..]));
+    };
+    let mut end = 0;
+    loop {
+        end += quoted[end..].find('"')?;
+        if !quoted[end + 1..].starts_with('"') {
+            return Some((
+                Cow::Owned(quoted[..end].replace("\"\"", "\"")),
+                &quoted[end + 1..],
+            ));
+        }
+        end += 2;
+    }
+}
+
+/// Where an installer puts the wheel member `name`: one beneath `<name>.data/purelib/` or
+/// `<name>.data/platlib/` at the top, where the rest of a pure-Python wheel goes, which is the
+/// snapshot's one directory on `sys.path`, and any other where it is.
+fn installed(name: &str) -> &str {
+    if let Some((top, rest)) = name.split_once('/')
+        && top.ends_with(".data")
+        && let Some(path) = rest
+            .strip_prefix("purelib/")
+            .or_else(|| rest.strip_prefix("platlib/"))
+    {
+        return path;
+    }
+    name
+}
+
+/// Refuse the wheel `files` were read from unless it is one -- a single `.dist-info` at the top,
+/// holding a `WHEEL` of version 1 -- whose tags say pure Python. Its `.dist-info`'s name.
+fn check_wheel(files: &[(String, Vec<u8>)], what: &str) -> Result<String> {
+    let refused = |why: String| unreadable(what, why);
+    // Files are in path order, so each directory's are together.
+    let mut infos: Vec<&str> = files
+        .iter()
+        .filter_map(|(path, _)| path.split_once('/'))
+        .map(|(top, _)| top)
+        .filter(|top| top.ends_with(".dist-info"))
+        .collect();
+    infos.dedup();
+    let [info] = infos[..] else {
+        return Err(refused(match &infos[..] {
+            [] => "it holds no `.dist-info`, which a wheel does".to_string(),
+            several => format!(
+                "it holds {} `.dist-info` directories, {}, where a wheel holds one",
+                several.len(),
+                several.join(" and ")
+            ),
+        }));
+    };
+    let wheel = format!("{info}/WHEEL");
+    let Some((_, text)) = files.iter().find(|(path, _)| *path == wheel) else {
+        return Err(refused(format!("it holds no {wheel}, which a wheel does")));
+    };
+    let text = String::from_utf8_lossy(text);
+    let version = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Wheel-Version:"))
+        .map(str::trim);
+    match version {
+        Some(version) if version.split('.').next() == Some("1") => {}
+        Some(version) => {
+            return Err(refused(format!(
+                "its Wheel-Version is {version}, and only a wheel of version 1 is read"
+            )));
+        }
+        None => return Err(refused(format!("its {wheel} names no Wheel-Version"))),
+    }
+    if let Some(tags) = install::impure_tags(&text) {
+        let name = info.strip_suffix(".dist-info").unwrap_or(info);
+        return Err(not_pure_python(format!("its wheel {name} {tags}")));
+    }
+    Ok(info.to_string())
+}
+
+/// The refusal of the artifact `what` names -- `archive`, `wheel <path>` -- which cannot be read
+/// for `why`.
+fn unreadable(what: &str, why: impl fmt::Display) -> OutrigError {
+    OutrigError::Configuration(format!("the application's {what} cannot be read: {why}"))
+}
+
+/// The refusal of code that is not pure Python, which `what` says how.
+fn not_pure_python(what: impl fmt::Display) -> OutrigError {
+    OutrigError::Configuration(format!(
+        "the application is refused (not-pure-python): {what}, and the session's interpreter \
+         loads no compiled code, so application code is pure Python only"
+    ))
 }
 
 impl Prepared {

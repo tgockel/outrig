@@ -1142,13 +1142,16 @@ async fn paths_a_program_cannot_mount_fail_its_entry() {
     assert!(ran.exit.left_open().is_empty());
 }
 
-/// Application code a program gives its session is imported as the session starts, and the
-/// session's events say so. Entry raises `RuntimeError` for an application directory that does
-/// not exist, before anything starts, and for a module of it that does not import, naming the
-/// module and ending with its traceback, once what the start made is proven stopped; making the
-/// session raises `TypeError` for what is not an `outrig.Application`.
+/// Application code a program gives its session, a directory or a wheel, is imported as the
+/// session starts, and the session's events say so. Entry raises `RuntimeError` for an application
+/// directory that does not exist or a file that is no wheel, before anything starts, and for a
+/// module of it that does not import, naming the module and ending with its traceback, once what
+/// the start made is proven stopped; making the session raises `TypeError` for what is not an
+/// `outrig.Application`.
 #[tokio::test]
 async fn a_programs_session_imports_its_application() {
+    use crate::python::zip::testing::{m, zip};
+
     let bed = Bed::new();
     let review = bed.dir.join("src/review");
     std::fs::create_dir_all(&review).unwrap();
@@ -1159,6 +1162,16 @@ async fn a_programs_session_imports_its_application() {
     ] {
         std::fs::write(review.join(name), source).unwrap();
     }
+    let wheel = zip(&[
+        m("review/__init__.py", ""),
+        m("review/agents.py", "AGENTS = True\n"),
+        m(
+            "review-1.0.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nTag: py3-none-any\n",
+        ),
+    ]);
+    std::fs::write(bed.dir.join("review-1.0-py3-none-any.whl"), wheel).unwrap();
+    std::fs::write(bed.dir.join("notes.txt"), "not a wheel\n").unwrap();
     bed.write(
         "application.py",
         r#"
@@ -1193,12 +1206,20 @@ async fn a_programs_session_imports_its_application() {
                 outrig.Session(application="src")
             except TypeError as e:
                 not_one = str(e)
+            wheeled = []
+            wheel = outrig.Application("review-1.0-py3-none-any.whl", imports=["review.agents"])
+            session = outrig.Session(application=wheel)
+            async with session:
+                watcher = asyncio.create_task(watch(session, wheeled))
+            await watcher
             print(json.dumps([
                 seen,
                 await entered(outrig.Application("missing", imports=["review.agents"])),
                 await entered(outrig.Application("src", imports=["review.broken"])),
                 not_one,
                 made(imports="review.agents"),
+                wheeled,
+                await entered(outrig.Application("notes.txt", imports=["review.agents"])),
             ]))
 
         asyncio.run(main())
@@ -1243,6 +1264,14 @@ async fn a_programs_session_imports_its_application() {
         "{said}"
     );
     assert_eq!(said[4], "imports takes a list of strings, not one string");
+    assert_eq!(said[5], said[0]);
+    assert_eq!(
+        said[6],
+        format!(
+            "the application {dir}/notes.txt is neither a directory nor a wheel, a file whose \
+             name ends .whl"
+        )
+    );
     assert!(
         ran.exit.left_open().is_empty(),
         "{:?}",

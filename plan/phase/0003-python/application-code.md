@@ -56,17 +56,32 @@ modules, as a project's `src/` is: the owner that holds a checkout of its applic
 it. The bytes form is an archive of the same layout the embedder carries in its binary --
 `include_bytes!` of a tar it built -- for an owner that ships one executable and no directory
 beside it; it is unpacked into the cache as the payload's archive is unpacked (`unpack`,
-`payload.rs:343`), and from then on the two forms are one. A wheel file is a natural third form,
-since the pure-Python check for one exists (`check_pure`,
-`crates/outrig/src/python/install.rs:353-395`), and is open. Either form is read on the host
-with no Python run, bounded as a skill directory is bounded -- entries, depth, file size, regular
-files only, no link followed (`DirectorySource`, `crates/outrig/src/harness/skills.rs:120-133`)
--- and copied whole into a cache directory named for its digest, staged and renamed into place
-as the `outrig` package is written (`payload.rs:192-209`). The session mounts that snapshot, so
+`payload.rs:343`), and from then on the two forms are one. Each form is read on the host with no
+Python run, bounded as a skill directory is bounded -- entries, depth, file size, regular files
+only, no link followed (`DirectorySource`, `crates/outrig/src/harness/skills.rs:120-133`) -- and
+copied whole into a cache directory named for its digest, staged and renamed into place as the
+`outrig` package is written (`payload.rs:192-209`). The session mounts that snapshot, so
 the agent sees one version for the session's life, an edit the owner makes meanwhile changes
 nothing until the next session, and a resume can tell whether the code it is given is the code
 the save was made under ("Identity"). The code is importable in every kernel of the session,
 since the mount and `sys.path` are the interpreter's and not a kernel's.
+
+A wheel is the third form (#777), for an owner whose build already writes one: the `.whl` file's
+path, or its bytes. The zip reader `build.rs` converts the pinned RPyC wheel with,
+`crates/outrig/src/python/zip.rs`, turns it into a tar the archive form then reads; each member is
+put to the directory's bounds at the size its central directory declares, so nothing they refuse is
+ever inflated. Its members are laid out as an installer lays out a pure-Python wheel: what it holds
+under `<name>.data/purelib/` or `platlib/` at the top, where the rest of it is, since both are the
+snapshot's one directory on `sys.path`; the rest of its `.data` where the wheel put it, inert; and
+its `.dist-info` kept, with its `RECORD` rewritten to name each file where it lands, its hashes and
+sizes as the wheel gives them, so `importlib.metadata` finds the distribution and its files. It must
+be a wheel -- one `.dist-info` holding a `WHEEL` of version 1 -- whose tags say pure Python, judged
+as `check_pure` judges an installed one (`install::impure_tags`); a wheel tagged for an ABI or a
+platform is refused `not-pure-python` as a compiled file is. An owner's wheel is not a pinned one,
+so the reader checks each member's CRC-32, reads a directory entry and a data descriptor as wheel
+tooling writes them, and refuses a member the zip marks as a link. A Rust owner gives either form
+(`ApplicationSpec::wheel`, `wheel_bytes`); a host program gives a path ending `.whl` where it gives
+a directory.
 
 ## Where it lands
 
@@ -117,7 +132,8 @@ the bindings process.
 
 An artifact's identity is the digest of its files' paths and contents, as `package_name`
 computes the `outrig` package's (`payload.rs:178-187`), the same for a directory and for bytes
-that unpack to the same files. It names the cache directory and the mount, is carried by the
+that unpack to the same files. A wheel's covers its `.dist-info`, so it is not the digest of a
+directory of its packages alone. It names the cache directory and the mount, is carried by the
 `application.provisioned` event, and is what a save records as the code the session ran
 (`continuation.md`). The owner may attach a label of its own -- its release's version, say --
 which is recorded beside the digest and compared by no one: the digest is the identity, and the
@@ -163,6 +179,11 @@ is what the owner declared and nothing the model chose; the model never installs
 code or its dependencies (OR-AG6). The first application's package has no third-party dependency
 (OR-A2-4): its facilities are services in Rust, and its Python imports the standard library and
 `outrig`. The dependency path exists for the applications after it.
+
+A wheel's own `Requires-Dist` is not read. The specification's requirements are the one
+declaration for every form, so the set a session installs, and the identity records, is what the
+owner wrote there; reading the metadata as well would mean evaluating its markers, dropping what
+an extra guards, and refusing what names a URL, for a second list the owner already controls.
 
 Two neighboring entries stay what they are. `plan/next/skill-dependency-installation.md` and
 `plan/next/pep723-dependencies-for-host-programs.md` ask for optional, off-by-default installs of
@@ -239,8 +260,7 @@ one module and keep separate instances (`task-agents.md`).
 - Whether `run-new` gains a way to supply application code for the primary. The CLI's primary is
   OutRig's own agent, the phase's exit criteria give the CLI save and resume only, and a
   task-bound primary under the CLI is a later question.
-- A wheel as a second artifact form, and a source form for an owner whose code lives in a
-  service.
+- A source form for an owner whose code lives in a service.
 - Whether several applications per session are ever needed, or one package with several classes
   is always the shape.
 - Whether the modules imported at start should default to every top-level package in the

@@ -27,6 +27,10 @@ mod stack {
     include!("stack.rs");
 }
 
+// The zip reader `build.rs` converts the pinned wheels with, and an application
+// wheel is read by: `build.rs` pulls it in with `include!`.
+pub(crate) mod zip;
+
 #[cfg(test)]
 pub(crate) mod relay;
 #[cfg(test)]

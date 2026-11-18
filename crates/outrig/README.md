@@ -153,10 +153,11 @@ println!("{:?}", report.verdict());
 
 A session's owner gives it application code -- the Python package its agent classes are in --
 with `SessionBuilder::application`: a directory, or the bytes of a tar of one that the owner's
-binary carries. The session copies it to a snapshot named for its digest, mounts that read-only
-in the container ahead of the workspace, installs the pure-Python packages it `requires`, and
-imports the modules it names before any kernel opens; one that does not import fails the start,
-naming it. `Session::application` says which code the session runs:
+binary carries, or a pure-Python wheel, as a file or as its bytes. The session copies it to a
+snapshot named for its digest, mounts that read-only in the container ahead of the workspace,
+installs the pure-Python packages it `requires`, and imports the modules it names before any
+kernel opens; one that does not import fails the start, naming it. `Session::application` says
+which code the session runs:
 
 ```rust,no_run
 # async fn example(config: outrig::config::Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

@@ -525,11 +525,12 @@ pub enum Payload {
     /// answered by an `application.imported`.
     #[non_exhaustive]
     ApplicationProvisioned {
-        /// The directory its owner gave, as given, or `None` for an archive.
+        /// The directory or the wheel file its owner gave, as given, or `None`
+        /// for bytes.
         path: Option<std::path::PathBuf>,
         /// The first 16 hex digits of a BLAKE3 digest of its files' paths and
         /// contents: its identity, the same for a directory and for an archive
-        /// holding the same files.
+        /// holding the same files. A wheel's covers its `.dist-info`.
         digest: String,
         /// What its owner calls it, which nothing compares.
         label: Option<String>,

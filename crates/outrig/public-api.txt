@@ -2324,6 +2324,8 @@ pub fn outrig::harness::ApplicationSpec::directory(impl core::convert::Into<std:
 pub fn outrig::harness::ApplicationSpec::imports<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn outrig::harness::ApplicationSpec::label(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::harness::ApplicationSpec::requires<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn outrig::harness::ApplicationSpec::wheel(impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn outrig::harness::ApplicationSpec::wheel_bytes(impl core::convert::Into<alloc::borrow::Cow<'static, [u8]>>) -> Self
 #[non_exhaustive] pub struct outrig::harness::ApprovalRequest
 pub outrig::harness::ApprovalRequest::declaration: alloc::string::String
 pub outrig::harness::ApprovalRequest::declared_in: core::option::Option<std::path::PathBuf>

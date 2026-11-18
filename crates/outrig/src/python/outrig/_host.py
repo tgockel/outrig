@@ -450,14 +450,17 @@ class Application:
     they import, which the session's interpreter imports from in every kernel.
 
     `path` is a directory whose top-level entries are packages and modules, as a project's `src/`
-    is, a str or path made absolute against the working directory when the `Application` is made.
-    `requires` names the distributions it imports beyond the standard library and `outrig`, as a
-    binding's `requires` does: a name, extras, a version specifier and markers, never a path or a
-    URL. `imports` names the modules imported as the session starts, in order.
+    is, or a pure-Python wheel, a file whose name ends `.whl`: a str or path made absolute against
+    the working directory when the `Application` is made. A wheel's files are laid out as an
+    installer lays them out, its `.dist-info` with them; the `Requires-Dist` in its metadata is
+    not read. `requires` names the distributions it imports beyond the standard library and
+    `outrig`, as a binding's `requires` does: a name, extras, a version specifier and markers,
+    never a path or a URL. `imports` names the modules imported as the session starts, in order.
 
-    Entry reads the directory with no Python run, refuses it if anything in it is compiled or a
-    link, and copies it whole to a directory named for its digest, which the container mounts
-    read-only: the session runs that copy, whatever happens to `path` meanwhile. The copy goes on
+    Entry reads the directory or the wheel with no Python run, refuses it if anything in it is
+    compiled or a link, or if the wheel's tags are not pure Python's, and copies it whole to a
+    directory named for its digest, which the container mounts read-only: the session runs that
+    copy, whatever happens to `path` meanwhile. The copy goes on
     `sys.path` after the `outrig` package and before the working directory, so no file there takes
     the place of one of its modules, and its `requires` -- pure-Python wheels only -- is installed
     and placed beside it. Each module of `imports` is then imported, and one that raises, is not

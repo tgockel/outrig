@@ -17,12 +17,13 @@
 //!   engine answers the same at the same version, before the program's script runs; a program
 //!   speaking another version is answered with an `error` and ended, and its start fails.
 //! - **Requests**, answered by `id` with a line of the same `t`, or an `error`: `config`;
-//!   `session.start` (`session`, `mounts`, `cwd`, `application` -- `path`, `requires`,
-//!   `imports` -- and `live`, the objects injected before entry), answered with the session's `id`, its `requests_max`, the `bindings` its
-//!   configuration declares and the `rpyc` the program serves live objects with, once it has
-//!   started; `inject` (`session`, `name`, `type`, `doc`, `serialize`), answered once every kernel
-//!   has the binding; `admission.close` (`session`), answered once the gate is closed; and
-//!   `session.shutdown` (`session`, `grace`), answered with the report once the session stopped.
+//!   `session.start` (`session`, `mounts`, `cwd`, `application` -- `path`, a directory or a
+//!   wheel, `requires`, `imports` -- and `live`, the objects injected before entry), answered
+//!   with the session's `id`, its `requests_max`, the `bindings` its configuration declares and
+//!   the `rpyc` the program serves live objects with, once it has started; `inject` (`session`,
+//!   `name`, `type`, `doc`, `serialize`), answered once every kernel has the binding;
+//!   `admission.close` (`session`), answered once the gate is closed; and `session.shutdown`
+//!   (`session`, `grace`), answered with the report once the session stopped.
 //!   `session` is a number the program chooses for each session, so what the engine pushes about
 //!   one can be routed before its start is answered.
 //! - **Its live objects' serving**, both ways, each line naming its `session` and answered by

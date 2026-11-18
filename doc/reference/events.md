@@ -313,9 +313,10 @@ three times for one call before the rejection ends it.
   error saying how the process ended.
 - `application.provisioned` -- the session's application code was copied to its snapshot and
   mounted, before any kernel opened:
-  - `path`: the directory its owner gave, as given, or `null` for an archive of bytes.
+  - `path`: the directory or the wheel file its owner gave, as given, or `null` for bytes.
   - `digest`: the first 16 hex digits of a BLAKE3 digest of its files' paths and contents, the
-    same for a directory and for an archive holding the same files.
+    same for a directory and for an archive holding the same files. A wheel's covers its
+    `.dist-info` too.
   - `label`: what its owner calls it, which nothing compares, or `null`.
   - `mount`: where the interpreter imports it from, `/outrig/app/<digest>` in a container.
   - `requires`: the requirement set its owner declared, sorted.

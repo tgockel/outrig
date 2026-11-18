@@ -19,6 +19,13 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **A wheel as application code.** `ApplicationSpec::wheel` takes a `.whl` file and
+  `ApplicationSpec::wheel_bytes` its bytes, and a host program's `outrig.Application` takes a
+  path ending `.whl` as it takes a directory. The wheel's members are read under a directory's
+  bounds before any is inflated and laid out as an installer lays out a pure-Python wheel, its
+  `.dist-info` kept for `importlib.metadata`. A wheel whose tags name an ABI or a platform is
+  refused as `not-pure-python`, as is one holding an extension module. Its `Requires-Dist` is
+  not read; `requires` stays the one declaration. The digest covers the `.dist-info`. (#777)
 - **An uncertain send is resolved by its identity, and the session keeps a registry of its
   channels.** `ChannelBackend` gains three required methods, each answering from the backend's
   durable record: `resolve_send(Query)`, what became of an item whose send was uncertain, as a

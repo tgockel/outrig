@@ -42,11 +42,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-// The payload and wheel checks: `verify_archive`, `verify_digest`, `wheel_to_tar`.
-// See `src/python/archive.rs` for why they are shared by `include!`. They rest on
-// the ELF parser below, which they reach through the `use`.
+// The payload and wheel checks, `verify_archive` and `verify_digest`, and the
+// wheels' conversion, `zip_to_tar`. See `src/python/archive.rs` for why they are
+// shared by `include!`. They rest on the ELF parser below, which they reach
+// through the `use`.
 include!("src/python/stack.rs");
 include!("src/python/archive.rs");
+include!("src/python/zip.rs");
 
 use elf::{ElfKind, elf_interp};
 
@@ -355,6 +357,7 @@ fn python_payload(out_dir: &Path) {
 /// wheel's members inflated and laid out under `<dir>/`, so the runtime unpacks
 /// it exactly as it unpacks the payload.
 fn wheels(out_dir: &Path) {
+    println!("cargo:rerun-if-changed=src/python/zip.rs");
     for wheel in WHEELS {
         println!("cargo:rerun-if-env-changed={}", wheel.local_env);
         let dir = wheel
@@ -388,7 +391,7 @@ fn wheels(out_dir: &Path) {
         // As for the payload: a wheel that fails here is the wrong one, not a
         // missing one, and no build embeds it.
         let tar = verify_digest(&bytes, wheel.sha256)
-            .and_then(|()| wheel_to_tar(&bytes, dir))
+            .and_then(|()| zip_to_tar(&bytes, |name, _| Ok(Some(format!("{dir}/{name}")))))
             .unwrap_or_else(|why| panic!("outrig: refusing the wheel {}: {why}", wheel.name));
         let compressed = ruzstd::encoding::compress_to_vec(
             &tar[..],

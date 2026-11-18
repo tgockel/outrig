@@ -76,11 +76,12 @@ print(session.shutdown_report)
   `ValueError`.
 - **Its application code.** `application=outrig.Application(path, requires=(), imports=())` gives
   the session the package the program's agent classes are in: `path` a directory whose top-level
-  entries are packages and modules, `requires` what it imports beyond the standard library and
-  `outrig`, written as a binding's `requires` is, and `imports` the modules imported as the
-  session starts. Entering copies the directory to a read-only snapshot every kernel imports from,
-  ahead of `cwd`, and fails -- naming the module and ending with its traceback -- when a module of
-  `imports` does not import, or when the directory does not exist or holds compiled code.
+  entries are packages and modules, or a pure-Python wheel (a file whose name ends `.whl`),
+  `requires` what it imports beyond the standard library and `outrig`, written as a binding's
+  `requires` is, and `imports` the modules imported as the session starts. Entering copies the
+  directory or the wheel's files to a read-only snapshot every kernel imports from, ahead of
+  `cwd`, and fails -- naming the module and ending with its traceback -- when a module of
+  `imports` does not import, or when the path does not exist or holds compiled code.
   [Application code](../concepts/python-runtime.md#application-code) says how.
 - **The configuration's workspace is not mounted.** `[workspace]` and `[[workspace.mounts]]` are
   the interactive session's; `outrig.config().workspace` and `outrig.config().mounts` show them

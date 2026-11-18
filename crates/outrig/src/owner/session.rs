@@ -89,8 +89,8 @@ pub(crate) struct MountRequest {
     access: MountAccess,
 }
 
-/// The application code a program gives its session: a directory on the host, what it requires,
-/// and the modules imported as the session starts.
+/// The application code a program gives its session: a directory or a wheel on the host, what it
+/// requires, and the modules imported as the session starts.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ApplicationRequest {
     path: PathBuf,
@@ -98,6 +98,23 @@ pub(crate) struct ApplicationRequest {
     requires: Vec<String>,
     #[serde(default)]
     imports: Vec<String>,
+}
+
+impl ApplicationRequest {
+    /// Whether `path` is a wheel: a file whose name ends `.whl`, as every wheel's does.
+    fn is_wheel(&self) -> bool {
+        self.path.is_file() && self.path.extension().is_some_and(|ext| ext == "whl")
+    }
+
+    /// What the session builder takes.
+    fn spec(self) -> ApplicationSpec {
+        let spec = if self.is_wheel() {
+            ApplicationSpec::wheel(self.path)
+        } else {
+            ApplicationSpec::directory(self.path)
+        };
+        spec.requires(self.requires).imports(self.imports)
+    }
 }
 
 /// A live object the program injects, which its own process serves: its binding's name, the
@@ -195,11 +212,7 @@ pub(crate) async fn run(
         .repo_root(&context.repo_root)
         .program(cwd);
     if let Some(application) = application {
-        builder = builder.application(
-            ApplicationSpec::directory(application.path)
-                .requires(application.requires)
-                .imports(application.imports),
-        );
+        builder = builder.application(application.spec());
     }
     if config.events.mode() == EventsMode::Record {
         builder = builder.record_events();
@@ -515,8 +528,8 @@ async fn settled(owed: Owed) -> Stopped {
 /// The configuration a session starts from: the engine's, with the program's mounts, each at its
 /// host path, in place of the configured workspace and its mounts, which are the interactive
 /// session's. Checked, so nothing starts on paths that cannot be mounted, in a working directory
-/// that is none, from application code in a directory that is none, or with a live object named
-/// as a configured binding.
+/// that is none, from application code that is neither a directory nor a wheel, or with a live
+/// object named as a configured binding.
 fn prepare(
     context: &Context,
     mounts: &[MountRequest],
@@ -540,10 +553,13 @@ fn prepare(
             cwd.display()
         ));
     }
-    if let Some(application) = application.filter(|app| !app.path.is_dir()) {
+    if let Some(application) = application.filter(|app| !app.path.is_dir() && !app.is_wheel()) {
         let path = application.path.display();
         return Err(if application.path.exists() {
-            format!("the application {path} is not a directory")
+            format!(
+                "the application {path} is neither a directory nor a wheel, a file whose name \
+                 ends .whl"
+            )
         } else {
             format!("the application {path} does not exist")
         });
