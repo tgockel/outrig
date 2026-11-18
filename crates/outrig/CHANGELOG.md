@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Session paths inside entirely ignored build contexts are now refused before building,
+  including nested repositories where the cache key falls back to hashing the whole tree.
+  These refusals explain why an existing ignore rule is ineffective and advise moving the path
+  outside the context or retaining a non-ignored input in the affected tree. (#920)
+
 - Registry-entry build-context errors now advise moving `--session-root` or ignoring
   its file-shaped entries, rather than suggesting the ineffective `--session-dir` remedy. (#919)
 

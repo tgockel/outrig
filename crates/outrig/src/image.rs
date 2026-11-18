@@ -616,6 +616,8 @@ fn context_changed(image: &str, tag: &ImageTag) -> OutrigError {
 /// context honors -- including a nested repository's own rule over a
 /// directory under it, as `hash_git_tree` honors. A non-git context has no
 /// ignore mechanism at all, so there every directory inside it conflicts.
+/// An ignored path also conflicts when the hasher falls back to the whole
+/// tree because every file is ignored, at any repository boundary (#920).
 pub async fn refuse_session_dir_in_build_context(
     image: &str,
     cfg: &ImageConfig,
@@ -679,7 +681,7 @@ async fn refuse_session_path_in_build_context(
     } else {
         registry_entry_is_ignored(session_path_logical).await?
     };
-    if ignored {
+    if ignored && context_honors_ignore_at(&context_canon, session_path_logical).await? {
         return Ok(());
     }
     Err(if directory {
@@ -687,14 +689,43 @@ async fn refuse_session_path_in_build_context(
             image: image.to_string(),
             dir: session_path.to_path_buf(),
             context,
+            whole_tree: ignored,
         }
     } else {
         OutrigError::SessionRegistryEntryInBuildContext {
             image: image.to_string(),
             entry: session_path.to_path_buf(),
             context,
+            whole_tree: ignored,
         }
     })
+}
+
+/// An ignore match is an exemption only if every tree the hasher enters on
+/// the way to `path` uses ignore rules. An all-ignored tree (including a nested
+/// repository) or a plain-tree submodule is hashed whole instead (#920).
+async fn context_honors_ignore_at(context: &Path, path: &Path) -> Result<bool> {
+    if !is_git_context(context).await? {
+        return Ok(false);
+    }
+    let mut tree = context.to_path_buf();
+    loop {
+        let listing = git_tree_listing(&tree).await?;
+        if listing.whole_tree {
+            return Ok(false);
+        }
+        let nested = listing.entries.into_iter().find_map(|(rel, meta)| {
+            let candidate = tree.join(OsStr::from_bytes(&rel));
+            (meta.is_dir() && path.starts_with(&candidate)).then_some(candidate)
+        });
+        let Some(nested) = nested else {
+            return Ok(true);
+        };
+        if !is_worktree_root(&nested).await? {
+            return Ok(false);
+        }
+        tree = nested;
+    }
 }
 
 /// Whether `dir` -- a path inside a build context, possibly not created yet
@@ -2162,23 +2193,17 @@ async fn hash_git_tree(
     links: &mut HardLinks,
 ) -> Result<()> {
     let tree = ctx.join(dir);
-    // What the rules admit, tracked or not, and what is tracked although a
-    // rule matches it.
-    let (paths, excluded) = tokio::try_join!(
-        ls_files(&tree, &["--cached", "--others", "--exclude-standard"]),
-        ls_files(&tree, &["--cached", "--ignored", "--exclude-standard"]),
-    )?;
+    let listing = git_tree_listing(&tree).await?;
 
-    // One blocking pass rather than an async round-trip per stat and read:
-    // a context can be a whole checkout.
+    // Read all listed content in one blocking pass rather than an async
+    // round-trip per file: a context can be a whole checkout.
     let (root, base) = (ctx.to_path_buf(), dir.to_path_buf());
     let (entries, listed_stamps) = tokio::task::spawn_blocking(move || {
         let mut tree = TreeHasher::new(&root);
-        let mut entries = Vec::with_capacity(paths.len());
-        for rel in paths {
-            if let Some((mode, entry)) = tree.listed(&base.join(OsStr::from_bytes(&rel)))? {
-                entries.push((rel, mode, entry));
-            }
+        let mut entries = Vec::with_capacity(listing.entries.len());
+        for (rel, meta) in listing.entries {
+            let entry = tree.listed_with_metadata(&base.join(OsStr::from_bytes(&rel)), &meta)?;
+            entries.push((rel, meta.mode(), entry));
         }
         Ok::<_, OutrigError>((entries, tree.stamps))
     })
@@ -2188,10 +2213,7 @@ async fn hash_git_tree(
 
     // Nothing left, or only what a rule excludes: the whole tree counts, and
     // so does its own mode, which `TreeHasher::dir` leaves to a parent.
-    if entries
-        .iter()
-        .all(|(rel, ..)| excluded.binary_search(rel).is_ok())
-    {
+    if listing.whole_tree {
         let root = tokio::fs::symlink_metadata(&tree)
             .await
             .path_ctx("stat", &tree)?;
@@ -2256,6 +2278,43 @@ async fn hash_git_tree(
         update_record(hasher, &rel, mode, &NO_CONTENT);
     }
     Ok(())
+}
+
+/// Git's admitted paths, with vanished index entries removed before deciding
+/// whether there are any non-ignored inputs. Both hashing and the session
+/// guard must make this decision over the same set, including tracked files
+/// that now match ignore rules and directories naming nested repositories.
+struct GitTreeListing {
+    entries: Vec<(Vec<u8>, std::fs::Metadata)>,
+    whole_tree: bool,
+}
+
+async fn git_tree_listing(tree: &Path) -> Result<GitTreeListing> {
+    let (paths, excluded) = tokio::try_join!(
+        ls_files(tree, &["--cached", "--others", "--exclude-standard"]),
+        ls_files(tree, &["--cached", "--ignored", "--exclude-standard"]),
+    )?;
+    let tree = tree.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut entries = Vec::with_capacity(paths.len());
+        for rel in paths {
+            let path = tree.join(OsStr::from_bytes(&rel));
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) => entries.push((rel, meta)),
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(err).path_ctx("stat", path),
+            }
+        }
+        let whole_tree = entries
+            .iter()
+            .all(|(rel, _)| excluded.binary_search(rel).is_ok());
+        Ok(GitTreeListing {
+            entries,
+            whole_tree,
+        })
+    })
+    .await
+    .expect("context listing task panicked")
 }
 
 /// One entry of the context stream. Everything after the NUL-terminated path is
@@ -2478,6 +2537,7 @@ impl<'a> TreeHasher<'a> {
     /// longer has: a tracked file deleted without `git rm`, which buildah does
     /// not see either. A directory is left to the caller, which asks git
     /// whether it is a repository of its own.
+    #[cfg(test)]
     fn listed(&mut self, rel: &Path) -> Result<Option<(u32, ContextEntry)>> {
         let path = self.ctx.join(rel);
         let meta = match std::fs::symlink_metadata(&path) {
@@ -2485,17 +2545,25 @@ impl<'a> TreeHasher<'a> {
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err).path_ctx("stat", path),
         };
+        Ok(Some((meta.mode(), self.listed_with_metadata(rel, &meta)?)))
+    }
+
+    fn listed_with_metadata(
+        &mut self,
+        rel: &Path,
+        meta: &std::fs::Metadata,
+    ) -> Result<ContextEntry> {
         let entry = if meta.is_dir() {
             ContextEntry::Dir
         } else if meta.is_file() {
             ContextEntry::File(
-                self.entry(rel, &meta)?,
+                self.entry(rel, meta)?,
                 (meta.nlink() > 1).then(|| (meta.dev(), meta.ino())),
             )
         } else {
-            ContextEntry::Leaf(self.entry(rel, &meta)?)
+            ContextEntry::Leaf(self.entry(rel, meta)?)
         };
-        Ok(Some((meta.mode(), entry)))
+        Ok(entry)
     }
 
     /// `ctx/rel` by what it is: a file by its content, a symlink by

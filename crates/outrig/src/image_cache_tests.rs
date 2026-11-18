@@ -1798,7 +1798,7 @@ async fn refuse_session_dir_refuses_inside_a_non_git_context() {
     assert!(
         matches!(
             &err,
-            OutrigError::SessionDirInBuildContext { image, dir: d, context }
+            OutrigError::SessionDirInBuildContext { image, dir: d, context, whole_tree: false }
                 if image == "tool" && d == &dir && context == &ctx_canon
         ),
         "got {err}"
@@ -1838,6 +1838,125 @@ async fn refuse_session_dir_allows_a_gitignored_directory() {
     refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
         .await
         .expect("a gitignored directory is excluded from the context, not a conflict");
+}
+
+/// #920: ignore matches do not exclude session writes when the hasher
+/// falls back to the whole tree. This applies at the context root and at
+/// nested repository boundaries, and to file-shaped registry entries too.
+#[tokio::test]
+async fn session_paths_are_refused_when_all_context_files_are_ignored() {
+    for nested in [false, true] {
+        for tracked in [false, true] {
+            let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+            git_init(ctx.path());
+            let ctx_canon = std::fs::canonicalize(ctx.path()).unwrap();
+            let tree = if nested {
+                let tree = ctx_canon.join("vendor/lib");
+                std::fs::create_dir_all(&tree).unwrap();
+                tree
+            } else {
+                ctx_canon.clone()
+            };
+            if nested {
+                std::fs::write(tree.join("input"), "content").unwrap();
+                git_init(&tree);
+            }
+            if !tracked {
+                git(&tree, &["rm", "-q", "-r", "--cached", "."]);
+            }
+            // Even force-added/tracked files are excluded by the hasher.
+            std::fs::write(tree.join(".gitignore"), "*\n").unwrap();
+            let cfg = session_dir_test_cfg(&ctx_canon);
+            let dir = tree.join("sessions/auto123");
+            let err = refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+                .await
+                .expect_err("the whole-tree fallback includes ignored session writes");
+            let message = err.to_string();
+            assert!(message.contains("tree is hashed whole"), "{message}");
+            assert!(
+                message.contains("pass --session-dir or --session-root outside"),
+                "{message}"
+            );
+            assert!(message.contains("retain a non-ignored input"), "{message}");
+            assert!(!message.contains("nothing excludes"), "{message}");
+            assert!(!message.contains(".gitignore"), "{message}");
+            assert!(
+                matches!(err, OutrigError::SessionDirInBuildContext { dir: got, whole_tree: true, .. } if got == dir)
+            );
+            assert!(!tree.join("sessions").exists(), "probe must clean up");
+
+            let entry = tree.join("registry/auto123");
+            let err = super::refuse_session_registry_entry_in_build_context(
+                "tool",
+                &cfg,
+                Path::new("/"),
+                &entry,
+                &entry,
+            )
+            .await
+            .expect_err("the fallback also includes ignored registry symlinks");
+            let message = err.to_string();
+            assert!(message.contains("tree is hashed whole"), "{message}");
+            assert!(message.contains("pass --session-root outside"), "{message}");
+            assert!(message.contains("retain a non-ignored input"), "{message}");
+            assert!(!message.contains("--session-dir"), "{message}");
+            assert!(!message.contains("nothing excludes"), "{message}");
+            assert!(!message.contains(".gitignore"), "{message}");
+            assert!(
+                matches!(err, OutrigError::SessionRegistryEntryInBuildContext { entry: got, whole_tree: true, .. } if got == entry)
+            );
+            assert!(!tree.join("registry").exists(), "probe must clean up");
+
+            // Exercise the recommended remedy in the tree whose rules were
+            // overridden, including when it is a nested repository.
+            std::fs::write(tree.join(".gitignore"), "*\n!keep\n").unwrap();
+            std::fs::write(tree.join("keep"), "non-ignored build input").unwrap();
+            refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+                .await
+                .expect("retaining a non-ignored input restores the directory exemption");
+            super::refuse_session_registry_entry_in_build_context(
+                "tool",
+                &cfg,
+                Path::new("/"),
+                &entry,
+                &entry,
+            )
+            .await
+            .expect("retaining a non-ignored input restores the registry exemption");
+            assert!(!tree.join("sessions").exists(), "probe must clean up");
+            assert!(!tree.join("registry").exists(), "probe must clean up");
+        }
+    }
+}
+
+/// A context beneath an ignored parent also uses the whole-tree fallback.
+/// A deleted tracked path must not count as a surviving non-ignored input.
+#[tokio::test]
+async fn session_guard_fallback_uses_only_existing_context_entries() {
+    let repo = make_ctx(&[
+        (".gitignore", "/build/\n"),
+        ("build/Dockerfile", "FROM alpine\n"),
+    ]);
+    git_init(repo.path());
+    let root = std::fs::canonicalize(repo.path()).unwrap();
+    let context = root.join("build");
+    let cfg = session_dir_test_cfg(&context);
+    let dir = context.join("sessions/auto123");
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .expect_err("a context ignored by its parent is hashed whole");
+    assert!(!context.join("sessions").exists());
+
+    // The index still lists .gitignore, but it is no longer a build input.
+    // Only the ignored Dockerfile survives; ignore rules live outside the context.
+    std::fs::write(root.join(".git/info/exclude"), "/build/\n/sessions/\n").unwrap();
+    std::fs::remove_file(root.join(".gitignore")).unwrap();
+    let cfg = session_dir_test_cfg(&root);
+    let dir = root.join("sessions/auto123");
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .expect_err("a vanished index entry cannot disable the whole-tree fallback");
+    assert!(!root.join("sessions").exists());
 }
 
 /// #909: the same git context with no rule excluding the directory still

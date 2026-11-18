@@ -206,38 +206,61 @@ pub enum OutrigError {
     #[non_exhaustive]
     BuildContextChanged { image: String, tag: String },
 
-    /// A fresh session's directory lies inside an unignored build context.
-    /// Refused before hashing or creating the session record (#909).
+    /// A fresh session's directory is included in the hashed build context.
+    /// Refused before hashing or creating the session record (#909, #920).
     #[error(
         "session directory {} is inside the build context {} for image-config {image:?}, and \
-         nothing excludes it there\n\
-         help: pass --session-dir or --session-root outside the build context, or add it to \
-         .gitignore",
+         {reason}\n\
+         help: pass --session-dir or --session-root outside the build context, or {remedy}",
         dir.display(),
-        context.display()
+        context.display(),
+        reason = if *whole_tree {
+            "its ignore rule is overridden because the tree is hashed whole"
+        } else {
+            "nothing excludes it there"
+        },
+        remedy = if *whole_tree {
+            "retain a non-ignored input in the affected context tree so ignore rules apply"
+        } else {
+            "add it to .gitignore"
+        }
     )]
     #[non_exhaustive]
     SessionDirInBuildContext {
         image: String,
         dir: PathBuf,
         context: PathBuf,
+        /// An ignore match was overridden by whole-tree hashing.
+        whole_tree: bool,
     },
 
-    /// An explicit session's registry symlink lies inside an unignored build
-    /// context. Moving only `--session-dir` cannot avoid this write (#919).
+    /// An explicit session's registry symlink is included in the hashed build
+    /// context. Moving only `--session-dir` cannot avoid this write (#919, #920).
     #[error(
         "session registry entry {} is inside the build context {} for image-config {image:?}, \
-         and nothing excludes it there\n\
-         help: pass --session-root outside the build context, or ignore its file-shaped \
-         entries in .gitignore (a directory-only rule does not exclude registry symlinks)",
+         and {reason}\n\
+         help: pass --session-root outside the build context, or {remedy}",
         entry.display(),
-        context.display()
+        context.display(),
+        reason = if *whole_tree {
+            "its ignore rule is overridden because the tree is hashed whole"
+        } else {
+            "nothing excludes it there"
+        },
+        remedy = if *whole_tree {
+            "retain a non-ignored input in the affected context tree so ignore rules apply"
+        } else {
+            "ignore its file-shaped entries in .gitignore (a directory-only rule does not \
+             exclude registry symlinks)"
+        }
     )]
     #[non_exhaustive]
     SessionRegistryEntryInBuildContext {
         image: String,
         entry: PathBuf,
         context: PathBuf,
+        /// An ignore match was overridden by whole-tree hashing.
+        whole_tree: bool,
     },
 
     // Raised by the build merge, a runtime read of a raw or sidecar image, and
