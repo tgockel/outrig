@@ -276,12 +276,18 @@ where
     );
     let binding = unbound
         .map(|model| Binding::new(RetryingModel::new(model, policy.clone(), retries.clone())));
-    Ok(Box::new(ModelCandidate::new(
+    let model = ModelCandidate::new(
         RetryingModel::new(model, policy.clone(), retries),
         &candidate.model_identifier,
         budget,
         binding,
-    )))
+    );
+    let model = if matches!(candidate.provider, ResolvedProvider::Messages { .. }) {
+        model.with_prompt_caching()
+    } else {
+        model
+    };
+    Ok(Box::new(model))
 }
 
 fn client_build(e: impl Display) -> AgentError {
@@ -369,6 +375,10 @@ fn remote_http_client(
 /// which is what makes the ceiling travel with the identifier instead of
 /// staying the head's.
 ///
+/// Tool and system breakpoints cache the static prefix; `ModelCandidate` asks
+/// for the moving top-level marker on each request. Between history cuts,
+/// each call can read back the growing prefix the preceding call wrote.
+///
 /// The model sends its tools without `eager_input_streaming`: nothing here
 /// streams, and a gateway that does not know the field refuses the request.
 pub(crate) fn anthropic_model(
@@ -403,6 +413,7 @@ pub(crate) fn anthropic_model(
     model.wire = model
         .wire
         .with_default_max_tokens(max_tokens)
+        .with_prompt_caching()
         .with_tool_input_streaming(ToolInputStreaming::Off);
     (model, u32::try_from(max_tokens).unwrap_or(u32::MAX))
 }

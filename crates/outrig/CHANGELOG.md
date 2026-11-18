@@ -1130,6 +1130,11 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Fixed
 
+- Anthropic requests from the library loop (`run-new`, host programs and `harness`) now ask
+  for five-minute prompt caching: a moving top-level marker and breakpoints on the last tool
+  definition and system block. Calls between history cuts can read back the preceding call's
+  prefix instead of paying full input price for it (#751).
+
 - Request children, including agent class instances, are told to end their round to wait for the
   next request, rather than block in `receive()` on one channel while another has work waiting.
   Their instructions explain that receives wait only on their own channel and distinguish

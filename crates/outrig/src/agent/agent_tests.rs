@@ -3794,26 +3794,49 @@ async fn the_reported_ceiling_is_the_one_on_the_wire() {
 
 // ---------------------------------------------------------------------------- caching
 
-/// A call asks Anthropic for no caching yet (#669). Once a round's view is full
-/// its front changes on every call, so a marker at the end of the request would
-/// pay the 1.25x write each time and never read it back. This pins the deferral
-/// `anthropic_model` records; when the view only grows between cuts (#666), it
-/// becomes the assertion that the markers are there.
+/// Every call asks Anthropic to cache the growing conversation, with separate
+/// breakpoints for the tools and system prompt that survive a history cut.
 #[tokio::test]
-async fn an_anthropic_call_does_not_ask_for_prompt_caching_yet() {
+async fn an_anthropic_call_asks_for_prompt_caching() {
     let (mut agent, mut requests) = agent_over(
-        "OUTRIG_TEST_AGENT_NO_PROMPT_CACHING",
+        "OUTRIG_TEST_AGENT_PROMPT_CACHING",
         MODEL,
         "",
-        vec![text_reply("done")],
+        vec![text_reply("first"), text_reply("second")],
     )
     .await;
     round(&mut agent, "hi").await;
+    round(&mut agent, "and then?").await;
 
     let recorded = mock_http::drain(&mut requests);
-    assert_eq!(recorded.len(), 1, "one call: {recorded:#?}");
-    let body = &recorded[0].body;
-    assert!(!body.to_string().contains("cache_control"), "{body:#}");
+    assert_eq!(recorded.len(), 2, "one call per round: {recorded:#?}");
+    for request in &recorded {
+        assert_prompt_caching(request);
+    }
+}
+
+/// The moving marker and both static breakpoints, at the default TTL.
+fn assert_prompt_caching(request: &RecordedRequest) {
+    let ephemeral = json!({ "type": "ephemeral" });
+    let body = &request.body;
+    assert_eq!(body["cache_control"], ephemeral, "{body:#}");
+    let tools = body["tools"].as_array().expect("tool definitions");
+    assert_eq!(
+        tools.last().expect("a tool")["cache_control"],
+        ephemeral,
+        "{body:#}",
+    );
+    let system = body["system"].as_array().expect("system blocks");
+    assert_eq!(
+        system.last().expect("a system block")["cache_control"],
+        ephemeral,
+        "{body:#}",
+    );
+    assert_eq!(
+        body.to_string().matches("\"cache_control\"").count(),
+        3,
+        "{body:#}"
+    );
 }
 
 // ---------------------------------------------------------------------------- resolution
@@ -6798,6 +6821,9 @@ async fn a_refused_drop_block_is_sent_again_without_it() {
         recorded[0].header("anthropic-beta"),
         Some("thinking-binding-controls-2026-08-01")
     );
+    for request in &recorded {
+        assert_prompt_caching(request);
+    }
     for request in &recorded[1..] {
         assert!(request.body.get("thinking").is_none(), "{:#}", request.body);
         assert_eq!(request.header("anthropic-beta"), None);
@@ -6839,6 +6865,7 @@ async fn reasoning_another_provider_wrote_is_not_sent_to_anthropic() {
 
     let moved = mock_http::drain(&mut tail_requests);
     assert_eq!(moved.len(), 1);
+    assert_prompt_caching(&moved[0]);
     assert!(
         blocks(&moved[0], "thinking").is_empty(),
         "{:#}",
@@ -6859,6 +6886,11 @@ async fn reasoning_another_provider_wrote_is_not_sent_to_anthropic() {
     );
     let headed = mock_http::drain(&mut head_requests);
     for request in &headed {
+        assert!(
+            !request.body.to_string().contains("cache_control"),
+            "{:#}",
+            request.body
+        );
         assert!(request.body.get("thinking").is_none(), "{:#}", request.body);
         assert_eq!(request.header("anthropic-beta"), None);
     }

@@ -479,21 +479,24 @@ know your model. It errs high deliberately, because a model whose real limit is 
 rejects the request and names that limit, whereas a ceiling set too low truncates replies
 mid-sentence with nothing logged.
 
-`outrig run` asks Anthropic to cache the prompt on every request. One marker at the top level of
-the request moves to its end, so a call reads back what the call before it wrote and pays full
-price for only its newest turn. Two more, on the last tool definition and the last block of the
-system prompt, keep the part every call shares cached whatever happens to the conversation after
-it. The cache lasts five minutes from its last use, so a pause longer than that starts the next
-call cold. A write costs 1.25 times plain input, and a read a tenth of it or less. A prompt
-shorter than the model's minimum, between 512 and 4,096 tokens depending on the model, is sent
-uncached, and Anthropic reports no error. `model.attempt` records what a request read and wrote as
-`cached_input_tokens` and `cache_creation_input_tokens`; see
+`outrig run-new` and the library loop ask Anthropic to cache the prompt on every request. One
+marker at the top level of the request moves to its end, so between history cuts a call reads
+back what the call before it wrote and pays full price for only its newest turn. `outrig run`
+asks too, with a marker on the last message block instead of at the top level. Two more, on the
+last tool definition and the last block of the system prompt, keep the part every call shares
+cached whatever happens to the conversation after it. The cache lasts five minutes from its last
+use, so a pause longer than that starts the next call cold. A write costs 1.25 times plain
+input, and a read a tenth of it or less. A prompt shorter than the model's minimum, between 512
+and 4,096 tokens depending on the model, is sent uncached, and Anthropic reports no error.
+`model.attempt` records what a request read and wrote as `cached_input_tokens` and
+`cache_creation_input_tokens`; see
 [Integration audit](../reference/events.md#integration-audit). No setting turns it off, so an
-endpoint at `base-url` that refuses a top-level `cache_control` answers `400` to every call.
+endpoint at `base-url` that refuses a top-level `cache_control` answers `400` to every call
+from `run-new` or the library loop.
 
-`run-new` and the library loop do not ask yet. A full history is cut in steps there and only
-grows between cuts, so a marker at the end of a request would be read back by the next; turning
-it on is #751.
+A full history in `run-new` and the library loop is cut in steps and only grows between cuts.
+After a cut changes the conversation prefix, the next call writes that prefix again; the tool
+and system breakpoints still cover the unchanged static prefix.
 
 Claude Opus 5.5, Sonnet 5.5 and Fable 5.1 bind each thinking block to everything sent before it,
 and an account created on or after 2026-08-31 gets a `400` for a call that sends one back after
@@ -622,8 +625,7 @@ stay up.
 
 > **TODO: Incomplete** -- v0 wires `"chat-completions"`, `"responses"`, and `"messages"`. The
 > other styles Rig ships adapters for (Cohere, Gemini, and friends) are not exposed yet, and
-> neither are the Anthropic-specific extras -- citations, configurable API versions, and prompt
-> caching in `run-new` and the library loop.
+> neither are the Anthropic-specific extras -- citations and configurable API versions.
 
 ## Tool calling
 

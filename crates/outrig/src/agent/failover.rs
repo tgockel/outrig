@@ -207,6 +207,8 @@ pub(crate) struct ModelCandidate {
     /// `drop_block`, which its calls go through once its endpoint has refused
     /// that.
     binding: Option<Binding>,
+    /// Ask for the moving cache marker only on an Anthropic candidate.
+    prompt_caching: bool,
 }
 
 impl ModelCandidate {
@@ -221,7 +223,14 @@ impl ModelCandidate {
             model_identifier: model_identifier.into(),
             budget,
             binding,
+            prompt_caching: false,
         }
+    }
+
+    /// Cache this candidate's growing conversation at the five-minute TTL.
+    pub(crate) fn with_prompt_caching(mut self) -> Self {
+        self.prompt_caching = true;
+        self
     }
 }
 
@@ -270,14 +279,26 @@ impl Candidate for ModelCandidate {
 
     fn completion(
         &self,
-        request: CompletionRequest,
+        mut request: CompletionRequest,
     ) -> std::pin::Pin<
         Box<dyn Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>,
     > {
-        let model = match &self.binding {
-            Some(binding) if binding.refused.load(Ordering::Relaxed) => &binding.unbound,
-            _ => &self.model,
+        let (model, unbound) = match &self.binding {
+            Some(binding) if binding.refused.load(Ordering::Relaxed) => (&binding.unbound, true),
+            _ => (&self.model, false),
         };
+        if self.prompt_caching {
+            if unbound {
+                // Rig does not map typed options for our renamed dialect.
+                // It is still Anthropic, so send the same marker directly.
+                request
+                    .additional_params
+                    .get_or_insert_with(|| serde_json::json!({}))["cache_control"] =
+                    serde_json::json!({"type": "ephemeral"});
+            } else {
+                request.options.cache = Some(rig::completion::CacheRetention::Short);
+            }
+        }
         Box::pin(model.completion(request))
     }
 }
