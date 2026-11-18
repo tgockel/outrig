@@ -3,8 +3,8 @@
 //! `Drop` cannot await, so a destructor cannot run the `podman rm -f` or
 //! `buildah rm` that a cancelled future left owing. What it *can* do is spawn
 //! a detached process and hand the reap to someone else. That is what this
-//! module is: [`detach_cleanup`] launches the cleanup command with nulled
-//! stdio and moves its handle onto a thread that blocks in `wait`.
+//! module is: [`detach_cleanup`] launches the cleanup command without
+//! user-facing stdio and moves its handle onto the reaper thread.
 //!
 //! Two properties come from being an ordinary OS process rather than a task:
 //!
@@ -12,7 +12,9 @@
 //!   panic sweep -- the two places that have no runtime to lean on.
 //! - It runs to completion even if outrig's runtime is torn down, or outrig
 //!   itself exits, immediately afterwards. A spawned task would be cancelled
-//!   by either.
+//!   by either. Ordered build cleanups also carry their bounded retries in
+//!   the detached shell; a lone command's reaper retries require outrig to
+//!   remain alive.
 //!
 //! Reaping is what this adds over a bare fire-and-forget spawn. Without it
 //! every cleanup leaves a zombie for the life of the process, which is what
@@ -72,6 +74,10 @@ pub(crate) enum Reissue {
     Safe,
     /// The command selects by an identity that can be reused. Issued once.
     Once,
+    /// A shell that owns its retries. Retry transient spawn failures only,
+    /// never replay a shell that started. It reports attempt/backoff boundaries
+    /// on stdout, allowing the group watchdog to reset for each phase.
+    SelfRetrying,
 }
 
 /// What this module has done to the attempt in flight.
@@ -197,10 +203,10 @@ pub(crate) fn detach_cleanup_chain(cmds: Vec<Cmd>, reissue: Reissue) {
         return;
     }
     let program = cmd.program;
-    let waiting = match spawn_cleanup(&cmd) {
+    let waiting = match spawn_attempt(&cmd, reissue) {
         // Timestamped at spawn, not at dequeue: the deadline is about how long
         // the command has been running, and time spent queued is time running.
-        Ok(child) => Wait::running(cmd, child, reissue, cmds),
+        Ok(started) => Wait::started(cmd, started, reissue, cmds),
         // It never started. A binary that is missing or not executable will
         // still be missing in 250 ms, but a process table that was briefly
         // full will not -- and dropping the obligation there loses a resource
@@ -420,23 +426,73 @@ fn ordered_shell(cmds: std::collections::VecDeque<Cmd>) -> Cmd {
     let mut script = String::new();
     let mut argv: Vec<std::ffi::OsString> = Vec::new();
     for cmd in cmds {
-        // One shell cannot scope an environment or a stand-in to one of the
-        // commands it runs, and no cleanup command carries either.
-        debug_assert!(
-            !cmd.carries_hidden(),
-            "a cleanup chain runs only plain argv"
-        );
-        let mut words = Vec::new();
-        for word in std::iter::once(std::ffi::OsString::from(cmd.program))
-            .chain(cmd.exec_args().iter().cloned())
-        {
-            argv.push(word);
-            words.push(format!("\"${{{}}}\"", argv.len()));
-        }
+        let words = shell_words(&cmd, &mut argv);
         if !script.is_empty() {
             script.push_str("; ");
         }
-        script.push_str(&words.join(" "));
+        script.push_str(&words);
+    }
+    Cmd::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg("outrig")
+        .args(argv)
+        .in_own_process_group()
+}
+
+/// Positional parameters keep arbitrary argv bytes out of shell source.
+fn shell_words(cmd: &Cmd, argv: &mut Vec<std::ffi::OsString>) -> String {
+    debug_assert!(
+        !cmd.carries_hidden(),
+        "a cleanup chain runs only plain argv"
+    );
+    std::iter::once(std::ffi::OsString::from(cmd.program))
+        .chain(cmd.exec_args().iter().cloned())
+        .map(|word| {
+            argv.push(word);
+            format!("\"${{{}}}\"", argv.len())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Unlike reaper retries, these attempts survive the owning process exiting.
+/// Each removal spends only its own budget; a terminal failure still advances
+/// to the next removal. Stderr is captured only to recognize an absent target.
+fn retrying_shell(cmds: Vec<(Cmd, Reissue, &'static str)>) -> Cmd {
+    // The progress reader disappears when outrig exits. Ignore SIGPIPE and
+    // failed writes so losing that observer cannot stop the surviving shell.
+    let mut script = String::from(
+        "trap '' PIPE; progress() { printf . 2>/dev/null || :; }; \
+         cleanup() { absent=$1; delays=$2; shift 2; \
+         for delay in $delays; do \
+         progress; [ \"$delay\" = 0 ] || sleep \"$delay\"; progress; \
+         error=$(\"$@\" 2>&1 >/dev/null); status=$?; \
+         [ \"$status\" -eq 0 ] && return 0; \
+         case \"$error\" in *\"$absent\"*) return 0 ;; esac; \
+         done; return \"$status\"; }; ",
+    );
+    let mut argv = Vec::new();
+    for (cmd, reissue, absent) in cmds {
+        assert!(
+            !absent.is_empty(),
+            "an absent-target sentinel must not match everything"
+        );
+        argv.push(std::ffi::OsString::from(absent));
+        let absent_word = format!("\"${{{}}}\"", argv.len());
+        let mut delays = String::from("0");
+        if reissue == Reissue::Safe {
+            for retry in 0..CLEANUP_RETRIES {
+                delays.push_str(&format!(
+                    " {}",
+                    (RETRY_BACKOFF * (1 << retry)).as_secs_f64()
+                ));
+            }
+        }
+        argv.push(std::ffi::OsString::from(delays));
+        let delays_word = format!("\"${{{}}}\"", argv.len());
+        let words = shell_words(&cmd, &mut argv);
+        script.push_str(&format!("cleanup {absent_word} {delays_word} {words}; "));
     }
     Cmd::new("sh")
         .arg("-c")
@@ -464,11 +520,30 @@ fn kill_cleanup(child: &mut Child, cmd: &Cmd) -> std::io::Result<()> {
     }
 }
 
+/// A shell's private, nonblocking progress reader. A socket pair lets us
+/// configure the reader before spawning, so any setup failure still means no
+/// shell ran and is safe to retry. Only the parent end is nonblocking.
+type Progress = std::os::unix::net::UnixStream;
+
+fn spawn_attempt(cmd: &Cmd, reissue: Reissue) -> std::io::Result<(Child, Option<Progress>)> {
+    if reissue != Reissue::SelfRetrying {
+        return spawn_cleanup(cmd).map(|child| (child, None));
+    }
+    let (reader, writer) = Progress::pair()?;
+    reader.set_nonblocking(true)?;
+    let stdout = Stdio::from(std::os::fd::OwnedFd::from(writer));
+    spawn_cleanup_with_stdout(cmd, stdout).map(|child| (child, Some(reader)))
+}
+
 /// Start one attempt at `cmd`, with stdio nulled.
 fn spawn_cleanup(cmd: &Cmd) -> std::io::Result<Child> {
+    spawn_cleanup_with_stdout(cmd, Stdio::null())
+}
+
+fn spawn_cleanup_with_stdout(cmd: &Cmd, stdout: Stdio) -> std::io::Result<Child> {
     cmd.std_command()
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(stdout)
         .stderr(Stdio::null())
         .spawn()
         .inspect_err(|e| {
@@ -584,8 +659,11 @@ struct Wait {
     cmd: Cmd,
     /// The attempt in flight, or `None` between attempts.
     child: Option<Child>,
+    /// Attempt/backoff boundaries from an internally retrying shell.
+    progress: Option<Progress>,
     /// When the attempt in flight began. Reset per attempt, since the wedged
-    /// deadline is about one command rather than the obligation.
+    /// deadline is about one command rather than the obligation. A shell's
+    /// progress also resets it at each attempt/backoff boundary.
     since: Instant,
     /// How long an attempt gets before it counts as wedged. Always
     /// [`WEDGED_CLEANUP`] outside tests, which drive it down rather than
@@ -605,6 +683,17 @@ struct Wait {
 }
 
 impl Wait {
+    fn started(
+        cmd: Cmd,
+        (child, progress): (Child, Option<Progress>),
+        reissue: Reissue,
+        then: std::collections::VecDeque<Cmd>,
+    ) -> Self {
+        let mut waiting = Self::running(cmd, child, reissue, then);
+        waiting.progress = progress;
+        waiting
+    }
+
     /// An obligation whose first attempt is already running.
     fn running(
         cmd: Cmd,
@@ -615,12 +704,17 @@ impl Wait {
         Self {
             cmd,
             child: Some(child),
+            progress: None,
             since: Instant::now(),
             patience: WEDGED_CLEANUP,
             kill: Kill::Untried,
             reissue,
             then,
-            retries_left: Self::budget(reissue),
+            retries_left: if reissue == Reissue::Safe {
+                CLEANUP_RETRIES
+            } else {
+                0
+            },
             retry_at: None,
         }
     }
@@ -647,6 +741,7 @@ impl Wait {
         Some(Self {
             cmd,
             child: None,
+            progress: None,
             since: Instant::now(),
             patience: WEDGED_CLEANUP,
             kill: Kill::Untried,
@@ -674,7 +769,7 @@ impl Wait {
 
     fn budget(reissue: Reissue) -> u8 {
         match reissue {
-            Reissue::Safe => CLEANUP_RETRIES,
+            Reissue::Safe | Reissue::SelfRetrying => CLEANUP_RETRIES,
             Reissue::Once => 0,
         }
     }
@@ -689,6 +784,15 @@ impl Wait {
         let Some(child) = self.child.as_mut() else {
             return self.start_retry();
         };
+        if let Some(progress) = self.progress.as_mut() {
+            use std::io::Read;
+            let mut bytes = [0; 256];
+            // The shell has finitely many phases; bound the drain anyway so
+            // progress can never starve the reaper's other obligations.
+            if matches!(progress.read(&mut bytes), Ok(n) if n > 0) {
+                self.since = Instant::now();
+            }
+        }
         match child.try_wait() {
             // Still running: kill it if it has had too long, and keep holding
             // it either way so the kill is collected rather than left a
@@ -748,8 +852,8 @@ impl Wait {
             // signal leaves the engine-side outcome *unknown* rather than
             // known-failed -- an OOM kill or an operator's SIGKILL says
             // nothing about whether the container went away -- and unknown is
-            // the case a replayable cleanup is for. `Reissue::Once` never
-            // reaches here: its budget is zero, so the arm above took it.
+            // the case a replayable cleanup is for. Neither a one-shot nor a
+            // started self-retrying shell reaches here: its budget is zero.
             Ok(Some(_)) => {
                 let backoff = RETRY_BACKOFF * (1 << (CLEANUP_RETRIES - self.retries_left) as u32);
                 self.retries_left -= 1;
@@ -783,8 +887,8 @@ impl Wait {
     fn start_retry(&mut self) -> bool {
         match self.retry_at {
             Some(at) if Instant::now() < at => true,
-            _ => match spawn_cleanup(&self.cmd) {
-                Ok(child) => {
+            _ => match spawn_attempt(&self.cmd, self.reissue) {
+                Ok((child, progress)) => {
                     tracing::debug!(
                         target: "outrig::supervise",
                         program = self.cmd.program,
@@ -792,6 +896,12 @@ impl Wait {
                         "retrying a cleanup that did not discharge"
                     );
                     self.child = Some(child);
+                    self.progress = progress;
+                    if self.reissue == Reissue::SelfRetrying {
+                        // Only spawn failures may be retried. Once running,
+                        // the shell owns all command attempts, even on failure.
+                        self.retries_left = 0;
+                    }
                     self.since = Instant::now();
                     self.kill = Kill::Untried;
                     self.retry_at = None;
@@ -866,34 +976,21 @@ impl CleanupGuard {
     /// dropped separately they run side by side, and the later one can spend
     /// its whole retry budget while the earlier is still being refused.
     ///
-    /// The sequencing is done by one `sh` that runs them in order
-    /// ([`ordered_shell`]), not by the reaper starting each after the last.
-    /// A process outlives outrig itself, so the later removal still runs when
-    /// the CLI exits on the error that canceled the build while an earlier one
-    /// is slow; a reaper thread dies with it. The shell also starts the later
-    /// removal the moment the earlier one answers -- including with "not
-    /// known", which is what a removal of something that was never created
-    /// says -- where a chained head would back off and retry first. The
-    /// shell's status is the last removal's, and a reissue runs the whole
-    /// sequence again, which is harmless because the chain is reissued only if
-    /// every removal in it may be. The reaper supervises the shell like any
-    /// cleanup, and its wedge kill reaches the whole group.
-    pub(crate) fn detach_chain(guards: Vec<CleanupGuard>) {
-        let mut reissue = Reissue::Safe;
-        let mut cmds: std::collections::VecDeque<Cmd> = guards
+    /// One shell owns both sequencing and each removal's bounded retries, so
+    /// neither depends on the CLI surviving. `absent` is the stderr sentinel
+    /// that discharges a removal immediately, without spending its retries.
+    /// The reaper must not replay this shell and multiply the retry budgets;
+    /// it retries only an unstarted shell, then reaps it and applies the
+    /// process-group wedge watchdog, reset at each attempt/backoff boundary.
+    pub(crate) fn detach_chain(guards: Vec<(CleanupGuard, &'static str)>) {
+        let cmds: Vec<_> = guards
             .into_iter()
-            .filter_map(|mut guard| guard.0.take())
-            .map(|(cmd, each)| {
-                if each == Reissue::Once {
-                    reissue = Reissue::Once;
-                }
-                cmd
+            .filter_map(|(mut guard, absent)| {
+                guard.0.take().map(|(cmd, reissue)| (cmd, reissue, absent))
             })
             .collect();
-        match cmds.len() {
-            0 => {}
-            1 => detach_cleanup(cmds.pop_front().expect("one command"), reissue),
-            _ => detach_cleanup(ordered_shell(cmds), reissue),
+        if !cmds.is_empty() {
+            detach_cleanup(retrying_shell(cmds), Reissue::SelfRetrying);
         }
     }
 }
@@ -1257,6 +1354,42 @@ mod tests {
         assert!(!dir.path().join("pwned").exists(), "argv is data");
     }
 
+    #[test]
+    fn a_retrying_shell_preserves_argv_and_treats_the_sentinel_literally() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("out");
+        let mut nasty = b"a'b\"c $(touch pwned) `id` \\ %s\n".to_vec();
+        nasty.push(0xff);
+        let sentinel = "absent [literal] $(exit 1)";
+        let cmd = Cmd::new("/bin/sh")
+            .arg("-c")
+            .arg("printf '%s' \"$1\" >> \"$2\"; printf '%s' \"$3\" >&2; exit 125")
+            .arg("_")
+            .arg(std::ffi::OsString::from_vec(nasty.clone()))
+            .arg(&out)
+            .arg(sentinel);
+        let mut child = spawn_cleanup(&retrying_shell(vec![(cmd, Reissue::Safe, sentinel)]))
+            .expect("shell starts");
+        assert!(child.wait().expect("shell ends").success());
+        assert_eq!(std::fs::read(out).expect("argv bytes"), nasty);
+    }
+
+    #[test]
+    fn a_retrying_shell_does_not_reissue_a_reusable_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("log");
+        let cmd = Cmd::new("/bin/sh")
+            .arg("-c")
+            .arg("echo once >> \"$1\"; exit 125")
+            .arg("_")
+            .arg(&log);
+        let mut child = spawn_cleanup(&retrying_shell(vec![(cmd, Reissue::Once, "not known")]))
+            .expect("shell starts");
+        assert!(!child.wait().expect("shell ends").success());
+        assert_eq!(std::fs::read_to_string(log).expect("log"), "once\n");
+    }
+
     /// A chain runs in order, and the second command does not start until the
     /// first has ended. Two `detach_cleanup` calls would spawn two children
     /// and race; where the second undoes something the first must remove
@@ -1320,6 +1453,7 @@ mod tests {
         let mut owed = Wait {
             cmd: Cmd::new("/bin/sh").arg("-c").arg("exit 0"),
             child: None,
+            progress: None,
             since: Instant::now(),
             patience: WEDGED_CLEANUP,
             // As if the attempt before this one had been killed for wedging.
@@ -1562,19 +1696,25 @@ mod tests {
         let second = dir.path().join("second");
 
         CleanupGuard::detach_chain(vec![
-            CleanupGuard::arm(
-                Cmd::new("/bin/sh")
-                    .arg("-c")
-                    .arg(format!("sleep 0.4; : > {}", first.display())),
-                Reissue::Safe,
+            (
+                CleanupGuard::arm(
+                    Cmd::new("/bin/sh")
+                        .arg("-c")
+                        .arg(format!("sleep 0.4; : > {}", first.display())),
+                    Reissue::Safe,
+                ),
+                "not known",
             ),
-            CleanupGuard::arm(
-                Cmd::new("/bin/sh").arg("-c").arg(format!(
-                    "test -e {} && : > {}",
-                    first.display(),
-                    second.display()
-                )),
-                Reissue::Safe,
+            (
+                CleanupGuard::arm(
+                    Cmd::new("/bin/sh").arg("-c").arg(format!(
+                        "test -e {} && : > {}",
+                        first.display(),
+                        second.display()
+                    )),
+                    Reissue::Safe,
+                ),
+                "not known",
             ),
         ]);
 
@@ -1594,15 +1734,21 @@ mod tests {
         let done = dir.path().join("done");
         let record = |what: &str, status: i32| {
             Cmd::new("/bin/sh").arg("-c").arg(format!(
-                "echo {what} >> {}; [ {status} -eq 0 ] && : > {}; exit {status}",
+                "echo container not known >&2; echo {what} >> {}; [ {status} -eq 0 ] && : > {}; exit {status}",
                 log.display(),
                 done.display()
             ))
         };
 
         CleanupGuard::detach_chain(vec![
-            CleanupGuard::arm(record("rm", 125), Reissue::Safe),
-            CleanupGuard::arm(record("rmi", 0), Reissue::Safe),
+            (
+                CleanupGuard::arm(record("rm", 125), Reissue::Safe),
+                "container not known",
+            ),
+            (
+                CleanupGuard::arm(record("rmi", 0), Reissue::Safe),
+                "image not known",
+            ),
         ]);
 
         wait_for(&done, Duration::from_secs(10), "the chain to finish");
@@ -1612,6 +1758,132 @@ mod tests {
             std::fs::read_to_string(&log).expect("log"),
             "rm\nrmi\n",
             "the first removal must run once, then the second"
+        );
+    }
+
+    /// Every command has its own budget, even when a predecessor exhausts
+    /// its budget. The reaper must not multiply them by replaying the shell.
+    #[test]
+    fn a_detached_chain_bounds_each_removals_retries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("log");
+        let record = |what: &str, reissue| {
+            (
+                CleanupGuard::arm(
+                    Cmd::new("/bin/sh")
+                        .arg("-c")
+                        .arg(format!("echo {what} >> {}; exit 125", log.display())),
+                    reissue,
+                ),
+                "not known",
+            )
+        };
+        CleanupGuard::detach_chain(vec![
+            record("first", Reissue::Safe),
+            record("last", Reissue::Safe),
+        ]);
+        wait_for(&log, Duration::from_secs(10), "the chain to start");
+        // Includes both commands' backoffs plus a whole additional reaper
+        // schedule, so a mistaken outer replay is observable.
+        std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(
+            std::fs::read_to_string(log).expect("log"),
+            "first\nfirst\nfirst\nlast\nlast\nlast\n"
+        );
+    }
+
+    /// An unstarted shell still has the old transient-spawn budget, but a
+    /// successfully spawned shell may never spend that budget on a replay.
+    #[test]
+    fn a_self_retrying_shell_retries_spawn_failures_but_never_replays() {
+        for errno in [nix::libc::EAGAIN, nix::libc::ENOMEM] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let log = dir.path().join("log");
+            let cmd = Cmd::new("/bin/sh")
+                .arg("-c")
+                .arg("echo attempt >> \"$1\"; exit 125")
+                .arg("_")
+                .arg(&log);
+            let mut waiting = Wait::pending(
+                retrying_shell(vec![(cmd, Reissue::Safe, "not known")]),
+                Reissue::SelfRetrying,
+                Default::default(),
+                &std::io::Error::from_raw_os_error(errno),
+            )
+            .expect("a transient initial spawn failure is retryable");
+            assert_eq!(waiting.retries_left, CLEANUP_RETRIES - 1);
+            // The initial delay is already tested elsewhere. Skip it so this
+            // exercises the transition from pending to successfully started.
+            waiting.retry_at = None;
+            assert!(waiting.start_retry());
+            assert!(waiting.progress.is_some());
+            assert_eq!(
+                waiting.retries_left, 0,
+                "a running shell cannot be replayed"
+            );
+            let until = Instant::now() + Duration::from_secs(10);
+            while waiting.still_owed() {
+                assert!(Instant::now() < until, "shell did not finish");
+                std::thread::sleep(REAP_POLL);
+            }
+            assert_eq!(
+                std::fs::read_to_string(log).expect("log"),
+                "attempt\nattempt\nattempt\n"
+            );
+        }
+        assert!(
+            Wait::pending(
+                Cmd::new("/nonexistent/cleanup-shell"),
+                Reissue::SelfRetrying,
+                Default::default(),
+                &std::io::Error::from(std::io::ErrorKind::NotFound),
+            )
+            .is_none(),
+            "a permanent spawn failure is not retried"
+        );
+    }
+
+    /// Three individually healthy attempts take longer than one watchdog
+    /// interval in total. Both the attempts and the later removal must finish.
+    #[test]
+    fn a_self_retrying_shell_gets_a_fresh_deadline_for_each_attempt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("log");
+        let tail = dir.path().join("tail");
+        let rm = Cmd::new("/bin/sh")
+            .arg("-c")
+            .arg("echo attempt >> \"$1\"; sleep 0.4; [ $(wc -l < \"$1\") -eq 3 ]")
+            .arg("_")
+            .arg(&log);
+        let rmi = Cmd::new("/bin/sh")
+            .arg("-c")
+            .arg(": > \"$1\"")
+            .arg("_")
+            .arg(&tail);
+        let shell = retrying_shell(vec![
+            (rm, Reissue::Safe, "container not known"),
+            (rmi, Reissue::Safe, "image not known"),
+        ]);
+        let started = spawn_attempt(&shell, Reissue::SelfRetrying).expect("shell starts");
+        let mut waiting = Wait::started(shell, started, Reissue::SelfRetrying, Default::default());
+        waiting.patience = Duration::from_millis(800);
+        let began = Instant::now();
+        while waiting.still_owed() {
+            assert!(
+                began.elapsed() < Duration::from_secs(10),
+                "shell did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            began.elapsed() > waiting.patience,
+            "the shared deadline must have passed"
+        );
+        assert_eq!(waiting.kill, Kill::Untried, "no individual attempt wedged");
+        assert!(tail.exists(), "the final tag removal must run");
+        assert_eq!(
+            std::fs::read_to_string(log).expect("log"),
+            "attempt\nattempt\nattempt\n"
         );
     }
 
@@ -1625,7 +1897,7 @@ mod tests {
         let pidfile = dir.path().join("pid");
         let after = dir.path().join("after");
 
-        let shell = ordered_shell(
+        let shell = retrying_shell(
             vec![
                 Cmd::new("/bin/sh")
                     .arg("-c")
@@ -1634,13 +1906,21 @@ mod tests {
                     .arg("-c")
                     .arg(format!(": > {}", after.display())),
             ]
-            .into(),
+            .into_iter()
+            .map(|cmd| (cmd, Reissue::Safe, "not known"))
+            .collect(),
         );
-        let child = spawn_cleanup(&shell).expect("the shell starts");
+        let (child, progress) =
+            spawn_attempt(&shell, Reissue::SelfRetrying).expect("the shell starts");
         let shell_pid = child.id() as i32;
         let wedged = published_pid(&pidfile, "the wedged removal");
 
-        let mut waiting = Wait::running(shell, child, Reissue::Safe, Default::default());
+        let mut waiting = Wait::started(
+            shell,
+            (child, progress),
+            Reissue::SelfRetrying,
+            Default::default(),
+        );
         waiting.patience = Duration::from_millis(100);
         // Driven by hand rather than through the reaper thread, so the test
         // reads the outcome off the same call that made it.

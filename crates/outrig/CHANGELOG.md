@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Canceled builds retain their cleanup retries after the CLI exits.** The detached
+  working-container and temporary-tag removals retry in order in their own process,
+  with bounded per-removal budgets and no backoff for an already absent target.
+  Transient shell-spawn failures remain retryable, and each cleanup attempt gets
+  its own process-group watchdog deadline. (#916)
+
 - **Network interception now refuses borrowed containers with bounding-only `CAP_NET_ADMIN`.**
   Both effective and bounding capabilities are inspected, preventing a non-root process from
   regaining the capability through a setuid-root helper and removing the redirect rules. (#887)

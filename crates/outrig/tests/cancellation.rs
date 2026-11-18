@@ -2022,6 +2022,63 @@ async fn a_canceled_build_removes_its_tag_after_a_slow_working_container_removal
     expect_refusals_spent(journal, "rm", &token);
 }
 
+/// Issue #916: retries must belong to the detached process, not the CLI's
+/// reaper thread. Re-exec this test as a CLI that exits immediately on cancel;
+/// only the outer test survives long enough to observe the removals.
+#[tokio::test]
+async fn a_canceled_build_retries_its_cleanup_after_the_process_exits() {
+    const CHILD: &str = "OUTRIG_TEST_EXITING_BUILD";
+    if let Some(token) = std::env::var_os(CHILD) {
+        // Inherit the parent's fake and journal, rather than making a new one.
+        let token = token.into_string().expect("token");
+        let journal = PathBuf::from(std::env::var_os("OUTRIG_FAKE_JOURNAL").expect("journal"));
+        let context = tempfile::tempdir().expect("tempdir");
+        std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n")
+            .expect("write Dockerfile");
+        let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
+        let final_tag = keyed_tag(&token, &cfg, context.path()).await;
+        let build = outrig::image::build_image_for(&token, &cfg, context.path(), &final_tag, false);
+        let mut build = Box::pin(build);
+        let from = ["outrig-label-", token.as_str()];
+        tokio::select! {
+            _ = &mut build => panic!("the fake `buildah from` should not have returned"),
+            _ = invocation(&journal, "from", &from) => {},
+        }
+        drop(build);
+        std::process::exit(0);
+    }
+
+    let journal = fake_runtime();
+    let token = unique_name("exit-chain");
+    return_immediately_for(journal, "build", &token);
+    refuse_for(journal, "rm", &token, 1);
+    refuse_for(journal, "rmi", &token, 1);
+    let mut child = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "a_canceled_build_retries_its_cleanup_after_the_process_exits",
+            "--nocapture",
+        ])
+        .env(CHILD, &token)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn exiting CLI");
+    let status = tokio::time::timeout(CEILING, child.wait())
+        .await
+        .expect("CLI exits promptly")
+        .expect("wait for CLI");
+    assert!(status.success(), "child test failed: {status}");
+
+    let (_, from_argv) = invocation(journal, "from", &["outrig-label-", token.as_str()]).await;
+    let builder = flag_value(&from_argv, "--name");
+    let (_, build_argv) = invocation(journal, "build", &[token.as_str()]).await;
+    let temp_tag = flag_value(&build_argv, "--tag");
+    expect_removed(journal, &builder).await;
+    expect_removed(journal, &temp_tag).await;
+    expect_refusals_spent(journal, "rm", &token);
+    expect_refusals_spent(journal, "rmi", &token);
+}
+
 /// A tag the build never created is not removed again.
 ///
 /// Every build that fails before tagging reaches the `rmi` of a tag that does

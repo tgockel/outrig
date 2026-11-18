@@ -1868,12 +1868,7 @@ impl Owing {
 
 impl Drop for Owing {
     fn drop(&mut self) {
-        let guards = self
-            .before
-            .drain(..)
-            .chain(self.tag.take())
-            .map(|(guard, _)| guard)
-            .collect();
+        let guards = self.before.drain(..).chain(self.tag.take()).collect();
         CleanupGuard::detach_chain(guards);
     }
 }

@@ -69,7 +69,10 @@ outrig build [--image <name>]
      the removal, outrig warns and reissues it in the background rather than leaving the tag
      behind; the build's own result stands either way. When the label-stamping working container
      could not be removed either, the tag is removed after it, since buildah refuses to remove an
-     image a container was made from.
+     image a container was made from. Each detached removal gets up to two retries,
+     with 250 ms then 500 ms backoffs; an already absent target needs no retry. The
+     ordered removals and their retries survive the CLI exiting after a canceled build,
+     but a removal that keeps failing is abandoned after its budget is spent.
      The repository is the `[images.<name>]` block key, so the built image is self-describing
      in `podman images`; the `<hash>` is the content-addressed cache key.
 
