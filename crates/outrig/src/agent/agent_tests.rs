@@ -4941,8 +4941,8 @@ async fn the_round_after_an_empty_reply_is_sent_no_trace_of_it() {
 
 /// A reply rig rejects that is not an empty reply the model ended on its own --
 /// cut off or filtered, or with something in it rig set aside -- is the
-/// provider's defect: retried twice, and then the round fails, keeping the
-/// Python it ran. The attempts record why each stopped.
+/// provider's defect: retried twice unless it is a content refusal, and then
+/// the round fails, keeping the Python it ran. The attempts record why each stopped.
 async fn a_rejected_reply_that_is_no_empty_stop_fails_the_round(
     style: Style,
     kind: &str,
@@ -4984,8 +4984,8 @@ async fn a_rejected_reply_that_is_no_empty_stop_fails_the_round(
     let recorded = mock_http::drain(&mut requests);
     assert_eq!(
         recorded.len(),
-        4 + usize::from(refused),
-        "the call, the empty reply, its two retries, and the call without its results"
+        if refused { 3 } else { 4 },
+        "the tool call, the unusable reply, then a withheld call or two retries"
     );
     let records = events::recorded(dir.path());
     let withheld = events::of_kind(&records, "model.withheld");
@@ -4993,7 +4993,7 @@ async fn a_rejected_reply_that_is_no_empty_stop_fails_the_round(
     if refused {
         assert_eq!(withheld[0]["turn"], 0);
         assert_eq!(withheld[0]["finish_reason"], finish_reason);
-        let (sent, resent) = (recorded[1].body.to_string(), recorded[4].body.to_string());
+        let (sent, resent) = (recorded[1].body.to_string(), recorded[2].body.to_string());
         assert!(sent.contains(r"ran\n"), "{sent}");
         assert!(
             !resent.contains(r"ran\n") && resent.contains(NOTICE),
@@ -5003,8 +5003,8 @@ async fn a_rejected_reply_that_is_no_empty_stop_fails_the_round(
     let retries = events::of_kind(&records, "model.retry");
     assert_eq!(
         retries.len(),
-        2,
-        "the call without its results is sent once"
+        if refused { 0 } else { 2 },
+        "neither a refusal nor the call without its results is retried"
     );
     let attempts = events::of_kind(&records, "model.attempt");
     for attempt in &attempts[1..] {
@@ -5116,9 +5116,9 @@ fn said(style: Style, content: &str, finish_reason: &str) -> mock_http::CannedRe
 }
 
 /// A provider's filter that ends a reply after the model reasoned, or after it
-/// said some of what it meant to, has not had the model end its turn. It takes
-/// the way an empty reply does -- tried again, and the round fails naming the
-/// finish reason -- and it is no assistant turn in the conversation.
+/// said some of what it meant to, has not had the model end its turn. It follows
+/// the content-refusal path -- sent without its results once, and the round
+/// fails naming the finish reason -- and is no assistant turn in the conversation.
 #[tokio::test]
 async fn a_reply_filtered_after_the_model_reasoned_fails_the_round() {
     for (style, reason) in [
@@ -5155,9 +5155,7 @@ async fn the_round_after_a_filtered_reply_is_sent_no_trace_of_it() {
         Events::off(),
         vec![
             style.submit("call_1", "print('ran')"),
-            // The call, its two retries, and the call without its results.
-            said(style, "I was about to", "content_filter"),
-            said(style, "I was about to", "content_filter"),
+            // The refusal, then the call without its results.
             said(style, "I was about to", "content_filter"),
             said(style, "I was about to", "content_filter"),
             style.text("done"),
@@ -5259,16 +5257,16 @@ async fn a_result_the_provider_will_not_read_is_left_out_and_the_round_goes_on()
             .collect();
         assert_eq!(
             carried,
-            [false, true, true, true, false, false],
-            "{style:?}: refused, retried twice, then sent without it, and never again"
+            [false, true, false, false],
+            "{style:?}: refused once, then sent without it, and never again"
         );
-        for body in &bodies[4..] {
+        for body in &bodies[2..] {
             assert!(body.contains(NOTICE), "{style:?}: {body}");
         }
         assert!(
-            bodies[5].contains("held whole: True"),
+            bodies[3].contains("held whole: True"),
             "{style:?}: {}",
-            bodies[5]
+            bodies[3]
         );
 
         let records = events::recorded(dir.path());
@@ -5337,7 +5335,7 @@ async fn a_provider_that_refuses_everything_fails_the_round_and_leaves_nothing_o
             .expect_err("every reply is refused"),
     );
     assert!(err.contains("finish reason content_filter: "), "{err}");
-    assert_eq!(mock_http::drain(&mut requests).len(), 1 + 3 + 1);
+    assert_eq!(mock_http::drain(&mut requests).len(), 1 + 1 + 1);
 
     post(&agent, "try again").await;
     within(agent.round())
@@ -5347,8 +5345,8 @@ async fn a_provider_that_refuses_everything_fails_the_round_and_leaves_nothing_o
     let next = mock_http::drain(&mut requests);
     assert_eq!(
         next.len(),
-        3,
-        "a round's opening has no results to leave out"
+        1,
+        "a round's opening has no results to leave out, and a refusal is not retried"
     );
     let body = next[0].body.to_string();
     assert!(body.contains("read me") && !body.contains(NOTICE), "{body}");

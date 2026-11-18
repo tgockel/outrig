@@ -61,7 +61,7 @@
 //!   rather than only the last.
 //! * **A refusal of what a call carried is not the last word.** A candidate
 //!   that ends a reply for its content -- `content_filter`, `refusal`
-//!   -- past its retries is sent the call once more, with the results of the
+//!   -- is sent the call once more, without identical retries, with the results of the
 //!   turn it answers replaced by a notice: the one thing that call carried no
 //!   earlier one had. Answered, every later call is sent the notice too, so a
 //!   result the provider will not read cannot refuse the rest of the session;

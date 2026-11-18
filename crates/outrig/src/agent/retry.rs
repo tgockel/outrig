@@ -43,7 +43,8 @@
 //!
 //! [`RetryingModel`] wraps the model itself and covers what is left: a response
 //! rig could not turn into a completion, or made one of that no model ended --
-//! a reply cut off with nothing in it, or ended by the provider for its content.
+//! a reply cut off with nothing in it. A content-policy refusal is an error too,
+//! but resending the same request cannot clear it, so it is not retried.
 //! It takes the same budget, and an attempt count on top, because an unusable
 //! body comes back immediately -- the budget alone would spend itself on dozens
 //! of tries instead of the handful a hiccup deserves. Sharing the budget keeps
@@ -469,10 +470,11 @@ impl HttpClientExt for RetryingHttpClient {
 /// Every such reply becomes a [`ProviderError::Response`], rig's own class for
 /// "the provider's body could not be turned into a completion", which is
 /// always the provider's doing and never a local misconfiguration; the loop
-/// retries that class. A reply with nothing in it that the provider says the
-/// model ended on its own is no defect: rig makes an empty turn of it, which
-/// its run loop reads as a turn that finished, and it passes through. A reply
-/// with anything in it, a refusal for one, is still an error.
+/// retries that class except for content-policy refusals. A reply with nothing
+/// in it that the provider says the model ended on its own is no defect: rig
+/// makes an empty turn of it, which its run loop reads as a turn that finished,
+/// and it passes through. A reply with anything in it, a refusal for one, is
+/// still an error.
 ///
 /// A model-layer wrapper is what `deedd83` deliberately removed when the
 /// transient retry moved down to [`RetryingHttpClient`], and it brings back the
@@ -529,23 +531,30 @@ impl RetryingModel {
     /// it comes back as; any body rig rejected has the finish reason it names
     /// put first in that error, since rig's own words say only what it could
     /// not find, and every retry line, event and round error after this one is
-    /// made from it.
+    /// made from it. The last value says the provider refused the content, so
+    /// the retry loop must not resend the same request.
     async fn attempt(
         &self,
         request: CompletionRequest,
     ) -> (
         Result<CompletionResponse, ProviderError>,
         Option<(CallId, AttemptId)>,
+        bool,
     ) {
         let settling = self.retries.slot.awaiting();
+        let mut refused = false;
         let outcome = match self.inner.call(request).await {
-            Ok(response) => match unusable_reply(&response) {
-                Some(message) => Err(ProviderError::Response(message)),
-                None => Ok(response),
-            },
+            Ok(response) => {
+                refused = reply_is_content_refusal(&response);
+                match unusable_reply(&response) {
+                    Some(message) => Err(ProviderError::Response(message)),
+                    None => Ok(response),
+                }
+            }
             Err(error) => match undecodable(error) {
                 Ok(message) => {
                     let reason = settling.body().and_then(|body| body_finish_reason(&body));
+                    refused = reason.as_deref().is_some_and(is_content_refusal);
                     Err(ProviderError::Response(match reason {
                         Some(reason) => format!("finish reason {reason}: {message}"),
                         None => message,
@@ -555,7 +564,7 @@ impl RetryingModel {
             },
         };
         let ids = settling.settle(&outcome);
-        (outcome, ids)
+        (outcome, ids, refused)
     }
 
     /// The retry loop proper. Split out so [`Self::completion`] can inspect
@@ -574,7 +583,8 @@ impl RetryingModel {
         // nor for a request its chain sends once, whose call has had its
         // retries.
         if self.policy.budget.is_zero() || self.retries.slot.once() {
-            return self.attempt(request).await;
+            let (outcome, ids, _) = self.attempt(request).await;
+            return (outcome, ids);
         }
 
         // `tokio::time::Instant` for the same reason `send_with_retry` uses it:
@@ -584,11 +594,11 @@ impl RetryingModel {
         let mut attempt = 0u32;
         loop {
             let (message, ids) = match self.attempt(request.clone()).await {
-                (Err(ProviderError::Response(message)), ids) => (message, ids),
+                (Err(ProviderError::Response(message)), ids, false) => (message, ids),
                 // A success, or a failure this layer cannot fix: one the HTTP
                 // client already retried, or a terminal one -- a bad key's
-                // `401` above all, which no number of tries will fix.
-                outcome => return outcome,
+                // `401`, or a content-policy refusal, which resending cannot fix.
+                (outcome, ids, _) => return (outcome, ids),
             };
 
             // Bounded by a count *and* by the budget, unlike the HTTP loop. An
@@ -693,10 +703,8 @@ impl std::error::Error for BudgetSpent {}
 fn unusable_reply(response: &CompletionResponse) -> Option<String> {
     let word = provider_finish_reason(&response.raw);
     let normalized = response.finish_reason();
-    let refusal = word.as_deref().is_some_and(is_content_refusal)
-        || matches!(normalized, Some(FinishReason::ContentFilter));
     let reason = word.or_else(|| normalized.clone().map(finish_word));
-    if refusal {
+    if reply_is_content_refusal(response) {
         let reason = reason.unwrap_or_else(|| "content_filter".to_string());
         return Some(format!(
             "finish reason {reason}: the provider ended the reply for its content"
@@ -719,6 +727,16 @@ fn unusable_reply(response: &CompletionResponse) -> Option<String> {
         let reason = reason.unwrap_or_else(|| "unknown".to_string());
         format!("finish reason {reason}: the reply holds no text and no tool call")
     })
+}
+
+/// Whether either the provider's document or rig's normalized reason names
+/// a content-policy refusal. Keep this independent of the error's wording:
+/// the error reports the provider's words, not a retry classification.
+fn reply_is_content_refusal(response: &CompletionResponse) -> bool {
+    provider_finish_reason(&response.raw)
+        .as_deref()
+        .is_some_and(is_content_refusal)
+        || matches!(response.finish_reason(), Some(FinishReason::ContentFilter))
 }
 
 /// The wire's spelling of a normalized finish reason, for an error that names
@@ -756,9 +774,9 @@ fn undecodable(error: ProviderError) -> Result<String, ProviderError> {
 }
 
 /// Whether `reason`, a provider's finish reason, says the model chose to stop:
-/// OpenAI's `stop`, Anthropic's `end_turn` and a Responses reply's `completed`. Every other reason of an empty
-/// reply -- a truncation, a filter -- is a turn that was cut short, and the
-/// provider's defect to retry.
+/// OpenAI's `stop`, Anthropic's `end_turn` and a Responses reply's `completed`.
+/// Other reasons name a cut-short turn or a content-policy refusal; refusals
+/// are errors, but must not be retried with the same request.
 pub(crate) fn is_normal_stop(reason: &str) -> bool {
     matches!(reason, "stop" | "end_turn" | "completed")
 }
@@ -1383,10 +1401,11 @@ fn is_transient(err: &HttpError) -> bool {
 ///
 /// A transient transport failure, or a status the HTTP loop retried until its
 /// budget stopped it -- which rig hands on as the provider's response, its
-/// status kept -- and an unusable reply, which [`RetryingModel`] re-rolled
-/// until its attempts ran out. Everything else -- a `401`, a model that does
-/// not exist, a provider-reported fault -- is terminal: no number of resends
-/// satisfies it.
+/// status kept -- and an unusable reply. [`RetryingModel`] re-rolls the latter
+/// until its attempts run out, except for content-policy refusals: those need
+/// a different request, which the chain assembles, not an identical retry.
+/// Everything else -- a `401`, a model that does not exist, a provider-reported
+/// fault -- is terminal: no number of resends satisfies it.
 ///
 /// Defined here, beside the loops whose classes it unions, so it cannot drift
 /// from what was retried. It answers for the *same* request only: a failover
@@ -1617,6 +1636,128 @@ mod tests {
     /// What [`AlwaysUnusable`]'s reply fails as.
     const UNUSABLE: &str = "finish reason length: the reply holds no text and no tool call";
 
+    /// A provider refusal, either decoded or rejected by rig. Like the real
+    /// HTTP layer, it reports the body before the model layer settles it.
+    #[derive(Clone)]
+    struct Refusing {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        slot: CallSlot,
+        raw: serde_json::Value,
+        finish: Option<FinishReason>,
+        text: bool,
+        undecodable: bool,
+    }
+
+    impl Transport<MockScript> for Refusing {
+        fn send(&self, _request: CompletionRequest, _exchange: Exchange) -> Opening<MockFrame> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(sent) = self.slot.sending() {
+                sent.answered(None)
+                    .arrived(&Bytes::from(serde_json::to_vec(&self.raw).unwrap()));
+            }
+            let frame = if self.undecodable {
+                Err(ProviderError::Response("no completion".into()))
+            } else {
+                let choice = if self.text {
+                    vec![AssistantContent::text("partial reply")]
+                } else {
+                    Vec::new()
+                };
+                Ok(MockFrame::Response(Box::new(
+                    CompletionResponse::new(
+                        choice,
+                        rig::completion::Usage::new(),
+                        Origin::new(MOCK_API, MOCK_PROVIDER, ""),
+                        self.raw.clone(),
+                    )
+                    .with_optional_finish_reason(self.finish.clone()),
+                )))
+            };
+            Opening::ready(Opened::new(futures_util::stream::iter([frame])))
+        }
+    }
+
+    /// Refusals stay errors and are recorded, but never spend an identical
+    /// request on a re-roll. Neither rig decoding the reply nor finding some
+    /// text in it changes that; rig's normalized reason also suffices alone.
+    #[tokio::test]
+    async fn content_refusals_end_the_reroll_without_hiding_the_failure() {
+        let reasons = [
+            (
+                serde_json::json!({"choices": [{"finish_reason": "content_filter"}]}),
+                None,
+            ),
+            (serde_json::json!({"stop_reason": "refusal"}), None),
+            (
+                serde_json::json!({
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "content_filter"}
+                }),
+                None,
+            ),
+            (serde_json::Value::Null, Some(FinishReason::ContentFilter)),
+        ];
+        for (raw, finish) in reasons {
+            for (text, undecodable) in [(false, false), (true, false), (false, true)] {
+                // A body rig rejected has no normalized reason to read.
+                if undecodable && raw.is_null() {
+                    continue;
+                }
+                let dir = tempfile::tempdir().unwrap();
+                let events = crate::events::opened(dir.path()).await;
+                let slot = CallSlot::new(
+                    crate::agent::ledger::Ledger::new(events.clone(), None, None),
+                    events.clone(),
+                    None,
+                );
+                slot.begin_call();
+                slot.candidate("m", "m", None);
+                let calls = Arc::default();
+                let model = RetryingModel::new(
+                    Model::new(
+                        MockScript::default(),
+                        Refusing {
+                            calls: Arc::clone(&calls),
+                            slot: slot.clone(),
+                            raw: raw.clone(),
+                            finish: finish.clone(),
+                            text,
+                            undecodable,
+                        },
+                    )
+                    .erase(),
+                    RetryPolicy::default(),
+                    Retries::new(slot.clone(), "m"),
+                );
+                let error = model
+                    .completion(CompletionRequest::new("hi"))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, ProviderError::Response(_)), "{error}");
+                assert_eq!(
+                    calls.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "raw={raw}, text={text}, undecodable={undecodable}"
+                );
+                events.close().await.unwrap();
+                let records = crate::events::recorded(dir.path());
+                assert!(crate::events::of_kind(&records, "model.retry").is_empty());
+                let attempts = crate::events::of_kind(&records, "model.attempt");
+                assert_eq!(attempts.len(), 1);
+                assert!(
+                    attempts[0]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("finish reason")
+                );
+                if let Some(reason) = provider_finish_reason(&raw) {
+                    assert_eq!(attempts[0]["finish_reason"], reason);
+                    assert_eq!(slot.filtered().as_deref(), Some(reason.as_str()));
+                }
+            }
+        }
+    }
+
     /// The count is what has to stop a provider answering empty forever: an
     /// unusable response comes back in milliseconds, so on the default
     /// ten-minute budget the backoff curve alone would keep re-rolling for the
@@ -1760,7 +1901,7 @@ mod tests {
         for normal in ["stop", "end_turn"] {
             assert!(is_normal_stop(normal), "{normal}");
         }
-        for cut_short in ["length", "max_tokens", "content_filter", "tool_calls", ""] {
+        for cut_short in ["length", "max_tokens", "tool_calls", ""] {
             assert!(!is_normal_stop(cut_short), "{cut_short}");
         }
         for refused in ["content_filter", "refusal"] {

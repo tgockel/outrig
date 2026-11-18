@@ -1130,6 +1130,10 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Fixed
 
+- Content-policy refusals (`content_filter` and `refusal`) no longer spend unusable-response
+  retries resending the same request. They remain recorded failures for the failover chain
+  to handle, whether the refused reply is empty, contains text, or cannot be decoded (#766).
+
 - Anthropic requests from the library loop (`run-new`, host programs and `harness`) now ask
   for five-minute prompt caching: a moving top-level marker and breakpoints on the last tool
   definition and system block. Calls between history cuts can read back the preceding call's
