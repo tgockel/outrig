@@ -105,7 +105,10 @@ refuses the run before anything is hashed or built, naming the directory. Left u
 session's own writes (`session.json`, `logs/`, and under `-v` a live transcript) would land in
 what the image's cache key hashes, so every build of it would finish only to be discarded and
 retried. Point `--session-dir` or `--session-root` outside the build context, or exclude it with
-a `.gitignore` rule, to fix it.
+a `.gitignore` rule, to fix it. An ignore rule is not enough if an unignored symlink in the
+context reaches the session path: the cache key follows the link and includes its target even
+when that target is ignored. In that case the refusal names both the session path and the
+symlink. Move the session path outside the context, or remove or ignore the symlink as well.
 
 ## `outrig ls`
 

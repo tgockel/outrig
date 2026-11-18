@@ -263,6 +263,23 @@ pub enum OutrigError {
         whole_tree: bool,
     },
 
+    /// An ignored session path is reached by a symlink admitted to the cache key.
+    #[error(
+        "session path {} is reached by symlink {} in the build context {} for \
+         image-config {image:?}, despite its ignore rule\n\
+         help: move the session path outside the build context, or remove or ignore the symlink",
+        path.display(),
+        link.display(),
+        context.display()
+    )]
+    #[non_exhaustive]
+    SessionPathViaSymlinkInBuildContext {
+        image: String,
+        path: PathBuf,
+        link: PathBuf,
+        context: PathBuf,
+    },
+
     // Raised by the build merge, a runtime read of a raw or sidecar image, and
     // `image inspect`, so the `help:` cannot assume the reader owns the
     // image's Dockerfile.

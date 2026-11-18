@@ -2344,3 +2344,309 @@ async fn refuse_session_registry_entry_skips_external_and_non_build_sources() {
     );
     assert!(!root.join("roots").exists());
 }
+
+/// #921: ignoring the session's real path is insufficient when COPY can reach
+/// it through a link admitted by git. Probe before creating even the leaf.
+#[tokio::test]
+async fn session_paths_are_refused_when_reached_by_admitted_symlinks() {
+    for (name, target) in [
+        ("parent", "sessions"),
+        ("exact", "sessions/new/session"),
+        ("absolute", "/sessions"),
+        ("clamped", "../../sessions"),
+        ("chain", "hidden/bridge"),
+        ("nested_link", "other"),
+    ] {
+        let ctx = make_ctx(&[
+            ("Dockerfile", "FROM alpine\n"),
+            (".gitignore", "/sessions/\n/hidden/\n"),
+        ]);
+        git_init(ctx.path());
+        let root = std::fs::canonicalize(ctx.path()).unwrap();
+        std::fs::create_dir(root.join("hidden")).unwrap();
+        std::os::unix::fs::symlink("../sessions", root.join("hidden/bridge")).unwrap();
+        std::fs::create_dir(root.join("other")).unwrap();
+        std::os::unix::fs::symlink("../sessions", root.join("other/back")).unwrap();
+        // In this case the inner link is not independently admitted by git.
+        std::fs::write(root.join("other/.gitignore"), "back\n").unwrap();
+        std::os::unix::fs::symlink(target, root.join("alias")).unwrap();
+        let dir = root.join("sessions/new/session");
+        let cfg = session_dir_test_cfg(&root);
+        let err = refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+            .await
+            .expect_err(name);
+        assert!(
+            matches!(&err, OutrigError::SessionPathViaSymlinkInBuildContext {
+                image, path, link, context,
+            } if image == "tool" && path == &dir && link == &root.join("alias") && context == &root),
+            "{name}: {err}"
+        );
+        let message = err.to_string();
+        assert!(message.contains(&dir.display().to_string()), "{message}");
+        assert!(
+            message.contains(&root.join("alias").display().to_string()),
+            "{message}"
+        );
+        assert!(
+            !root.join("sessions").exists(),
+            "probe must undo temporary directories"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_symlink_probe_honors_nested_repository_boundaries() {
+    for whole_tree in [false, true] {
+        let ctx = make_ctx(&[
+            ("Dockerfile", "FROM alpine\n"),
+            (".gitignore", "/sessions/\n"),
+            (
+                "nested/.gitignore",
+                if whole_tree { "*\n" } else { "unrelated\n" },
+            ),
+        ]);
+        git_init(ctx.path());
+        git_init(&ctx.path().join("nested"));
+        let root = std::fs::canonicalize(ctx.path()).unwrap();
+        std::os::unix::fs::symlink("../sessions", root.join("nested/alias")).unwrap();
+        let dir = root.join("sessions/new");
+        let err = refuse_session_dir_in_build_context(
+            "tool",
+            &session_dir_test_cfg(&root),
+            Path::new("/"),
+            &dir,
+            &dir,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, OutrigError::SessionPathViaSymlinkInBuildContext { link, .. }
+            if link == root.join("nested/alias"))
+        );
+        assert!(!root.join("sessions").exists());
+    }
+}
+
+#[tokio::test]
+async fn session_symlink_probe_allows_ignored_unrelated_and_looping_aliases() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        (".gitignore", "/sessions/\n/alias\n/nested/\n"),
+    ]);
+    git_init(ctx.path());
+    let root = std::fs::canonicalize(ctx.path()).unwrap();
+    std::os::unix::fs::symlink("sessions", root.join("alias")).unwrap();
+    std::os::unix::fs::symlink("unrelated", root.join("dangling")).unwrap();
+    std::os::unix::fs::symlink("loop-b", root.join("loop-a")).unwrap();
+    std::os::unix::fs::symlink("loop-a", root.join("loop-b")).unwrap();
+    std::fs::create_dir(root.join("nested")).unwrap();
+    git_init(&root.join("nested"));
+    std::os::unix::fs::symlink("../sessions", root.join("nested/alias")).unwrap();
+    let dir = root.join("sessions/new");
+    refuse_session_dir_in_build_context(
+        "tool",
+        &session_dir_test_cfg(&root),
+        Path::new("/"),
+        &dir,
+        &dir,
+    )
+    .await
+    .unwrap();
+    assert!(!root.join("sessions").exists());
+}
+
+#[tokio::test]
+async fn session_registry_entry_is_refused_through_an_admitted_alias() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        (".gitignore", "/sessions/*\n"),
+    ]);
+    git_init(ctx.path());
+    let root = std::fs::canonicalize(ctx.path()).unwrap();
+    std::os::unix::fs::symlink("sessions", root.join("alias")).unwrap();
+    let entry = root.join("sessions/new");
+    let err = super::refuse_session_registry_entry_in_build_context(
+        "tool",
+        &session_dir_test_cfg(&root),
+        Path::new("/"),
+        &entry,
+        &entry,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, OutrigError::SessionPathViaSymlinkInBuildContext { path, link, .. }
+        if path == entry && link == root.join("alias"))
+    );
+    assert!(!root.join("sessions").exists());
+}
+
+#[tokio::test]
+async fn session_alias_really_includes_ignored_session_writes_in_the_key() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\nCOPY alias /sessions\n"),
+        (".gitignore", "/sessions/\n"),
+    ]);
+    git_init(ctx.path());
+    let root = std::fs::canonicalize(ctx.path()).unwrap();
+    let dir = root.join("sessions/new");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::os::unix::fs::symlink("sessions", root.join("alias")).unwrap();
+    let cfg = session_dir_test_cfg(&root);
+    let err = refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        OutrigError::SessionPathViaSymlinkInBuildContext { .. }
+    ));
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+
+    // Without the refusal, session creation after keying invalidates the build.
+    let before = key(&root.join("Dockerfile"), &BTreeMap::new(), &root).await;
+    std::fs::write(dir.join("session.json"), "{}").unwrap();
+    let after = key(&root.join("Dockerfile"), &BTreeMap::new(), &root).await;
+    assert_ne!(before, after);
+}
+
+/// Assert that a link's absent referent stays absent after session-owned writes.
+async fn assert_session_writes_leave_alias_key_stable(target: &str) {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        (".gitignore", "/sessions/\n"),
+    ]);
+    git_init(ctx.path());
+    let root = std::fs::canonicalize(ctx.path()).unwrap();
+    std::os::unix::fs::symlink(target, root.join("alias")).unwrap();
+    let dir = root.join("sessions/new");
+    let cfg = session_dir_test_cfg(&root);
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .unwrap_or_else(|err| panic!("{target}: {err}"));
+    assert!(
+        !root.join("sessions").exists(),
+        "probe must undo temporary directories"
+    );
+    let before = key(&root.join("Dockerfile"), &BTreeMap::new(), &root).await;
+    std::fs::create_dir_all(dir.join("logs")).unwrap();
+    std::fs::write(dir.join("session.json"), "{}").unwrap();
+    std::fs::write(dir.join("outrig-enter"), "launcher").unwrap();
+    std::fs::write(dir.join("logs/container.log"), "build output").unwrap();
+    std::fs::write(dir.join("logs/network.jsonl"), "network audit").unwrap();
+    std::fs::write(dir.join("logs/fs.stderr"), "MCP stderr").unwrap();
+    std::fs::write(dir.join("logs/subagent-parent.log"), "parent transcript").unwrap();
+    std::fs::create_dir(dir.join("logs/subagent-parent")).unwrap();
+    std::fs::write(
+        dir.join("logs/subagent-parent/subagent-child.log"),
+        "child transcript",
+    )
+    .unwrap();
+    let after = key(&root.join("Dockerfile"), &BTreeMap::new(), &root).await;
+    assert_eq!(
+        before, after,
+        "{target}: session writes must not change the key"
+    );
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .unwrap_or_else(|err| panic!("{target} after session writes: {err}"));
+}
+
+/// Review of #921: absent children that no session write creates must not
+/// defeat an ignore rule.
+#[tokio::test]
+async fn session_symlink_probe_allows_unwritten_descendants() {
+    for target in [
+        "sessions/new/unused",
+        "sessions/new/logs-unused",
+        "sessions/new/session.json/unused",
+        "sessions/new/outrig-enter/unused",
+    ] {
+        assert_session_writes_leave_alias_key_stable(target).await;
+    }
+}
+
+/// A log file cannot acquire children, even when it does not exist yet.
+#[tokio::test]
+async fn session_symlink_probe_allows_descendants_of_log_files() {
+    for target in [
+        "sessions/new/logs/container.log/unused",
+        "sessions/new/logs/network.jsonl/unused",
+        "sessions/new/logs/fs.stderr/unused",
+        "sessions/new/logs/subagent-parent.log/unused",
+        "sessions/new/logs/subagent-parent/subagent-child.log/unused",
+    ] {
+        assert_session_writes_leave_alias_key_stable(target).await;
+    }
+}
+
+/// TreeHasher::referent treats a failed stat, including ENOTDIR, as absent.
+#[tokio::test]
+async fn session_symlink_probe_allows_unresolvable_referents() {
+    assert_session_writes_leave_alias_key_stable("Dockerfile/x").await;
+}
+
+#[tokio::test]
+async fn session_symlink_probe_refuses_session_owned_descendants() {
+    for child in [
+        "session.json",
+        "outrig-enter",
+        "logs",
+        "logs/container.log",
+        "logs/network.jsonl",
+        "logs/fs.stderr",
+        "logs/subagent-parent.log",
+        "logs/subagent-parent",
+        "logs/subagent-parent/subagent-child.log",
+    ] {
+        let ctx = make_ctx(&[
+            ("Dockerfile", "FROM alpine\n"),
+            (".gitignore", "/sessions/\n"),
+        ]);
+        git_init(ctx.path());
+        let root = std::fs::canonicalize(ctx.path()).unwrap();
+        std::os::unix::fs::symlink(format!("sessions/new/{child}"), root.join("alias")).unwrap();
+        let dir = root.join("sessions/new");
+        let err = refuse_session_dir_in_build_context(
+            "tool",
+            &session_dir_test_cfg(&root),
+            Path::new("/"),
+            &dir,
+            &dir,
+        )
+        .await
+        .expect_err(child);
+        assert!(
+            matches!(err, OutrigError::SessionPathViaSymlinkInBuildContext { .. }),
+            "{err}"
+        );
+        assert!(!root.join("sessions").exists());
+    }
+}
+
+#[tokio::test]
+async fn session_symlink_probe_keeps_errors_for_admitted_paths() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        (".gitignore", "/sessions/\n"),
+        ("blocked/tracked", "input"),
+    ]);
+    git_init(ctx.path());
+    let root = std::fs::canonicalize(ctx.path()).unwrap();
+    std::fs::remove_dir_all(root.join("blocked")).unwrap();
+    std::fs::write(root.join("blocked"), "not a directory").unwrap();
+    let dir = root.join("sessions/new");
+    let err = refuse_session_dir_in_build_context(
+        "tool",
+        &session_dir_test_cfg(&root),
+        Path::new("/"),
+        &dir,
+        &dir,
+    )
+    .await
+    .expect_err("an admitted path's ENOTDIR is not an absent referent");
+    assert!(err.to_string().contains("blocked/tracked"), "{err}");
+    assert!(!root.join("sessions").exists());
+    CacheKey::compute(&root.join("Dockerfile"), &BTreeMap::new(), &root)
+        .await
+        .expect_err("the hasher also fails on the admitted path");
+}

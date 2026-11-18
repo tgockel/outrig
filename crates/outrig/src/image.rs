@@ -617,7 +617,8 @@ fn context_changed(image: &str, tag: &ImageTag) -> OutrigError {
 /// directory under it, as `hash_git_tree` honors. A non-git context has no
 /// ignore mechanism at all, so there every directory inside it conflicts.
 /// An ignored path also conflicts when the hasher falls back to the whole
-/// tree because every file is ignored, at any repository boundary (#920).
+/// tree because every file is ignored, at any repository boundary (#920), or
+/// an admitted symlink reaches it through a whole-referent walk (#921).
 pub async fn refuse_session_dir_in_build_context(
     image: &str,
     cfg: &ImageConfig,
@@ -682,6 +683,16 @@ async fn refuse_session_path_in_build_context(
         registry_entry_is_ignored(session_path_logical).await?
     };
     if ignored && context_honors_ignore_at(&context_canon, session_path_logical).await? {
+        if let Some(link) =
+            session_path_via_symlink(&context_canon, session_path_logical, directory).await?
+        {
+            return Err(OutrigError::SessionPathViaSymlinkInBuildContext {
+                image: image.to_string(),
+                path: session_path.to_path_buf(),
+                link: context_canon.join(link),
+                context,
+            });
+        }
         return Ok(());
     }
     Err(if directory {
@@ -726,6 +737,114 @@ async fn context_honors_ignore_at(context: &Path, path: &Path) -> Result<bool> {
         }
         tree = nested;
     }
+}
+
+/// Find an admitted link whose referent walk can include session writes.
+/// Use the hasher's repository boundaries and resolver, not host canonicalize:
+/// COPY resolves absolute targets and `..` against the context root. Referents
+/// are walked whole, including ignored paths and further links. No file content
+/// is read, and a dangling target can still name a future session directory.
+async fn session_path_via_symlink(
+    context: &Path,
+    session_path: &Path,
+    directory: bool,
+) -> Result<Option<PathBuf>> {
+    let mut trees = vec![PathBuf::new()];
+    // The final flag distinguishes a link's referent root (whose failed stat
+    // TreeHasher::referent treats as absent) from entries of a traversed tree.
+    let mut seeds: Vec<(PathBuf, Option<PathBuf>, bool)> = Vec::new();
+    while let Some(dir) = trees.pop() {
+        let listing = git_tree_listing(&context.join(&dir)).await?;
+        if listing.whole_tree {
+            // The root fallback was already refused by context_honors_ignore_at.
+            // A nested fallback follows links just like TreeHasher::new.
+            seeds.push((dir, None, false));
+            continue;
+        }
+        for (rel, meta) in listing.entries {
+            let rel = dir.join(OsStr::from_bytes(&rel));
+            if meta.is_dir() {
+                if is_worktree_root(&context.join(&rel)).await? {
+                    trees.push(rel);
+                } else {
+                    seeds.push((rel, None, false));
+                }
+            } else if meta.file_type().is_symlink() {
+                seeds.push((rel, None, false));
+            }
+        }
+    }
+    let (context, session_path) = (context.to_path_buf(), session_path.to_path_buf());
+    tokio::task::spawn_blocking(move || {
+        let mut seen = HashSet::new();
+        let mut stamps = Stamps::default();
+        while let Some((rel, via, referent)) = seeds.pop() {
+            let path = context.join(&rel);
+            if let Some(link) = &via
+                && session_path_is_written(&session_path, &path, directory)
+            {
+                return Ok(Some(link.clone()));
+            }
+            if seen.contains(&rel) {
+                continue;
+            }
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                // Match TreeHasher::referent, not the stricter entry walk.
+                Err(_) if referent => continue,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(err).path_ctx("stat", &path),
+            };
+            seen.insert(rel.clone());
+            if meta.file_type().is_symlink() {
+                if let Some(target) = resolve_in_context(&context, &rel, &mut stamps) {
+                    seeds.push((target, Some(via.unwrap_or(rel)), true));
+                }
+            } else if meta.is_dir() {
+                for entry in std::fs::read_dir(&path).path_ctx("read", &path)? {
+                    let entry = entry.path_ctx("read", &path)?;
+                    seeds.push((rel.join(entry.file_name()), via.clone(), false));
+                }
+            }
+        }
+        Ok(None)
+    })
+    .await
+    .expect("session symlink probe panicked")
+}
+
+/// A referent at or above the session path includes its future writes. Below
+/// a session directory, only session-owned entries can change: arbitrary
+/// dangling children remain absent. Registry entries are file-shaped, so have
+/// no writable descendants. Keep these names in sync with the CLI session store.
+fn session_path_is_written(session: &Path, referent: &Path, directory: bool) -> bool {
+    if session.starts_with(referent) {
+        return true;
+    }
+    let Ok(child) = referent.strip_prefix(session) else {
+        return false;
+    };
+    if !directory {
+        return false;
+    }
+    if child == Path::new("session.json") || child == Path::new("outrig-enter") {
+        return true;
+    }
+    let Ok(log_path) = child.strip_prefix("logs") else {
+        return false;
+    };
+    // Log outputs are files, not directories. Their own paths can change,
+    // but descendants remain absent both before and after the files exist.
+    // Subagent ancestry directories (subagent-<name>, with no dot) still count.
+    let mut parents = log_path.components();
+    parents.next_back();
+    !parents.any(|component| {
+        let name = component.as_os_str().as_bytes();
+        name == b"container.log"
+            || name == b"network.jsonl"
+            || name.ends_with(b".stderr")
+            || (name.starts_with(b"subagent-") && name.ends_with(b".log"))
+    })
 }
 
 /// Whether `dir` -- a path inside a build context, possibly not created yet

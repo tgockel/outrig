@@ -103,3 +103,128 @@ async fn external_session_checks_the_registry_entry_before_creation() {
         }
     }
 }
+
+/// #921: refuse the alias route before hashing, building, or session writes,
+/// for auto-allocated directories, explicit ones, and registry entries alike.
+#[tokio::test]
+async fn ignored_session_paths_reached_by_alias_are_refused_before_creation() {
+    for mode in ["auto", "explicit", "registry"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let agents = repo.join(".agents/outrig");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("config.toml"),
+            "default-image = \"tool\"\n[images.tool]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n"
+        ).unwrap();
+        std::fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "/sessions/\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::os::unix::fs::symlink("sessions", repo.join("alias")).unwrap();
+        let global = tmp.path().join("global.toml");
+        std::fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+        let root = if mode == "explicit" {
+            tmp.path().join("registry")
+        } else {
+            repo.join("sessions")
+        };
+        let explicit = if mode == "registry" {
+            tmp.path().join("external-session")
+        } else {
+            repo.join("sessions/new")
+        };
+        let mut args = vec![
+            "--global-config",
+            utf8(&global),
+            "--session-root",
+            utf8(&root),
+            "run",
+        ];
+        if mode != "auto" {
+            args.extend(["--session-dir", utf8(&explicit)]);
+        }
+        let (ok, stderr) = run_outrig(&repo, &args).await;
+        assert!(!ok, "{mode}: {stderr}");
+        assert!(stderr.contains("is reached by symlink"), "{mode}: {stderr}");
+        assert!(
+            stderr.contains(utf8(&repo.join("alias"))),
+            "{mode}: {stderr}"
+        );
+        assert!(
+            stderr.contains(utf8(&repo.join("sessions"))),
+            "{mode}: {stderr}"
+        );
+        assert!(!stderr.contains("computing image tag"), "{mode}: {stderr}");
+        assert!(
+            !repo.join("sessions").exists(),
+            "probe left session paths behind"
+        );
+        assert!(!root.exists(), "registry was created");
+        assert!(!explicit.exists(), "session record was created");
+    }
+}
+
+/// Review of #921: unrelated dangling or unresolvable referents do not make
+/// an ignored explicit session part of the key.
+#[tokio::test]
+async fn ignored_sessions_with_unwritten_or_unresolvable_aliases_reach_startup() {
+    for target in [
+        "sessions/new/unused",
+        "Dockerfile/x",
+        "sessions/new/logs/container.log/unused",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let agents = repo.join(".agents/outrig");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("config.toml"),
+            "default-image = \"tool\"\n[images.tool]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n"
+        ).unwrap();
+        std::fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "/sessions/\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::os::unix::fs::symlink(target, repo.join("alias")).unwrap();
+        let global = tmp.path().join("global.toml");
+        std::fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+        let root = tmp.path().join("registry");
+        let explicit = repo.join("sessions/new");
+        let (ok, stderr) = run_outrig(
+            &repo,
+            &[
+                "--global-config",
+                utf8(&global),
+                "--session-root",
+                utf8(&root),
+                "-v",
+                "run",
+                "--session-dir",
+                utf8(&explicit),
+            ],
+        )
+        .await;
+        assert!(!ok, "the stub runtime stops an allowed run: {stderr}");
+        assert!(stderr.contains("image tag computed"), "{target}: {stderr}");
+        assert!(
+            !stderr.contains("is reached by symlink"),
+            "{target}: {stderr}"
+        );
+        assert!(explicit.join("session.json").exists(), "{target}: {stderr}");
+        assert!(
+            explicit.join("logs/container.log").is_file(),
+            "{target}: {stderr}"
+        );
+    }
+}

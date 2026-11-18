@@ -1095,6 +1095,11 @@ pub outrig::error::OutrigError::SessionDirInBuildContext::context: std::path::Pa
 pub outrig::error::OutrigError::SessionDirInBuildContext::dir: std::path::PathBuf
 pub outrig::error::OutrigError::SessionDirInBuildContext::image: alloc::string::String
 pub outrig::error::OutrigError::SessionDirInBuildContext::whole_tree: bool
+#[non_exhaustive] pub outrig::error::OutrigError::SessionPathViaSymlinkInBuildContext
+pub outrig::error::OutrigError::SessionPathViaSymlinkInBuildContext::context: std::path::PathBuf
+pub outrig::error::OutrigError::SessionPathViaSymlinkInBuildContext::image: alloc::string::String
+pub outrig::error::OutrigError::SessionPathViaSymlinkInBuildContext::link: std::path::PathBuf
+pub outrig::error::OutrigError::SessionPathViaSymlinkInBuildContext::path: std::path::PathBuf
 #[non_exhaustive] pub outrig::error::OutrigError::SessionRegistryEntryInBuildContext
 pub outrig::error::OutrigError::SessionRegistryEntryInBuildContext::context: std::path::PathBuf
 pub outrig::error::OutrigError::SessionRegistryEntryInBuildContext::entry: std::path::PathBuf

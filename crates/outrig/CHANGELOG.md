@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Ignored session paths reached through an admitted build-context symlink are now refused
+  before hashing or building. The error names both the session path and the symlink, including
+  links through nested repositories or ignored referents. Unwritten dangling children and
+  unrelated unresolvable referents remain allowed, including descendants of file-shaped log
+  outputs. (#921)
+
 - Session paths inside entirely ignored build contexts are now refused before building,
   including nested repositories where the cache key falls back to hashing the whole tree.
   These refusals explain why an existing ignore rule is ineffective and advise moving the path
