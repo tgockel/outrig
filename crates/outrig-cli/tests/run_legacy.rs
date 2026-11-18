@@ -188,7 +188,7 @@ async fn run_legacy_behaves_as_run() {
         assert!(run.1.contains(expect), "{flags:?}: {}", run.1);
         // A config that sets neither key gets no word about them.
         assert!(
-            !run.1.contains(ONLY_RUN_NEW_READS_IT),
+            !run.1.contains(ONLY_RUN_NEW_READS_THEM),
             "{flags:?}: {}",
             run.1
         );
@@ -367,15 +367,15 @@ async fn run_new_refuses_a_session_dir_that_is_not_empty() {
 }
 
 /// What `run` says at startup about a key only `run-new` reads.
-const ONLY_RUN_NEW_READS_IT: &str = "only `run-new` reads it";
+const ONLY_RUN_NEW_READS_THEM: &str = "only `run-new` reads them";
 
 /// A config that sets `context-window` on the session's model and turns the
-/// event log on gets one warning per key from `run`, ahead of the first pull,
+/// event log on gets one warning listing both from `run`, ahead of the first pull,
 /// because it parses both and does nothing with either. `run-new` reads both,
 /// so it says nothing. (`run-legacy` is `run`; `run_legacy_behaves_as_run`
 /// holds that.)
 #[tokio::test]
-async fn run_warns_once_per_key_only_run_new_reads() {
+async fn run_warns_once_for_all_keys_only_run_new_reads() {
     let repo = repo_holding(&format!("{CONFIG}{RUN_NEW_ONLY_KEYS}"));
     let flags = ["--model", "windowed"];
 
@@ -383,19 +383,17 @@ async fn run_warns_once_per_key_only_run_new_reads() {
     assert_eq!(code, Some(1), "{stderr}");
     let warned: Vec<&str> = stderr
         .lines()
-        .filter(|line| line.contains(ONLY_RUN_NEW_READS_IT))
+        .filter(|line| line.contains(ONLY_RUN_NEW_READS_THEM))
         .collect();
     assert_eq!(
         warned,
         [
-            "[outrig] warning: context-window on [models.windowed] is ignored by \
-             `run`; only `run-new` reads it",
-            "[outrig] warning: [events] mode = \"record\" is ignored by \
-             `run`; only `run-new` reads it",
+            "[outrig] warning: `run` ignores these settings; only `run-new` reads them: \
+             context-window on [models.windowed]; [events] mode = \"record\"",
         ],
         "{stderr}"
     );
-    let first_warning = stderr.find(ONLY_RUN_NEW_READS_IT).expect("a warning");
+    let first_warning = stderr.find(ONLY_RUN_NEW_READS_THEM).expect("a warning");
     let pull = stderr.find("ensuring image").expect("it reached the pull");
     assert!(first_warning < pull, "{stderr}");
 
@@ -405,5 +403,5 @@ async fn run_warns_once_per_key_only_run_new_reads() {
         stderr.contains("ensuring image"),
         "it reached the pull: {stderr}"
     );
-    assert!(!stderr.contains(ONLY_RUN_NEW_READS_IT), "{stderr}");
+    assert!(!stderr.contains(ONLY_RUN_NEW_READS_THEM), "{stderr}");
 }

@@ -14,11 +14,11 @@
 
 use outrig::config::{Config, EventsMode};
 
-/// The lines `outrig run` prints, in order, for keys `cfg` sets that only
+/// The single warning `outrig run` prints for keys `cfg` sets that only
 /// `outrig run-new` reads. Empty when it sets none.
 ///
 /// `models` is every row the session may run against, so a failover chain's
-/// fallback is named too: one line, naming each row that sets a window.
+/// fallback is named too, naming each row that sets a window.
 /// `agent` is the session's agent, whose own limits count as the top
 /// level's do.
 pub(crate) fn warnings<'a>(
@@ -26,7 +26,7 @@ pub(crate) fn warnings<'a>(
     agent: Option<&str>,
     models: impl IntoIterator<Item = &'a str>,
 ) -> Vec<String> {
-    let mut lines = Vec::new();
+    let mut keys = Vec::new();
 
     let windowed: Vec<String> = models
         .into_iter()
@@ -38,14 +38,11 @@ pub(crate) fn warnings<'a>(
         .map(|name| format!("[models.{name}]"))
         .collect();
     if !windowed.is_empty() {
-        lines.push(ignored(&format!(
-            "context-window on {}",
-            windowed.join(", ")
-        )));
+        keys.push(format!("context-window on {}", windowed.join(", ")));
     }
 
     if matches!(cfg.events.mode(), EventsMode::Record) {
-        lines.push(ignored("[events] mode = \"record\""));
+        keys.push("[events] mode = \"record\"".to_string());
     }
 
     let agent = agent.and_then(|name| cfg.agents.get(name));
@@ -71,20 +68,24 @@ pub(crate) fn warnings<'a>(
     ];
     for (key, top, own) in limits {
         if top || own {
-            lines.push(ignored(key));
+            keys.push(key.to_string());
         }
     }
 
     // `run` sends the agent's preamble alone, whichever way the key is set.
     if agent.is_some_and(|a| a.repo_instructions.is_some()) {
-        lines.push(ignored("repo-instructions"));
+        keys.push("repo-instructions".to_string());
     }
 
-    lines
+    if keys.is_empty() {
+        Vec::new()
+    } else {
+        vec![ignored(&keys.join("; "))]
+    }
 }
 
 fn ignored(what: &str) -> String {
-    format!("[outrig] warning: {what} is ignored by `run`; only `run-new` reads it")
+    format!("[outrig] warning: `run` ignores these settings; only `run-new` reads them: {what}")
 }
 
 #[cfg(test)]
@@ -134,7 +135,7 @@ provider = "openai"
 
     /// The window of a failover chain's fallback is ignored as surely as the
     /// first row's, so the one line names every row of the chain that sets
-    /// one, and the events line follows it.
+    /// one, with the events setting in the same warning.
     #[test]
     fn each_chain_row_that_sets_a_window_is_named_on_one_line() {
         let cfg = config(
@@ -156,10 +157,9 @@ context-window = 64000
         );
         assert_eq!(
             warnings(&cfg, None, ["first", "second", "third"]),
-            [
-                ignored("context-window on [models.second], [models.third]"),
-                ignored("[events] mode = \"record\""),
-            ]
+            [ignored(
+                "context-window on [models.second], [models.third]; [events] mode = \"record\""
+            )]
         );
     }
 
@@ -184,7 +184,7 @@ requests-max = 4
         );
         assert_eq!(
             warnings(&cfg, Some("coding"), ["fast"]),
-            [ignored("children-max"), ignored("token-budget")]
+            [ignored("children-max; token-budget")]
         );
         assert_eq!(
             warnings(&cfg, None, ["fast"]),
@@ -209,14 +209,50 @@ model-request-limit = 40
         );
         assert_eq!(
             warnings(&cfg, Some("coding"), ["fast"]),
-            [
-                ignored("model-request-limit"),
-                ignored("model-request-warnings")
-            ]
+            [ignored("model-request-limit; model-request-warnings")]
         );
         assert_eq!(
             warnings(&cfg, None, ["fast"]),
             [ignored("model-request-warnings")]
+        );
+    }
+
+    /// All applicable keys share one warning. A key set at both scopes is
+    /// named only once, and unused models do not add settings.
+    #[test]
+    fn all_ignored_settings_share_one_warning() {
+        let cfg = config(
+            r#"
+children-max = 2
+model-concurrency-max = 3
+requests-max = 4
+token-budget = 1000
+model-request-limit = 40
+model-request-warnings = [5, 1]
+
+[events]
+mode = "record"
+
+[models.fast]
+provider = "openai"
+context-window = 32000
+
+[models.unused]
+provider = "openai"
+context-window = 64000
+
+[agents.coding]
+children-max = 4
+repo-instructions = "agents-md"
+"#,
+        );
+        assert_eq!(
+            warnings(&cfg, Some("coding"), ["fast"]),
+            [ignored(
+                "context-window on [models.fast]; [events] mode = \"record\"; \
+                 children-max; model-concurrency-max; requests-max; token-budget; \
+                 model-request-limit; model-request-warnings; repo-instructions"
+            )]
         );
     }
 

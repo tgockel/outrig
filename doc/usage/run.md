@@ -332,17 +332,16 @@ The lines are buildah's own (`podman pull`'s, as `[podman]`, for an `image-name`
 it, each line still appears once. A sidecar image that needs building shows the same, under its
 own `ensuring sidecar image <name>` / `sidecar image ready` pair.
 
-Two config keys are read only by `outrig run-new`: `context-window` on a `[models.<name>]` row,
-and `[events] mode = "record"`. `outrig run` parses them and does nothing with them, so when a
-config sets either, it says so with one line per key before it pulls or starts anything:
+Some config settings are read only by `outrig run-new`: `context-window` on a
+`[models.<name>]` row, `[events] mode = "record"`, `children-max`, `model-concurrency-max`,
+`requests-max`, `token-budget`, `model-request-limit`, `model-request-warnings`, and an agent's
+`repo-instructions`. `outrig run` parses them and does nothing with them, so when any apply to
+the session, it lists them together in one warning before it pulls or starts anything.
 
-```
-[outrig] warning: context-window on [models.fast] is ignored by `run`; only `run-new` reads it
-[outrig] warning: [events] mode = "record" is ignored by `run`; only `run-new` reads it
-```
-
-When the session's model is an alias for several, the `context-window` line names each model
-that sets one. Without either key, startup is as above. See
+When the session's model is an alias for several, the warning names each model that sets
+`context-window`. Limits count when set at the top level or on the session's agent;
+`repo-instructions` counts only on that agent. Settings on unused models or other agents do
+not add warnings. Without any applicable settings, startup is as above. See
 [Config](../reference/config.md#remote-provider-models) for `context-window` and
 [Config](../reference/config.md#events) for the event log.
 

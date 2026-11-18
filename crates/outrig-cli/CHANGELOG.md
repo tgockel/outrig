@@ -292,6 +292,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One startup warning for settings only `run-new` reads.** `outrig run` lists all applicable
+  settings in one warning, including model context windows, rather than warning once per key.
+  (#767)
+
 - **A session directory cannot contain the session root.** `run`, `run-new`, and `mcp` refuse
   such an explicit directory before creating anything, even when the root does not exist yet.
   Preflight follows dangling symlink targets too, including ones that directory creation activates,
