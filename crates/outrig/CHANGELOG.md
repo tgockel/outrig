@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A rejected nft redirect transaction no longer reports an incomplete network attach rollback
+  when its table was never created. By-name cleanup accepts confirmed absence, while failed
+  listings and tables still present remain cleanup errors. Cancelling this shell-based cleanup
+  kills its entire process group rather than leaving an nft child running. (#925)
+
 - Ignored session paths reached through an admitted build-context symlink are now refused
   before hashing or building. The error names both the session path and the symlink, including
   links through nested repositories or ignored referents. Unwritten dangling children and

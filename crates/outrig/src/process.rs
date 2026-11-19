@@ -26,6 +26,9 @@
 //! process will be gone -- but a graceful stop trades a bounded delay for the
 //! chance that the child cleans up after itself on the way out. It is for the
 //! one command that owns resources outrig cannot name; see [`Termination`].
+//! `KillGroup` instead starts an isolated process group and kills the group,
+//! for shell-based cleanup that waits on external commands rather than
+//! execing them. Ordinary commands still receive signals only by pid.
 //!
 //! A grace is worth something only while this runtime is alive. A runtime
 //! shutting down inside one drops the reap task, `kill_on_drop` escalates
@@ -118,6 +121,9 @@ const TRUNCATED_MARKER: &str = "... (truncated) ...\n";
 pub(crate) enum Termination {
     /// `SIGKILL`, delivered synchronously as the drop returns.
     Kill,
+    /// `SIGKILL` to the child's isolated process group, including descendants.
+    /// Spawning under this policy always creates a fresh process group.
+    KillGroup,
     /// `SIGTERM`, then `SIGKILL` once the grace has passed without an exit.
     ///
     /// The grace rides in the variant rather than being read from a constant
@@ -306,6 +312,9 @@ impl Cmd {
         let handle = Handle::current();
 
         let mut command = self.to_tokio_command();
+        if termination == Termination::KillGroup {
+            command.process_group(0);
+        }
         command
             .stdin(stdio.stdin)
             .stdout(stdio.stdout)
@@ -317,7 +326,7 @@ impl Cmd {
         // invariant is "a graceful child keeps its write ends usable until
         // the reap" and not "... if somebody took its readers".
         let keepalive = match termination {
-            Termination::Kill => Vec::new(),
+            Termination::Kill | Termination::KillGroup => Vec::new(),
             Termination::TermThenKill(_) => keep_pipes_open(&mut child),
         };
         Ok(Owned {
@@ -500,6 +509,21 @@ fn request_stop(child: &Child) -> bool {
     .is_ok()
 }
 
+/// Signal before waiting/reaping, while the child's pid (and thus its group
+/// number) cannot have been reused. `KillGroup` created this group at spawn;
+/// ordinary commands share our group and must only be signalled by pid.
+fn kill_child(child: &mut Child, termination: Termination) {
+    if termination == Termination::KillGroup
+        && let Some(pid) = child.id()
+    {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    let _ = child.start_kill();
+}
+
 /// A stream-draining task that is **aborted** when dropped, rather than
 /// detached.
 ///
@@ -634,7 +658,8 @@ impl Owned {
         }
         // The only `start_kill` failure is "already exited", which is the
         // state this is trying to reach.
-        let _ = self.child_mut().start_kill();
+        let termination = self.termination;
+        kill_child(self.child_mut(), termination);
         self.child_mut().wait().await?;
         Ok(())
     }
@@ -676,7 +701,7 @@ impl Drop for Owned {
         } else {
             // The only `start_kill` failure is "already exited", which is the
             // state this is trying to reach.
-            let _ = child.start_kill();
+            kill_child(&mut child, self.termination);
             None
         };
         // Spawning on a runtime that has already shut down does not panic;
@@ -1042,10 +1067,11 @@ pub(crate) async fn run_capture_logged(
 /// [`run_capture_logged`] for a caller that owns the termination claim.
 ///
 /// Separate rather than a fourth parameter on the common helper: `Kill` is
-/// right for every one of its callers but the build, and a parameter on all
-/// of them would bury the single exception in a column of identical
-/// arguments instead of naming it. [`run_capture_shown`] is the same shape
-/// for the other exception a session's build makes.
+/// right for ordinary commands, while the build needs a grace period and
+/// shell-based network cleanup owns descendants. A parameter on every caller
+/// would bury these exceptions in a column of identical arguments.
+/// [`run_capture_shown`] is the same shape for the other exception a session's
+/// build makes.
 ///
 /// `keep_stdout` is false for the build and the pull, whose stdout is not read
 /// and can run to the length of a build log.

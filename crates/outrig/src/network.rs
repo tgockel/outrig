@@ -1509,7 +1509,12 @@ enum NamespaceAnswer {
 /// checked -- a teardown that quietly failed is the thing this reports --
 /// output teed to the container's transcript, stdout handed back.
 async fn run_step(cmd: Cmd, transcript: Option<Transcript>) -> Result<Vec<u8>> {
-    process::run_capture_logged(cmd, "network", transcript.as_ref())
+    let termination = if cmd.leads_process_group() {
+        process::Termination::KillGroup
+    } else {
+        process::Termination::Kill
+    };
+    process::run_capture_logged_terminating(cmd, "network", transcript.as_ref(), termination, true)
         .await
         .map(|output| output.stdout)
 }
@@ -4254,10 +4259,30 @@ fn bind_to(ty: SockType, addr: SocketAddr) -> nix::Result<OwnedFd> {
 }
 
 fn delete_nft_table(pid: u32, table: &str) -> Cmd {
-    nsenter_nft(pid)
-        .args(["delete", "table", "inet"])
-        .arg(table)
+    // The shell waits on nft rather than execing it. Both must be killed if
+    // an awaited rollback is cancelled; the reaper also honors this group.
+    nsenter_net(pid)
+        .args(["--", "sh", "-c", NFT_DELETE_BY_NAME, "_", table])
+        .in_own_process_group()
 }
+
+/// The pre-commit undo must also succeed when a rejected transaction made no
+/// table. Delete first, then accept only a successful listing that confirms
+/// absence; neither an unavailable nft nor a failed listing proves cleanup.
+/// Run inside the entered namespace so both commands see the same ruleset.
+/// Keep the delete's diagnostic only if the obligation could not be discharged.
+const NFT_DELETE_BY_NAME: &str = r#"
+error=$(nft delete table inet "$1" 2>&1) && exit 0
+status=$?
+if listed=$(nft list tables); then
+    printf '%s\n' "$listed" | grep -qxF "table inet $1"
+    case $? in
+        1) exit 0 ;;
+    esac
+fi
+printf '%s\n' "$error" >&2
+exit "$status"
+"#;
 
 /// Delete the table the kernel gave `handle` to, and nothing else.
 ///
@@ -4376,10 +4401,6 @@ fn echoed_handles(output: &[u8]) -> impl Iterator<Item = (&str, u64)> {
             let (named, handle) = line.split_once("# handle ")?;
             Some((named, handle.split_whitespace().next()?.parse().ok()?))
         })
-}
-
-fn nsenter_nft(pid: u32) -> Cmd {
-    nsenter_net(pid).arg("nft")
 }
 
 /// `nsenter` into the container's user and network namespaces, and no
@@ -5442,6 +5463,9 @@ mod tests {
         /// What nft answers an apply with, in place of the well-formed echo.
         /// For the outputs an attach cannot read a handle out of.
         echo: Option<Vec<u8>>,
+        /// A rejected apply creates nothing; successful commits do. Unlike a
+        /// permissive runner, nft rejects deletion of an absent table.
+        table_exists: Mutex<bool>,
     }
 
     impl FakeRunner {
@@ -5469,7 +5493,27 @@ mod tests {
             // Without this the tests would exercise only the unnarrowed undo,
             // which is the fallback rather than the rule.
             if rendered.contains("--echo --handle") {
+                *self.table_exists.lock().expect("fake table") = true;
                 return Ok(self.echo.clone().unwrap_or_else(complete_commit_echo));
+            }
+            if cmd.exec_args().iter().any(|arg| arg == NFT_DELETE_BY_NAME) {
+                let exists = *self.table_exists.lock().expect("fake table");
+                let result = run_step_gated(fake_nft_delete(exists, 0, 0), None).await;
+                if result.is_ok() {
+                    *self.table_exists.lock().expect("fake table") = false;
+                }
+                return result;
+            }
+            if rendered.contains("delete table inet handle") {
+                *self.table_exists.lock().expect("fake table") = false;
+            } else if rendered.contains("nft delete table inet") {
+                let mut exists = self.table_exists.lock().expect("fake table");
+                if !*exists {
+                    return Err(OutrigError::Configuration(
+                        "nft: No such file or directory".to_string(),
+                    ));
+                }
+                *exists = false;
             }
             Ok(Vec::new())
         }
@@ -5490,6 +5534,89 @@ mod tests {
                 ..Self::default()
             }
         }
+    }
+
+    /// Exercise the real by-name undo shell with an nft model, without
+    /// nsenter or privileges. A missing table fails deletion just as nft does;
+    /// unrelated families and longer names must not count as this table.
+    fn fake_nft_delete(exists: bool, delete_status: i32, list_status: i32) -> Cmd {
+        let script = format!(
+            r#"
+nft() {{
+    case "$1" in
+        delete)
+            if [ {delete_status} -ne 0 ]; then
+                echo 'delete refused' >&2
+                return {delete_status}
+            fi
+            if [ {exists} = false ]; then
+                echo 'No such file or directory' >&2
+                return 1
+            fi
+            ;;
+        list)
+            [ {list_status} -eq 0 ] || return {list_status}
+            printf '%s\n' 'table ip outrig_test' 'table inet outrig_test_suffix'
+            if [ {exists} = true ]; then
+                echo 'table inet outrig_test'
+            fi
+            ;;
+    esac
+}}
+{NFT_DELETE_BY_NAME}
+"#,
+        );
+        Cmd::new("/bin/sh").args(["-c", &script, "_", "outrig_test"])
+    }
+
+    #[test]
+    fn by_name_cleanup_accepts_only_success_or_confirmed_absence() {
+        for (exists, delete_status, list_status, expected) in [
+            (false, 0, 0, 0),       // rejected apply, nothing to remove
+            (true, 0, 0, 0),        // committed apply, successful delete
+            (false, 0, 9, 1),       // missing table, but absence cannot be confirmed
+            (true, 4, 0, 4),        // delete failed and the table is still listed
+            (true, 4, 9, 4),        // listing failed too: keep the delete's status
+            (false, 127, 127, 127), // nft unavailable is not confirmed absence
+        ] {
+            let cmd = fake_nft_delete(exists, delete_status, list_status);
+            let output = std::process::Command::new(cmd.program)
+                .args(cmd.exec_args())
+                .output()
+                .expect("run cleanup script");
+            assert_eq!(output.status.code(), Some(expected), "{output:?}");
+            if expected == 0 {
+                assert!(output.stderr.is_empty(), "{output:?}");
+            } else {
+                assert!(!output.stderr.is_empty(), "{output:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_by_name_cleanup_stays_armed() {
+        for (exists, delete_status, list_status) in [(true, 4, 0), (false, 0, 9)] {
+            let mut rollback = this_process_rollback().expect("this process has a namespace");
+            let armed = rollback.arm(fake_nft_delete(exists, delete_status, list_status));
+            let run = |cmd| run_step_gated(cmd, None);
+            let residue = rollback.undo_now(&run).await;
+            assert_eq!(residue.len(), 1, "{residue:#?}");
+            assert_eq!(rollback.armed().len(), 1);
+            // This test owns a simulated failure, not real interception to reap.
+            rollback.disarm(armed);
+        }
+    }
+
+    #[test]
+    fn by_name_cleanup_does_not_mistake_missing_nft_for_a_missing_table() {
+        let empty = tempfile::tempdir().expect("empty PATH");
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", NFT_DELETE_BY_NAME, "_", "outrig_test"])
+            .env("PATH", empty.path())
+            .output()
+            .expect("run cleanup without nft");
+        assert_eq!(output.status.code(), Some(127), "{output:?}");
+        assert!(!output.stderr.is_empty(), "{output:?}");
     }
 
     /// `install_interception` with the ports and policy default that none of
@@ -6568,6 +6695,91 @@ mod tests {
         );
     }
 
+    /// The by-name undo waits on nft beneath a shell. Cancelling the wait
+    /// must kill that descendant too, before the armed undo can be reissued.
+    #[tokio::test]
+    async fn cancelling_by_name_rollback_kills_the_blocked_nft_child() {
+        let resolver = FakeResolver::new();
+        let fake = FakeRunner {
+            fail_on: Some("--echo --handle"),
+            ..FakeRunner::default()
+        };
+        let mut rollback = this_process_rollback().expect("this process has a namespace");
+        install(&|cmd| fake.run(cmd), &mut rollback, &target(), &resolver)
+            .await
+            .expect_err("rejected apply leaves the by-name undo armed");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("nft.pid");
+        let run = |cmd: Cmd| {
+            // Skip nsenter, not the production cleanup shell or group policy.
+            // The nft stand-in publishes its pid and blocks as an external
+            // process, rather than only hanging the Rust future.
+            let args = cmd.exec_args();
+            assert_eq!(args[5], "sh");
+            let script = format!(
+                "nft() {{ /bin/sh -c 'echo $$ > \"$1\"; exec sleep 5' _ \"$NFT_PID\"; }}\n{}",
+                args[7].to_str().expect("cleanup script")
+            );
+            let mut host = Cmd::new("/bin/sh")
+                .args(["-c", &script])
+                .args(&args[8..])
+                .env_hidden("NFT_PID", &pid_file);
+            if cmd.leads_process_group() {
+                host = host.in_own_process_group();
+            }
+            run_step_gated(host, None)
+        };
+        let mut undoing = Box::pin(rollback.undo_now(&run));
+        let pid = tokio::select! {
+            _ = &mut undoing => panic!("nft should block"),
+            pid = async {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        if let Ok(text) = std::fs::read_to_string(&pid_file)
+                            && let Ok(pid) = text.trim().parse::<i32>()
+                        {
+                            break pid;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }).await.expect("nft never started")
+            } => pid,
+        };
+        drop(undoing);
+        assert_eq!(rollback.armed().len(), 2, "cancellation keeps both undos");
+
+        let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+                if stat.is_err()
+                    || stat.as_ref().is_ok_and(|s| {
+                        s.rsplit_once(") ")
+                            .is_some_and(|(_, rest)| rest.starts_with('Z'))
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        // No real interception exists. Discharge the model's table obligation
+        // and restore its resolver without handing nsenter to the reaper.
+        rollback.undo_now(&|_| async { Ok(Vec::new()) }).await;
+        if stopped.is_err() {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        assert!(
+            stopped.is_ok(),
+            "cancelled rollback left nft pid {pid} running"
+        );
+        assert_eq!(resolver.read(), ORIGINAL_RESOLV);
+    }
+
     /// What survives a partial undo survives in arming order, because `Drop`
     /// walks it in reverse. Retained newest-first it would be reversed a
     /// second time.
@@ -6660,7 +6872,7 @@ mod tests {
         assert!(text.contains("outrig-test"), "{text}");
         assert!(text.contains("could not be fully undone"), "{text}");
         assert!(
-            text.contains("delete table inet outrig_test"),
+            text.contains("delete table inet") && text.contains("outrig_test"),
             "the residue is named, not just counted: {text}"
         );
     }
@@ -6680,12 +6892,17 @@ mod tests {
 
         let installed = install(&run, &mut rollback, &target(), &resolver).await;
         assert!(installed.is_err(), "the nft apply was injected to fail");
+        assert!(!*fake.table_exists.lock().expect("fake table"));
         let residue = rollback.undo_now(&run).await;
+        assert!(rollback.armed().is_empty(), "no destructor reissue is owed");
 
         assert!(residue.is_empty(), "{residue:#?}");
         let ran = fake.ran();
         assert_eq!(ran.len(), 2, "{ran:#?}");
-        assert!(ran[1].contains("delete table inet outrig_test"), "{ran:#?}");
+        assert!(
+            ran[1].contains("delete table inet") && ran[1].contains("outrig_test"),
+            "{ran:#?}"
+        );
         assert_eq!(resolver.read(), ORIGINAL_RESOLV);
     }
 
@@ -6714,7 +6931,7 @@ mod tests {
         assert_eq!(armed.len(), 2, "{armed:#?}");
         assert!(armed[0].contains("nameserver 10.0.2.3"), "{armed:#?}");
         assert!(
-            armed[1].contains("delete table inet outrig_test"),
+            armed[1].contains("delete table inet") && armed[1].contains("outrig_test"),
             "{armed:#?}"
         );
     }
@@ -6918,7 +7135,7 @@ mod tests {
         assert!(
             armed
                 .iter()
-                .any(|cmd| cmd.contains("delete table inet outrig_test")),
+                .any(|cmd| cmd.contains("delete table inet") && cmd.contains("outrig_test")),
             "what the apply may have committed is still owed a removal: {armed:#?}"
         );
         assert!(

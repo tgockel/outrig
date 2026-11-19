@@ -933,6 +933,41 @@ async fn a_dropped_try_capture_kills_and_reaps_its_child() {
     println!("try_capture drop: pid {pid} gone in {took:?} (ceiling {REAP_CEILING:?})");
 }
 
+/// Group termination must isolate the command itself, even without a Cmd
+/// group flag, and reach the external process a shell is waiting for. Cover
+/// both cooperative termination and cancellation's synchronous drop path.
+#[tokio::test(flavor = "current_thread")]
+async fn group_termination_kills_shell_descendants() {
+    for terminate in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = pid_file(&dir);
+        let cmd = Cmd::new("/bin/sh").args([
+            "-c".into(),
+            "/bin/sh -c 'echo $$ > \"$1\"; exec sleep 5' _ \"$1\"; :".into(),
+            "_".into(),
+            path.as_os_str().to_os_string(),
+        ]);
+        let mut child = cmd
+            .spawn_owned(super::StdioSpec::captured(), Termination::KillGroup)
+            .expect("spawn group");
+        let parent = child.child_mut().id().expect("shell pid");
+        let descendant = published_pid(&path).await;
+        assert_ne!(parent, descendant, "the shell must not exec the descendant");
+        if terminate {
+            child.terminate().await.expect("terminate group");
+        }
+        drop(child);
+        elapsed_until_gone(parent).await;
+        tokio::time::timeout(REAP_CEILING, async {
+            while !has_stopped(descendant) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("group termination left a shell descendant running");
+    }
+}
+
 /// `spawn_stdio` is the module's stated exception: the caller owns the child.
 /// It is still kill-on-drop, so dropping the handle terminates the process --
 /// the reap is what moves to the holder, not the kill.
