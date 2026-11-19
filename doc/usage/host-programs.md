@@ -261,8 +261,9 @@ async def main():
 - **`inject` is synchronous**, and returns `None` once every agent can reach the object; before
   entry, the object is served from the session's start. The name must be a Python identifier,
   not a keyword, `runtime`, `asyncio`, `outrig` or a dunder, and neither one already injected
-  nor one the configuration declares a binding of: otherwise `ValueError`, or, for an object
-  injected before entry under a configured binding's name, a failed entry. While the session
+  nor one the configuration declares a binding of, nor an MCP service's, started or not:
+  otherwise `ValueError`, or, for an object injected before entry under a configured binding's
+  or MCP server's name, a failed entry. While the session
   starts, and once it has closed to new work, `RuntimeError`. Nothing replaces or withdraws an
   injected object.
 - **Threads, not the loop.** Each agent's operations run on a thread of their own, never on the
@@ -289,8 +290,14 @@ names, and the top-level limits -- `children-max`, `model-concurrency-max`, `req
 `tool-call-max`, `tool-result-max` -- all do. The
 configured workspace and its mounts are not mounted: a program passes `mounts=`. No
 `[agents.<name>]` table, `default-agent` or `preamble` applies to an agent class, whose
-docstring is its instructions. No MCP server or sidecar starts, as for `outrig run-new`, and a
-program's session serves no skills. [Config -> What a host program's session
+docstring is its instructions. The configuration's MCP servers start with the session as
+services, as for `outrig run-new`, beside those the program declares with
+`outrig.Session(mcp=[...])` -- `McpCommand`, `McpSidecar` or `McpPrimaryView` -- and
+`session.mcp` says how each start ended. A program's session has no workspace, so an
+`McpSidecar`'s `workspace` is the session's `cwd`, at its host path and never with more access
+than the session's mounts grant there (see
+[MCP Servers](../concepts/mcp-servers.md#in-a-session-mcp-services)). A program's session serves
+no skills. [Config -> What a host program's session
 reads](../reference/config.md#what-a-host-programs-session-reads) has each setting.
 
 ## Signals and the grace

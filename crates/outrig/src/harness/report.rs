@@ -43,6 +43,9 @@ pub struct ShutdownReport {
     /// Each external channel the session declared, and what the close left on
     /// it.
     pub channels: Vec<ChannelClose>,
+    /// Each MCP service the session declared, and how it was stopped: a
+    /// container that would not stop makes the report not proven stopped.
+    pub mcp_services: Vec<super::McpServiceStop>,
     /// How the session's events reached its subscriptions and its log.
     pub events: EventDelivery,
 }

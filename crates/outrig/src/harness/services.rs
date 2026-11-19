@@ -118,6 +118,13 @@ impl ServiceDescription {
         self.call_deadline = Some(deadline);
         self
     }
+
+    /// The description of a service of `kind`, one OutRig ships.
+    #[must_use]
+    pub(crate) fn of_kind(mut self, kind: ServiceKind) -> Self {
+        self.kind = kind;
+        self
+    }
 }
 
 /// One method a service offers.
@@ -394,6 +401,11 @@ struct State {
     served: Vec<Served>,
     /// Each call not yet ended.
     flights: HashMap<ServiceCallId, Flight>,
+    /// What holds each held service's new calls back from dispatch.
+    holds: HashMap<String, Hold>,
+    /// Set once the session's admission closes, so a call waiting on a hold
+    /// is woken to be refused.
+    closed: bool,
     /// Set once the report is read: nothing more is published.
     sealed: bool,
     after_close: Vec<ServiceCall>,
@@ -429,9 +441,30 @@ struct Flight {
     ask: u64,
     service: String,
     method: String,
+    /// Past every check and any hold: on its way to its service, or there.
+    dispatched: bool,
+}
+
+/// What holds a service's new calls back from dispatch, while it is quiesced:
+/// see [`McpServices::quiesce`](super::McpServices::quiesce).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hold {
+    /// Refused, reason `paused`: the owner paused it, and a model should
+    /// learn that rather than wait.
+    Refuse,
+    /// Held until the hold is lifted, or refused `paused` at `until`: a cut
+    /// paused it, and the round it lets finish is admitted whole.
+    Wait { until: Instant },
+    /// Refused, reason `stopped`.
+    Stopped,
 }
 
 impl Flight {
+    /// Whether it calls one of `services`.
+    fn of(&self, services: &[String]) -> bool {
+        services.contains(&self.service)
+    }
+
     /// The report's row for the call `call`, ended as said.
     fn row(
         self,
@@ -564,6 +597,13 @@ impl Services {
             }),
             policy,
         });
+        // A call waiting on a hold is woken by the close, to be refused.
+        let weak = Arc::downgrade(&table);
+        lifecycle.on_close(Arc::new(move |_| {
+            if let Some(table) = weak.upgrade() {
+                table.with(|s| s.closed = true);
+            }
+        }));
         if any {
             let services: Vec<Value> = table
                 .state
@@ -645,18 +685,88 @@ impl Services {
 
     /// Resolves once no call is in flight.
     pub(crate) fn drained(&self) -> impl Future<Output = ()> + Send + 'static {
-        let mut state = self.0.state.subscribe();
-        async move {
-            let _ = state.wait_for(|s| s.flights.is_empty()).await;
-        }
+        self.until_none(|_| true)
     }
 
     /// The session's drain has ended: tell every call still in flight to
     /// stop, reason `closed`. Each is then given its grace and aborted.
     pub(crate) fn terminate(&self) {
-        let calls: Vec<ServiceCallId> = self.0.state.borrow().flights.keys().copied().collect();
-        for call in calls {
-            self.0.stop(call, ServiceReason::Closed);
+        self.stop_where(|_| true, ServiceReason::Closed);
+    }
+
+    /// Hold each of `services`' new calls back from dispatch as `hold` says,
+    /// until [`Services::release`].
+    pub(crate) fn hold(&self, services: &[String], hold: Hold) {
+        self.0.with(|s| {
+            for service in services {
+                s.holds.insert(service.clone(), hold);
+            }
+        });
+    }
+
+    /// Lift the holds on `services`: a call waiting on one goes on to dispatch.
+    pub(crate) fn release(&self, services: &[String]) {
+        self.0.with(|s| {
+            for service in services {
+                s.holds.remove(service);
+            }
+        });
+    }
+
+    /// The calls of `services` dispatched and not yet ended, in id order.
+    pub(crate) fn dispatched(&self, services: &[String]) -> Vec<ServiceCallId> {
+        let mut calls = self.calls_where(|flight| flight.dispatched && flight.of(services));
+        calls.sort();
+        calls
+    }
+
+    /// Resolves once no call of `services` is dispatched and not yet ended.
+    pub(crate) fn settled(&self, services: &[String]) -> impl Future<Output = ()> + Send + 'static {
+        let services = services.to_vec();
+        self.until_none(move |flight| flight.dispatched && flight.of(&services))
+    }
+
+    /// Resolves once no call of `services` is in flight, dispatched or held.
+    pub(crate) fn drained_of(
+        &self,
+        services: &[String],
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let services = services.to_vec();
+        self.until_none(move |flight| flight.of(&services))
+    }
+
+    /// Tell every call of `services` in flight to stop, for `reason`.
+    pub(crate) fn stop_calls(&self, services: &[String], reason: ServiceReason) {
+        self.stop_where(|flight| flight.of(services), reason);
+    }
+
+    /// The calls in flight that `pick` picks.
+    fn calls_where(&self, pick: impl Fn(&Flight) -> bool) -> Vec<ServiceCallId> {
+        self.0
+            .state
+            .borrow()
+            .flights
+            .iter()
+            .filter(|(_, flight)| pick(flight))
+            .map(|(call, _)| *call)
+            .collect()
+    }
+
+    /// Resolves once no call in flight is one `pick` picks.
+    fn until_none(
+        &self,
+        pick: impl Fn(&Flight) -> bool + Send + Sync + 'static,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let mut state = self.0.state.subscribe();
+        async move {
+            let _ = state.wait_for(|s| !s.flights.values().any(&pick)).await;
+        }
+    }
+
+    /// Tell every call in flight `pick` picks to stop, for `reason`.
+    fn stop_where(&self, pick: impl Fn(&Flight) -> bool, reason: ServiceReason) {
+        for call in self.calls_where(pick) {
+            self.0.stop(call, reason);
         }
     }
 
@@ -787,6 +897,7 @@ impl Table {
                     ask,
                     service: request.service.clone(),
                     method: request.method.clone(),
+                    dispatched: false,
                 },
             );
             false
@@ -909,6 +1020,12 @@ impl Table {
                 )
             });
         }
+        if let Some(end) = self
+            .held(call, &request, since + deadline, &mut stopped)
+            .await
+        {
+            return ended(end);
+        }
         // Copied out first: the guard is not held while `ended` locks the table.
         let told_already = *stopped.borrow();
         if let Some(reason) = told_already {
@@ -981,6 +1098,94 @@ impl Table {
             }
         };
         ended(self.outcome(finished))
+    }
+
+    /// Wait out any hold on `request`'s service, marking `call` dispatched in
+    /// the change that finds none -- so a quiesce that sets a hold and then
+    /// waits for its service's dispatched calls either sees this one or holds
+    /// it. How the call ended, when a hold ended it: refused for an owner's
+    /// pause, a stop, a cut's pause past its deadline or the close; cancelled
+    /// at its own deadline or when told to stop while it waited.
+    async fn held(
+        &self,
+        call: ServiceCallId,
+        request: &Request,
+        deadline: Instant,
+        stopped: &mut watch::Receiver<Option<ServiceReason>>,
+    ) -> Option<End> {
+        let service = &request.service;
+        loop {
+            // Marking a call dispatched satisfies no waiter, so nobody is woken.
+            let mut hold = None;
+            self.state.send_if_modified(|s| {
+                match s.holds.get(service) {
+                    Some(held) => hold = Some(*held),
+                    None => {
+                        if let Some(flight) = s.flights.get_mut(&call) {
+                            flight.dispatched = true;
+                        }
+                    }
+                }
+                false
+            });
+            let hold = hold?;
+            let until = match hold {
+                Hold::Refuse => {
+                    return Some(End::refused(
+                        ServiceReason::Paused,
+                        format!("service {service:?} is paused, so the call was not made"),
+                    ));
+                }
+                Hold::Stopped => {
+                    return Some(End::refused(
+                        ServiceReason::Stopped,
+                        format!("service {service:?} was stopped, so the call was not made"),
+                    ));
+                }
+                Hold::Wait { until } => until,
+            };
+            let mut state = self.state.subscribe();
+            let lifted = state.wait_for(|s| s.closed || s.holds.get(service) != Some(&hold));
+            tokio::select! {
+                _ = lifted => {}
+                () = tokio::time::sleep_until(until) => {
+                    return Some(End::refused(
+                        ServiceReason::Paused,
+                        format!(
+                            "service {service:?} stayed paused past the deadline of what paused \
+                             it, so the call was not made"
+                        ),
+                    ));
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    return Some(End::stopped(
+                        ServiceOutcome::Cancelled,
+                        ServiceReason::Deadline,
+                        format!(
+                            "the call's deadline passed while service {service:?} was paused, so \
+                             it was not made"
+                        ),
+                    ));
+                }
+                reason = told(stopped) => {
+                    return Some(End::stopped(
+                        ServiceOutcome::Cancelled,
+                        reason,
+                        format!(
+                            "the call was cancelled before it was made: {}",
+                            said(reason)
+                        ),
+                    ));
+                }
+            }
+            if self.state.borrow().closed {
+                return Some(End::refused(
+                    ServiceReason::AdmissionClosed,
+                    "the session closed to new work while the call waited, so it was not made"
+                        .into(),
+                ));
+            }
+        }
     }
 
     /// How a call whose service's task finished ended.
@@ -1149,6 +1354,7 @@ fn changes(old: &ServiceDescription, new: &ServiceDescription) -> ServiceChanges
 fn presenter(kind: ServiceKind) -> &'static str {
     match kind {
         ServiceKind::Rust => "service",
+        ServiceKind::Mcp => "mcp",
     }
 }
 
@@ -1171,6 +1377,8 @@ fn said(reason: ServiceReason) -> &'static str {
         ServiceReason::Deadline => "its deadline passed",
         ServiceReason::Interrupted => "its caller was interrupted",
         ServiceReason::Closed => "the session's drain ended",
+        ServiceReason::Stopped => "its service was stopped",
+        ServiceReason::Paused => "its service is paused",
         _ => "it was refused",
     }
 }

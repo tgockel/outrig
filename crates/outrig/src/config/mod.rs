@@ -187,6 +187,15 @@ pub const DEFAULT_MCP_CALL_TIMEOUT_SECS: u64 = 600;
 /// `0` is an immediate timeout rather than none, so it is rejected.
 pub const MCP_CALL_TIMEOUT_SECS_CEILING: u64 = 3600;
 
+/// How long a session gives each MCP server it places to start: every
+/// attempt -- each bounded as `outrig run` bounds its one, at two minutes --
+/// and every wait between them, together. Two minutes, one attempt's bound,
+/// so a session that sets nothing waits for a hung server as `outrig run`
+/// does and still retries a fast transient failure. The top-level
+/// `mcp-connect-budget-secs` overrides it, within the same hour
+/// [`MCP_CALL_TIMEOUT_SECS_CEILING`] allows.
+pub const DEFAULT_MCP_CONNECT_BUDGET_SECS: u64 = 120;
+
 /// The `tools/call` deadline for one server: its own `call-timeout-secs`, else
 /// the session's `mcp-call-timeout-secs`, else
 /// [`DEFAULT_MCP_CALL_TIMEOUT_SECS`]. Most specific wins, and the values are
@@ -447,6 +456,11 @@ pub struct Config {
     /// [`DEFAULT_MCP_CALL_TIMEOUT_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_call_timeout_secs: Option<u64>,
+    /// How long a session gives each MCP server it places to start, every
+    /// attempt and wait between them included, in seconds. See
+    /// [`DEFAULT_MCP_CONNECT_BUDGET_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_connect_budget_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "NetworkConfig::is_default")]
     pub network: NetworkConfig,
     #[serde(default, skip_serializing_if = "EventsConfig::is_default")]

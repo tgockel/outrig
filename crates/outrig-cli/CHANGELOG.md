@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`run-new` starts the configuration's MCP servers, as services.** The image's
+  `[images.<name>.mcp]` servers, the sidecars they name and its `org.outrig.mcp` label start with
+  the session, and agent code calls each as `outrig.bindings[name]`; startup prints one line per
+  server -- `[outrig] MCP service fs: ready, 12 tools`, or why it did not start -- in place of
+  `run-new starts no MCP servers`, and the session goes on with those that are ready. A server
+  holding a `${VAR}` placed in the session's own container does not start: it would be readable
+  from agent Python. The new top-level `mcp-connect-budget-secs` bounds each server's start: see
+  the library's changelog.
+
 - **`run-new` stops at the agent's model-request limit.** With `model-request-limit` set, the
   round that reaches it closes on `(round ended: model-request-limit (N) reached: ...)`, and a line
   typed afterwards is answered with the same stop rather than a round, since `run-new` has no

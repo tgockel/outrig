@@ -18,7 +18,7 @@ use super::Config;
 ///   `default-model`, `tool-call-max`, `tool-result-max`,
 ///   `subagent-depth-max`, `subagent-width-max`, `children-max`,
 ///   `model-concurrency-max`, `requests-max`, `token-budget`,
-///   `retry-budget-secs`, `mcp-call-timeout-secs`):
+///   `retry-budget-secs`, `mcp-call-timeout-secs`, `mcp-connect-budget-secs`):
 ///   repo's value wins if set, else global's.
 /// - `session-root` is global-only: it is taken from `global` and never read
 ///   from `repo`, so a repo value cannot move where this machine writes,
@@ -107,6 +107,9 @@ pub fn merge(global: Config, repo: Config) -> Config {
             .or(global.model_request_warnings),
         retry_budget_secs: repo.retry_budget_secs.or(global.retry_budget_secs),
         mcp_call_timeout_secs: repo.mcp_call_timeout_secs.or(global.mcp_call_timeout_secs),
+        mcp_connect_budget_secs: repo
+            .mcp_connect_budget_secs
+            .or(global.mcp_connect_budget_secs),
         network,
         events,
         host,

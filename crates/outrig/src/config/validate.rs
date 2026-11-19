@@ -474,6 +474,12 @@ pub enum ConfigValidationError {
     )]
     McpCallTimeoutSecsZero { path: String, max: u64 },
 
+    #[error(
+        "{path} must be between 1 and {max} seconds; got {value}: it bounds every attempt to \
+         start an MCP server and every wait between them"
+    )]
+    McpConnectBudgetSecsOutOfRange { path: String, value: u64, max: u64 },
+
     #[error("{message}")]
     NetworkPolicyInvalid { message: String },
 
@@ -1014,6 +1020,15 @@ pub(super) fn validate_with_options(
     }
     if let Some(value) = cfg.mcp_call_timeout_secs {
         check_mcp_call_timeout_secs("top-level mcp-call-timeout-secs", value)?;
+    }
+    if let Some(value) = cfg.mcp_connect_budget_secs
+        && !(1..=MCP_CALL_TIMEOUT_SECS_CEILING).contains(&value)
+    {
+        return Err(ConfigValidationError::McpConnectBudgetSecsOutOfRange {
+            path: "top-level mcp-connect-budget-secs".into(),
+            value,
+            max: MCP_CALL_TIMEOUT_SECS_CEILING,
+        });
     }
     validate_network_policy(cfg)?;
 

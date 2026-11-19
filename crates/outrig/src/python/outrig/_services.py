@@ -166,8 +166,9 @@ class Service:
 
 
 # Each presenter -- the class a service's object is made from -- by the kind its description
-# names. A kind OutRig does not know is presented by the generic one.
-_PRESENTERS = {"service": Service}
+# names. A kind OutRig does not know is presented by the generic one. An MCP service is presented
+# by the generic class until its own presenter, which shows a result as content blocks, is written.
+_PRESENTERS = {"service": Service, "mcp": Service}
 
 
 def _made(cls, name, kernel):

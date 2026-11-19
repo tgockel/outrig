@@ -76,6 +76,24 @@ SECTIONS = [
         ],
     ),
     (
+        "MCP services",
+        "A session places the MCP servers a program declares with `outrig.Session(mcp=[...])` -- "
+        "an `outrig.McpCommand`, an `outrig.McpSidecar` or an `outrig.McpPrimaryView` each -- "
+        "beside those the configuration declares, and starts them as an `outrig.McpPolicy` says. "
+        "After entry, `session.mcp` maps each name to an `McpOutcome`, with an `McpCause` for one "
+        "that did not start, met only as values. See "
+        "[MCP Servers](../concepts/mcp-servers.md#in-a-session-mcp-services).",
+        "_host.py",
+        [
+            "outrig.McpCommand",
+            "outrig.McpSidecar",
+            "outrig.McpPrimaryView",
+            "outrig.McpPolicy",
+            "McpOutcome",
+            "McpCause",
+        ],
+    ),
+    (
         "Shutdown",
         "Leaving a session's `async with` block shuts it down and sets its `shutdown_report`, an "
         "`outrig.ShutdownReport`, whose fields hold the classes after it, met only as values. "
@@ -89,6 +107,7 @@ SECTIONS = [
             "ExecutionOutcome",
             "HostedCall",
             "ServiceCall",
+            "McpServiceStop",
             "RequestOutcome",
             "BindingStop",
             "EventDelivery",

@@ -20,7 +20,7 @@ use crate::config::{Binding, Config};
 use crate::python::host::Outcome;
 use crate::python::testing::{Flag, within};
 
-const VAR: &str = "OUTRIG_TEST_SERVICES_KEY";
+pub(super) const VAR: &str = "OUTRIG_TEST_SERVICES_KEY";
 
 /// A credential of the fixture's, which its `panic` method panics with: it must appear in nothing
 /// an agent or an owner reads.
@@ -260,7 +260,7 @@ impl Service for Fixture {
 }
 
 /// A configuration whose one model is served nowhere, run by a `coding` agent.
-fn config() -> Config {
+pub(super) fn config() -> Config {
     let cfg = Config::load_from_str(&format!(
         r#"
 default-model = "sonnet"
@@ -282,7 +282,7 @@ identifier = "{MODEL}"
     cfg
 }
 
-fn builder() -> SessionBuilder {
+pub(super) fn builder() -> SessionBuilder {
     SessionBuilder::new(config(), Some("coding"), None)
         .secrets(|var: &str| (var == VAR).then(|| "sk-test".to_string()))
 }
@@ -306,7 +306,7 @@ async fn served_with(builder: SessionBuilder, policy: ServicePolicy) -> (Session
 }
 
 /// What agent code reads of a call that raised `outrig.ServiceError`.
-const ERR: &str = r#"
+pub(super) const ERR: &str = r#"
 import outrig
 def err(f, *args, **kwargs):
     try:
@@ -316,7 +316,7 @@ def err(f, *args, **kwargs):
 "#;
 
 /// A policy whose calls have `deadline` and a grace of 300 ms.
-fn quick(deadline: Duration) -> ServicePolicy {
+pub(super) fn quick(deadline: Duration) -> ServicePolicy {
     ServicePolicy {
         call_deadline: deadline,
         cancel_grace: Duration::from_millis(300),
@@ -325,7 +325,7 @@ fn quick(deadline: Duration) -> ServicePolicy {
 }
 
 /// The `data` of each event of `kind`, in order.
-fn of_kind(events: &[Arc<Event>], kind: &str) -> Vec<Value> {
+pub(super) fn of_kind(events: &[Arc<Event>], kind: &str) -> Vec<Value> {
     events
         .iter()
         .filter(|event| event.kind() == kind)

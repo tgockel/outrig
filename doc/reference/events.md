@@ -80,9 +80,10 @@ The interpreter belongs to the session rather than to one agent, so events about
 and neither do the session's own, `session.state` and `session.report`, those of its bindings,
 `binding.refused`, `binding.injected` and `binding.exited`, those of its application code,
 `application.provisioned` and `application.imported`, what its skill sources hold,
-`skill.discovered`, or its services, `service.bound` and `service.described`. A request to a
-binding is the agent's that made it, and so is a call of a service's method and the import of a
-skill, which code outside every execution makes for no agent.
+`skill.discovered`, its services, `service.bound` and `service.described`, or the placement of
+its MCP services, `mcp.service.*`. A request to a binding is the agent's that made it, and so is
+a call of a service's method and the import of a skill, which code outside every execution makes
+for no agent.
 
 A child agent, which an agent's code launches with `runtime.spawn`, is named `c1`, `c2`, and so on
 in launch order, and its events carry its own subject, `agent/c1`: its `agent.started`,
@@ -289,6 +290,12 @@ three times for one call before the rejection ends it.
     answer has settled, `channel.item.resolved` -- `accepted`, with its `reference`,
     `not_accepted`, or still `uncertain`. One send in `sends` ended `uncertain` makes the verdict
     `stopped_with_unknown`; one in `uncertain` does not, its sender having been told.
+  - `mcp_services`: each MCP service the session declared, in the order declared, as `{service,
+    placement, outcome, how, proven}`: `placement` and `outcome` as its `mcp.service.started` or
+    `mcp.service.failed` say; `how`, `stopped` -- its transport closed and its container stopped
+    -- `with_primary`, its transport closed, its server ending with the session's container, or
+    `not_started`; and `proven`, whether that stop is. One not proven makes `stopped`
+    `not_proven`.
   - `verdict`: `clean`, `stopped_with_unknown`, or `not_proven_stopped`.
 - `channel.attached` -- an external channel the session's owner declared was attached to the
   subject's kernel, which holds it from then on as `runtime.channels[channel]`: `channel`;
@@ -791,7 +798,8 @@ between a child's failed rounds is in that read and has no event of its own.
 - `hosted.callback` -- a binding's library called a callable agent code passed it: `parent`, the
   request it was passed to; `agent`; `binding`.
 - `service.bound` -- a service the owner bound, as the session started: `service`, the name agents
-  reach it by; `kind`, `rust` for one an owner wrote; `methods`, how many it describes;
+  reach it by; `kind`, `rust` for one an owner wrote, `mcp` for an MCP server the session placed;
+  `methods`, how many it describes;
   `generation`, 1; and `unchecked`, the methods whose argument schema did not compile, by exact
   name, each called with its arguments unchecked.
 - `service.described` -- a service's description changed while the session ran: `service`;
@@ -835,7 +843,41 @@ between a child's failed rounds is in that read and has no event of its own.
   That a service was never called is read from `refused` or `cancelled` alone, as for a request
   to a binding. The family follows the rule for a new one: the agent as subject, one id the host
   mints, the interpreter's ids said to be its claims, previews of by-value data only, and no
-  "attempt".
+  "attempt". A call of an MCP service's tool is a call of this family, `kind` `mcp` and `method`
+  the tool's exact name; a call of a paused service is `refused`, `paused`, and one of a stopped
+  service `refused`, `stopped`; a call in flight when its service is stopped is told to stop,
+  `stopped`, and ends `unknown` with that reason.
+- `mcp.service.started` -- an MCP server the session placed started, as the session started: its
+  container placed, its `initialize` answered and its tools listed. `service`, the name agents
+  reach it by; `server`, its own name in the configuration where that differs -- `my-fs`, bound
+  as `my_fs` -- else `null`; `placement`, `command` (exec'd in the session's container),
+  `sidecar` or `primary_view` (a sidecar that sees the session container's filesystem);
+  `declared_in`, `owner`, `config` or `image_label`; `tools`, how many its listing holds;
+  `listing`, 1; `attempts`; and `duration`, seconds its start took. Its `service.bound` follows.
+- `mcp.service.retry` -- an attempt to start a server failed in a way that may pass -- its
+  transport failed, or its handshake did not answer within its bound -- and it is tried again:
+  `service`; `attempt`, the one that failed, from 1; `delay`, seconds until the next; and
+  `cause`, `{kind, message}`: `kind`, `transport`, `protocol`, `timeout`, `canceled` or `other`,
+  or `null`.
+- `mcp.service.failed` -- a server did not start, and the session starts without it: `service`;
+  `outcome`: `unavailable`, a failure that may pass, every attempt the connect budget allowed;
+  `refused`, it answered `initialize` with an error; `misconfigured`, it cannot start as
+  declared -- a binary not there, a credential where agent code could read it, a `${VAR}` with no
+  value; or `unclassified`, any other failure, named so; `cause`, `{service, server, placement,
+  declared_in, command, exit, stderr_tail, message, kind, attempts}`, where `command` shows its
+  environment as declared, each `${VAR}` as the reference, and `exit` and `stderr_tail` are how
+  its transport ended and what it wrote, when one ran; `attempts`, 0 for a declaration that could
+  not start as written; and `duration`.
+- `mcp.service.paused` -- a service's new calls were held, by `McpServices::quiesce`, and its
+  container frozen when `proven`: `service`; `how`, `refuse` (a call made meanwhile is refused,
+  `paused`) or `hold` (it waits for the resume, the cut's deadline at most); `proven`; and
+  `calls`, the calls of its container's services still running when the wait ran out, which left
+  it unfrozen. One per service its container hosts.
+- `mcp.service.resumed` -- a paused service was thawed, its held calls let go on: `service`,
+  `proven`.
+- `mcp.service.stopped` -- a service's transport was closed and what it ran in stopped, by a
+  quiesce or the session's close: `service`; `how`, `stopped` or `with_primary`; and `proven`,
+  whether its container is proven stopped. A service that never started has none.
 
 **Totals.** What a session spent is the sum of its `model.attempt` usage, each `attempt_id`
 counted once, with a `model.usage.replaced` taking the place of its attempt's `null` and a

@@ -337,6 +337,44 @@ fn read_resolv_conf(container: &Container) -> Vec<u8> {
     .stdout
 }
 
+/// What a session's MCP sidecar stops in this order: stopped while still
+/// attached, so what it runs is filtered and audited to its end, then detached
+/// -- which finds the namespaces holding its table and resolver gone with it,
+/// and succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_container_stopped_while_attached_detaches_cleanly() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let context = dir.path().join("image");
+    std::fs::create_dir_all(&context).expect("image context dir");
+    write_curl_image_context(&context);
+    let image = ensure_curl_image(&context).await;
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let log_dir = dir.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, &workspace).await;
+    let name = container.name().to_string();
+    let mut interceptor =
+        NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+            .await
+            .expect("start interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+    interceptor
+        .detach(&name)
+        .await
+        .expect("a stopped container detaches");
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+}
+
 /// The inverse-pair property against a real container: what `attach` changed,
 /// `detach` changes back, and the connections `attach`'s listeners accepted
 /// are cut *and recorded* by the time `detach` returns.

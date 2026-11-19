@@ -8,8 +8,11 @@
 //! between rounds: here what the user types reaches the agent's `user`
 //! channel while a round runs, too.
 //!
-//! **No MCP server and no sidecar starts**: see
-//! [`harness::container_spec`], which describes the container.
+//! **The configuration's MCP servers start with the session, as services**,
+//! under its rules -- a server holding a credential never in the session's own
+//! container -- and one line each says how each start ended: see
+//! [`harness::container_spec`], which describes the container, and
+//! [`SessionBuilder::mcp`].
 //!
 //! The session is recorded like any other, in the order that keeps
 //! `session.json` honest: the record is written once the interpreter is up,
@@ -43,7 +46,8 @@ use nix::fcntl::{Flock, FlockArg};
 use outrig::config::{Config, EnvSecrets, EventsMode, HOST_GRACE_SECS_CEILING, ImageConfig};
 use outrig::error::IoPathExt;
 use outrig::harness::{
-    self, DEFAULT_DRAIN, DirectorySource, Progress, SessionBuilder, Step, Verdict,
+    self, DEFAULT_DRAIN, DirectorySource, McpOutcomeKind, McpServiceOutcome, Progress,
+    SessionBuilder, Step, Verdict,
 };
 use outrig::image::{self, BuildOutput, ImageTag};
 use outrig::LaunchSpec;
@@ -809,24 +813,57 @@ async fn start(args: Start<'_>) -> Result<harness::Session> {
     // The image work above can take minutes, and the repo is writable by a
     // concurrent session: look again at what the guard validated (#604).
     recheck_pinned_mounts(pinned_mounts)?;
-    let (spec, skipped) =
-        launch_spec(cfg, image_cfg_name, &image.tag, repo_root, log_dir, &record.id).await?;
-    if !skipped.is_empty() {
-        say(&format!(
-            "[outrig] run-new starts no MCP servers; not started: {}",
-            skipped.join(", ")
-        ));
-    }
-
+    let spec = launch_spec(cfg, image_cfg_name, &image.tag, repo_root, log_dir, &record.id).await?;
     let session = builder.container(spec).start().await?;
+    for line in mcp_lines(&session.mcp().outcomes()) {
+        say(&line);
+    }
     record.container_name = session.container_name().to_string();
     Ok(session)
 }
 
+/// One line for each MCP service the session declared, saying how its start
+/// ended: the session goes on with those that are ready.
+fn mcp_lines(outcomes: &[(String, McpServiceOutcome)]) -> Vec<String> {
+    outcomes
+        .iter()
+        .map(|(name, outcome)| {
+            let tools = match outcome {
+                McpServiceOutcome::Ready { tools, .. } => *tools,
+                _ => 0,
+            };
+            let cause = outcome
+                .cause()
+                .map(|cause| (cause.message.as_str(), cause.exit.as_deref()));
+            mcp_line(name, outcome.kind(), tools, cause)
+        })
+        .collect()
+}
+
+/// The line for service `name`, whose start ended as `kind`: with `tools`
+/// tools when it is ready, or for `cause`, a message and how its transport
+/// ended.
+fn mcp_line(
+    name: &str,
+    kind: McpOutcomeKind,
+    tools: usize,
+    cause: Option<(&str, Option<&str>)>,
+) -> String {
+    let Some((message, exit)) = cause else {
+        let plural = if tools == 1 { "" } else { "s" };
+        return format!("[outrig] MCP service {name}: ready, {tools} tool{plural}");
+    };
+    let kind = kind.as_str();
+    let exit = exit
+        .map(|exit| format!(" (exit: {exit})"))
+        .unwrap_or_default();
+    format!("[outrig] MCP service {name}: {kind}, not started: {message}{exit}")
+}
+
 /// The launch for `image_cfg_name`, running the already-ensured `tag`, with no
-/// MCP server and no sidecar in it -- and the names of the servers left out.
-/// Its container is named for `sid` and carries it as `org.outrig.session`, as
-/// `run`'s is.
+/// MCP server and no sidecar in it: the session started with it starts those
+/// the configuration declares. Its container is named for `sid` and carries it
+/// as `org.outrig.session`, as `run`'s is.
 ///
 /// The image-config is replaced by one naming `tag`, keeping only its
 /// security, so the image that runs is the one the session records and
@@ -838,13 +875,10 @@ async fn launch_spec(
     repo_root: &Path,
     log_dir: PathBuf,
     sid: &SessionId,
-) -> Result<(LaunchSpec, Vec<String>)> {
+) -> Result<LaunchSpec> {
     let container =
         harness::container_spec(cfg, image_cfg_name, Some(tag), repo_root, log_dir).await?;
-    Ok((
-        container.spec.with_session_id(sid.as_str()),
-        container.left_out,
-    ))
+    Ok(container.spec.with_session_id(sid.as_str()))
 }
 
 struct Banner<'a> {
@@ -975,21 +1009,22 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
 "#;
 
     /// The policy, asserted on what is launched rather than on what Python can
-    /// read: the spec carries no server and no sidecar, ignores the image's
-    /// label, and names what it left out. Were `leaky` started, resolving its
-    /// unset `${..}` alone would fail the launch. The image-config, here a
+    /// read: the spec carries no server and no sidecar, and ignores the image's
+    /// label -- the session's MCP table starts what the configuration declares.
+    /// Were `leaky` in the launch, resolving its unset `${..}` alone would fail
+    /// it. The image-config, here a
     /// Dockerfile, is pinned to the tag already ensured and keeps its security.
     /// The spec carries the session id, so the container is named and labeled
     /// for it.
     #[tokio::test]
-    async fn the_launch_starts_no_mcp_server_and_no_sidecar() {
+    async fn the_launch_leaves_mcp_servers_to_the_session() {
         let cfg = Config::load_from_str(WITH_SERVERS).expect("config parses");
         cfg.validate(None).expect("config validates");
         let repo = tempfile::tempdir().expect("a repo dir");
 
         let tag = ImageTag::new("docker.io/library/alpine:latest");
         let sid = SessionId("20260925T000000-abcd".to_string());
-        let (spec, skipped) = launch_spec(
+        let spec = launch_spec(
             &cfg,
             "primary",
             &tag,
@@ -1004,7 +1039,6 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
         assert!(spec.mcp.is_empty(), "{:?}", spec.mcp.keys());
         assert!(spec.sidecars.is_empty(), "a sidecar would start");
         assert_eq!(spec.embedded_mcp_policy, EmbeddedMcpPolicy::Ignore);
-        assert_eq!(skipped, ["fs", "leaky"]);
         assert_eq!(
             format!("{:?}", spec.security),
             format!(
@@ -1016,6 +1050,39 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
             cfg.images["primary"].mcp().contains_key("leaky") && cfg.sidecars.contains_key("tools"),
             "the session's own config is left whole"
         );
+    }
+
+    /// One line an MCP service each: ready with its tools, or why it did not
+    /// start and how its server ended.
+    #[test]
+    fn each_mcp_outcome_is_one_line() {
+        assert_eq!(
+            mcp_line("fs", McpOutcomeKind::Ready, 12, None),
+            "[outrig] MCP service fs: ready, 12 tools"
+        );
+        assert_eq!(
+            mcp_line("one", McpOutcomeKind::Ready, 1, None),
+            "[outrig] MCP service one: ready, 1 tool"
+        );
+        assert_eq!(
+            mcp_line(
+                "leaky",
+                McpOutcomeKind::Misconfigured,
+                0,
+                Some(("it holds a credential", None))
+            ),
+            "[outrig] MCP service leaky: misconfigured, not started: it holds a credential"
+        );
+        assert_eq!(
+            mcp_line(
+                "gh",
+                McpOutcomeKind::Unavailable,
+                0,
+                Some(("connection closed", Some("code 1")))
+            ),
+            "[outrig] MCP service gh: unavailable, not started: connection closed (exit: code 1)"
+        );
+        assert!(mcp_lines(&[]).is_empty());
     }
 
     /// A summary of a report that `verdict` reads as, and nothing else.

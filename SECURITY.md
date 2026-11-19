@@ -41,8 +41,10 @@ Issues that bear on **host integrity** are in scope, for example:
   processes outside the configured workspace mount(s).
 - OutRig leaking host secrets, credentials, or environment into the container when not
   configured to, including through a podman default OutRig leaves in place, such as
-  `--http-proxy`, or, under `outrig run-new`, through an MCP server's or a sidecar's environment:
-  `run-new` starts neither, so no credential from those blocks reaches its container.
+  `--http-proxy`, or, under `outrig run-new` or a host program's session, through an MCP server's
+  environment: a session places no server holding a credential in its own container or a sidecar
+  that shares its view, so no credential from those blocks reaches the container agent code runs
+  in.
 - Agent code starting a container, a sidecar, an MCP server, a binding, or a service. Those come
   from the configuration, the operator, an embedder, or a host program's `inject`, never from the
   agent: the agent cannot grow its own environment.
@@ -148,6 +150,18 @@ Issues that bear on **host integrity** are in scope, for example:
   `unknown`, since what it did before the abort stands, and a call blocking a thread runs on in
   the embedder's process. A service written by whoever embeds OutRig is that embedder's trusted
   code, not a vulnerability.
+- An **MCP service** a session places (`SessionBuilder::mcp`, `outrig.Session(mcp=...)`, and the
+  configuration's `[images.<name>.mcp]` under `outrig run-new`, 0.3) is a service as above: every
+  tool its server offers is callable by every agent of the session, each call published. A server
+  placed in the session's container runs beside the interpreter as the session's user -- the
+  agent can signal it, read its `/proc` entries and the literals in its environment, and it writes
+  what the agent can -- which is why one with a `${VAR}` in its `env` is refused there and in a
+  primary-view sidecar, and runs only in a sidecar of its own. A literal in `env` is not checked:
+  OutRig cannot tell a token from a path. A configuration's sidecar block hosting several servers
+  is one container, whose servers and their credentials share it. What a server returns, and what
+  it writes to stderr, is its own text, which OutRig redacts nothing of. Pausing a sidecar freezes
+  its container; a server in the session's container cannot be frozen apart from the interpreter,
+  and the control says so. See [Trust Model](doc/concepts/mcp-trust-model.md).
 - **Application code** (`SessionBuilder::application`, `outrig.Session(application=...)`, 0.3)
   runs in the container with the agent's authority, which is arbitrary execution there: it is the
   owner's code, trusted as the owner is. Its snapshot is mounted read-only so that the code the

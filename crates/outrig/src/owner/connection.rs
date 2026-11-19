@@ -5,7 +5,7 @@
 //! that exited may leave its read end with a process that never reads it, and a full pipe nobody
 //! reads must not hold up the stopping of what the program left open.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,7 +20,10 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::LeftOpen;
-use super::session::{self, ApplicationRequest, Command, Context, Live, MountRequest, Request};
+use super::session::{
+    self, ApplicationRequest, Command, Context, Live, McpPolicyRequest, McpRequest, MountRequest,
+    Request,
+};
 use crate::harness::DEFAULT_DRAIN;
 use crate::python::host::next_line;
 use crate::python::supervisor::quoted;
@@ -137,6 +140,11 @@ struct Start {
     application: Option<ApplicationRequest>,
     #[serde(default)]
     live: Vec<Live>,
+    #[serde(default)]
+    mcp: Vec<McpRequest>,
+    mcp_policy: Option<McpPolicyRequest>,
+    #[serde(default)]
+    mcp_identity: BTreeMap<String, String>,
 }
 
 /// Read the program's requests until it is gone, then wait for every session it asked for to
@@ -204,6 +212,9 @@ pub(crate) async fn serve(
                             cwd: start.cwd,
                             application: start.application,
                             live: start.live,
+                            mcp: start.mcp,
+                            mcp_policy: start.mcp_policy,
+                            mcp_identity: start.mcp_identity,
                         };
                         started.spawn(session::run(
                             request,

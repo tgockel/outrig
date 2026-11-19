@@ -4,9 +4,10 @@
 reaches tools. `outrig run`'s agent acts by calling the tools of the MCP servers an image-config
 declares, and `outrig mcp` serves the same tools to an external client. `outrig run-new`'s agent
 acts by writing Python instead (see
-[Python Runtime](https://tgockel.github.io/outrig/concepts/python-runtime.html)), and starts none
-of these servers; its startup names the configured ones it left out. On this page, "the agent" is
-`outrig run`'s, and a turn is one prompt and the agent's work on it.
+[Python Runtime](https://tgockel.github.io/outrig/concepts/python-runtime.html)): its session
+starts the same servers as **MCP services**, each a Python object agent code calls, under rules of
+its own -- see [In a session: MCP services](#in-a-session-mcp-services). Elsewhere on this page,
+"the agent" is `outrig run`'s, and a turn is one prompt and the agent's work on it.
 
 Each MCP server is a child process that runs inside a session container and speaks JSON-RPC over
 its stdio. outrig connects to each one by `podman exec -i`'ing into the container, hands the
@@ -19,9 +20,10 @@ dependencies stay out of the workspace image and the server sees only what its c
 granted. See [Sidecar placement](#sidecar-placement) below and
 [Containers](containers.md#sidecar-containers) for the container-side details.
 
-The same `[images.<name>.mcp]` table is consumed by both `outrig run` and
-`outrig mcp`, and set aside by `outrig run-new`. `outrig run` registers those tools with its
-built-in agent; `outrig mcp` republishes them as one stdio MCP server for an external client. See
+The same `[images.<name>.mcp]` table is consumed by `outrig run`, `outrig mcp` and
+`outrig run-new`. `outrig run` registers those tools with its built-in agent; `outrig mcp`
+republishes them as one stdio MCP server for an external client; `outrig run-new` binds each
+server to its session as a service. See
 [Usage -> outrig mcp](https://tgockel.github.io/outrig/usage/mcp.html) for client setup and
 transport rules.
 When `outrig mcp --attach` points at an existing container, it still starts its own
@@ -447,6 +449,87 @@ shuts down only the MCP children it started and leaves the borrowed container ru
 If the owner stops the container while the attacher is live, the attacher exits instead
 of trying to relaunch it.
 
+## In a session: MCP services
+
+A session -- `outrig run-new`'s, a host program's `outrig.Session`, or one a Rust program starts
+with `SessionBuilder` -- places, starts and stops MCP servers itself and binds each to the session
+as a **service**: an object agent code reaches as `outrig.bindings[name]`, and as a global of that
+name where it is free, with a method per tool by the tool's exact name. Every call is checked
+against the tool's schema, held to a deadline, recorded as `service.call.*` events with
+`kind: "mcp"`, and listed in the shutdown report when the close ends it, as any service's call is.
+A call still running once its deadline and the grace after it are out ends `unknown`, its server
+sent `notifications/cancelled`: the server may have done the work.
+
+A server comes from one of three places: the configuration's `[images.<name>.mcp]` entries and the
+sidecar blocks they name, and the image's `org.outrig.mcp` label under `[repo] env-allow`, as
+above; a host program's `outrig.Session(mcp=[...])`; or `SessionBuilder::mcp`. A configured
+server is bound under its own name, or with `-` read as `_` when that is free -- `my-fs` as
+`my_fs` -- and its events keep its own name as `server`. Each runs in one of three placements:
+
+- **command** -- exec'd in the session's container, beside the interpreter, as the session's
+  user, as a primary-placed entry is.
+- **sidecar** -- in a container of its own, seeing what that container is granted. A
+  configuration's `[sidecars.<sc>]` block hosting several servers is one container for them all,
+  as for `outrig run`; a host program's or a builder's sidecar hosts one server, in a container
+  named `mcp-<name>`. A configured block of that name is never placed in its stead: its servers
+  are `misconfigured`.
+- **primary view** -- an entrypoint sidecar with `view = "primary"`, seeing the session container's
+  whole filesystem; see [Primary filesystem view](#primary-filesystem-view).
+
+**A server that holds a credential is never placed beside the interpreter.** A `${VAR}` in a
+command's or a primary view's `env` would be readable from agent Python wherever `/proc` allows,
+so such a server does not start; a credentialed server is a sidecar. A `${VAR}` under a key podman
+reads itself (see [MCP `env` value syntax](../reference/config.md#mcp-env-value-syntax)) does not
+start either, since its value would reach podman's command line. Each `${VAR}` is resolved once,
+by the session's secret resolver -- the process environment for `run-new` -- and a value reaches
+podman by name, never on a command line.
+
+**Startup.** The servers start as the session does, beside its interpreter and concurrently with
+one another: placed, `initialize` answered, tools listed. An attempt's handshake and its listing
+are each bounded at two minutes, and the whole attempt, its container's preparation included, by
+what is left of the **connect budget**: two minutes, or the top-level `mcp-connect-budget-secs`;
+the primary image's label is read within that budget too. A failure that may pass -- the
+transport failed, the handshake did not answer -- is tried again, waiting half a second and then
+twice as long each time, up to eight, within that budget, and no server starts after it. A sidecar
+of one server's own is stopped before each new attempt, so what a failed one left running does not
+run beside the next, and a sidecar none of whose servers started is stopped once the start ends;
+while that stop is not proven, its servers are still listed as writers, as is a command that was
+launched and did not start, since what it ran may still run in the session's container. Each ends
+with an outcome:
+
+- `ready` -- started and bound.
+- `unavailable` -- it failed in a way that may pass, every attempt the budget allowed.
+- `refused` -- it answered `initialize` with an error.
+- `misconfigured` -- it cannot start as declared: its command exited 126 or 127, it holds a
+  credential beside the interpreter, a `${VAR}` has no value, a configured sidecar's image could
+  not be built, pulled or found.
+- `unclassified` -- any other failure, another exit status included, named so rather than guessed.
+
+A server that does not start does not stop the session: it starts with the servers that are
+ready. `run-new` prints one line per server; a host program reads `session.mcp`; a Rust program
+reads `Session::mcp().outcomes()`. The `mcp.service.*` events in
+[Events](https://tgockel.github.io/outrig/reference/events.html) record each start, retry and
+failure. A sidecar's `on-failure` is not consulted, and a `start = "manual"` sidecar's servers are
+`misconfigured`: a session starts every server it places.
+
+**Quiescing.** `Session::mcp()` also says which servers can write what -- a command and a primary
+view the session container's filesystem, a sidecar the workspace when it mounts it `rw` and its
+`rw` mounts -- and can pause or stop one: a pause holds its new calls, waits for those running, and
+freezes its container with `podman pause`; a stop tells each call in flight to stop, closes the
+transport and stops the container, which stays under the session's network policy until its stop
+is proven. A pause or a stop runs to its end even when its caller stops waiting, and a resume
+asked after it waits for it and undoes what it did; one whose caller stopped waiting before it
+began does nothing. A command placement cannot be frozen apart from the interpreter, and
+a stopped server is not paused; each says so. A container a configuration's block shares is
+paused or stopped for all of its servers at once.
+
+**The close.** At the session's close each server's transport is closed and its container
+stopped, a paused one thawed first, one a stop left unproven stopped again -- a server that never
+started included, when its container ran; a command placement ends with the session's container,
+and is proven stopped only once that is -- one that did not start too, when an attempt ran it.
+The shutdown report's `mcp_services` lists each, with how it was stopped and whether that was
+proven.
+
 ## Dynamic addition
 
 Sidecars can also join a session after it starts. The primitive is the library API:
@@ -661,7 +744,7 @@ Two practical guidelines:
 - [Trust Model](mcp-trust-model.md) -- the container boundary that makes broad MCP tools
   practical.
 - [Python Runtime](https://tgockel.github.io/outrig/concepts/python-runtime.html) -- the agent
-  that acts by writing Python, which starts no MCP server.
+  that acts by writing Python, which reaches MCP servers as services.
 - [AI-assisted design](../usage/ai-assisted-design.md) -- use `outrig mcp self` to design custom
   MCP-enabled image-configs.
 - [Sessions](https://tgockel.github.io/outrig/usage/sessions.html) --

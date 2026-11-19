@@ -178,6 +178,11 @@ const BACKEND_END: &str = "backend";
 const DRAINED: &str = "the session's drain ended before the backend answered";
 
 impl ChannelDefinition {
+    /// The name the channel's holder reaches it by.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
     /// A channel named `name` -- the holder's `runtime.channels` key -- that
     /// carries text both ways, holds up to [`CHANNEL_BOUND_MAX`] items unread,
     /// and wakes its holder.

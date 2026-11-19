@@ -56,11 +56,15 @@ inside the container is the point of giving an agent a development environment. 
 
 **Secrets.** Keep secrets and host-only material out of the container unless the agent should be
 able to use them. Whatever reaches the container is the agent's to read: an MCP server's `env` is
-readable, where `/proc` allows, by every other process the session user runs there. That is why
-`outrig run-new` starts no MCP server and no sidecar: a server in the primary would run beside the
-agent's interpreter as the same user, with whatever its `env` resolved, so no credential from an MCP
-or sidecar block reaches a `run-new` session's container. For the same reason, OutRig turns off
-podman's copying of the host's proxy variables into every container it starts.
+readable, where `/proc` allows, by every other process the session user runs there. That is why a
+session -- `outrig run-new`'s, or a program's -- **never places a server that holds a credential
+beside the interpreter**: a server in the primary, or in a sidecar that joins its view, runs where
+the agent's code reads its environment, so a declaration with a `${VAR}` in its `env` there does
+not start, and says why. A credentialed server runs in a sidecar of its own, and no credential from
+an MCP or sidecar block reaches a session's own container. A literal in `env` is not one by this
+rule: OutRig cannot tell a token from a path, and a literal secret in a config file is the
+operator's choice. For the same reason, OutRig turns off podman's copying of the host's proxy
+variables into every container it starts.
 
 **Network.** What the agent's code reaches over the network is bounded by the container's network
 namespace and by the session's network policy, which covers every container of the session:
@@ -100,6 +104,21 @@ with: the launcher sets the flag itself, and a `view = "primary"` sidecar cannot
 only the mount namespace is joined -- PID, network, and cgroup stay the sidecar's own. Grant it
 only to a sidecar image you trust with the primary's files: it reads them all, even though it
 writes as you.
+
+**What a session's placement grants.** A session binds each MCP server it places as a
+[service](mcp-servers.md#in-a-session-mcp-services), and the service is the grant: every tool the
+server offers is callable by every agent of the session, each call recorded. A command placement
+runs as the session's user beside the interpreter: the agent can signal it, read its `/proc`
+entries and the literals in its environment, and it writes the workspace as the agent does. A
+sidecar sees what its container is granted and nothing else; a primary view reads the primary's
+whole filesystem, as above. A configuration's sidecar block hosting several servers is one
+container, so its servers -- and their credentials -- share it, as for `outrig run`; a program's
+own sidecars host one server each, and a configured block never takes one's place, so a program's
+server runs, with its values, only in the container the program declared; such a sidecar sees the
+working directory it asks for with no more access than the session's own mounts grant there or
+anywhere inside it. No
+agent-callable
+operation declares a server: the session's servers are fixed when it starts.
 
 ## The configuration is inside the boundary
 

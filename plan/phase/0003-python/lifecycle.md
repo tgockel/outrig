@@ -299,6 +299,25 @@ the session.
 A service has no process of its own to stop: it is the embedder's object, dropped with the
 session.
 
+**MCP services** (`0003-54`)
+
+- *Ready, in a sidecar or a primary view.* Outcome: after the drain, its transport is closed
+  (`McpClient::shutdown`, which says nothing about the server) and its container detached from the
+  interceptor and stopped, before the session's container; a stop that fails makes the report not
+  proven stopped. Invoked: not a call; a call it was serving is a **Service calls** row. Effects:
+  what its tools did stands, and a write its container was making is cut off by the stop, which
+  `mcp_services` says was proven or not.
+- *Ready, in the primary.* Outcome: its transport is closed, and the server ends with the
+  session's container. Invoked: not a call. Effects: as for a sidecar.
+- *Paused, by a quiesce.* Outcome: its container is thawed, then as ready. Invoked: no. Effects:
+  as for ready.
+- *Stopped, by a quiesce.* Outcome: nothing more; its earlier stop is what `mcp_services` reports.
+  Invoked: no. Effects: as its stop left them.
+- *Not started* -- `unavailable`, `refused`, `misconfigured` or `unclassified`. Outcome: nothing
+  to stop; `mcp_services` lists it, `not_started`. Invoked: no. Effects: none.
+
+A call of one waiting on a cut's hold at the close is refused, admission closed, never dispatched.
+
 **Root agents** (`0003-35`, `0003-46`)
 
 - *Constructing* (`0003-46`): the owner asked, and the root's kernel has not answered. Outcome: the

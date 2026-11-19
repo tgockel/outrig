@@ -32,7 +32,7 @@ use rmcp::service::{
 use serde_json::Value;
 
 use crate::config::{EnvValue, McpServerSpec, ResolvedEnvValue, effective_mcp_call_timeout};
-use crate::container::{Container, ExecOptions, embedded::McpDeclarationSource};
+use crate::container::{Container, ExecOptions, ExecTarget, embedded::McpDeclarationSource};
 use crate::error::{IoPathExt, McpFailureKind, McpSessionError, OutrigError, Result};
 use crate::mcp_content::{McpTool, McpToolResult, result_from_rmcp, tool_from_rmcp};
 use crate::process::{Cmd, Owned, StdioSpec, Transcript};
@@ -46,7 +46,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// itself on first launch (`npx -y`, `uvx`) spends its download inside it too
 /// -- which is why it is minutes rather than seconds. Past it the server is
 /// presumed hung, and startup fails the way it does for a server that crashed.
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How many `tools/list` pages a server may send before its listing is
 /// refused. No server a model could use comes near it -- most send every tool
@@ -84,7 +84,9 @@ const ABANDONED_REASON: &str = "outrig stopped waiting for this call";
 pub struct McpClient {
     name: String,
     service: RunningService<RoleClient, ()>,
-    child: Owned,
+    /// The transport's host-side process; `None` for a transport with no
+    /// process of its own, as a test's in-memory one.
+    child: Option<Owned>,
     /// Kept so a failure after the handshake can show what the server said,
     /// the way a failed handshake already does.
     stderr_path: PathBuf,
@@ -148,19 +150,13 @@ impl McpClient {
     ) -> Result<Self> {
         let (command, env_spec) = server_cfg.normalize();
         let env = resolve_mcp_env(name, env_spec, extra_env)?;
-        // Sidecar servers run wherever their image puts them; no exec-side
-        // working directory has come up for one yet.
-        let exec_cmd =
-            container.build_exec_argv(&command, &ExecOptions::new().with_resolved_env(env));
-        let client = Self::connect_stdio_cmd(
-            exec_cmd,
+        let client = Self::connect_exec(
+            &container.exec_target(),
+            &command,
+            env,
             name,
             declaration_source,
             log_dir,
-            container.transcript(),
-            // An exec'd server's output is not in the container's log.
-            None,
-            &command,
             STARTUP_TIMEOUT,
         )
         .await?;
@@ -192,6 +188,53 @@ impl McpClient {
         declaration_source: McpDeclarationSource,
         log_dir: &Path,
     ) -> Result<Self> {
+        Self::connect_via_podman_start_within(
+            container,
+            name,
+            Some(declaration_source.description()),
+            log_dir,
+            STARTUP_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Connect `command`, exec'd in the container `target` names with `env`,
+    /// giving its `initialize` handshake `initialize_within`.
+    pub(crate) async fn connect_exec(
+        target: &ExecTarget,
+        command: &[String],
+        env: BTreeMap<String, ResolvedEnvValue>,
+        name: &str,
+        declaration_source: Option<&'static str>,
+        log_dir: &Path,
+        initialize_within: Duration,
+    ) -> Result<Self> {
+        // Sidecar servers run wherever their image puts them; no exec-side
+        // working directory has come up for one yet.
+        let cmd = target.exec_argv(command, &ExecOptions::new().with_resolved_env(env));
+        Self::connect_stdio_cmd(
+            cmd,
+            name,
+            declaration_source,
+            log_dir,
+            target.transcript(),
+            // An exec'd server's output is not in the container's log.
+            None,
+            command,
+            initialize_within,
+        )
+        .await
+    }
+
+    /// [`McpClient::connect_via_podman_start`], giving its `initialize`
+    /// handshake `initialize_within`.
+    pub(crate) async fn connect_via_podman_start_within(
+        container: &Container,
+        name: &str,
+        declaration_source: Option<&'static str>,
+        log_dir: &Path,
+        initialize_within: Duration,
+    ) -> Result<Self> {
         let cmd = Cmd::new("podman")
             .args(["start", "--attach", "--interactive"])
             .arg(container.selector());
@@ -207,12 +250,12 @@ impl McpClient {
         Self::connect_stdio_cmd(
             cmd,
             name,
-            Some(declaration_source.description()),
+            declaration_source,
             log_dir,
             container.transcript(),
             container.ctr_log_path(),
             &argv,
-            STARTUP_TIMEOUT,
+            initialize_within,
         )
         .await
     }
@@ -234,6 +277,7 @@ impl McpClient {
         display_command: &[String],
         initialize_within: Duration,
     ) -> Result<Self> {
+        let by = tokio::time::Instant::now() + initialize_within;
         tokio::fs::create_dir_all(log_dir)
             .await
             .path_ctx("create directory", log_dir)?;
@@ -267,26 +311,26 @@ impl McpClient {
         // `IntoTransport for (R, W)` impl. Going through
         // `rmcp::transport::TokioChildProcess::new` would spawn its own child
         // internally, leaving us no `Child` handle for graceful shutdown.
-        let handshake =
-            tokio::time::timeout(initialize_within, serve_client((), (stdout, stdin))).await;
-        let source: Box<dyn std::error::Error + Send + Sync> = match handshake {
+        let handshake = tokio::time::timeout_at(by, serve_client((), (stdout, stdin))).await;
+        // A handshake that failed is classified already: what diagnosing it
+        // waits for is bounded by what its own bound left, so the caller's
+        // bound does not end it as out of time. One that ran out of time is
+        // transient whatever the diagnosis finds, and keeps the ceilings.
+        let (failed, until) = match handshake {
             Ok(Ok(service)) => {
                 return Ok(Self {
                     name: name.to_string(),
                     service,
-                    child,
+                    child: Some(child),
                     stderr_path,
                     call_timeout: effective_mcp_call_timeout(None, None),
                 });
             }
-            Ok(Err(source)) => Box::new(source),
+            Ok(Err(source)) => (Handshake::failed(source), Some(by)),
             // rmcp drives the handshake inline, so the elapsed future took the
             // transport with it: the server's stdin is closed by the time
             // `enrich_startup_error` waits on it.
-            Err(_) => Box::new(McpSessionError::new(
-                McpFailureKind::Timeout,
-                format!("no `initialize` response within {initialize_within:?}"),
-            )),
+            Err(_) => (Handshake::timed_out(initialize_within), None),
         };
         Err(enrich_startup_error(
             name,
@@ -295,9 +339,98 @@ impl McpClient {
             &stderr_path,
             ctr_log,
             &mut child,
-            source,
+            failed,
+            until,
         )
         .await)
+    }
+
+    /// The first line of what the server said of itself in its `initialize`
+    /// answer, if it said anything.
+    pub(crate) fn instructions(&self) -> Option<String> {
+        let info = self.service.peer_info()?;
+        let line = info.instructions.as_deref()?.lines().next()?.trim();
+        (!line.is_empty()).then(|| line.to_string())
+    }
+
+    /// A client of the server `script` runs under `sh`, its stderr kept in
+    /// `log_dir`: a test's server that is a real process.
+    #[cfg(test)]
+    pub(crate) async fn connect_script(
+        name: &str,
+        script: &str,
+        log_dir: &Path,
+        initialize_within: Duration,
+    ) -> Result<Self> {
+        let cmd = Cmd::new("sh").args(["-c", script]);
+        Self::connect_stdio_cmd(cmd, name, None, log_dir, None, None, &[], initialize_within).await
+    }
+
+    /// A client of `server`, served in memory with no process behind it, for a
+    /// test: the handshake, its bound and its classification are the ones a
+    /// podman transport gets.
+    #[cfg(test)]
+    pub(crate) async fn handshake_in_memory<S>(
+        name: &str,
+        server: S,
+        initialize_within: Duration,
+    ) -> Result<Self>
+    where
+        S: rmcp::ServerHandler,
+    {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(running) = rmcp::service::serve_server(server, server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let failed =
+            match tokio::time::timeout(initialize_within, serve_client((), client_io)).await {
+                Ok(Ok(service)) => {
+                    return Ok(Self {
+                        name: name.to_string(),
+                        service,
+                        child: None,
+                        stderr_path: PathBuf::new(),
+                        call_timeout: effective_mcp_call_timeout(None, None),
+                    });
+                }
+                Ok(Err(source)) => Handshake::failed(source),
+                Err(_) => Handshake::timed_out(initialize_within),
+            };
+        Err(startup_failure(
+            name,
+            None,
+            &[],
+            None,
+            Path::new(""),
+            "(empty)".into(),
+            failed,
+        ))
+    }
+
+    /// A start whose server exited with `code` before it answered, having
+    /// written `stderr_tail`: what a missing binary looks like, for a test.
+    #[cfg(test)]
+    pub(crate) fn exited_before_initialize(
+        name: &str,
+        command: &[String],
+        code: i32,
+        stderr_tail: &str,
+    ) -> OutrigError {
+        use std::os::unix::process::ExitStatusExt;
+        let failed = Handshake::failed(rmcp::service::ClientInitializeError::ConnectionClosed(
+            "initialize response".into(),
+        ));
+        startup_failure(
+            name,
+            None,
+            command,
+            Some(std::process::ExitStatus::from_raw(code << 8)),
+            Path::new(""),
+            stderr_tail.to_string(),
+            failed,
+        )
     }
 
     /// Replace the `tools/call` deadline. The cascade -- a server's own
@@ -330,7 +463,7 @@ impl McpClient {
     /// [`Self::list_tools`] with the bound named, so a test can reach the
     /// timeout without waiting out the real one. No cancel goes upstream on
     /// expiry: every caller abandons a server whose listing failed.
-    async fn list_tools_within(&self, bound: Duration) -> Result<Vec<McpTool>> {
+    pub(crate) async fn list_tools_within(&self, bound: Duration) -> Result<Vec<McpTool>> {
         let source = match tokio::time::timeout(bound, self.list_every_page()).await {
             Ok(Ok(tools)) => return Ok(tools.into_iter().map(tool_from_rmcp).collect()),
             Ok(Err(source)) => source,
@@ -479,15 +612,16 @@ impl McpClient {
     /// the pipe is closed and the client is gone, not that the server has
     /// stopped.
     pub async fn shutdown(self) -> Result<()> {
-        let Self {
-            service, mut child, ..
-        } = self;
+        let Self { service, child, .. } = self;
 
         // A `JoinError` here just means the rmcp task panicked, which doesn't
         // affect our ability to clean up the child below. Bound cancellation
         // too: if the owning container disappeared, the transport task can be
         // wedged behind already-broken podman exec pipes.
         let _ = tokio::time::timeout(SHUTDOWN_GRACE, service.cancel()).await;
+        let Some(mut child) = child else {
+            return Ok(());
+        };
 
         match tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await {
             Ok(Ok(_)) => Ok(()),
@@ -585,12 +719,13 @@ pub fn resolve_mcp_env(
 /// the child's exit status (so the user sees *why* the pipe closed), and a
 /// tail of whatever the child wrote to stderr. The brief `child.wait()`
 /// timeout lets a child that crashed mid-write flush its last few bytes
-/// before we read them.
+/// before we read them. `until`, when given, bounds both waits.
 ///
 /// For `podman start --attach` the child is a client relaying the container's
 /// stderr, and it can relay none of it for a container that exits within
 /// milliseconds. `ctr_log` is where that text still is: see
 /// [`restore_lost_stderr`].
+#[allow(clippy::too_many_arguments)]
 async fn enrich_startup_error(
     name: &str,
     declaration_source: Option<&str>,
@@ -598,23 +733,35 @@ async fn enrich_startup_error(
     stderr_path: &Path,
     ctr_log: Option<&Path>,
     child: &mut Owned,
-    source: Box<dyn std::error::Error + Send + Sync>,
+    failed: Handshake,
+    until: Option<tokio::time::Instant>,
 ) -> OutrigError {
-    let exit_status = match tokio::time::timeout(CHILD_EXIT_CEILING, child.wait()).await {
+    let within = |ceiling: Duration| match until {
+        Some(by) => ceiling.min(by.saturating_duration_since(tokio::time::Instant::now())),
+        None => ceiling,
+    };
+    let exit_status = match tokio::time::timeout(within(CHILD_EXIT_CEILING), child.wait()).await {
         Ok(Ok(status)) => Some(status),
         _ => None,
     };
-    let exit = format_exit(exit_status);
     // Not before the client has exited: until then it may still be writing the
     // file, and what is in it is not yet what it will hold.
     if let (Some(ctr_log), Some(_)) = (ctr_log, exit_status) {
         restore_lost_stderr(name, stderr_path, ctr_log).await;
     }
-    let stderr_tail = read_stderr_tail_settled(stderr_path).await;
+    // A client that has exited wrote all it ever will: read once.
+    let settle = match exit_status {
+        Some(_) => Duration::ZERO,
+        None => within(STDERR_SETTLE_CEILING),
+    };
+    let stderr_tail = read_stderr_tail_settling_for(stderr_path, settle).await;
 
     let what = match exit_status {
         Some(status) if status.success() => None,
-        Some(_) => Some(format!("terminated before initialize ({exit})")),
+        Some(status) => Some(format!(
+            "terminated before initialize ({})",
+            format_exit(Some(status))
+        )),
         // A handshake that timed out against a server ignoring its closed
         // stdin: it did not terminate, and saying so would send the reader
         // looking for a crash.
@@ -629,15 +776,142 @@ async fn enrich_startup_error(
         );
     }
 
+    startup_failure(
+        name,
+        declaration_source,
+        command,
+        exit_status,
+        stderr_path,
+        stderr_tail,
+        failed,
+    )
+}
+
+/// A handshake that failed: the SDK's error, or the bound that ran out, with
+/// its one classification.
+struct Handshake {
+    source: Box<dyn std::error::Error + Send + Sync>,
+    classified: McpSessionError,
+    class: StartupClass,
+}
+
+impl Handshake {
+    fn failed(source: rmcp::service::ClientInitializeError) -> Self {
+        let (kind, class) = init_error_class(&source);
+        Self {
+            classified: McpSessionError::new(kind, source.to_string()),
+            source: Box::new(source),
+            class,
+        }
+    }
+
+    fn timed_out(bound: Duration) -> Self {
+        let message = format!("no `initialize` response within {bound:?}");
+        Self {
+            source: Box::new(McpSessionError::new(
+                McpFailureKind::Timeout,
+                message.clone(),
+            )),
+            classified: McpSessionError::new(McpFailureKind::Timeout, message),
+            class: StartupClass::Transient,
+        }
+    }
+}
+
+/// The startup failure of server `name`, which ran `command` and ended with
+/// `exit_status` -- `None` when it was still running -- having written
+/// `stderr_tail` to `stderr_path`, its handshake having `failed`.
+fn startup_failure(
+    name: &str,
+    declaration_source: Option<&str>,
+    command: &[String],
+    exit_status: Option<std::process::ExitStatus>,
+    stderr_path: &Path,
+    stderr_tail: String,
+    failed: Handshake,
+) -> OutrigError {
+    let Handshake {
+        source,
+        classified,
+        class,
+    } = failed;
     OutrigError::McpStartupFailed(Box::new(crate::error::McpStartupFailure {
         name: name.to_string(),
         declaration_source: declaration_source.map(str::to_string),
         command: render_command(command),
-        exit,
+        exit: format_exit(exit_status),
         stderr_path: stderr_path.to_path_buf(),
         stderr_tail,
+        kind: classified.kind,
+        class: by_exit(class, classified.kind, exit_status),
+        classified,
         source,
     }))
+}
+
+/// What a failed start means for trying again: the classes of
+/// `mcp-presenter.md`'s "Startup" table. Only a transient one is retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupClass {
+    /// The transport failed or closed, or the handshake timed out: it may
+    /// work if tried again.
+    Transient,
+    /// The server answered `initialize` with an error.
+    Refused,
+    /// The declaration cannot work as written: a binary that is not there, a
+    /// protocol revision that cannot be agreed, a value that does not resolve.
+    Misconfigured,
+    /// Anything else, named so rather than guessed at.
+    Unclassified,
+}
+
+/// `class`, for a transport failure of a stdio server that ended with
+/// `exit_status`: one that exited 126 or 127 -- the shell's "cannot run" and
+/// "not found", which `podman exec` passes on -- is misconfigured, one that
+/// exited otherwise unclassified, since a server that exits before it answers
+/// would only exit again; one still running stays as it was.
+fn by_exit(
+    class: StartupClass,
+    kind: McpFailureKind,
+    exit_status: Option<std::process::ExitStatus>,
+) -> StartupClass {
+    match (kind, exit_status) {
+        (McpFailureKind::Transport, Some(status)) => match status.code() {
+            Some(126 | 127) => StartupClass::Misconfigured,
+            _ => StartupClass::Unclassified,
+        },
+        _ => class,
+    }
+}
+
+/// Classify a failed `initialize` handshake: the kind a mid-session failure of
+/// the same shape has, and what it means for trying again.
+fn init_error_class(
+    source: &rmcp::service::ClientInitializeError,
+) -> (McpFailureKind, StartupClass) {
+    use rmcp::service::ClientInitializeError as E;
+
+    use McpFailureKind as K;
+    use StartupClass as C;
+
+    // `ClientInitializeError` is `#[non_exhaustive]`, so the wildcard is
+    // mandatory; `REVIEWED_RMCP`, in `tests/reviewed_rmcp.rs`, is what keeps
+    // it from going unreviewed.
+    match source {
+        E::ConnectionClosed(_) | E::TransportError { .. } => (K::Transport, C::Transient),
+        E::JsonRpcError(_) => (K::Protocol, C::Refused),
+        E::NoCompatibleProtocolVersion { .. } | E::NoPreferredProtocolVersion => {
+            (K::Protocol, C::Misconfigured)
+        }
+        E::ExpectedInitResponse(_)
+        | E::ExpectedInitResult(_)
+        | E::ConflictInitResponseId(..)
+        | E::UncorrelatedErrorResponse { .. } => (K::Protocol, C::Unclassified),
+        E::Cancelled => (K::Canceled, C::Unclassified),
+        // The legacy handshake's failure is the one this client acts on.
+        E::LegacyFallbackFailed { fallback, .. } => init_error_class(fallback),
+        _ => (K::Other, C::Unclassified),
+    }
 }
 
 /// Put the container's own stderr into `stderr_path` when the attach stream
@@ -703,20 +977,20 @@ async fn restore_lost_stderr(name: &str, stderr_path: &Path, ctr_log: &Path) {
 /// which is the only reason there is a timeout here at all.
 const CHILD_EXIT_CEILING: Duration = Duration::from_secs(2);
 
-/// How long [`read_stderr_tail_settled`] keeps looking for stderr that has not
-/// landed yet.
+/// How long [`read_stderr_tail_settling_for`] keeps looking for stderr that
+/// has not landed yet.
 ///
 /// A client that is still running can still write the file; one that has
-/// exited cannot, so for it an empty file is empty for good and this only
-/// waits. (#422's `(empty)` was output podman dropped, not output that was
-/// late: see [`restore_lost_stderr`].)
+/// exited cannot, so for it an empty file is empty for good, and its file is
+/// read once. (#422's `(empty)` was output podman dropped, not output that
+/// was late: see [`restore_lost_stderr`].)
 ///
 /// Paid only on a failure path, and only while the file is *still* empty: a
 /// server that genuinely said nothing waits this out once, on its way to an
 /// error it was going to return regardless.
 const STDERR_SETTLE_CEILING: Duration = Duration::from_secs(5);
 
-/// How often [`read_stderr_tail_settled`] re-reads while it waits.
+/// How often [`read_stderr_tail_settling_for`] re-reads while it waits.
 const STDERR_SETTLE_POLL: Duration = Duration::from_millis(25);
 
 fn format_exit(status: Option<std::process::ExitStatus>) -> String {
@@ -761,14 +1035,9 @@ fn render_stderr_tail(read: std::io::Result<Vec<u8>>) -> String {
     }
 }
 
-/// The tail of `path`, giving a writer that has not caught up a bounded chance
-/// to land. See [`STDERR_SETTLE_CEILING`] for why one read is not enough.
-async fn read_stderr_tail_settled(path: &Path) -> String {
-    read_stderr_tail_settling_for(path, STDERR_SETTLE_CEILING).await
-}
-
-/// The above with the ceiling named, so a test can assert the giving-up branch
-/// without waiting out the real one.
+/// The tail of `path`, giving a writer that has not caught up `ceiling` to
+/// land: [`STDERR_SETTLE_CEILING`] at most, and nothing for a writer that has
+/// exited. See that constant for why one read is not always enough.
 async fn read_stderr_tail_settling_for(path: &Path, ceiling: Duration) -> String {
     let deadline = tokio::time::Instant::now() + ceiling;
     loop {
@@ -784,7 +1053,9 @@ async fn read_stderr_tail_settling_for(path: &Path, ceiling: Duration) -> String
     }
 }
 
-fn render_command(argv: &[String]) -> String {
+/// `argv` as one line a shell would read back as it: a word holding a space
+/// or a quote, quoted.
+pub(crate) fn render_command(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
             if a.is_empty()
@@ -821,9 +1092,10 @@ fn session_error_from_rmcp(source: &rmcp::service::ServiceError) -> McpSessionEr
 
     // `ServiceError` is `#[non_exhaustive]`, so the wildcard is mandatory and
     // a variant an SDK upgrade adds becomes `Other` without a compile error.
-    // Review this mapping on every rmcp bump, alongside
+    // Review this mapping on every rmcp bump, with `init_error_class` and
     // `SUPPORTED_PROTOCOL_VERSIONS` -- `plan/next/rmcp-list-result-spec-gaps.md`
-    // carries both obligations.
+    // carries the obligations, and `REVIEWED_RMCP` in `tests/reviewed_rmcp.rs`
+    // makes the bump say so.
     let kind = match source {
         E::TransportSend(_) | E::TransportClosed => McpFailureKind::Transport,
         E::McpError(_) | E::UnexpectedResponse | E::InputRequiredRoundsExceeded { .. } => {
@@ -883,6 +1155,90 @@ pub(crate) mod tests {
                 "the SDK's own wording is what a human reads"
             );
         }
+    }
+
+    /// All eleven `ClientInitializeError` variants rmcp 3.4.1 declares, named
+    /// one by one with the kind and the startup class each gets: the
+    /// classifier's wildcard means this list is the only record of what was
+    /// classified on purpose. The SDK's wording reaches `classified` verbatim.
+    #[rustfmt::skip]
+    #[test]
+    fn every_rmcp_init_error_is_classified() {
+        use rmcp::model::{ErrorData, NumberOrString};
+        use rmcp::service::ClientInitializeError as E;
+
+        use McpFailureKind as K;
+        use StartupClass as C;
+
+        let id = |n| NumberOrString::Number(n);
+        let closed = || E::ConnectionClosed("initialize response".into());
+        for (source, kind, class) in [
+            (E::ExpectedInitResponse(None), K::Protocol, C::Unclassified),
+            (E::ExpectedInitResult(None), K::Protocol, C::Unclassified),
+            (E::ConflictInitResponseId(id(1), id(2)), K::Protocol, C::Unclassified),
+            (E::UncorrelatedErrorResponse { expected: id(1), received: id(2) }, K::Protocol,
+             C::Unclassified),
+            (closed(), K::Transport, C::Transient),
+            (E::TransportError { error: transport_error(), context: "send initialize".into() },
+             K::Transport, C::Transient),
+            (E::JsonRpcError(ErrorData::invalid_request("not you", None)), K::Protocol,
+             C::Refused),
+            (E::NoCompatibleProtocolVersion { client_supported: vec![], server_supported: vec![] },
+             K::Protocol, C::Misconfigured),
+            (E::NoPreferredProtocolVersion, K::Protocol, C::Misconfigured),
+            (E::Cancelled, K::Canceled, C::Unclassified),
+            (E::LegacyFallbackFailed {
+                discover: Box::new(E::NoPreferredProtocolVersion),
+                fallback: Box::new(closed()),
+            }, K::Transport, C::Transient),
+        ] {
+            let rendered = source.to_string();
+            let failed = Handshake::failed(source);
+            assert_eq!((failed.classified.kind, failed.class), (kind, class), "{rendered:?}");
+            assert_eq!(failed.classified.message, rendered);
+            assert_eq!(failed.source.to_string(), rendered, "the SDK's error is kept as raised");
+        }
+    }
+
+    /// Fork 6: a stdio server whose transport closed is judged by how it
+    /// ended -- not found or not runnable is the declaration's fault, any
+    /// other exit unclassified, still running transient -- and a failure that
+    /// is not the transport's keeps its class whatever the exit.
+    #[test]
+    fn a_server_that_exited_is_classified_by_its_exit() {
+        use std::os::unix::process::ExitStatusExt;
+        let exited = |code: i32| Some(std::process::ExitStatus::from_raw(code << 8));
+        let transient = StartupClass::Transient;
+
+        for (exit, expected) in [
+            (exited(127), StartupClass::Misconfigured),
+            (exited(126), StartupClass::Misconfigured),
+            (exited(1), StartupClass::Unclassified),
+            (exited(0), StartupClass::Unclassified),
+            (None, StartupClass::Transient),
+        ] {
+            assert_eq!(
+                by_exit(transient, McpFailureKind::Transport, exit),
+                expected
+            );
+        }
+        assert_eq!(
+            by_exit(transient, McpFailureKind::Timeout, exited(0)),
+            transient,
+            "a handshake that timed out is not judged by the exit its closed stdin caused"
+        );
+        assert_eq!(
+            by_exit(StartupClass::Refused, McpFailureKind::Protocol, exited(1)),
+            StartupClass::Refused
+        );
+
+        let failure = McpClient::exited_before_initialize("fs", &["fs-server".into()], 127, "nope");
+        let OutrigError::McpStartupFailed(failure) = failure else {
+            panic!("a startup failure")
+        };
+        assert_eq!(failure.class, StartupClass::Misconfigured);
+        assert_eq!(failure.kind, McpFailureKind::Transport);
+        assert_eq!(failure.exit, "code 127");
     }
 
     #[test]
@@ -960,6 +1316,50 @@ pub(crate) mod tests {
         let text = std::fs::read_to_string(&log).expect("read transcript");
         assert!(text.contains("--env 'TOKEN=${FETCH_TOKEN}'"), "{text}");
         assert!(!text.contains("s3cret"), "{text}");
+    }
+
+    /// A server that refuses `initialize`, saying nothing on stderr, is
+    /// refused within the bound it was given: the diagnosis waits no longer
+    /// than the bound left -- and not at all for stderr from a server that
+    /// has exited -- so a caller that bounds the start as tightly reads the
+    /// refusal, not a start that ran out of time.
+    #[tokio::test]
+    async fn a_refusal_is_reported_within_its_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let refusing = |then: &str| {
+            let script = r#"read -r line
+                id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -n 1 | cut -d: -f2)
+                printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32600,"message":"no"}}\n' "$id"
+                THEN"#;
+            Cmd::new("sh").args(["-c", &script.replace("THEN", then)])
+        };
+        let bound = Duration::from_secs(1);
+        // One that has exited is read at once; one still running is waited
+        // on only as long as the bound left.
+        for (then, within) in [
+            ("exit 0", bound / 2),
+            ("exec sleep 30", bound + Duration::from_millis(500)),
+        ] {
+            let started = std::time::Instant::now();
+            let err = McpClient::connect_stdio_cmd(
+                refusing(then),
+                "svc",
+                None,
+                dir.path(),
+                None,
+                None,
+                &[],
+                bound,
+            )
+            .await
+            .expect_err("a refused handshake does not connect");
+            let elapsed = started.elapsed();
+            let OutrigError::McpStartupFailed(failure) = &err else {
+                panic!("expected McpStartupFailed, got {err:?}");
+            };
+            assert_eq!(failure.class, StartupClass::Refused, "{then}: {err}");
+            assert!(elapsed < within, "{then}: diagnosed for {elapsed:?}");
+        }
     }
 
     /// #338's repro without podman: `cat` echoes `initialize` back as if it
@@ -1112,7 +1512,7 @@ pub(crate) mod tests {
         let client = McpClient {
             name: "svc".to_string(),
             service,
-            child,
+            child: Some(child),
             stderr_path,
             call_timeout: effective_mcp_call_timeout(None, None),
         };
@@ -1519,7 +1919,7 @@ pub(crate) mod tests {
             "-c".to_string(),
             "echo boom 1>&2; exit 7".to_string(),
         ];
-        let source = Box::new(rmcp::service::ClientInitializeError::ConnectionClosed(
+        let source = Handshake::failed(rmcp::service::ClientInitializeError::ConnectionClosed(
             "expect initialize response".to_string(),
         ));
 
@@ -1531,6 +1931,7 @@ pub(crate) mod tests {
             None,
             &mut child,
             source,
+            None,
         )
         .await;
 
@@ -1574,8 +1975,8 @@ pub(crate) mod tests {
         (child, stderr_path, argv)
     }
 
-    fn connection_closed() -> Box<dyn std::error::Error + Send + Sync> {
-        Box::new(rmcp::service::ClientInitializeError::ConnectionClosed(
+    fn connection_closed() -> Handshake {
+        Handshake::failed(rmcp::service::ClientInitializeError::ConnectionClosed(
             "initialize response".to_string(),
         ))
     }
@@ -1609,6 +2010,7 @@ pub(crate) mod tests {
             Some(log.path()),
             &mut child,
             connection_closed(),
+            None,
         )
         .await;
 
@@ -1649,6 +2051,7 @@ pub(crate) mod tests {
             Some(log.path()),
             &mut child,
             connection_closed(),
+            None,
         )
         .await;
 
@@ -1692,6 +2095,7 @@ pub(crate) mod tests {
             Some(log.path()),
             &mut child,
             connection_closed(),
+            None,
         )
         .await;
 

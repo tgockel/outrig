@@ -20,6 +20,7 @@
 //! session: its lines about them go to the session's children, in order, through its shutdown,
 //! and what they tell it is pushed to it in order, all of it before the shutdown's answer.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,17 +35,20 @@ use super::connection::Out;
 use super::{LeftOpen, SessionEnd};
 use crate::agent::children::Children;
 use crate::config::{
-    Config, EventsMode, MountAccess, MountConfig, Workspace, validate_session_paths,
+    Config, EnvValue, EventsMode, MCP_CALL_TIMEOUT_SECS_CEILING, MountAccess, MountConfig,
+    SidecarWorkspaceAccess, Workspace, validate_session_paths,
 };
 use crate::events::Record;
 use crate::harness::bindings::Brief;
 use crate::harness::event::{Received, Subscription};
+use crate::harness::mcp::check_connect_budget;
 use crate::harness::{
-    ApplicationSpec, Closer, ContainerSpec, DEFAULT_DRAIN, Session, SessionBuilder, ShutdownReport,
-    Stopped, container_spec,
+    ApplicationSpec, Closer, ContainerSpec, DEFAULT_DRAIN, McpPlacement, McpPolicy, McpServiceSpec,
+    Session, SessionBuilder, ShutdownReport, Stopped, container_spec,
 };
 use crate::image;
 use crate::supervise::{Owed, Tracked};
+use crate::{MountSpec, SidecarServerSpec, SidecarSpec};
 
 /// How long the engine waits for what an interrupted or failed start handed over to be
 /// cleaned up: past the reaper's own bound on a wedged cleanup and its retries.
@@ -78,6 +82,216 @@ pub(crate) struct Request {
     pub(crate) application: Option<ApplicationRequest>,
     /// The live objects the program injected before entry, installed at the start.
     pub(crate) live: Vec<Live>,
+    /// The MCP servers the program declared, placed as services.
+    pub(crate) mcp: Vec<McpRequest>,
+    /// How they start, when the program said.
+    pub(crate) mcp_policy: Option<McpPolicyRequest>,
+    /// The program's identity headers, for the URL services it declares.
+    pub(crate) mcp_identity: BTreeMap<String, String>,
+}
+
+/// An MCP server a program declares: its bound name, where it runs, and what it is given. Each
+/// `env` value is a literal or a `${VAR}` the engine resolves; no value reaches the program.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "placement", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum McpRequest {
+    /// Exec'd in the primary container.
+    Command {
+        name: String,
+        command: Vec<String>,
+        #[serde(default)]
+        env: BTreeMap<String, EnvValue>,
+        call_timeout_secs: Option<u64>,
+        description: Option<String>,
+    },
+    /// In a sidecar of its own: exec'd as `command`, or the image's entrypoint given `args`.
+    Sidecar {
+        name: String,
+        image: String,
+        command: Option<Vec<String>>,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: BTreeMap<String, EnvValue>,
+        #[serde(default)]
+        workspace: SidecarWorkspaceAccess,
+        #[serde(default)]
+        mounts: Vec<MountRequest>,
+        call_timeout_secs: Option<u64>,
+        description: Option<String>,
+    },
+    /// The image's entrypoint, in a sidecar that sees the primary's filesystem.
+    PrimaryView {
+        name: String,
+        image: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: BTreeMap<String, EnvValue>,
+        call_timeout_secs: Option<u64>,
+        description: Option<String>,
+    },
+}
+
+impl McpRequest {
+    /// Its name, and the declaration the builder takes, in a session working
+    /// in `cwd` with the mounts `session`; or why it cannot be one.
+    fn declaration(
+        self,
+        cwd: Option<&Path>,
+        session: &[MountRequest],
+    ) -> Result<(String, McpServiceSpec), String> {
+        let (name, placement, call_timeout_secs, description) = match self {
+            Self::Command {
+                name,
+                command,
+                env,
+                call_timeout_secs,
+                description,
+            } => (
+                name,
+                McpPlacement::Command { command, env },
+                call_timeout_secs,
+                description,
+            ),
+            Self::Sidecar {
+                name,
+                image,
+                command,
+                args,
+                env,
+                workspace,
+                mounts,
+                call_timeout_secs,
+                description,
+            } => {
+                let server = match command {
+                    Some(command) => SidecarServerSpec::exec(command),
+                    None => SidecarServerSpec::entrypoint(args),
+                };
+                let mut sidecar = SidecarSpec::from_image(name.clone(), image)
+                    .with_mounts(mounts.into_iter().map(|mount| {
+                        MountSpec::new(mount.host_path.clone(), mount.host_path, mount.access)
+                    }))
+                    .with_server_spec(name.clone(), server.with_env(env));
+                if let Some(access) = workspace.mount_access() {
+                    sidecar = sidecar.with_mounts(working_directory(&name, access, cwd, session)?);
+                }
+                (
+                    name,
+                    McpPlacement::Sidecar(sidecar),
+                    call_timeout_secs,
+                    description,
+                )
+            }
+            Self::PrimaryView {
+                name,
+                image,
+                args,
+                env,
+                call_timeout_secs,
+                description,
+            } => (
+                name,
+                McpPlacement::PrimaryView { image, args, env },
+                call_timeout_secs,
+                description,
+            ),
+        };
+        let spec = McpServiceSpec {
+            placement,
+            call_timeout_secs,
+            description,
+        };
+        Ok((name, spec))
+    }
+}
+
+/// The mounts a program's sidecar asking for `access` to the workspace gets:
+/// a program's session has no workspace of its own, so its working directory
+/// `cwd`, at its host path, as it is in the session's container -- never more
+/// than the session's `mounts` grant there, or anywhere inside it.
+fn working_directory(
+    name: &str,
+    access: MountAccess,
+    cwd: Option<&Path>,
+    mounts: &[MountRequest],
+) -> Result<Vec<MountSpec>, String> {
+    let Some(cwd) = cwd else {
+        return Err(format!(
+            "the MCP service `{name}` asks for the workspace, which in a program's session is its \
+             working directory, and the session has no `cwd`"
+        ));
+    };
+    let granted = mounts
+        .iter()
+        .filter(|mount| cwd.starts_with(&mount.host_path))
+        .max_by_key(|mount| mount.host_path.components().count())
+        .map(|mount| mount.access);
+    match (granted, access) {
+        (None, _) => Err(format!(
+            "the MCP service `{name}` asks for the working directory {}, which none of the \
+             session's mounts holds",
+            cwd.display()
+        )),
+        (Some(MountAccess::ReadOnly), MountAccess::ReadWrite) => Err(format!(
+            "the MCP service `{name}` asks for `rw` access to the working directory {}, which \
+             the session mounts read-only",
+            cwd.display()
+        )),
+        _ => {
+            // A read-only mount inside it stays read-only, as it is in the
+            // session's container: the directory's own grant does not reach
+            // past it. Shallowest first, so each lands over its parent.
+            let mut inside: Vec<&MountRequest> = mounts
+                .iter()
+                .filter(|mount| {
+                    access == MountAccess::ReadWrite
+                        && mount.access == MountAccess::ReadOnly
+                        && mount.host_path.starts_with(cwd)
+                        && mount.host_path != cwd
+                })
+                .collect();
+            inside.sort_by_key(|mount| mount.host_path.components().count());
+            Ok(std::iter::once(MountSpec::new(cwd, cwd, access))
+                .chain(inside.into_iter().map(|mount| {
+                    MountSpec::new(&mount.host_path, &mount.host_path, MountAccess::ReadOnly)
+                }))
+                .collect())
+        }
+    }
+}
+
+/// How a program's MCP services start: what it said, the defaults for the rest.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct McpPolicyRequest {
+    connect_budget_secs: Option<f64>,
+    reconnect_max: Option<u32>,
+}
+
+impl McpPolicyRequest {
+    /// The policy, with `config`'s budget where the program gave none; or why
+    /// the budget it gave cannot be one.
+    fn policy(self, config: &Config) -> Result<McpPolicy, String> {
+        let mut policy = McpPolicy::for_config(config);
+        if let Some(secs) = self.connect_budget_secs {
+            let budget = Duration::try_from_secs_f64(secs)
+                .map_err(|e| e.to_string())
+                .and_then(|budget| check_connect_budget(budget).map(|()| budget))
+                .map_err(|_| {
+                    format!(
+                        "mcp_policy's connect_budget_secs is from 1 to \
+                         {MCP_CALL_TIMEOUT_SECS_CEILING} seconds, not {secs}"
+                    )
+                })?;
+            policy.connect_budget = budget;
+        }
+        if let Some(max) = self.reconnect_max {
+            policy.reconnect_max = max;
+        }
+        Ok(policy)
+    }
 }
 
 /// One mount a program asks for, which the container sees at its host path, read-only unless it
@@ -182,6 +396,9 @@ pub(crate) async fn run(
         cwd,
         application,
         live: injected,
+        mcp,
+        mcp_policy,
+        mcp_identity,
     } = request;
     let prepared = prepare(
         &context,
@@ -191,10 +408,17 @@ pub(crate) async fn run(
         &injected,
     )
     .and_then(|config| {
+        let declared = mcp
+            .into_iter()
+            .map(|declared| declared.declaration(cwd.as_deref(), &mounts))
+            .collect::<Result<Vec<_>, _>>()?;
+        let policy = mcp_policy
+            .map(|policy| policy.policy(&config))
+            .transpose()?;
         let (id, logs) = session_dir(&config)?;
-        Ok((config, id, logs))
+        Ok((config, declared, policy, id, logs))
     });
-    let (config, id, logs) = match prepared {
+    let (config, declared, policy, id, logs) = match prepared {
         Ok(prepared) => prepared,
         Err(why) => {
             out.send(json!({"t": "events.end", "session": handle}))
@@ -217,6 +441,13 @@ pub(crate) async fn run(
     if config.events.mode() == EventsMode::Record {
         builder = builder.record_events();
     }
+    for (name, spec) in declared {
+        builder = builder.mcp(name, spec);
+    }
+    if let Some(policy) = policy {
+        builder = builder.mcp_policy(policy);
+    }
+    builder = builder.mcp_identity(mcp_identity);
     let events = builder.subscribe();
     #[cfg(test)]
     let builder = context.testing.adjust(builder, handle, &id, &logs);
@@ -306,8 +537,19 @@ pub(crate) async fn run(
     }
     // Where the program imports RPyC from to serve its live objects, and what it may not name one.
     let rpyc = crate::python::payload::rpyc_dir().await.ok();
+    // How each MCP service's start ended, for `session.mcp`: each outcome, named.
+    let mcp: Vec<Value> = session
+        .mcp()
+        .outcomes()
+        .into_iter()
+        .map(|(service, outcome)| {
+            let mut row = serde_json::to_value(outcome).unwrap_or_else(|_| json!({}));
+            row["service"] = json!(service);
+            row
+        })
+        .collect();
     let session_line = json!({
-        "id": id, "requests_max": requests_max, "bindings": configured, "rpyc": rpyc,
+        "id": id, "requests_max": requests_max, "bindings": configured, "rpyc": rpyc, "mcp": mcp,
     });
     out.send(json!({"t": "session.start", "id": reply, "session": session_line}))
         .await;
@@ -705,6 +947,103 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+
+    /// A program's sidecar that asks for the workspace sees the session's working directory at
+    /// its host path, as it asks, with each read-only mount inside it read-only still; asking
+    /// with no `cwd`, outside every mount, or for `rw` of a directory the session mounts
+    /// read-only, is refused.
+    #[test]
+    fn a_programs_sidecar_workspace_is_its_working_directory() {
+        let cwd = Path::new("/home/me/repo");
+        let mount = |path: &str, access| MountRequest {
+            host_path: PathBuf::from(path),
+            access,
+        };
+        let sidecar = |workspace: &str| -> McpRequest {
+            serde_json::from_value(json!({
+                "placement": "sidecar", "name": "fs", "image": "mcp-image",
+                "command": ["fs-server"], "workspace": workspace,
+            }))
+            .unwrap()
+        };
+        let mounts_of = |declared: Result<(String, McpServiceSpec), String>| {
+            let (_, spec) = declared.unwrap();
+            let McpPlacement::Sidecar(sidecar) = spec.placement else {
+                panic!("a sidecar")
+            };
+            assert_eq!(sidecar.workspace, SidecarWorkspaceAccess::None);
+            sidecar
+                .mounts
+                .iter()
+                .map(|mount| (mount.host.clone(), mount.container.clone(), mount.access))
+                .collect::<Vec<_>>()
+        };
+        let session = [
+            mount("/home/me", MountAccess::ReadOnly),
+            mount("/home/me/repo", MountAccess::ReadWrite),
+        ];
+        for (asked, access) in [
+            ("rw", MountAccess::ReadWrite),
+            ("ro", MountAccess::ReadOnly),
+        ] {
+            assert_eq!(
+                mounts_of(sidecar(asked).declaration(Some(cwd), &session)),
+                [(cwd.to_path_buf(), cwd.to_path_buf(), access)],
+                "{asked}"
+            );
+        }
+        assert!(mounts_of(sidecar("none").declaration(None, &[])).is_empty());
+        let refused = |asked, cwd: Option<&Path>, session: &[MountRequest]| {
+            sidecar(asked).declaration(cwd, session).unwrap_err()
+        };
+        assert!(refused("ro", None, &session).contains("no `cwd`"));
+        assert!(refused("ro", Some(Path::new("/elsewhere")), &session).contains("none of"));
+        let protected = [
+            mount("/home/me/repo", MountAccess::ReadWrite),
+            mount("/home/me/repo/vendor/sub", MountAccess::ReadOnly),
+            mount("/home/me/repo/vendor", MountAccess::ReadOnly),
+            mount("/home/me/repo/out", MountAccess::ReadWrite),
+        ];
+        let vendor = cwd.join("vendor");
+        let sub = vendor.join("sub");
+        assert_eq!(
+            mounts_of(sidecar("rw").declaration(Some(cwd), &protected)),
+            [
+                (cwd.to_path_buf(), cwd.to_path_buf(), MountAccess::ReadWrite),
+                (vendor.clone(), vendor, MountAccess::ReadOnly),
+                (sub.clone(), sub, MountAccess::ReadOnly),
+            ],
+            "a read-only mount inside the working directory stays read-only"
+        );
+        let read_only = [mount("/home/me", MountAccess::ReadOnly)];
+        assert!(refused("rw", Some(cwd), &read_only).contains("read-only"));
+        assert_eq!(
+            mounts_of(sidecar("ro").declaration(Some(cwd), &read_only)),
+            [(cwd.to_path_buf(), cwd.to_path_buf(), MountAccess::ReadOnly)]
+        );
+    }
+
+    /// A program's connect budget is held to the configuration's range, never quietly
+    /// replaced by the default.
+    #[test]
+    fn a_programs_connect_budget_is_checked() {
+        let policy = |budget: f64| {
+            serde_json::from_value::<McpPolicyRequest>(json!({"connect_budget_secs": budget}))
+                .unwrap()
+                .policy(&Config::default())
+        };
+        for budget in [-1.0, 0.0, 0.5, 3600.5] {
+            let refused = policy(budget).unwrap_err();
+            assert!(
+                refused.contains("from 1 to 3600 seconds"),
+                "{budget}: {refused}"
+            );
+        }
+        assert_eq!(
+            policy(30.0).unwrap().connect_budget,
+            Duration::from_secs(30)
+        );
+    }
 
     /// What a session a program asks for mounts is the program's alone: the configuration's
     /// `[workspace]` and `[[workspace.mounts]]` are left out of the config each session starts

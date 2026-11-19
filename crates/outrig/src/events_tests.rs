@@ -9,11 +9,13 @@ use tokio::sync::mpsc;
 
 use super::*;
 use crate::agent::rig_json;
+use crate::error::McpFailureKind;
 use crate::harness::event::*;
 use crate::harness::{
     BindingStop, ChannelClose, ChannelOperation, ChannelRequestAtClose, ClosedBy, Direction,
-    ExecutionOutcome, ExecutionStatus, HostedCall, RequestOutcome, SendAtClose, ServiceCall,
-    ServiceErrorCategory, Stopped, UncertainAtClose, Verdict,
+    ExecutionOutcome, ExecutionStatus, HostedCall, McpDeclaredIn, McpOutcomeKind, McpPauseHow,
+    McpPlacementKind, McpRetryCause, McpServiceStop, McpStartupCause, McpStopHow, RequestOutcome,
+    SendAtClose, ServiceCall, ServiceErrorCategory, Stopped, UncertainAtClose, Verdict,
 };
 
 const SOURCE: &str = "/outrig/session/20260921T103000-a1b2";
@@ -292,6 +294,13 @@ fn each_event_has_exactly_its_data_fields() {
                         reference: Some(text("row-3")),
                     }],
                 }],
+                mcp_services: vec![McpServiceStop {
+                    service: text("gh"),
+                    placement: McpPlacementKind::Sidecar,
+                    outcome: McpOutcomeKind::Ready,
+                    how: McpStopHow::Stopped,
+                    proven: true,
+                }],
                 verdict: Verdict::StoppedWithUnknown,
             },
             "session.report",
@@ -304,6 +313,7 @@ fn each_event_has_exactly_its_data_fields() {
                 "bindings",
                 "requests",
                 "channels",
+                "mcp_services",
                 "verdict",
             ],
         ),
@@ -488,6 +498,91 @@ fn each_event_has_exactly_its_data_fields() {
                 "call", "service", "kind", "method", "agent", "execid", "outcome", "category",
                 "reason", "detail", "bytes", "duration", "body",
             ],
+        ),
+        (
+            Payload::McpServiceStarted {
+                service: text("my_fs"),
+                server: Some(text("my-fs")),
+                placement: McpPlacementKind::Command,
+                declared_in: McpDeclaredIn::Config,
+                tools: 3,
+                listing: 1,
+                attempts: 2,
+                duration: Duration::from_millis(900),
+            },
+            "mcp.service.started",
+            &[
+                "service",
+                "server",
+                "placement",
+                "declared_in",
+                "tools",
+                "listing",
+                "attempts",
+                "duration",
+            ],
+        ),
+        (
+            Payload::McpServiceRetry {
+                service: text("gh"),
+                attempt: 1,
+                delay: Duration::from_millis(500),
+                cause: McpRetryCause {
+                    kind: Some(McpFailureKind::Timeout),
+                    message: text("no `initialize` response within 120s"),
+                },
+            },
+            "mcp.service.retry",
+            &["service", "attempt", "delay", "cause"],
+        ),
+        (
+            Payload::McpServiceFailed {
+                service: text("gh"),
+                outcome: McpOutcomeKind::Misconfigured,
+                cause: McpStartupCause {
+                    service: text("gh"),
+                    server: None,
+                    placement: McpPlacementKind::Sidecar,
+                    declared_in: McpDeclaredIn::Owner,
+                    command: Some(text("TOKEN=${GH_TOKEN} gh-mcp")),
+                    exit: Some(text("code 127")),
+                    stderr_tail: Some(text("gh-mcp: not found")),
+                    message: text("connection closed: initialize response"),
+                    kind: Some(McpFailureKind::Transport),
+                    attempts: 1,
+                },
+                attempts: 1,
+                duration: Duration::from_millis(40),
+            },
+            "mcp.service.failed",
+            &["service", "outcome", "cause", "attempts", "duration"],
+        ),
+        (
+            Payload::McpServicePaused {
+                service: text("gh"),
+                how: McpPauseHow::Hold,
+                proven: true,
+                calls: vec![],
+            },
+            "mcp.service.paused",
+            &["service", "how", "proven", "calls"],
+        ),
+        (
+            Payload::McpServiceResumed {
+                service: text("gh"),
+                proven: true,
+            },
+            "mcp.service.resumed",
+            &["service", "proven"],
+        ),
+        (
+            Payload::McpServiceStopped {
+                service: text("gh"),
+                how: McpStopHow::Stopped,
+                proven: false,
+            },
+            "mcp.service.stopped",
+            &["service", "how", "proven"],
         ),
         (
             Payload::BindingRefused {
@@ -1465,6 +1560,13 @@ fn each_event_has_exactly_its_data_fields() {
                     "reason": null,
                     "reference": "row-3",
                 }],
+            }],
+            "mcp_services": [{
+                "service": "gh",
+                "placement": "sidecar",
+                "outcome": "ready",
+                "how": "stopped",
+                "proven": true,
             }],
             "verdict": "stopped_with_unknown",
         })

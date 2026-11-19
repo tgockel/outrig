@@ -17,8 +17,14 @@ categories.workspace    = true
 # The test that reads it has to travel with it: it is ungated, so shipping the
 # test without its input turns `cargo test` in an unpacked or vendored package
 # into a missing-file panic. Excluding both keeps the check strict in the repo,
-# where a snapshot that has gone missing is exactly what it should catch.
-exclude                 = ["public-api.txt", "tests/public_api_boundary.rs"]
+# where a snapshot that has gone missing is exactly what it should catch. The
+# rmcp review guard reads the workspace's `Cargo.lock`, which no package
+# carries -- and a vendored copy would find a consumer's -- so it stays too.
+exclude                 = [
+    "public-api.txt",
+    "tests/public_api_boundary.rs",
+    "tests/reviewed_rmcp.rs",
+]
 
 [features]
 e2e = []

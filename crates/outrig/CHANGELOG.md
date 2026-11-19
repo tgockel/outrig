@@ -19,6 +19,41 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **A session places MCP servers as services.** `SessionBuilder::mcp(name, McpServiceSpec)` --
+  `McpServiceSpec::command`, `sidecar(SidecarSpec)` or `primary_view(image)`, each with `env`
+  values a literal or a `${VAR}` the session's `Secrets` resolve once -- starts a server with the
+  session, beside its interpreter, and binds it as a service of kind `mcp`: agent code reaches it
+  as `outrig.bindings[name]`, a method per tool by its exact name, each call the service table's.
+  `container_spec` carries the configuration's `[images.<name>.mcp]` servers, the sidecar blocks
+  they name and the image's `org.outrig.mcp` label to the session in its `LaunchSpec`, which the
+  launch still starts nothing of, so `outrig run-new` and a host program's session start them; a
+  configured name holding `-` is bound with `_` where that is free. A server holding a credential
+  -- a `${VAR}` in its `env` -- is never placed in the session's container or a primary view: it
+  is `misconfigured` and does not start; nor is a configured sidecar block named as an owner's
+  sidecar, `mcp-<name>`, placed in its stead. A transient failure is tried again within
+  `McpPolicy::connect_budget` (`SessionBuilder::mcp_policy`, or the new top-level
+  `mcp-connect-budget-secs`, default 120), and each start ends in an `McpServiceOutcome` --
+  `Ready`, `Unavailable`, `Refused`, `Misconfigured` or `Unclassified`, the last four with a
+  redacted `McpStartupCause` -- which `Session::mcp().outcomes()` returns; the session starts with
+  the ready ones. `Session::mcp()` is also the control a cut quiesces a writer with: `writers()`,
+  `quiesce(service, Quiesce::Pause | PauseHolding | Stop, wait)` returning a `QuiesceOutcome`, and
+  `resume(service)`, a container a configuration's block shares quiesced for every server it
+  hosts. A paused service's call is refused `paused` (`ServiceReason::Paused`), or held for a
+  cut's pause; a stop tells its calls to stop (`ServiceReason::Stopped`). The close stops each
+  server's container and `ShutdownReport::mcp_services` lists each (`McpServiceStop`). Events
+  `mcp.service.started`, `retry`, `failed`, `paused`, `resumed` and `stopped`. A host program
+  declares the same as `outrig.Session(mcp=[outrig.McpCommand | McpSidecar | McpPrimaryView],
+  mcp_policy=outrig.McpPolicy(...), mcp_identity={...})` and reads `session.mcp`; an
+  `McpSidecar`'s `workspace` is the session's `cwd`, a read-only session mount inside it staying
+  read-only, and a connect budget, the program's or the builder's, is held to
+  `mcp-connect-budget-secs`'s 1 to 3600 seconds; `SessionBuilder::mcp_identity` holds the owner's
+  identity headers for the URL services to come.
+- **A startup failure carries its classification beside its cause.** `McpStartupFailure` gains
+  `kind`, an `McpFailureKind`, and `classified`, an `McpSessionError`, from a classifier over every
+  variant of rmcp's `ClientInitializeError`; `source` is as it was, and documented as the SDK's
+  error, not a surface to downcast. `McpFailureKind` is `Serialize`, and
+  `ResolvedEnvValue::resolve_with` resolves a value through a `Secrets`, with
+  `EnvValueError::Unresolved` for one it has none for.
 - **A wheel as application code.** `ApplicationSpec::wheel` takes a `.whl` file and
   `ApplicationSpec::wheel_bytes` its bytes, and a host program's `outrig.Application` takes a
   path ending `.whl` as it takes a directory. The wheel's members are read under a directory's
@@ -1189,6 +1224,11 @@ without touching each other, from one ensured image. [The container facade besid
   remove the spelling.
 
 ### Fixed
+
+- `Container::stop` counts a container removed while it ran as stopped. An entrypoint sidecar
+  whose server had just exited could be removed by its `--rm` between podman looking it up and
+  stopping it, and podman then reported it missing past `--ignore`, which left a session not
+  proven stopped. A stop by id, which the engine never hands out twice, reads missing as gone.
 
 - Content-policy refusals (`content_filter` and `refusal`) no longer spend unusable-response
   retries resending the same request. They remain recorded failures for the failover chain

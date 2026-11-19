@@ -528,9 +528,12 @@ async fn names_survive_rounds_and_ctrl_c_stops_python_not_the_session() {
         "the agent sent nothing, and its commentary is on stderr"
     );
 
-    // Startup: nothing MCP started, and Python came up.
+    // Startup: the server holding a credential was not placed beside the interpreter, and
+    // Python came up.
     assert!(
-        stderr.contains("[outrig] run-new starts no MCP servers; not started: leaky"),
+        stderr.contains(
+            "[outrig] MCP service leaky: misconfigured, not started: it holds a credential"
+        ),
         "{stderr}"
     );
     assert!(

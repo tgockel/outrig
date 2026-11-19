@@ -928,6 +928,15 @@ impl Container {
         container
     }
 
+    /// A handle to an owned container whose stop never answers, for tests of
+    /// what a holder does with one whose stop is cut off part-way.
+    #[cfg(test)]
+    pub(crate) fn slow_to_stop() -> Self {
+        let mut container = Self::unstoppable();
+        container.engine_override = vec![("stop", Cmd::new("/bin/sleep").arg("10"))];
+        container
+    }
+
     /// A handle whose stop is a no-op that cannot fail: a *borrowed*
     /// container, which outrig never stops because it never started it. The
     /// clean-unwind counterpart to [`unstoppable`](Self::unstoppable).
@@ -1479,25 +1488,27 @@ impl Container {
     /// the user/group don't exist inside the container, so a `--user`-scoped
     /// exec would fail at the podman layer with a less useful message.
     pub(crate) fn build_exec_argv(&self, cmd: &[String], options: &ExecOptions) -> Cmd {
-        let home = self
-            .home
-            .as_deref()
-            .expect("bootstrap_user must be called before build_exec_argv");
+        self.exec_target().exec_argv(cmd, options)
+    }
 
-        let mut c = Cmd::new("podman")
-            .args(["exec", "-i"])
-            .arg(format!("--user={}:{}", self.uid, self.gid))
-            .arg("--env")
-            .arg(format!("HOME={home}"));
-        c = engine_env::push_resolved(c, "--env", &options.env);
-        if let Some(workdir) = &options.workdir {
-            c = c.arg("--workdir").arg(workdir);
+    /// What an exec in this container needs of it, held apart from it, for
+    /// a driver that execs into it after this handle is out of reach: the
+    /// session's MCP table, which starts a server in the primary again on a
+    /// reconnect.
+    ///
+    /// Panics if [`Container::bootstrap_user`] has not yet been called, as
+    /// [`Container::build_exec_argv`] does.
+    pub(crate) fn exec_target(&self) -> ExecTarget {
+        ExecTarget {
+            selector: self.selector().to_string(),
+            uid: self.uid,
+            gid: self.gid,
+            home: self
+                .home
+                .clone()
+                .expect("bootstrap_user must be called before build_exec_argv"),
+            transcript: self.transcript.clone(),
         }
-        c = c.arg(self.selector());
-        for arg in cmd {
-            c = c.arg(arg);
-        }
-        c
     }
 
     /// Suffix appended to `outrig-` in the container name -- the timestamp +
@@ -1624,6 +1635,13 @@ impl Container {
         real
     }
 
+    /// [`stop`](Self::stop) through a borrow, for a holder that keeps the
+    /// handle until the stop is done: a stop dropped part-way leaves it with
+    /// the holder rather than to [`Drop`]'s detached removal.
+    pub(crate) async fn stop_in_place(&mut self, grace: Duration) -> Result<()> {
+        self.stop_inner(grace).await
+    }
+
     /// [`stop`](Self::stop), handing the container back if it did not stop.
     ///
     /// `None` means it is gone and the handle with it. `Some` means it is
@@ -1672,6 +1690,13 @@ impl Container {
         .await;
         match classify_engine_call(&stop, stopped) {
             EngineOutcome::Done => {}
+            // `--ignore` covers a container gone before the stop looked it
+            // up; one removed while the stop ran -- an entrypoint sidecar's
+            // `--rm`, its server having just exited -- is reported missing all
+            // the same. By id, which the engine never hands out twice, missing
+            // is gone; by name it could be another's, and stays a failure.
+            EngineOutcome::Failed(OutrigError::Process { stderr_tail, .. })
+                if self.id.is_some() && stderr_tail.contains("no such container") => {}
             // Nothing here can tell whether the container stopped, so it is
             // not disposed of, and the obligation is not discharged: the
             // caller keeps a handle to try again through, and `Drop` still has
@@ -1746,10 +1771,83 @@ impl Container {
         Ok(())
     }
 
+    /// Freeze every process in the container: `podman pause`, which stops
+    /// them through the cgroup freezer, descendants included. Bounded as a
+    /// stop is, so an engine that never answers is an error rather than a
+    /// hang; a container outrig only borrowed is not its to freeze.
+    pub(crate) async fn pause(&self) -> Result<()> {
+        self.freezer("pause").await
+    }
+
+    /// Thaw what [`Container::pause`] froze: `podman unpause`.
+    pub(crate) async fn unpause(&self) -> Result<()> {
+        self.freezer("unpause").await
+    }
+
+    async fn freezer(&self, verb: &'static str) -> Result<()> {
+        if self.ownership == ContainerOwnership::Attached {
+            return Err(OutrigError::Configuration(format!(
+                "container {:?} is not outrig's to {verb}",
+                self.name
+            )));
+        }
+        let cmd = Cmd::new("podman").arg(verb).arg(self.selector());
+        let ran = process::try_capture_logged_until(
+            self.engine_call(cmd.clone()),
+            "podman",
+            self.transcript.as_ref(),
+            process::Termination::Kill,
+            tokio::time::sleep(self.engine_budget(MIN_REMOVAL_BUDGET)),
+        )
+        .await;
+        match classify_engine_call(&cmd, ran) {
+            EngineOutcome::Done => Ok(()),
+            EngineOutcome::TimedOut => Err(cmd.canceled_error()),
+            EngineOutcome::Failed(e) => Err(e),
+        }
+    }
+
     /// The session transcript podman commands are logged to, if any. Cloned
     /// so mid-session container starts (e.g. `/sidecar add`) can log into
     /// the same `container.log`.
     pub fn transcript(&self) -> Option<Transcript> {
+        self.transcript.clone()
+    }
+}
+
+/// What `podman exec` into one container needs, held apart from its
+/// [`Container`]: see [`Container::exec_target`].
+#[derive(Debug, Clone)]
+pub(crate) struct ExecTarget {
+    selector: String,
+    uid: u32,
+    gid: u32,
+    home: String,
+    transcript: Option<Transcript>,
+}
+
+impl ExecTarget {
+    /// `podman exec -i` of `cmd` as the session's user, with `options`'
+    /// environment and working directory: see [`Container::build_exec_argv`].
+    pub(crate) fn exec_argv(&self, cmd: &[String], options: &ExecOptions) -> Cmd {
+        let mut c = Cmd::new("podman")
+            .args(["exec", "-i"])
+            .arg(format!("--user={}:{}", self.uid, self.gid))
+            .arg("--env")
+            .arg(format!("HOME={}", self.home));
+        c = engine_env::push_resolved(c, "--env", &options.env);
+        if let Some(workdir) = &options.workdir {
+            c = c.arg("--workdir").arg(workdir);
+        }
+        c = c.arg(&self.selector);
+        for arg in cmd {
+            c = c.arg(arg);
+        }
+        c
+    }
+
+    /// The session transcript podman commands are logged to, if any.
+    pub(crate) fn transcript(&self) -> Option<Transcript> {
         self.transcript.clone()
     }
 }
@@ -3055,6 +3153,49 @@ mod tests {
         assert!(
             kept.stop(Duration::from_secs(1)).await.is_err(),
             "the handle has to still be the container"
+        );
+    }
+
+    /// A container removed while its stop ran -- an entrypoint sidecar's `--rm` racing the stop
+    /// its server's exit made moot -- is stopped, though podman reports it missing past
+    /// `--ignore`: it was stopped by id, which nothing else can hold. Any other failure is not.
+    #[tokio::test]
+    async fn a_container_removed_while_it_is_stopped_is_stopped() {
+        // Reaches `stop_inner`'s callsites with no subscriber installed. See
+        // `process_tests::TRACING_CALLSITES`.
+        let _emitting = crate::process::process_tests::emitting().await;
+        let missing = |stderr: &str| {
+            Cmd::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("echo '{stderr}' >&2; exit 125"))
+        };
+        let mut container = Container::unstoppable();
+        container.engine_override = vec![
+            (
+                "stop",
+                missing("Error: no container with ID 0000 found in database: no such container"),
+            ),
+            ("rm", Cmd::new("/bin/true")),
+        ];
+        assert!(
+            container
+                .stop_or_keep(Duration::from_secs(1))
+                .await
+                .is_none(),
+            "a container gone by id is stopped"
+        );
+
+        let mut container = Container::unstoppable();
+        container.engine_override = vec![
+            ("stop", missing("Error: something else went wrong")),
+            ("rm", Cmd::new("/bin/true")),
+        ];
+        assert!(
+            container
+                .stop_or_keep(Duration::from_secs(1))
+                .await
+                .is_some(),
+            "any other failure is not"
         );
     }
 

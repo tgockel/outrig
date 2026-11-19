@@ -51,6 +51,7 @@ model-request-limit   = 200                           # optional; no limit when 
 model-request-warnings = [20, 1]                      # optional; no warning when unset
 retry-budget-secs     = 600                           # optional; defaults to 600
 mcp-call-timeout-secs = 600                           # optional; defaults to 600
+mcp-connect-budget-secs = 120                         # optional; defaults to 120
 
 [network]
 mode = "default"                                      # optional: default, audit, or filter
@@ -68,31 +69,32 @@ grace-secs = 5                                        # optional; defaults to 5
 env-allow = ["GITHUB_TOKEN"]                          # optional; global only
 ```
 
-| Key                      | Type    | Required               | Where  | Description               |
-|--------------------------|---------|------------------------|--------|---------------------------|
-| `default-image`          | string  | no                     | repo   | Default `--image`.        |
-| `default-agent`          | string  | no                     | repo   | Default `--agent`.        |
-| `default-model`          | string  | if agent omits `model` | global | Fallback model name.      |
-| `session-root`           | path    | no                     | global | Sessions root dir.        |
-| `tool-call-max`          | integer | no                     | global | Tool calls per round.     |
-| `tool-result-max`        | integer | no                     | global | Per-tool-result byte max. |
-| `subagent-depth-max`     | integer | no                     | global | Max subagent nesting.     |
-| `subagent-width-max`     | integer | no                     | global | Max live subagents/agent. |
-| `children-max`           | integer | no                     | global | Max children (`run-new`). |
-| `model-concurrency-max`  | integer | no                     | global | Model requests in flight. |
-| `requests-max`           | integer | no                     | global | Unsettled requests/child. |
-| `token-budget`           | integer | no                     | global | Session token cap.        |
-| `model-request-limit`    | integer | no                     | global | Model requests per agent. |
-| `model-request-warnings` | array   | no                     | global | Counts warned at.         |
-| `retry-budget-secs`      | integer | no                     | global | LLM retry budget (secs).  |
-| `mcp-call-timeout-secs`  | integer | no                     | either | MCP tools/call deadline.  |
-| `network.mode`           | string  | no                     | either | Network mode.             |
-| `network.default`        | string  | no                     | global | Filter fallback action.   |
-| `network.allow`          | array   | no                     | global | Filter allow entries.     |
-| `network.deny`           | array   | no                     | global | Filter deny entries.      |
-| `events.mode`            | string  | no                     | either | Agent event log.          |
-| `host.grace-secs`        | integer | no                     | either | Host program grace (s).   |
-| `repo.env-allow`         | array   | no                     | global | Variables a repo may use. |
+| Key                       | Type    | Required               | Where  | Description              |
+|---------------------------|---------|------------------------|--------|--------------------------|
+| `default-image`           | string  | no                     | repo   | Default `--image`.       |
+| `default-agent`           | string  | no                     | repo   | Default `--agent`.       |
+| `default-model`           | string  | if agent omits `model` | global | Fallback model name.     |
+| `session-root`            | path    | no                     | global | Sessions root dir.       |
+| `tool-call-max`           | integer | no                     | global | Tool calls per round.    |
+| `tool-result-max`         | integer | no                     | global | Per-tool-result byte max.|
+| `subagent-depth-max`      | integer | no                     | global | Max subagent nesting.    |
+| `subagent-width-max`      | integer | no                     | global | Max live subagents/agent.|
+| `children-max`            | integer | no                     | global | Max children (`run-new`).|
+| `model-concurrency-max`   | integer | no                     | global | Model requests in flight.|
+| `requests-max`            | integer | no                     | global | Unsettled requests/child.|
+| `token-budget`            | integer | no                     | global | Session token cap.       |
+| `model-request-limit`     | integer | no                     | global | Model requests per agent.|
+| `model-request-warnings`  | array   | no                     | global | Counts warned at.        |
+| `retry-budget-secs`       | integer | no                     | global | LLM retry budget (secs). |
+| `mcp-call-timeout-secs`   | integer | no                     | either | MCP tools/call deadline. |
+| `mcp-connect-budget-secs` | integer | no                     | either | MCP start budget (secs). |
+| `network.mode`            | string  | no                     | either | Network mode.            |
+| `network.default`         | string  | no                     | global | Filter fallback action.  |
+| `network.allow`           | array   | no                     | global | Filter allow entries.    |
+| `network.deny`            | array   | no                     | global | Filter deny entries.     |
+| `events.mode`             | string  | no                     | either | Agent event log.         |
+| `host.grace-secs`         | integer | no                     | either | Host program grace (s).  |
+| `repo.env-allow`          | array   | no                     | global | Variables a repo may use.|
 
 `default-agent` is optional. With neither `--agent` nor `default-agent`, `outrig run` starts
 with no agent: no preamble is sent, every knob comes from the top level, and the image cascade
@@ -112,6 +114,12 @@ server and hands the model a timeout in place of a result -- 1 to 3600, default 
 default for every server in the session, sidecars and image-label servers included; a server's
 own [`call-timeout-secs`](#imagesnamemcp) overrides it, and in either file the repo value wins.
 The server is sent `notifications/cancelled`, which it may or may not act on.
+`mcp-connect-budget-secs` is how long a session -- `outrig run-new`'s, or a host program's --
+gives each MCP server it places to start: every attempt, each bounded at two minutes, and every
+wait between them, together -- 1 to 3600, default 120. A failure that may pass is tried again
+within it; past it the server is `unavailable`, and the session starts without it (see
+[MCP Servers](../concepts/mcp-servers.md#in-a-session-mcp-services)). `outrig run` does not read
+it: it tries each server once. In either file the repo value wins.
 `session-root` is global-only: it chooses where this machine writes session records, and so
 where `outrig clean` and `outrig discard` delete. A repo config that sets it is rejected at
 load.
@@ -530,7 +538,13 @@ These apply:
   constructs runs on -- its `model=`, else `default-model`.
 - The top-level `children-max`, `model-concurrency-max`, `requests-max`, `token-budget`,
   `model-request-limit`, `model-request-warnings`, `subagent-depth-max`, `tool-call-max`,
-  `tool-result-max` and `retry-budget-secs`.
+  `tool-result-max`, `retry-budget-secs`, `mcp-call-timeout-secs` and
+  `mcp-connect-budget-secs`.
+- `[images.<name>.mcp]`, the `[sidecars.<sc>]` blocks they name, and the image's
+  `org.outrig.mcp` label under `[repo] env-allow`: each server starts with the session as a
+  service, as for `outrig run-new` (see
+  [MCP Servers](../concepts/mcp-servers.md#in-a-session-mcp-services)), beside those the program
+  declares with `outrig.Session(mcp=...)`.
 - `[host]`: the program's own grace.
 
 These do not:
@@ -539,8 +553,6 @@ These do not:
   program that wants them passes them to `outrig.Session(mounts=...)`.
 - `[agents.<name>]`, `default-agent` and an agent's `preamble` select nothing for an agent class:
   its docstring is its instructions, and its model is `model=` or `default-model`.
-- `[images.<name>.mcp]` and `[sidecars.<sc>]`: no MCP server and no sidecar starts, as for
-  `outrig run-new`.
 
 ## `[repo]`
 
@@ -1801,6 +1813,7 @@ model-request-limit = 200                        # optional; no limit when unset
 model-request-warnings = [20, 1]                 # optional; no warning when unset
 retry-budget-secs  = 600                         # optional; default = 600
 mcp-call-timeout-secs = 600                      # optional; default = 600
+mcp-connect-budget-secs = 120                    # optional; default = 120
 
 [network]
 mode = "default"                                 # optional; default, audit, or filter
@@ -2011,6 +2024,7 @@ image-config in the merged config but does not require agent/model/provider wiri
 - `mcp-call-timeout-secs` at the top level and `call-timeout-secs` on an MCP entry, if set,
   must be between `1` and `3600` seconds. `0` is not legal, for the same reason as
   `request-timeout-secs`. `outrig build` checks both too.
+- `mcp-connect-budget-secs`, if set, must be between `1` and `3600` seconds.
 - `[network].mode`, if set, must be `default`, `audit`, or `filter`. `filter` additionally
   requires at least one global `allow` or `deny` entry.
 - A repo config may set `[network].mode` only; `[network].default`, `[network].allow`, and

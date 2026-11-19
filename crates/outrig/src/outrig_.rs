@@ -14,8 +14,8 @@ use tokio::process::Child;
 
 use crate::config::{
     CapabilityProfile, Config, ContainerSecurity, EnvValue, ImageConfig, McpServerSpec,
-    MountAccess, NetworkConfig, NetworkMode, NetworkPolicy, SidecarStart, SidecarView,
-    SidecarWorkspaceAccess, check_entrypoint_hosting, check_mcp_call_timeout_secs,
+    MountAccess, NetworkConfig, NetworkMode, NetworkPolicy, ResolvedEnvValue, SidecarStart,
+    SidecarView, SidecarWorkspaceAccess, check_entrypoint_hosting, check_mcp_call_timeout_secs,
     check_sidecar_image, check_sidecar_name, check_view_exclusions, effective_mcp_call_timeout,
     is_valid_mcp_server_name,
 };
@@ -33,7 +33,7 @@ use crate::mcp_content::{McpIcon, McpTool, McpToolAnnotations, McpToolResult};
 use crate::network::NetworkInterceptor;
 use crate::python::payload;
 
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// Where the container's image comes from. Either a Dockerfile + context
 /// (built via buildah, with the project's content-addressed cache) or an
@@ -511,6 +511,12 @@ pub struct LaunchSpec {
     /// removes the sidecar from `sidecars` loses the server rather than
     /// falling back to the label's.
     placed_elsewhere: BTreeSet<String>,
+    /// What a configuration's image block declares of MCP, for a session's
+    /// MCP table to start: set by [`container_spec`](crate::harness::container_spec),
+    /// which leaves those servers out of the launch itself, so a session given
+    /// the spec starts them under its own rules. `None` otherwise, and never
+    /// read by [`Outrig::launch`].
+    pub(crate) configured_mcp: Option<ConfiguredMcp>,
     pub sidecars: Vec<SidecarSpec>,
     /// The id the session's containers carry. The primary is named
     /// `outrig-<id>` and labeled `org.outrig.session=<id>`; a sidecar is
@@ -567,6 +573,7 @@ impl LaunchSpec {
             embedded_mcp_env_allow: Vec::new(),
             mcp,
             placed_elsewhere: BTreeSet::new(),
+            configured_mcp: None,
             sidecars: Vec::new(),
             session_id: None,
             log_dir,
@@ -592,6 +599,7 @@ impl LaunchSpec {
             embedded_mcp_env_allow: Vec::new(),
             mcp,
             placed_elsewhere: BTreeSet::new(),
+            configured_mcp: None,
             sidecars: Vec::new(),
             session_id: None,
             log_dir,
@@ -708,6 +716,7 @@ impl LaunchSpec {
                 .filter(|(_, placed)| placed.placement != Placement::Primary)
                 .map(|(name, _)| name.clone())
                 .collect(),
+            configured_mcp: None,
             sidecars,
             session_id: None,
             log_dir,
@@ -970,6 +979,134 @@ async fn resolve_sidecar_image_tag(
     }
 }
 
+/// What a configuration's `[images.<name>]` block declares of MCP, lowered
+/// for a session's MCP table rather than a launch: the servers its `[mcp]`
+/// entries place in the primary, each sidecar its other entries name with its
+/// image resolved, and what its sidecars' own `org.outrig.mcp` labels add.
+/// The primary image's label is read once the primary runs, by the table.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConfiguredMcp {
+    /// Each server placed in the primary.
+    pub(crate) primary: BTreeMap<String, McpServerSpec>,
+    /// Each `start = "auto"` sidecar a server is placed in, the servers it
+    /// hosts among its spec's.
+    pub(crate) sidecars: Vec<ConfiguredSidecar>,
+    /// Each server placed in a `start = "manual"` sidecar, and that sidecar.
+    pub(crate) manual: BTreeMap<String, String>,
+    /// Where each server sidecar labels added was declared: its sidecar's
+    /// image, not the configuration.
+    pub(crate) from_labels: BTreeSet<String>,
+    /// Every server name the block declares, in whatever placement: a label
+    /// entry of one of them is not added.
+    pub(crate) names: BTreeSet<String>,
+    /// `[repo] env-allow`: the variables a label entry may reference.
+    pub(crate) env_allow: Vec<String>,
+    /// The top-level `mcp-call-timeout-secs`.
+    pub(crate) call_timeout_secs: Option<u64>,
+}
+
+/// One sidecar a configuration's servers run in.
+#[derive(Debug, Clone)]
+pub(crate) struct ConfiguredSidecar {
+    /// The container, its image resolved when it could be, and its servers.
+    pub(crate) spec: SidecarSpec,
+    /// Why its image could not be resolved, or its label read.
+    pub(crate) failed: Option<String>,
+}
+
+impl ConfiguredMcp {
+    /// What `config`'s block `image_name` declares of MCP, each sidecar's
+    /// image built, pulled or found as [`LaunchSpec::from_config`] would, and
+    /// each label a sidecar honors merged. A sidecar whose image or label
+    /// cannot be had is kept with the reason, for its servers to be reported
+    /// misconfigured rather than to fail the session.
+    pub(crate) async fn from_config(config: &Config, image_name: &str, repo_root: &Path) -> Self {
+        let Some(block) = config.images.get(image_name) else {
+            return Self::default();
+        };
+        let mut plan = sidecar::plan_from_config(config, block);
+        let names = plan.servers.keys().cloned().collect();
+        let mut failed: BTreeMap<String, String> = BTreeMap::new();
+        let mut images: BTreeMap<String, String> = BTreeMap::new();
+        let auto: Vec<String> = plan
+            .sidecars
+            .values()
+            .filter(|sc| sc.start == SidecarStart::Auto)
+            .map(|sc| sc.name.clone())
+            .collect();
+        // Each sidecar's image at once: a pull or an inspect overlaps another's.
+        let resolved = futures_util::future::join_all(auto.iter().map(|name| {
+            let sc = &plan.sidecars[name];
+            let declared_by = sc.image_declared_by();
+            async move {
+                let resolved =
+                    resolve_sidecar_image_tag(config, repo_root, &sc.image, &declared_by).await;
+                (name.clone(), resolved)
+            }
+        }))
+        .await;
+        for (name, resolved) in resolved {
+            match resolved {
+                Ok(tag) => images.insert(name, tag),
+                Err(e) => failed.insert(name, e.to_string()),
+            };
+        }
+        for name in &auto {
+            let (Some(tag), true) = (
+                images.get(name),
+                plan.sidecar_honors_labels(&plan.sidecars[name]),
+            ) else {
+                continue;
+            };
+            let merged = match embedded::read_embedded_mcp(&ImageTag::new(tag.clone()), None).await
+            {
+                Ok(labels) => sidecar::merge_sidecar_labels(&mut plan, name, labels),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = merged {
+                failed.insert(name.clone(), e.to_string());
+            }
+        }
+        let from_labels = plan
+            .servers
+            .iter()
+            .filter(|(_, placed)| placed.source == McpDeclarationSource::ImageLabel)
+            .map(|(name, _)| name.clone())
+            .collect();
+        let manual = plan
+            .servers
+            .iter()
+            .filter_map(|(server, placed)| {
+                let sc = placed.placement.sidecar_name()?;
+                (plan.sidecars.get(sc)?.start != SidecarStart::Auto)
+                    .then(|| (server.clone(), sc.to_string()))
+            })
+            .collect();
+        let (primary, specs) = plan_to_launch_parts(&plan, repo_root);
+        let sidecars = specs
+            .into_iter()
+            .map(|mut spec| {
+                if let Some(tag) = images.get(&spec.name) {
+                    spec.image = tag.clone();
+                }
+                ConfiguredSidecar {
+                    failed: failed.remove(&spec.name),
+                    spec,
+                }
+            })
+            .collect();
+        Self {
+            primary,
+            sidecars,
+            manual,
+            from_labels,
+            names,
+            env_allow: config.repo.env_allow().to_vec(),
+            call_timeout_secs: config.mcp_call_timeout_secs,
+        }
+    }
+}
+
 /// Description of a single tool exposed by one of the running MCP servers.
 /// `server` is the local config name (`spec.mcp` key) and `name` is the
 /// tool name as advertised by the server (un-namespaced). Everything from
@@ -1010,7 +1147,9 @@ pub struct Outrig {
     container: Container,
     clients: BTreeMap<String, Arc<McpClient>>,
     tools: Vec<ToolHandle>,
-    network: Option<NetworkInterceptor>,
+    /// Shared with each [`SidecarHost`] taken from the session, so a sidecar
+    /// the session's MCP table starts is intercepted as one this starts is.
+    network: Option<SharedNetwork>,
     log_dir: PathBuf,
     /// [`LaunchSpec::mcp_call_timeout_secs`], kept for the servers
     /// [`Outrig::add_sidecar`] connects after launch.
@@ -1213,7 +1352,7 @@ impl Outrig {
             container,
             clients,
             tools,
-            network,
+            network: network.map(|network| Arc::new(tokio::sync::Mutex::new(Some(network)))),
             log_dir: spec.log_dir.clone(),
             mcp_call_timeout_secs: spec.mcp_call_timeout_secs,
         };
@@ -1256,104 +1395,33 @@ impl Outrig {
     /// `SidecarViewNoNewPrivsOff` say which.
     pub async fn add_sidecar(&mut self, spec: SidecarSpec) -> Result<Vec<ToolHandle>> {
         validate_sidecar_spec(&spec, &self.clients, &self.sidecars, enter::is_available())?;
-
-        let workspace_access = spec.workspace.mount_access();
-        if workspace_access.is_some() && self.container.host_workspace().as_os_str().is_empty() {
-            return Err(OutrigError::Configuration(format!(
-                "sidecar {:?} requests workspace access but the session has no workspace",
-                spec.name
-            )));
-        }
-        let launch = ContainerLaunchSpec {
-            workspace: workspace_access.map(|access| {
-                ContainerWorkspace::new(
-                    self.container.host_workspace(),
-                    self.container.container_workspace(),
-                    access,
-                )
-            }),
-            mounts: spec
-                .mounts
-                .iter()
-                .map(|mount| {
-                    ContainerMount::new(mount.host.clone(), mount.container.clone(), mount.access)
-                })
-                .collect(),
-            capabilities: ContainerCapabilities::from(&spec.security.capabilities),
-            devices: spec.security.devices.clone(),
-            no_new_privileges: spec.security.no_new_privileges,
-            unmask: spec.security.unmask.clone(),
-            labels: BTreeMap::from([
-                (
-                    LABEL_SESSION.to_string(),
-                    self.container.session_suffix().to_string(),
-                ),
-                (LABEL_SIDECAR.to_string(), spec.name.clone()),
-            ]),
-            // Set by `create_entrypoint_sidecar` for a `view = "primary"`
-            // sidecar; every other placement leaves it `None`.
-            primary_view: None,
-        };
-        let container_name =
-            crate::container::sidecar_container_name(self.container.session_suffix(), &spec.name);
-        let image = ImageTag::new(spec.image.clone());
-
+        let host = self.sidecar_host().await?;
         // Validation guarantees an entrypoint host serves exactly one server,
         // so the first is the only one.
-        let entrypoint_server = spec
+        let entrypoint = match spec
             .servers
             .iter()
-            .find(|(_, server)| server.is_entrypoint());
-
-        let mut container = match entrypoint_server {
-            Some((name, server)) => {
-                self.create_entrypoint_sidecar(&spec, name, server, launch, image, container_name)
-                    .await?
-            }
-            None => Container::start_named(&image, launch, container_name, None).await?,
-        };
-
-        // Bootstrap only where identity matters; `bootstrap_needed` owns the
-        // entrypoint-host exemption, so both paths get it from one place.
-        let needs_bootstrap = sidecar::bootstrap_needed(
-            entrypoint_server.is_some(),
-            !spec.servers.is_empty(),
-            spec.workspace,
-            !spec.mounts.is_empty(),
-        );
-        // Every failure from here on has a live container behind it, so every
-        // one reports what stopping it could not do. A sidecar that was
-        // created and could not be stopped was never added to the session map
-        // and has no orderly owner left, which is not a detail to fold into
-        // the error that started it.
-        if needs_bootstrap && let Err(e) = container.bootstrap_user().await {
-            return Err(unwind_sidecar(
-                &spec.name,
-                e,
-                container,
-                SHUTDOWN_GRACE,
-                &mut self.abandoned,
-            )
-            .await);
-        }
-
-        if let Some(network) = &mut self.network
-            && let Err(e) = network.attach(&container).await
+            .find(|(_, server)| server.is_entrypoint())
         {
-            return Err(unwind_sidecar(
-                &spec.name,
-                e,
-                container,
-                SHUTDOWN_GRACE,
+            Some((name, server)) => Some((
+                server,
+                crate::mcp::resolve_mcp_env(name, server.env().clone(), &BTreeMap::new())?,
+            )),
+            None => None,
+        };
+        let container = host
+            .prepare(
+                &spec,
+                host.container_name(&spec.name),
+                entrypoint,
                 &mut self.abandoned,
             )
-            .await);
-        }
+            .await?;
 
         // A no-op when the session has no interceptor. Armed across the connect
         // because that is where a caller's timeout or `select!` drops this
         // future, and the container's own `Drop` removes only the container.
-        let attachment = UncommittedAttachment::arm(self.network.as_mut(), container.name());
+        let attachment = host.uncommitted(container.name());
         let connected =
             connect_sidecar_servers(&container, &spec, &self.log_dir, self.mcp_call_timeout_secs)
                 .await;
@@ -1368,101 +1436,29 @@ impl Outrig {
                 self.tools.extend(tools.iter().cloned());
                 Ok(tools)
             }
-            Err(e) => {
-                // Both compensations are attempted, and what either of them
-                // could not do travels with the failure rather than being
-                // dropped. A detach that failed means the sidecar is still
-                // carrying interception no attachment owns, and there is no
-                // later retry path once this returns -- so the caller has to
-                // be told, not just the reason its servers would not start.
-                let mut residue = Vec::new();
-                if let Some(network) = &mut self.network
-                    && let Err(detached) = network.detach(container.name()).await
-                {
-                    residue.push(detached);
-                }
-                Err(unwound(
-                    &spec.name,
-                    e,
-                    residue,
-                    container,
-                    SHUTDOWN_GRACE,
-                    &mut self.abandoned,
-                )
-                .await)
-            }
+            Err(e) => Err(host
+                .unwind(&spec.name, e, container, &mut self.abandoned)
+                .await),
         }
     }
 
-    /// `podman create` + `podman init` an entrypoint-stdio sidecar without
-    /// running its ENTRYPOINT: the interceptor attaches to the initialized
-    /// network namespace first, and the `podman start --attach` that finally
-    /// runs the server happens later, in [`connect_sidecar_servers`]. The
-    /// server's environment is baked in here because `podman start` carries no
-    /// `--env`.
-    ///
-    /// A `view = "primary"` sidecar additionally resolves the primary's
-    /// namespaces and materializes the `outrig-enter` launcher *before*
-    /// anything is created, so a missing helper or a not-yet-running primary
-    /// fails without leaving a container behind.
-    async fn create_entrypoint_sidecar(
-        &self,
-        spec: &SidecarSpec,
-        server_name: &str,
-        server: &SidecarServerSpec,
-        mut launch: ContainerLaunchSpec,
-        image: ImageTag,
-        container_name: String,
-    ) -> Result<Container> {
-        let (image_entrypoint, image_cmd) = if spec.view == SidecarView::Primary {
-            // The log dir is otherwise created lazily by the first MCP
-            // connection, which for an entrypoint server happens after the
-            // helper is already needed.
-            tokio::fs::create_dir_all(&self.log_dir)
-                .await
-                .path_ctx("create directory", &self.log_dir)?;
-            // Two unrelated podman inspects -- the primary's PID and the
-            // sidecar image's config -- so they overlap.
-            let (pid, payload) = tokio::try_join!(
-                self.container.pid(),
-                image::read_image_entrypoint_cmd(&image, None),
-            )?;
-            // `home_dir` is `Some` here: the session's primary is bootstrapped
-            // at start, and `add_sidecar` runs against a started session.
-            let payload_home = self.container.home_dir().ok_or_else(|| {
-                OutrigError::Configuration(
-                    "a view = \"primary\" sidecar needs the primary's user, which has not been \
-                     bootstrapped"
-                        .to_string(),
-                )
-            })?;
-            launch.primary_view = Some(PrimaryView::new(
-                self.container.selector(),
-                pid,
-                enter::materialize(&self.log_dir)?,
-                payload_home,
-            ));
-            payload
-        } else {
-            (Vec::new(), Vec::new())
-        };
-
-        let options = ContainerCreateOptions::new(image, launch, container_name)
-            .with_resolved_env(crate::mcp::resolve_mcp_env(
-                server_name,
-                server.env().clone(),
-                &BTreeMap::new(),
-            )?)
-            .with_intercept_dns(self.network.is_some())
-            .with_args(sidecar::entrypoint_create_args(
-                spec.view,
-                &image_entrypoint,
-                &image_cmd,
-                server.args(),
-                self.container.container_workspace(),
-                Some((self.container.uid(), self.container.gid())),
-            ));
-        Container::create_initialized(options).await
+    /// What a sidecar of this session needs of it, held apart from it: see
+    /// [`SidecarHost`].
+    pub(crate) async fn sidecar_host(&self) -> Result<SidecarHost> {
+        Ok(SidecarHost {
+            selector: self.container.selector().to_string(),
+            session_suffix: self.container.session_suffix().to_string(),
+            host_workspace: self.container.host_workspace().to_path_buf(),
+            container_workspace: self.container.container_workspace().to_path_buf(),
+            uid: self.container.uid(),
+            gid: self.container.gid(),
+            home: self.container.home_dir(),
+            // Read when the user was bootstrapped at launch, so this is the
+            // cached answer.
+            pid: self.container.pid().await?,
+            log_dir: self.log_dir.clone(),
+            network: self.network.clone(),
+        })
     }
 
     /// Tools advertised by every connected MCP server: launch-time servers in
@@ -1573,6 +1569,12 @@ impl Outrig {
                 }
             }
         }
+        // Taken out of its lock, so a `SidecarHost` the session's MCP table
+        // still holds finds nothing left to attach to.
+        let network = match network {
+            Some(network) => network.lock().await.take(),
+            None => None,
+        };
         if let Some(network) = network
             && let Err(e) = network.shutdown().await
         {
@@ -1616,6 +1618,14 @@ impl Outrig {
 /// `helper_available` is [`enter::is_available`]'s answer, threaded in rather
 /// than read here so the missing-`outrig-enter` rejection is testable on a
 /// host that does have the helper.
+/// Whether `spec` is one [`Outrig::add_sidecar`] would start, apart from
+/// what the session already runs: for the session's MCP table, which starts
+/// its sidecars apart from the [`Outrig`]'s.
+pub(crate) fn validate_sidecar(spec: &SidecarSpec) -> Result<()> {
+    let none = BTreeMap::<String, ()>::new();
+    validate_sidecar_spec(spec, &none, &none, enter::is_available())
+}
+
 fn validate_sidecar_spec<C, S>(
     spec: &SidecarSpec,
     existing_clients: &BTreeMap<String, C>,
@@ -1693,6 +1703,263 @@ fn validate_sidecar_spec<C, S>(
     Ok(())
 }
 
+/// A session's network interceptor, shared between the [`Outrig`] that
+/// launched it and each [`SidecarHost`] taken from it. Locked only to attach,
+/// detach or retire one container, never across a server's handshake. The
+/// shutdown takes it out, whoever else holds the `Arc`: an attach, detach or
+/// retire after that finds nothing to do.
+pub(crate) type SharedNetwork = Arc<tokio::sync::Mutex<Option<NetworkInterceptor>>>;
+
+/// What a sidecar needs of the session it joins, held apart from the
+/// [`Outrig`] that launched the session: the facts of the primary a sidecar
+/// reads -- its workspace, its user, its namespaces for a primary view -- where
+/// the session's logs go, and the session's interceptor. [`Outrig::add_sidecar`]
+/// starts its sidecars through one, and so does a session's MCP table, which
+/// holds one for its life and needs no borrow of the session's [`Outrig`].
+#[derive(Clone)]
+pub(crate) struct SidecarHost {
+    selector: String,
+    session_suffix: String,
+    host_workspace: PathBuf,
+    container_workspace: PathBuf,
+    uid: u32,
+    gid: u32,
+    home: Option<String>,
+    pid: u32,
+    log_dir: PathBuf,
+    network: Option<SharedNetwork>,
+}
+
+impl std::fmt::Debug for SidecarHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SidecarHost")
+            .field("session_suffix", &self.session_suffix)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SidecarHost {
+    /// A host with no primary behind it, whose interceptor is `network`: for a
+    /// test of what a placement stops and detaches.
+    #[cfg(test)]
+    pub(crate) fn bare(network: Option<SharedNetwork>) -> Self {
+        Self {
+            selector: String::new(),
+            session_suffix: "test".to_string(),
+            host_workspace: PathBuf::new(),
+            container_workspace: PathBuf::new(),
+            uid: 0,
+            gid: 0,
+            home: None,
+            pid: 0,
+            log_dir: std::env::temp_dir(),
+            network,
+        }
+    }
+
+    /// The container name a sidecar named `sidecar` gets in this session.
+    pub(crate) fn container_name(&self, sidecar: &str) -> String {
+        crate::container::sidecar_container_name(&self.session_suffix, sidecar)
+    }
+
+    /// Where the session's logs go: each server's stderr among them.
+    pub(crate) fn log_dir(&self) -> &Path {
+        &self.log_dir
+    }
+
+    /// The sidecar `spec` describes, as `container_name`: created and
+    /// initialized with `entrypoint`'s environment baked in when it hosts that
+    /// entrypoint server, which then starts only when it is connected, or else
+    /// started; its user bootstrapped where identity matters; and attached to
+    /// the session's interceptor. Not connected. A failure stops what was
+    /// started, keeping a container that would not stop in `abandoned`.
+    pub(crate) async fn prepare(
+        &self,
+        spec: &SidecarSpec,
+        container_name: String,
+        entrypoint: Option<(&SidecarServerSpec, BTreeMap<String, ResolvedEnvValue>)>,
+        abandoned: &mut Vec<Container>,
+    ) -> Result<Container> {
+        let workspace_access = spec.workspace.mount_access();
+        if workspace_access.is_some() && self.host_workspace.as_os_str().is_empty() {
+            return Err(OutrigError::Configuration(format!(
+                "sidecar {:?} requests workspace access but the session has no workspace",
+                spec.name
+            )));
+        }
+        let launch = ContainerLaunchSpec {
+            workspace: workspace_access.map(|access| {
+                ContainerWorkspace::new(&self.host_workspace, &self.container_workspace, access)
+            }),
+            mounts: spec
+                .mounts
+                .iter()
+                .map(|mount| {
+                    ContainerMount::new(mount.host.clone(), mount.container.clone(), mount.access)
+                })
+                .collect(),
+            capabilities: ContainerCapabilities::from(&spec.security.capabilities),
+            devices: spec.security.devices.clone(),
+            no_new_privileges: spec.security.no_new_privileges,
+            unmask: spec.security.unmask.clone(),
+            labels: BTreeMap::from([
+                (LABEL_SESSION.to_string(), self.session_suffix.clone()),
+                (LABEL_SIDECAR.to_string(), spec.name.clone()),
+            ]),
+            // Set by `create_entrypoint` for a `view = "primary"` sidecar;
+            // every other placement leaves it `None`.
+            primary_view: None,
+        };
+        let image = ImageTag::new(spec.image.clone());
+        let hosts_entrypoint = entrypoint.is_some();
+        let container = match entrypoint {
+            Some((server, env)) => {
+                self.create_entrypoint(spec, server, env, launch, image, container_name)
+                    .await?
+            }
+            None => Container::start_named(&image, launch, container_name, None).await?,
+        };
+
+        // Bootstrap only where identity matters; `bootstrap_needed` owns the
+        // entrypoint-host exemption, so both paths get it from one place.
+        let needs_bootstrap = sidecar::bootstrap_needed(
+            hosts_entrypoint,
+            !spec.servers.is_empty(),
+            spec.workspace,
+            !spec.mounts.is_empty(),
+        );
+        // Every failure from here on has a live container behind it, so every
+        // one reports what stopping it could not do. A sidecar that was
+        // created and could not be stopped was never added to the session and
+        // has no orderly owner left, which is not a detail to fold into the
+        // error that started it.
+        //
+        // Held from here until it is handed over, so a preparation dropped
+        // part-way -- a start cut off at its budget, or cancelled -- leaves the
+        // container in `abandoned` for a stop to find.
+        let mut held = Unowned::new(container, abandoned);
+        if needs_bootstrap && let Err(e) = held.get_mut().bootstrap_user().await {
+            return Err(unwound(&spec.name, e, Vec::new(), held, SHUTDOWN_GRACE).await);
+        }
+        if let Some(network) = &self.network {
+            let attached = match network.lock().await.as_mut() {
+                Some(network) => network.attach(held.get()).await,
+                None => Err(OutrigError::Configuration(
+                    "the session's network interceptor has shut down".into(),
+                )),
+            };
+            if let Err(e) = attached {
+                return Err(unwound(&spec.name, e, Vec::new(), held, SHUTDOWN_GRACE).await);
+            }
+        }
+        Ok(held.into_inner())
+    }
+
+    /// `podman create` + `podman init` an entrypoint-stdio sidecar without
+    /// running its ENTRYPOINT: the interceptor attaches to the initialized
+    /// network namespace first, and the `podman start --attach` that finally
+    /// runs the server happens when it is connected. The server's environment,
+    /// `env`, is baked in here because `podman start` carries no `--env`.
+    ///
+    /// A `view = "primary"` sidecar additionally takes the primary's
+    /// namespaces and materializes the `outrig-enter` launcher *before*
+    /// anything is created, so a missing helper fails without leaving a
+    /// container behind.
+    async fn create_entrypoint(
+        &self,
+        spec: &SidecarSpec,
+        server: &SidecarServerSpec,
+        env: BTreeMap<String, ResolvedEnvValue>,
+        mut launch: ContainerLaunchSpec,
+        image: ImageTag,
+        container_name: String,
+    ) -> Result<Container> {
+        let (image_entrypoint, image_cmd) = if spec.view == SidecarView::Primary {
+            // The log dir is otherwise created lazily by the first MCP
+            // connection, which for an entrypoint server happens after the
+            // helper is already needed.
+            tokio::fs::create_dir_all(&self.log_dir)
+                .await
+                .path_ctx("create directory", &self.log_dir)?;
+            let payload = image::read_image_entrypoint_cmd(&image, None).await?;
+            // `home` is `Some` here: the session's primary is bootstrapped at
+            // launch, and a sidecar joins a launched session.
+            let payload_home = self.home.clone().ok_or_else(|| {
+                OutrigError::Configuration(
+                    "a view = \"primary\" sidecar needs the primary's user, which has not been \
+                     bootstrapped"
+                        .to_string(),
+                )
+            })?;
+            launch.primary_view = Some(PrimaryView::new(
+                &self.selector,
+                self.pid,
+                enter::materialize(&self.log_dir)?,
+                payload_home,
+            ));
+            payload
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        let options = ContainerCreateOptions::new(image, launch, container_name)
+            .with_resolved_env(env)
+            .with_intercept_dns(self.network.is_some())
+            .with_args(sidecar::entrypoint_create_args(
+                spec.view,
+                &image_entrypoint,
+                &image_cmd,
+                server.args(),
+                &self.container_workspace,
+                Some((self.uid, self.gid)),
+            ));
+        Container::create_initialized(options).await
+    }
+
+    /// A sidecar whose servers did not connect, `failed`: detached from the
+    /// interceptor and stopped, the failure reported with whatever either of
+    /// those could not do. A container that would not stop is kept in
+    /// `abandoned`.
+    pub(crate) async fn unwind(
+        &self,
+        sidecar: &str,
+        failed: OutrigError,
+        container: Container,
+        abandoned: &mut Vec<Container>,
+    ) -> OutrigError {
+        // Both compensations are attempted, and what either of them could not
+        // do travels with the failure rather than being dropped. A detach that
+        // failed means the sidecar is still carrying interception no
+        // attachment owns, and there is no later retry path once this returns
+        // -- so the caller has to be told, not just the reason its servers
+        // would not start.
+        let held = Unowned::new(container, abandoned);
+        let mut residue = Vec::new();
+        if let Err(detached) = self.detach(held.get().name()).await {
+            residue.push(detached);
+        }
+        unwound(sidecar, failed, residue, held, SHUTDOWN_GRACE).await
+    }
+
+    /// Detach the container named `name` from the session's interceptor, when
+    /// the session has one.
+    pub(crate) async fn detach(&self, name: &str) -> Result<()> {
+        match &self.network {
+            Some(network) => match network.lock().await.as_mut() {
+                Some(network) => network.detach(name).await,
+                None => Ok(()),
+            },
+            None => Ok(()),
+        }
+    }
+
+    /// An attachment for the container named `name`, to be retired if it is
+    /// dropped before [`UncommittedAttachment::disarm`].
+    pub(crate) fn uncommitted(&self, name: &str) -> UncommittedAttachment {
+        UncommittedAttachment::arm(self.network.clone(), name)
+    }
+}
+
 /// A sidecar's interceptor attachment between a successful `attach` and the
 /// point where [`Outrig::add_sidecar`] either commits it or detaches it in
 /// order.
@@ -1706,13 +1973,13 @@ fn validate_sidecar_spec<C, S>(
 /// lands. A server that withheld `initialize` stays filtered, and its audit
 /// records are still written, until `shutdown` tears the attachment down in
 /// order.
-struct UncommittedAttachment<'a> {
-    network: Option<&'a mut NetworkInterceptor>,
+pub(crate) struct UncommittedAttachment {
+    network: Option<SharedNetwork>,
     container: String,
 }
 
-impl<'a> UncommittedAttachment<'a> {
-    fn arm(network: Option<&'a mut NetworkInterceptor>, container: &str) -> Self {
+impl UncommittedAttachment {
+    fn arm(network: Option<SharedNetwork>, container: &str) -> Self {
         Self {
             network,
             container: container.to_string(),
@@ -1720,33 +1987,88 @@ impl<'a> UncommittedAttachment<'a> {
     }
 
     /// The add reached a path that sees to the attachment itself.
-    fn disarm(mut self) {
+    pub(crate) fn disarm(mut self) {
         self.network = None;
     }
 }
 
-impl Drop for UncommittedAttachment<'_> {
+impl Drop for UncommittedAttachment {
     fn drop(&mut self) {
-        if let Some(network) = self.network.take() {
-            network.retire_attachment(&self.container);
+        let Some(network) = self.network.take() else {
+            return;
+        };
+        // Retired at once when nothing holds the interceptor; otherwise on a
+        // task of its own once it is free, since `Drop` cannot wait -- and
+        // with no runtime left to run that task, nothing is left to attach the
+        // name again either.
+        if let Ok(mut held) = network.try_lock() {
+            if let Some(held) = held.as_mut() {
+                held.retire_attachment(&self.container);
+            }
+            return;
         }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let container = std::mem::take(&mut self.container);
+        runtime.spawn(async move {
+            if let Some(network) = network.lock().await.as_mut() {
+                network.retire_attachment(&container);
+            }
+        });
     }
 }
 
 /// Stop `container` and report `source` with whatever stopping it could not
 /// do. The pre-connect shape of [`unwound`], where there is no attachment to
 /// detach yet.
-async fn unwind_sidecar(
-    sidecar: &str,
-    source: OutrigError,
-    container: Container,
-    grace: Duration,
-    abandoned: &mut Vec<Container>,
-) -> OutrigError {
-    unwound(sidecar, source, Vec::new(), container, grace, abandoned).await
+/// A container on its way to an owner, held so that if what holds it is
+/// dropped first -- a start cut off at its budget, or cancelled -- it lands in
+/// `abandoned` for a later stop to find and prove, rather than with `Drop`'s
+/// detached removal, which reports nothing.
+pub(crate) struct Unowned<'a> {
+    container: Option<Container>,
+    abandoned: &'a mut Vec<Container>,
 }
 
-/// Stop `container`, add that to `residue`, and report the lot.
+impl<'a> Unowned<'a> {
+    pub(crate) fn new(container: Container, abandoned: &'a mut Vec<Container>) -> Self {
+        Self {
+            container: Some(container),
+            abandoned,
+        }
+    }
+
+    pub(crate) fn get(&self) -> &Container {
+        self.container.as_ref().expect("held until handed over")
+    }
+
+    fn get_mut(&mut self) -> &mut Container {
+        self.container.as_mut().expect("held until handed over")
+    }
+
+    /// Handed over to its owner: no longer kept.
+    pub(crate) fn into_inner(mut self) -> Container {
+        self.container.take().expect("held until handed over")
+    }
+
+    /// Stop it, in place: gone once that worked, and still held if not.
+    pub(crate) async fn stop(&mut self, grace: Duration) -> Result<()> {
+        self.get_mut().stop_in_place(grace).await?;
+        self.container = None;
+        Ok(())
+    }
+}
+
+impl Drop for Unowned<'_> {
+    fn drop(&mut self) {
+        if let Some(container) = self.container.take() {
+            self.abandoned.push(container);
+        }
+    }
+}
+
+/// Stop the container `held`, add that to `residue`, and report the lot.
 ///
 /// A clean unwind returns the failure that started it and nothing else: the
 /// machine is as it was, and the call can be tried again. Anything left over
@@ -1756,14 +2078,14 @@ async fn unwound(
     sidecar: &str,
     source: OutrigError,
     mut residue: Vec<OutrigError>,
-    container: Container,
+    mut held: Unowned<'_>,
     grace: Duration,
-    abandoned: &mut Vec<Container>,
 ) -> OutrigError {
-    // The handle comes back if it did not stop: a sidecar left running with
-    // nothing holding it has only `Drop`'s detached removal, which reports
-    // nothing and which `shutdown` cannot retry.
-    let Some((stopped, kept)) = container.stop_or_keep(grace).await else {
+    // The handle stays if it did not stop -- or if this is dropped while it
+    // stops: a sidecar left running with nothing holding it has only `Drop`'s
+    // detached removal, which reports nothing and which `shutdown` cannot
+    // retry.
+    let Err(stopped) = held.stop(grace).await else {
         // Stopping it worked, so the container is gone and its namespaces with
         // it -- including the interception a failed detach could not undo, and
         // the rules and resolver it would have undone. `SidecarNotUnwound` is
@@ -1785,7 +2107,8 @@ async fn unwound(
         return crate::error::superseded_by_a_confirmed_stop(source, sidecar);
     };
     residue.push(stopped);
-    abandoned.push(kept);
+    // Kept in `abandoned` as `held` goes.
+    drop(held);
     OutrigError::SidecarNotUnwound(Box::new(SidecarUnwindFailure {
         sidecar: sidecar.to_string(),
         source: Box::new(source),
@@ -1890,6 +2213,52 @@ fn tool_handles(server: &str, listed: Vec<McpTool>) -> Vec<ToolHandle> {
 mod tests {
     use super::*;
 
+    /// A block's servers lower for the session's MCP table: each in the primary as declared, one
+    /// in a `start = "manual"` sidecar kept aside by name, and every name the block declares
+    /// remembered, so a label entry of one is not added. No sidecar starts automatically here, so
+    /// nothing is built or pulled.
+    #[tokio::test]
+    async fn a_blocks_servers_lower_for_the_mcp_table() {
+        let config = Config::load_from_str(
+            r#"
+[images.x]
+image-name = "docker.io/library/alpine:latest"
+
+[sidecars.later]
+image = "x"
+start = "manual"
+
+[images.x.mcp]
+fs    = { command = ["fs-server"] }
+my-fs = { command = ["my-fs-server"], call-timeout-secs = 30 }
+held  = { command = ["held-server"], sidecar = "later" }
+"#,
+        )
+        .expect("config parses");
+        let repo = tempfile::tempdir().expect("a repo");
+        let configured = ConfiguredMcp::from_config(&config, "x", repo.path()).await;
+        assert_eq!(
+            configured.primary.keys().collect::<Vec<_>>(),
+            ["fs", "my-fs"]
+        );
+        assert_eq!(configured.primary["my-fs"].call_timeout_secs(), Some(30));
+        assert!(configured.sidecars.is_empty());
+        assert_eq!(
+            configured.manual,
+            BTreeMap::from([("held".to_string(), "later".to_string())])
+        );
+        assert_eq!(
+            configured.names.iter().collect::<Vec<_>>(),
+            ["fs", "held", "my-fs"]
+        );
+        assert!(
+            ConfiguredMcp::from_config(&config, "absent", repo.path())
+                .await
+                .primary
+                .is_empty()
+        );
+    }
+
     fn log_dir() -> PathBuf {
         PathBuf::from("logs")
     }
@@ -1905,12 +2274,12 @@ mod tests {
         let _emitting = crate::process::process_tests::emitting().await;
         let mut abandoned = Vec::new();
 
-        let reported = unwind_sidecar(
+        let reported = unwound(
             "tools",
             OutrigError::Configuration("the sidecar never came up".to_string()),
-            Container::unstoppable(),
+            Vec::new(),
+            Unowned::new(Container::unstoppable(), &mut abandoned),
             Duration::from_secs(1),
-            &mut abandoned,
         )
         .await;
 
@@ -1952,9 +2321,8 @@ mod tests {
                 "detaching the interceptor failed".to_string(),
             )],
             // A borrowed container: stopping it is a no-op that cannot fail.
-            Container::stops_cleanly(),
+            Unowned::new(Container::stops_cleanly(), &mut abandoned),
             Duration::from_secs(1),
-            &mut abandoned,
         )
         .await;
 
@@ -1980,7 +2348,7 @@ mod tests {
         let _emitting = crate::process::process_tests::emitting().await;
         let mut abandoned = Vec::new();
 
-        let reported = unwind_sidecar(
+        let reported = unwound(
             "tools",
             OutrigError::NetworkAttachNotUndone(Box::new(crate::error::NetworkAttachFailure {
                 container: "outrig-tools".to_string(),
@@ -1991,9 +2359,9 @@ mod tests {
                     "and the resolver did not go back".to_string(),
                 )],
             })),
-            Container::stops_cleanly(),
+            Vec::new(),
+            Unowned::new(Container::stops_cleanly(), &mut abandoned),
             Duration::from_secs(1),
-            &mut abandoned,
         )
         .await;
 
@@ -2017,14 +2385,14 @@ mod tests {
         // with no subscriber installed. See `process_tests::TRACING_CALLSITES`.
         let _emitting = crate::process::process_tests::emitting().await;
         let mut abandoned = Vec::new();
-        let reported = unwind_sidecar(
+        let reported = unwound(
             "tools",
             OutrigError::Configuration("the sidecar never came up".to_string()),
+            Vec::new(),
             // Nothing to stop: a borrowed container is one outrig never
             // started, and stopping it is a no-op that cannot fail.
-            Container::stops_cleanly(),
+            Unowned::new(Container::stops_cleanly(), &mut abandoned),
             Duration::from_secs(1),
-            &mut abandoned,
         )
         .await;
 
@@ -2033,6 +2401,37 @@ mod tests {
             matches!(reported, OutrigError::Configuration(_)),
             "a clean unwind reports what started it and nothing else: {reported:#?}"
         );
+    }
+
+    /// A container on its way to an owner is kept for teardown when what
+    /// holds it is dropped -- a start cut off at its budget, or cancelled --
+    /// and when a stop through it is dropped part-way; handed over, or
+    /// stopped, it is not.
+    #[tokio::test]
+    async fn a_container_dropped_on_its_way_is_kept_for_teardown() {
+        // Reaches `stop_inner`'s callsites with no subscriber installed. See
+        // `process_tests::TRACING_CALLSITES`.
+        let _emitting = crate::process::process_tests::emitting().await;
+        let mut abandoned = Vec::new();
+        drop(Unowned::new(Container::unstoppable(), &mut abandoned));
+        assert_eq!(abandoned.len(), 1, "dropped while held");
+
+        let mut abandoned = Vec::new();
+        let mut held = Unowned::new(Container::slow_to_stop(), &mut abandoned);
+        let stopping = tokio::time::timeout(Duration::from_millis(200), held.stop(SHUTDOWN_GRACE));
+        assert!(stopping.await.is_err(), "the stop is cut off");
+        drop(held);
+        assert_eq!(abandoned.len(), 1, "dropped while it stopped");
+
+        let mut abandoned = Vec::new();
+        let handed = Unowned::new(Container::stops_cleanly(), &mut abandoned).into_inner();
+        let mut held = Unowned::new(Container::stops_cleanly(), &mut abandoned);
+        held.stop(SHUTDOWN_GRACE)
+            .await
+            .expect("a borrowed container stops");
+        drop(held);
+        assert!(abandoned.is_empty(), "handed over, or stopped");
+        drop(handed);
     }
 
     #[test]

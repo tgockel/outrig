@@ -173,7 +173,8 @@ programs](../usage/host-programs.md#sessions).
 
 ```python
 class Session:
-    def __init__(self, *, mounts=(), cwd=None, grace=None, application=None): ...
+    def __init__(self, *, mounts=(), cwd=None, grace=None, application=None, mcp=(),
+                 mcp_policy=None, mcp_identity=None): ...
 ```
 
 A session this program owns, with no primary agent: a container, the interpreter in it,
@@ -197,6 +198,11 @@ Making one checks its inputs and starts nothing:
   container after it take bounded times of their own.
 - `application`: an `Application`, the code this program's agent classes are in, which every
   kernel of the session imports from; or `None`.
+- `mcp`: the MCP servers it places and binds, each an `McpCommand`, an `McpSidecar` or an
+  `McpPrimaryView`; `mcp_policy`, an `McpPolicy`, how they start; and `mcp_identity`, a
+  mapping of header names to values carried unread on every request to a URL server this
+  program declares. Each starts with the session, beside its interpreter, and one that does
+  not start does not fail entry: `session.mcp` says how each start ended.
 
 Relative paths are made absolute against the working directory now. A mount that does not
 exist, is not a directory, or is `/`, a `cwd` that is not a directory, and an application
@@ -290,10 +296,10 @@ reading not proven stopped.
 
 Raises `TypeError` for a `name` that is not a str or a `serialize` that is not a bool;
 `ValueError` for a name a binding cannot have -- not an identifier, a keyword, `runtime`,
-`asyncio`, `outrig` or a dunder -- or one the session already binds; and `RuntimeError`
-while the session starts, and once it takes no more: its admission closed, or it ended. A
-name injected before entry that the configuration declares a binding of fails the
-entry.
+`asyncio`, `outrig` or a dunder -- or one the session already binds, an MCP service's
+among them; and `RuntimeError` while the session starts, and once it takes no more: its
+admission closed, or it ended. A name injected before entry that the configuration
+declares a binding or an MCP server of fails the entry.
 
 #### `outrig.Session.events`
 
@@ -403,6 +409,142 @@ class Missed:
 `count` records of a session's events lost between the item before this one and the item
 after it, because they were not read in time: see `help(outrig.Session.events)`.
 
+## MCP services
+
+A session places the MCP servers a program declares with `outrig.Session(mcp=[...])` -- an
+`outrig.McpCommand`, an `outrig.McpSidecar` or an `outrig.McpPrimaryView` each -- beside those the
+configuration declares, and starts them as an `outrig.McpPolicy` says. After entry, `session.mcp`
+maps each name to an `McpOutcome`, with an `McpCause` for one that did not start, met only as
+values. See [MCP Servers](../concepts/mcp-servers.md#in-a-session-mcp-services).
+
+### `outrig.McpCommand`
+
+```python
+@dataclasses.dataclass(frozen=True)
+class McpCommand:
+    name: str
+    command: tuple
+    env: Mapping = dataclasses.field(default_factory=dict)
+    call_timeout_secs: int | None = None
+    description: str | None = None
+```
+
+An MCP server a session places in its container, beside the interpreter, as the session's
+user: `command` exec'd there, bound as `name` -- a Python identifier nothing else in the
+session takes -- for agent code to reach as `outrig.bindings[name]`, its tools its methods.
+
+`env` sets the server's environment: each value a literal, or `"${VAR}"`, which the engine
+resolves. A server here may hold no credential -- its environment would be readable from
+agent Python -- so one with a `"${VAR}"` value does not start, and `session.mcp` says why:
+place it in an `McpSidecar`. `call_timeout_secs` bounds each of its calls in place of the
+session's ten minutes; `description` is what agents are told it is, in place of the first line
+of the server's own `instructions`.
+
+### `outrig.McpSidecar`
+
+```python
+@dataclasses.dataclass(frozen=True)
+class McpSidecar:
+    name: str
+    image: str
+    command: tuple | None = None
+    args: tuple = ()
+    env: Mapping = dataclasses.field(default_factory=dict)
+    workspace: str = 'none'
+    mounts: tuple = ()
+    call_timeout_secs: int | None = None
+    description: str | None = None
+```
+
+An MCP server a session places in a container of its own, of `image`, bound as `name`:
+`command` exec'd there, or, with no `command`, the image's entrypoint handed `args`.
+
+`env` is as for `McpCommand`, and a `"${VAR}"` value is allowed here: the container holds it,
+not the interpreter's. `workspace` is how much of the session's working directory, its `cwd`,
+it sees -- `"none"`, the default, `"ro"` or `"rw"` -- at its path on this host, and `mounts`
+the directories it sees besides, each a `Mount` or a path, at its path on this host. It never
+sees more of the working directory than the session's mounts grant there, or anywhere inside
+it -- a read-only mount inside a `"rw"` working directory stays read-only: one that asks for it
+in a session with no `cwd`, or for `"rw"` where the session mounts it read-only, fails the
+entry. `call_timeout_secs` and `description` are as for `McpCommand`.
+
+### `outrig.McpPrimaryView`
+
+```python
+@dataclasses.dataclass(frozen=True)
+class McpPrimaryView:
+    name: str
+    image: str
+    args: tuple = ()
+    env: Mapping = dataclasses.field(default_factory=dict)
+    call_timeout_secs: int | None = None
+    description: str | None = None
+```
+
+An MCP server a session places as `image`'s entrypoint, handed `args`, in a container that
+sees the session container's whole filesystem, bound as `name`. As in an `McpCommand`, it may
+hold no credential; `env`, `call_timeout_secs` and `description` are as there.
+
+### `outrig.McpPolicy`
+
+```python
+@dataclasses.dataclass(frozen=True)
+class McpPolicy:
+    connect_budget_secs: float | None = None
+    reconnect_max: int | None = None
+```
+
+How a session's MCP servers start: `connect_budget_secs`, how long each has to start --
+every attempt and every wait between them -- before it is `"unavailable"`, from 1 to 3600
+seconds as the configuration's `mcp-connect-budget-secs` is, that or two minutes when `None`;
+and `reconnect_max`, how many times one is connected again after its transport fails, three
+when `None`. Raises `TypeError` for a value of another type, and `ValueError` for one out of
+range.
+
+### `McpOutcome`
+
+```python
+@dataclasses.dataclass(frozen=True)
+class McpOutcome:
+    service: str
+    outcome: str
+    tools: int | None = None
+    listing: int | None = None
+    attempts: int | None = None
+    cause: McpCause | None = None
+```
+
+How a declared MCP service's start ended: `session.mcp[name]` after entry. `outcome` is
+`"ready"` -- started and bound, with `tools` tools in its first listing, generation `listing`,
+after `attempts` attempts -- or `"unavailable"`, `"refused"`, `"misconfigured"` or
+`"unclassified"`, with the `McpCause` in `cause`. The session starts with the ready ones; what
+the others mean is this program's to decide.
+
+### `McpCause`
+
+```python
+@dataclasses.dataclass(frozen=True)
+class McpCause:
+    service: str
+    server: str | None
+    placement: str
+    declared_in: str
+    command: str | None
+    exit: str | None
+    stderr_tail: str | None
+    message: str
+    kind: str | None
+    attempts: int
+```
+
+Why an MCP service did not start, holding no value a `"${VAR}"` resolved to: the
+`service`, the `server`'s own name where it differs, its `placement` -- `"command"`,
+`"sidecar"` or `"primary_view"` -- who it was `declared_in`, the `command` run with its
+environment as declared, how its transport ended (`exit`), the end of what it wrote to stderr
+(`stderr_tail`), what went wrong (`message`), the `kind` of failure -- `"transport"`,
+`"protocol"`, `"timeout"`, `"canceled"` or `"other"` -- and how many `attempts` were made; each
+`None` where there is none.
+
 ## Shutdown
 
 Leaving a session's `async with` block shuts it down and sets its `shutdown_report`, an
@@ -423,6 +565,7 @@ class ShutdownReport:
     requests: tuple[RequestOutcome, ...]
     bindings: BindingStop | None
     events: EventDelivery
+    mcp_services: tuple[McpServiceStop, ...] = ()
 ```
 
 What a session's shutdown found: `session.shutdown_report` after the exit.
@@ -438,7 +581,8 @@ What a session's shutdown found: `session.shutdown_report` after the exit.
 `closed_by`, a `ClosedBy`, is what closed admission; `stopped`, a `Stopped`, whether
 everything is proven stopped; `executions`, each execution running when admission closed;
 `hosted`, each hosted call whose outcome came after admission closed; `services`, each
-`ServiceCall` whose outcome came after it; `requests`, each
+`ServiceCall` whose outcome came after it; `mcp_services`, each `McpServiceStop`, every MCP
+service and how it was stopped; `requests`, each
 `RequestOutcome`, a request made of a child agent that was open then; `bindings`, a
 `BindingStop`, how the process holding the bindings stopped, or `None` for a session with
 none; and `events`, an `EventDelivery`, how the session's events were delivered. It never
@@ -517,6 +661,22 @@ A call of a service's method whose outcome came after a session's admission clos
 `outcome` -- `"returned"`, `"raised"`, `"refused"`, `"cancelled"` or `"unknown"` -- the
 service's `category` for a `"raised"` one, and the `reason` for one of the last three, such as
 `"admission_closed"` or `"closed"`; each `None` where there is none.
+
+### `McpServiceStop`
+
+```python
+@dataclasses.dataclass(frozen=True)
+class McpServiceStop:
+    service: str
+    placement: str
+    outcome: str
+    how: str
+    proven: bool
+```
+
+One MCP service at a session's close: the `service`, its `placement`, how its start ended
+(`outcome`), `how` it was stopped -- `"stopped"`, its container stopped; `"with_primary"`, it
+ended with the session's container; or `"not_started"` -- and whether that is `proven`.
 
 ### `RequestOutcome`
 

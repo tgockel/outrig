@@ -444,6 +444,32 @@ class Mount:
             raise ValueError(f"access is 'read-only' or 'read-write', not {self.access!r}")
 
 
+def _mounts(mounts):
+    """`mounts`, each a `Mount` or a path, as `Mount`s; `TypeError` for one path given alone."""
+    if isinstance(mounts, str):
+        raise TypeError("mounts takes Mount entries or paths, not one path")
+    return tuple(m if isinstance(m, Mount) else Mount(m) for m in mounts)
+
+
+def _strings(name, value):
+    """`value`, a list of strings, as a tuple; `TypeError` naming `name` otherwise."""
+    if isinstance(value, str):
+        raise TypeError(f"{name} takes a list of strings, not one string")
+    value = tuple(value)
+    if not all(isinstance(item, str) for item in value):
+        raise TypeError(f"{name} takes strings, not {value!r}")
+    return value
+
+
+def _string_map(name, value):
+    """`value`, a mapping of strings to strings, as a dict; `TypeError` naming `name` otherwise."""
+    if not isinstance(value, Mapping) or not all(
+        isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+    ):
+        raise TypeError(f"{name} takes a mapping of strings to strings, not {value!r}")
+    return dict(value)
+
+
 @dataclasses.dataclass(frozen=True)
 class Application:
     """A session's application code: the package holding this program's agent classes and what
@@ -475,13 +501,7 @@ class Application:
     def __post_init__(self):
         object.__setattr__(self, "path", str(pathlib.Path(self.path).absolute()))
         for name in ("requires", "imports"):
-            value = getattr(self, name)
-            if isinstance(value, str):
-                raise TypeError(f"{name} takes a list of strings, not one string")
-            value = tuple(value)
-            if not all(isinstance(item, str) for item in value):
-                raise TypeError(f"{name} takes strings, not {value!r}")
-            object.__setattr__(self, name, value)
+            object.__setattr__(self, name, _strings(name, getattr(self, name)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -621,6 +641,19 @@ class EventDelivery:
 
 
 @dataclasses.dataclass(frozen=True)
+class McpServiceStop:
+    """One MCP service at a session's close: the `service`, its `placement`, how its start ended
+    (`outcome`), `how` it was stopped -- `"stopped"`, its container stopped; `"with_primary"`, it
+    ended with the session's container; or `"not_started"` -- and whether that is `proven`."""
+
+    service: str
+    placement: str
+    outcome: str
+    how: str
+    proven: bool
+
+
+@dataclasses.dataclass(frozen=True)
 class ShutdownReport:
     """What a session's shutdown found: `session.shutdown_report` after the exit.
 
@@ -635,7 +668,8 @@ class ShutdownReport:
     `closed_by`, a `ClosedBy`, is what closed admission; `stopped`, a `Stopped`, whether
     everything is proven stopped; `executions`, each execution running when admission closed;
     `hosted`, each hosted call whose outcome came after admission closed; `services`, each
-    `ServiceCall` whose outcome came after it; `requests`, each
+    `ServiceCall` whose outcome came after it; `mcp_services`, each `McpServiceStop`, every MCP
+    service and how it was stopped; `requests`, each
     `RequestOutcome`, a request made of a child agent that was open then; `bindings`, a
     `BindingStop`, how the process holding the bindings stopped, or `None` for a session with
     none; and `events`, an `EventDelivery`, how the session's events were delivered. It never
@@ -651,6 +685,7 @@ class ShutdownReport:
     requests: tuple[RequestOutcome, ...]
     bindings: BindingStop | None
     events: EventDelivery
+    mcp_services: tuple[McpServiceStop, ...] = ()
 
 
 def _report(raw, lost):
@@ -671,6 +706,7 @@ def _report(raw, lost):
         ),
         hosted=tuple(HostedCall(**row) for row in raw["hosted"]),
         services=tuple(ServiceCall(**row) for row in raw["services"]),
+        mcp_services=tuple(McpServiceStop(**row) for row in raw.get("mcp_services", ())),
         requests=tuple(RequestOutcome(**row) for row in raw["requests"]),
         bindings=bindings,
         events=EventDelivery(
@@ -778,6 +814,190 @@ async def _settled(reply):
     return cancelled
 
 
+def _mcp_common(declaration):
+    """Check what every MCP declaration has -- its `name`, `image` where it has one, `env`,
+    `call_timeout_secs` and `description` -- and make its `env` a plain dict."""
+    for field in ("name", "image"):
+        value = getattr(declaration, field, "")
+        if not isinstance(value, str):
+            raise TypeError(f"{field} takes a string, not {value!r}")
+    object.__setattr__(declaration, "env", _string_map("env", declaration.env))
+    timeout = declaration.call_timeout_secs
+    if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, int)):
+        raise TypeError(
+            f"call_timeout_secs takes None or a whole number of seconds, not {timeout!r}"
+        )
+    if declaration.description is not None and not isinstance(declaration.description, str):
+        raise TypeError(f"description takes None or a string, not {declaration.description!r}")
+
+
+@dataclasses.dataclass(frozen=True)
+class McpCommand:
+    """An MCP server a session places in its container, beside the interpreter, as the session's
+    user: `command` exec'd there, bound as `name` -- a Python identifier nothing else in the
+    session takes -- for agent code to reach as `outrig.bindings[name]`, its tools its methods.
+
+    `env` sets the server's environment: each value a literal, or `"${VAR}"`, which the engine
+    resolves. A server here may hold no credential -- its environment would be readable from
+    agent Python -- so one with a `"${VAR}"` value does not start, and `session.mcp` says why:
+    place it in an `McpSidecar`. `call_timeout_secs` bounds each of its calls in place of the
+    session's ten minutes; `description` is what agents are told it is, in place of the first line
+    of the server's own `instructions`.
+    """
+
+    name: str
+    command: tuple
+    env: Mapping = dataclasses.field(default_factory=dict)
+    call_timeout_secs: int | None = None
+    description: str | None = None
+
+    _placement = "command"
+
+    def __post_init__(self):
+        object.__setattr__(self, "command", _strings("command", self.command))
+        _mcp_common(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class McpSidecar:
+    """An MCP server a session places in a container of its own, of `image`, bound as `name`:
+    `command` exec'd there, or, with no `command`, the image's entrypoint handed `args`.
+
+    `env` is as for `McpCommand`, and a `"${VAR}"` value is allowed here: the container holds it,
+    not the interpreter's. `workspace` is how much of the session's working directory, its `cwd`,
+    it sees -- `"none"`, the default, `"ro"` or `"rw"` -- at its path on this host, and `mounts`
+    the directories it sees besides, each a `Mount` or a path, at its path on this host. It never
+    sees more of the working directory than the session's mounts grant there, or anywhere inside
+    it -- a read-only mount inside a `"rw"` working directory stays read-only: one that asks for it
+    in a session with no `cwd`, or for `"rw"` where the session mounts it read-only, fails the
+    entry. `call_timeout_secs` and `description` are as for `McpCommand`.
+    """
+
+    name: str
+    image: str
+    command: tuple | None = None
+    args: tuple = ()
+    env: Mapping = dataclasses.field(default_factory=dict)
+    workspace: str = "none"
+    mounts: tuple = ()
+    call_timeout_secs: int | None = None
+    description: str | None = None
+
+    _placement = "sidecar"
+
+    def __post_init__(self):
+        if self.command is not None:
+            object.__setattr__(self, "command", _strings("command", self.command))
+        object.__setattr__(self, "args", _strings("args", self.args))
+        if self.workspace not in ("none", "ro", "rw"):
+            raise ValueError(f"workspace is 'none', 'ro' or 'rw', not {self.workspace!r}")
+        object.__setattr__(self, "mounts", _mounts(self.mounts))
+        _mcp_common(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class McpPrimaryView:
+    """An MCP server a session places as `image`'s entrypoint, handed `args`, in a container that
+    sees the session container's whole filesystem, bound as `name`. As in an `McpCommand`, it may
+    hold no credential; `env`, `call_timeout_secs` and `description` are as there."""
+
+    name: str
+    image: str
+    args: tuple = ()
+    env: Mapping = dataclasses.field(default_factory=dict)
+    call_timeout_secs: int | None = None
+    description: str | None = None
+
+    _placement = "primary_view"
+
+    def __post_init__(self):
+        object.__setattr__(self, "args", _strings("args", self.args))
+        _mcp_common(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class McpPolicy:
+    """How a session's MCP servers start: `connect_budget_secs`, how long each has to start --
+    every attempt and every wait between them -- before it is `"unavailable"`, from 1 to 3600
+    seconds as the configuration's `mcp-connect-budget-secs` is, that or two minutes when `None`;
+    and `reconnect_max`, how many times one is connected again after its transport fails, three
+    when `None`. Raises `TypeError` for a value of another type, and `ValueError` for one out of
+    range."""
+
+    connect_budget_secs: float | None = None
+    reconnect_max: int | None = None
+
+    def __post_init__(self):
+        budget = self.connect_budget_secs
+        if budget is not None:
+            if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+                raise TypeError(
+                    f"connect_budget_secs takes None or a number of seconds, not {budget!r}"
+                )
+            if not 1 <= budget <= _MCP_CONNECT_BUDGET_MAX:
+                raise ValueError(
+                    f"connect_budget_secs takes from 1 to {_MCP_CONNECT_BUDGET_MAX} seconds, "
+                    f"not {budget!r}"
+                )
+        reconnects = self.reconnect_max
+        if reconnects is not None:
+            if isinstance(reconnects, bool) or not isinstance(reconnects, int):
+                raise TypeError(f"reconnect_max takes None or an int, not {reconnects!r}")
+            if not 0 <= reconnects < 2**32:
+                raise ValueError(f"reconnect_max takes a count from 0, not {reconnects!r}")
+
+
+# The most `connect_budget_secs` may be: the configuration's `mcp-connect-budget-secs`'s.
+_MCP_CONNECT_BUDGET_MAX = 3600
+
+
+@dataclasses.dataclass(frozen=True)
+class McpCause:
+    """Why an MCP service did not start, holding no value a `"${VAR}"` resolved to: the
+    `service`, the `server`'s own name where it differs, its `placement` -- `"command"`,
+    `"sidecar"` or `"primary_view"` -- who it was `declared_in`, the `command` run with its
+    environment as declared, how its transport ended (`exit`), the end of what it wrote to stderr
+    (`stderr_tail`), what went wrong (`message`), the `kind` of failure -- `"transport"`,
+    `"protocol"`, `"timeout"`, `"canceled"` or `"other"` -- and how many `attempts` were made; each
+    `None` where there is none."""
+
+    service: str
+    server: str | None
+    placement: str
+    declared_in: str
+    command: str | None
+    exit: str | None
+    stderr_tail: str | None
+    message: str
+    kind: str | None
+    attempts: int
+
+
+@dataclasses.dataclass(frozen=True)
+class McpOutcome:
+    """How a declared MCP service's start ended: `session.mcp[name]` after entry. `outcome` is
+    `"ready"` -- started and bound, with `tools` tools in its first listing, generation `listing`,
+    after `attempts` attempts -- or `"unavailable"`, `"refused"`, `"misconfigured"` or
+    `"unclassified"`, with the `McpCause` in `cause`. The session starts with the ready ones; what
+    the others mean is this program's to decide."""
+
+    service: str
+    outcome: str
+    tools: int | None = None
+    listing: int | None = None
+    attempts: int | None = None
+    cause: McpCause | None = None
+
+
+def _mcp_outcome(row):
+    """The `McpOutcome` the engine's `row` describes."""
+    row = dict(row)
+    outcome = row.pop("outcome")
+    if outcome == "ready":
+        return McpOutcome(outcome=outcome, **row)
+    return McpOutcome(service=row["service"], outcome=outcome, cause=McpCause(**row))
+
+
 class Session:
     """A session this program owns, with no primary agent: a container, the interpreter in it,
     and the configuration's bindings, which the engine that runs this program starts and stops.
@@ -800,6 +1020,11 @@ class Session:
       container after it take bounded times of their own.
     - `application`: an `Application`, the code this program's agent classes are in, which every
       kernel of the session imports from; or `None`.
+    - `mcp`: the MCP servers it places and binds, each an `McpCommand`, an `McpSidecar` or an
+      `McpPrimaryView`; `mcp_policy`, an `McpPolicy`, how they start; and `mcp_identity`, a
+      mapping of header names to values carried unread on every request to a URL server this
+      program declares. Each starts with the session, beside its interpreter, and one that does
+      not start does not fail entry: `session.mcp` says how each start ended.
 
     Relative paths are made absolute against the working directory now. A mount that does not
     exist, is not a directory, or is `/`, a `cwd` that is not a directory, and an application
@@ -834,15 +1059,23 @@ class Session:
     directory under the session root, and `None` before.
     """
 
-    def __init__(self, *, mounts=(), cwd=None, grace=None, application=None):
-        if isinstance(mounts, str):
-            raise TypeError("mounts takes Mount entries or paths, not one path")
+    def __init__(
+        self,
+        *,
+        mounts=(),
+        cwd=None,
+        grace=None,
+        application=None,
+        mcp=(),
+        mcp_policy=None,
+        mcp_identity=None,
+    ):
         if grace is not None:
             if isinstance(grace, bool) or not isinstance(grace, (int, float)):
                 raise TypeError(f"grace takes None or a number of seconds, not {grace!r}")
             if not 0 <= grace <= GRACE_MAX:
                 raise ValueError(f"grace takes from 0 to {GRACE_MAX} seconds, not {grace!r}")
-        self._mounts = [dataclasses.asdict(m if isinstance(m, Mount) else Mount(m)) for m in mounts]
+        self._mounts = [dataclasses.asdict(mount) for mount in _mounts(mounts)]
         hosts = [os.path.normpath(mount["host_path"]) for mount in self._mounts]
         for host in hosts:
             if hosts.count(host) > 1:
@@ -856,11 +1089,35 @@ class Session:
         if application is not None and not isinstance(application, Application):
             raise TypeError(f"application takes an outrig.Application or None, not {application!r}")
         self._application = None if application is None else dataclasses.asdict(application)
+        declarations = (McpCommand, McpSidecar, McpPrimaryView)
+        # Read once: an iterator gives its declarations only once.
+        mcp = list(mcp)
+        for declaration in mcp:
+            if not isinstance(declaration, declarations):
+                raise TypeError(
+                    "mcp takes McpCommand, McpSidecar and McpPrimaryView entries, not "
+                    f"{declaration!r}"
+                )
+        self._mcp = [
+            {"placement": declaration._placement, **dataclasses.asdict(declaration)}
+            for declaration in mcp
+        ]
+        # The MCP services declared here, which no live object may be named as.
+        self._mcp_names = frozenset(declaration.name for declaration in mcp)
+        if mcp_policy is not None and not isinstance(mcp_policy, McpPolicy):
+            raise TypeError(f"mcp_policy takes an outrig.McpPolicy or None, not {mcp_policy!r}")
+        self._mcp_policy = None if mcp_policy is None else dataclasses.asdict(mcp_policy)
+        self._mcp_identity = _string_map(
+            "mcp_identity", {} if mcp_identity is None else mcp_identity
+        )
+        # How each MCP service's start ended, by name: said at entry.
+        self.mcp = types.MappingProxyType({})
         # Each live object injected, by name: what it is, and whether its calls take turns. Under
         # `_lock`, with entry, so an injection from another thread is never lost or doubled.
         self._live = {}
         self._lock = threading.Lock()
-        # The configuration's bindings, which no live object may be named as; said at entry.
+        # The configuration's bindings and the session's MCP services, the configuration's among
+        # them, which no live object may be named as; said at entry.
         self._configured = frozenset()
         # What serves this session's live objects from entry on, when RPyC is there to.
         self._server = None
@@ -894,6 +1151,9 @@ class Session:
                 cwd=self._cwd,
                 application=self._application,
                 live=live,
+                mcp=self._mcp,
+                mcp_policy=self._mcp_policy,
+                mcp_identity=self._mcp_identity,
             )
         except BaseException:
             # Nothing was sent, so nothing but this ends the session's events.
@@ -912,13 +1172,17 @@ class Session:
             raise
         self._requests_max = answer["session"]["requests_max"]
         with self._lock:
-            self._configured = frozenset(answer["session"]["bindings"])
+            mcp = answer["session"].get("mcp", ())
+            self._configured = frozenset(answer["session"]["bindings"]).union(
+                row["service"] for row in mcp
+            )
             if answer["session"]["rpyc"] is not None:
                 # Before anything can call what was injected before entry: no agent exists yet.
                 self._server = _server(self._handle, answer["session"]["rpyc"])
                 for name, (obj, serialize) in self._live.items():
                     self._server.hosted[name] = _serve.Hosted(obj, serialize)
             self.id = answer["session"]["id"]
+            self.mcp = types.MappingProxyType({row["service"]: _mcp_outcome(row) for row in mcp})
         self._token = _current.set(self)
         return self
 
@@ -992,10 +1256,10 @@ class Session:
 
         Raises `TypeError` for a `name` that is not a str or a `serialize` that is not a bool;
         `ValueError` for a name a binding cannot have -- not an identifier, a keyword, `runtime`,
-        `asyncio`, `outrig` or a dunder -- or one the session already binds; and `RuntimeError`
-        while the session starts, and once it takes no more: its admission closed, or it ended. A
-        name injected before entry that the configuration declares a binding of fails the
-        entry."""
+        `asyncio`, `outrig` or a dunder -- or one the session already binds, an MCP service's
+        among them; and `RuntimeError` while the session starts, and once it takes no more: its
+        admission closed, or it ended. A name injected before entry that the configuration
+        declares a binding or an MCP server of fails the entry."""
         if not isinstance(name, str):
             raise TypeError(f"a binding is named by a str, not {type(name).__qualname__}")
         if not isinstance(serialize, bool):
@@ -1005,7 +1269,7 @@ class Session:
                 or len(name) > 4 and name.startswith("__") and name.endswith("__")):
             raise ValueError(f"{name!r} cannot name a binding: it is a global in every kernel")
         with self._lock:
-            if name in self._live or name in self._configured:
+            if name in self._live or name in self._configured or name in self._mcp_names:
                 raise ValueError(f"the session already binds {name!r}")
             if self.shutdown_report is not None or self._entered and self.id is None:
                 raise RuntimeError("the session takes no live object: it has ended, or is starting")

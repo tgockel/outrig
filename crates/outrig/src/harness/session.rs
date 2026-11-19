@@ -12,6 +12,7 @@ use super::builder::{self, SessionBuilder};
 use super::channels::{Channel, Channels};
 use super::event::{AgentInstanceId, Payload, SessionState};
 use super::lifecycle::Lifecycle;
+use super::mcp::McpServices;
 use super::registry::ChannelSnapshot;
 use super::report::{
     self, EventDelivery, ExecutionOutcome, ExecutionStatus, ShutdownReport, Stopped,
@@ -70,6 +71,8 @@ pub struct Session {
     bindings: Bindings,
     /// The services its owner gave, and their calls.
     services: Services,
+    /// The MCP services it placed, bound among `services`.
+    mcp: McpServices,
     /// The external channels its owner declared.
     channels: Channels,
     /// The application code it runs, when its owner gave any.
@@ -117,6 +120,7 @@ impl Session {
         lifecycle: Arc<Lifecycle>,
         bindings: Bindings,
         services: Services,
+        mcp: McpServices,
         channels: Channels,
         setup: ChildSetup,
     ) -> Self {
@@ -163,6 +167,7 @@ impl Session {
             lifecycle,
             bindings,
             services,
+            mcp,
             channels,
             application: None,
             ledger,
@@ -254,8 +259,10 @@ impl Session {
         let Self {
             container,
             mut bindings,
+            mcp,
             ..
         } = self;
+        mcp.close().await;
         builder::stop(container, &mut bindings).await;
     }
 
@@ -264,8 +271,9 @@ impl Session {
     /// container described by `config` alone.
     ///
     /// That container runs the agent's `image`, or `default-image`, as its
-    /// `[images.<name>]` block describes, with no MCP server and no sidecar
-    /// (see [`container_spec`](super::container_spec)). It mounts a workspace
+    /// `[images.<name>]` block describes, its MCP servers and their sidecars
+    /// started by the session as services (see
+    /// [`container_spec`](super::container_spec)). It mounts a workspace
     /// only if `[workspace] host-path` declares one; repository-relative paths
     /// resolve against the current directory. Its logs go under
     /// `session-root`, or a directory of the system's temporary directory,
@@ -413,10 +421,32 @@ impl Session {
     /// `outrig.bindings`, and as a global where its name is free. Returns once
     /// every kernel has it; a child made later is oriented with it, and each
     /// made before is told of it in its next result. Refused once admission
-    /// has closed, and in a session that takes no live object.
+    /// has closed, in a session that takes no live object, and for a name the
+    /// session binds already: a binding's, a service's -- an MCP service's
+    /// among them, whether or not it started -- or a live object's.
     pub(crate) async fn inject(&self, brief: Brief) -> Result<(), String> {
         if let Some(by) = self.lifecycle.closed() {
             return Err(Closed::from(by).to_string());
+        }
+        let name = &brief.name;
+        let bound = self
+            .bindings
+            .briefs()
+            .iter()
+            .any(|bound| bound.name == *name)
+            || self
+                .services
+                .briefs()
+                .iter()
+                .any(|served| served.name == *name)
+            || self
+                .mcp
+                .outcomes()
+                .iter()
+                .any(|(service, _)| service == name)
+            || self.bindings.live().is_some_and(|live| live.holds(name));
+        if bound {
+            return Err(format!("the session already binds {name:?}"));
         }
         let Some(live) = self.bindings.live() else {
             return Err("this session takes no live object: this build carries no RPyC".into());
@@ -684,6 +714,7 @@ impl Session {
             lifecycle,
             mut bindings,
             services,
+            mcp,
             channels,
             application: _,
             ledger: _,
@@ -752,8 +783,12 @@ impl Session {
             .collect();
         // Nothing the engine owns runs these, so nothing it does can end them.
         failed.extend(bindings.seal_live());
+        // After the drain, so no call of theirs is still running, and before
+        // the container, whose interceptor their sidecars must leave first.
+        failed.extend(mcp.close().await);
         let gone = interpreter.gone();
         interpreter.expect_exit();
+        let before = failed.len();
         match container {
             Some(outrig) => {
                 failed.extend(outrig.stop().await);
@@ -771,6 +806,9 @@ impl Session {
         }
         #[cfg(test)]
         failed.extend(fail_stop);
+        // A server in the session's container is stopped as that is.
+        let mcp_services = mcp.closed(failed.len() == before).await;
+        drop(mcp);
         // Last, once the interpreter has stopped too, so the calls it never
         // sent are in: nothing hosted is published after.
         let hosted = bindings.report();
@@ -806,6 +844,7 @@ impl Session {
             bindings: binding_stop.clone(),
             requests: requests.clone(),
             channels: channel_close.clone(),
+            mcp_services: mcp_services.clone(),
             verdict: report::verdict(
                 &stopped,
                 &executions,
@@ -830,12 +869,20 @@ impl Session {
             bindings: binding_stop,
             requests,
             channels: channel_close,
+            mcp_services,
             events: EventDelivery {
                 last_sequence: tally.last,
                 missed: tally.missed,
                 log,
             },
         }
+    }
+
+    /// The MCP services the session placed: how each one's start ended, and
+    /// the control a cut quiesces them with. See
+    /// [`SessionBuilder::mcp`](super::SessionBuilder::mcp).
+    pub fn mcp(&self) -> &McpServices {
+        &self.mcp
     }
 
     /// The session's interpreter, for a test.

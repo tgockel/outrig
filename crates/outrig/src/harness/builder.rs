@@ -1,6 +1,7 @@
 //! Everything a session needs from outside, given before it starts, and the
 //! one call that starts it.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -11,6 +12,10 @@ use super::bindings::{self, BindingSpec, Bindings, Declared, Places, Setup};
 use super::channels::{self, ChannelBackend, ChannelDefinition, Channels};
 use super::event::{DEFAULT_CAPACITY, Subscription};
 use super::lifecycle::Lifecycle;
+use super::mcp::{
+    self, HostPlan, Labels as ConfiguredLabels, McpPolicy, McpServiceSpec, McpServices, Plan,
+};
+use super::mcp_placement::Placement;
 use super::root::ConstructSpec;
 use super::services::{self, Service, ServicePolicy, Services};
 use super::skills::{self, Catalog, SkillSource};
@@ -25,6 +30,7 @@ use crate::outrig_::resolve_session_id;
 use crate::python::host::{Interpreter, READY_TIMEOUT};
 use crate::python::payload::RPYC_MOUNT;
 use crate::{EmbeddedMcpPolicy, LaunchSpec, Outrig};
+use tokio_util::sync::CancellationToken;
 
 /// A step of a session's start, as a progress callback is told of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -99,6 +105,19 @@ pub struct SessionBuilder {
     channels: Vec<(ChannelDefinition, Arc<dyn ChannelBackend>)>,
     /// How the session's services are called.
     service_policy: ServicePolicy,
+    /// MCP services given through [`SessionBuilder::mcp`], in order.
+    mcp: Vec<(String, McpServiceSpec)>,
+    /// How they start, when the owner said.
+    mcp_policy: Option<McpPolicy>,
+    /// The owner's identity headers, for the URL services it declares.
+    mcp_identity: Vec<(String, String)>,
+    /// What places a test's MCP servers, in place of containers.
+    #[cfg(test)]
+    mcp_placements: Option<Placer>,
+    /// What a test's configuration declares of MCP, and its primary image's
+    /// label entries, for a host session to plan.
+    #[cfg(test)]
+    mcp_configured: Option<(crate::outrig_::ConfiguredMcp, ConfiguredLabels)>,
     /// The bindings process's environment, exactly, when the owner gave one.
     bindings_env: Option<Vec<(OsString, OsString)>>,
     approver: Option<Arc<dyn Approver>>,
@@ -166,6 +185,13 @@ impl SessionBuilder {
             served: Vec::new(),
             channels: Vec::new(),
             service_policy: ServicePolicy::default(),
+            mcp: Vec::new(),
+            mcp_policy: None,
+            mcp_identity: Vec::new(),
+            #[cfg(test)]
+            mcp_placements: None,
+            #[cfg(test)]
+            mcp_configured: None,
             bindings_env: None,
             approver: None,
             repo_root: None,
@@ -310,6 +336,54 @@ impl SessionBuilder {
         self
     }
 
+    /// Place, start and serve the MCP server `spec` declares to agent Python
+    /// as `name`, as a service: under `name` where the name is free and as
+    /// `outrig.bindings[name]` always, its tools its methods by their exact
+    /// names, each call under the [`SessionBuilder::service_policy`]. No
+    /// approval is asked: the owner is trusted as the operator is.
+    ///
+    /// It starts with the session, beside its interpreter, concurrently with
+    /// the other servers: placed, its `initialize` answered and its tools
+    /// listed, a failure that may pass tried again within the
+    /// [`McpPolicy::connect_budget`]. A `${VAR}` in its environment is
+    /// resolved once by the session's [`Secrets`], and reaches podman by name.
+    /// A server that does not start does not fail the session: it starts
+    /// without it, and [`Session::mcp`] says why. A name a binding could not
+    /// take, or that a binding, a service, a channel or another `mcp` takes,
+    /// fails the start.
+    ///
+    /// The configuration's `[images.<name>.mcp]` servers start the same way,
+    /// in a container [`container_spec`] describes, under the name each has
+    /// there -- `-` read as `_` where that name is free.
+    pub fn mcp(mut self, name: impl Into<String>, spec: McpServiceSpec) -> Self {
+        self.mcp.push((name.into(), spec));
+        self
+    }
+
+    /// Start the session's MCP services under `policy`, in place of
+    /// [`McpPolicy::default`] with the configuration's
+    /// `mcp-connect-budget-secs`.
+    pub fn mcp_policy(mut self, policy: McpPolicy) -> Self {
+        self.mcp_policy = Some(policy);
+        self
+    }
+
+    /// Carry `headers`, unread and unchanged, on every request to every URL
+    /// MCP service the owner declares -- one of them may be a fence token --
+    /// and on none a configuration declares. A server in a container receives
+    /// identity only through the environment its declaration gives it.
+    pub fn mcp_identity<K, V>(mut self, headers: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.mcp_identity = headers
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        self
+    }
+
     /// Call the session's services under `policy`, in place of
     /// [`ServicePolicy::default`].
     pub fn service_policy(mut self, policy: ServicePolicy) -> Self {
@@ -444,10 +518,67 @@ impl SessionBuilder {
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         services::check_names(&declared, &self.served).map_err(start_error)?;
         self.check_channels(&declared)?;
+        self.check_mcp(&declared)?;
         skills::check_sources(&self.skill_sources)
             .map_err(|e| start_error(OutrigError::Configuration(e)))?;
         application::check(self.application.as_ref()).map_err(start_error)?;
         self.check_root()
+    }
+
+    /// The MCP services given through [`SessionBuilder::mcp`], against the
+    /// bindings `declared` and the services and channels given.
+    fn check_mcp(&self, declared: &[Declared]) -> Result<(), SessionError> {
+        mcp::check_names(declared, &self.taken(), &self.mcp).map_err(start_error)?;
+        if let Some(spec) = &self.container {
+            mcp::check_launch_sidecars(&self.mcp, &spec.sidecars).map_err(start_error)?;
+        }
+        if let Some(policy) = &self.mcp_policy {
+            mcp::check_connect_budget(policy.connect_budget)
+                .map_err(|why| start_error(OutrigError::Configuration(why)))?;
+        }
+        Ok(())
+    }
+
+    /// The names the services and channels given take.
+    fn taken(&self) -> Vec<&str> {
+        self.served
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .chain(
+                self.channels
+                    .iter()
+                    .map(|(definition, _)| definition.name()),
+            )
+            .collect()
+    }
+
+    /// How the session's MCP services start: the owner's policy, or the
+    /// default with the configuration's budget.
+    pub(super) fn mcp_policy_or_default(&self) -> McpPolicy {
+        self.mcp_policy
+            .clone()
+            .unwrap_or_else(|| McpPolicy::for_config(&self.config))
+    }
+
+    /// What planning and starting the session's MCP services takes, held
+    /// apart from the builder -- a borrow of it held across an await would be
+    /// the start's future's, and the progress callback is not `Sync` -- where
+    /// a configured name one of the `bindings` takes is not bound.
+    pub(super) fn mcp_inputs(&self, bindings: Vec<String>, events: &Events) -> McpInputs {
+        let mut taken: Vec<String> = self.taken().into_iter().map(str::to_string).collect();
+        taken.extend(bindings);
+        taken.extend(self.mcp.iter().map(|(name, _)| name.clone()));
+        McpInputs {
+            owner: self.mcp.clone(),
+            taken,
+            launched: BTreeSet::new(),
+            start: mcp::Start {
+                policy: self.mcp_policy_or_default(),
+                identity: self.mcp_identity.clone(),
+                secrets: Arc::clone(&self.secrets),
+                events: events.clone(),
+            },
+        }
     }
 
     /// The channels given through [`SessionBuilder::channel`], against the bindings `declared`
@@ -600,6 +731,7 @@ impl SessionBuilder {
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         services::check_names(&declared, &self.served).map_err(start_error)?;
         self.check_channels(&declared)?;
+        self.check_mcp(&declared)?;
         skills::check_sources(&self.skill_sources)
             .map_err(|e| start_error(OutrigError::Configuration(e)))?;
         application::check(self.application.as_ref()).map_err(start_error)?;
@@ -620,6 +752,23 @@ impl SessionBuilder {
             skills::SOURCE_TIMEOUT,
         )
         .await;
+        // The launch leaves the configuration's servers out; the MCP table
+        // starts them, once the primary they may run in is up.
+        let configured = spec.configured_mcp.take();
+        let mcp = McpInputs {
+            launched: spec
+                .sidecars
+                .iter()
+                .map(|sidecar| sidecar.name.clone())
+                .collect(),
+            ..self.mcp_inputs(
+                declared
+                    .iter()
+                    .map(|binding| binding.name.clone())
+                    .collect(),
+                &events,
+            )
+        };
 
         // A program's session works in its `cwd`, at the same path on both sides.
         let cwd = self.workdir.clone().unwrap_or_else(|| {
@@ -653,21 +802,78 @@ impl SessionBuilder {
         };
         self.report(Progress::Finished(Step::Container));
 
+        // The primary's facts, which it read as it launched.
+        let host = match outrig.sidecar_host().await {
+            Ok(host) => host,
+            Err(e) => {
+                stop(Some(outrig), &mut bindings).await;
+                return Err(start_error(e));
+            }
+        };
+        let target = outrig.primary().exec_target();
+        let log_dir = spec.log_dir.clone();
+        let place = |planned: &HostPlan| -> Arc<dyn Placement> {
+            match planned {
+                HostPlan::Primary => Arc::new(super::mcp_placement::Primary::new(
+                    target.clone(),
+                    log_dir.clone(),
+                )),
+                HostPlan::Sidecar(spec) => Arc::new(super::mcp_placement::Sidecar::new(
+                    host.clone(),
+                    crate::SidecarSpec::clone(spec),
+                )),
+            }
+        };
+        let workspace = spec
+            .workspace
+            .as_ref()
+            .map(|workspace| lexical(&workspace.host));
+
         self.report(Progress::Started(Step::Python));
         let rpyc = bindings.rpyc_dir().map(|_| RPYC_MOUNT);
         let workdir = self.workdir.as_deref();
-        let started = Interpreter::start(outrig.primary(), events.clone(), rpyc, workdir).await;
+        // Both need only the container, so the servers start -- the primary
+        // image's label read first -- while the interpreter does, and both are
+        // in before anything is told of them. An interpreter that does not
+        // start gives up on the servers still starting.
+        let cancel = CancellationToken::new();
+        let labels = async {
+            match &configured {
+                Some(_) => primary_labels(&outrig).await,
+                None => ConfiguredLabels::default(),
+            }
+        };
+        let (started, mcp) = tokio::join!(
+            async {
+                let started =
+                    Interpreter::start(outrig.primary(), events.clone(), rpyc, workdir).await;
+                if started.is_err() {
+                    cancel.cancel();
+                }
+                started
+            },
+            mcp.start(
+                configured.as_ref(),
+                labels,
+                workspace,
+                place,
+                cancel.clone()
+            ),
+        );
         let interpreter = match started {
             Ok(interpreter) => interpreter,
             Err(e) => {
+                mcp.close().await;
                 stop(Some(outrig), &mut bindings).await;
                 return Err(SessionError::Start(Failure(e.into())));
             }
         };
+        self.served.extend(mcp.ready());
         bindings.connect(&interpreter, &events);
         bindings.declare(&interpreter, bindings::container_path);
         skills::serve(&catalog, &interpreter, &events);
         let services = self.serve_services(&interpreter, &lifecycle);
+        mcp.bind(&services);
         let channels = self.channels(&interpreter, &lifecycle, &catalog);
         self.report(Progress::Finished(Step::Python));
 
@@ -688,6 +894,7 @@ impl SessionBuilder {
             lifecycle,
             bindings,
             services,
+            mcp,
             channels,
             setup,
         );
@@ -819,6 +1026,29 @@ impl SessionBuilder {
         self
     }
 
+    /// Place a host session's MCP servers with `place`, in place of
+    /// containers.
+    #[cfg(test)]
+    pub(crate) fn mcp_placements(
+        mut self,
+        place: impl Fn(&HostPlan) -> Arc<dyn Placement> + Send + Sync + 'static,
+    ) -> Self {
+        self.mcp_placements = Some(Arc::new(place));
+        self
+    }
+
+    /// Plan what `configured` declares of MCP, with `labels` as the primary
+    /// image's label entries, in a host session.
+    #[cfg(test)]
+    pub(crate) fn mcp_configured(
+        mut self,
+        configured: crate::outrig_::ConfiguredMcp,
+        labels: ConfiguredLabels,
+    ) -> Self {
+        self.mcp_configured = Some((configured, labels));
+        self
+    }
+
     /// Install the session's requirement sets under `root`, with `pip_env`
     /// added to pip's environment, and remember approvals in `approvals`, in
     /// place of the user's cache, index and state directory.
@@ -848,6 +1078,7 @@ impl SessionBuilder {
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         services::check_names(&declared, &self.served).map_err(start_error)?;
         self.check_channels(&declared)?;
+        self.check_mcp(&declared)?;
         application::check(self.application.as_ref()).map_err(start_error)?;
         self.check_root()?;
         let repo_root = chosen_repo_root(self.repo_root.as_deref()).map_err(start_error)?;
@@ -861,6 +1092,17 @@ impl SessionBuilder {
         )
         .await;
         let cwd = self.workdir.clone().unwrap_or_else(|| repo_root.clone());
+        let (configured, labels) = match self.mcp_configured.take() {
+            Some((configured, labels)) => (Some(configured), labels),
+            None => (None, ConfiguredLabels::default()),
+        };
+        let mcp = self.mcp_inputs(
+            declared
+                .iter()
+                .map(|binding| binding.name.clone())
+                .collect(),
+            &events,
+        );
         let application = self.prepare_application().await.map_err(start_error)?;
         let mut bindings = self
             .start_bindings(declared, &repo_root, &cwd, &events)
@@ -870,16 +1112,34 @@ impl SessionBuilder {
             bindings.allow_live().await;
         }
         self.report(Progress::Started(Step::Python));
-        let interpreter = crate::python::testing::start_on_host_in(
-            events.clone(),
-            bindings.rpyc_dir(),
-            self.workdir.as_deref(),
-        )
-        .await;
+        let placements = self.mcp_placements.clone();
+        let place = |planned: &HostPlan| -> Arc<dyn Placement> {
+            match &placements {
+                Some(place) => place(planned),
+                None => Arc::new(super::mcp_placement::fake::Fake::default()),
+            }
+        };
+        let workspace = self.host_workspace.clone();
+        let (interpreter, mcp) = tokio::join!(
+            crate::python::testing::start_on_host_in(
+                events.clone(),
+                bindings.rpyc_dir(),
+                self.workdir.as_deref(),
+            ),
+            mcp.start(
+                configured.as_ref(),
+                async { labels },
+                workspace,
+                place,
+                CancellationToken::new(),
+            ),
+        );
+        self.served.extend(mcp.ready());
         bindings.connect(&interpreter, &events);
         bindings.declare(&interpreter, Path::to_path_buf);
         skills::serve(&catalog, &interpreter, &events);
         let services = self.serve_services(&interpreter, &lifecycle);
+        mcp.bind(&services);
         let channels = self.channels(&interpreter, &lifecycle, &catalog);
         self.report(Progress::Finished(Step::Python));
         let workspace = self.host_workspace.take().or(self.workdir.clone());
@@ -892,6 +1152,7 @@ impl SessionBuilder {
             lifecycle,
             bindings,
             services,
+            mcp,
             channels,
             setup,
         )
@@ -907,6 +1168,79 @@ impl SessionBuilder {
             &catalog,
         )
         .await
+    }
+}
+
+/// What planning and starting a session's MCP services takes: see
+/// [`SessionBuilder::mcp_inputs`].
+pub(super) struct McpInputs {
+    owner: Vec<(String, McpServiceSpec)>,
+    /// The names a configured server cannot be bound as.
+    taken: Vec<String>,
+    /// The sidecars the launch starts, by name.
+    launched: BTreeSet<String>,
+    start: mcp::Start,
+}
+
+impl McpInputs {
+    /// Plan the owner's services and what `configured` declares, with the
+    /// primary image's `labels` once they are read, and start them, each in
+    /// the placement `place` makes, until `cancel` gives up on them.
+    pub(super) async fn start(
+        self,
+        configured: Option<&crate::outrig_::ConfiguredMcp>,
+        labels: impl Future<Output = ConfiguredLabels>,
+        workspace: Option<PathBuf>,
+        place: impl Fn(&HostPlan) -> Arc<dyn Placement>,
+        cancel: CancellationToken,
+    ) -> McpServices {
+        // Given up with the servers, and within their connect budget: an
+        // engine that never answers the read would otherwise hold the
+        // session's start -- and the unwind of one whose interpreter failed.
+        let budget = self.start.policy.connect_budget;
+        let by = tokio::time::Instant::now() + budget;
+        let labels = tokio::select! {
+            read = tokio::time::timeout_at(by, labels) => read.unwrap_or_else(|_| {
+                tracing::warn!(
+                    target: "outrig::harness",
+                    "the primary image's org.outrig.mcp label was not read within the {budget:?} \
+                     connect budget, so none of its servers start"
+                );
+                ConfiguredLabels::default()
+            }),
+            () = cancel.cancelled() => ConfiguredLabels::default(),
+        };
+        let plan = Plan::new(
+            &self.owner,
+            configured,
+            labels,
+            |name| self.taken.iter().any(|taken| taken == name),
+            workspace,
+            self.launched,
+        );
+        McpServices::start(self.start, plan, place, by, cancel).await
+    }
+}
+
+/// What places a test's MCP servers.
+#[cfg(test)]
+type Placer = Arc<dyn Fn(&HostPlan) -> Arc<dyn Placement> + Send + Sync>;
+
+/// What the primary `outrig` runs declares in its image's `org.outrig.mcp`
+/// label. A label that cannot be read is said in the log and adds nothing:
+/// the configuration's own servers start all the same.
+async fn primary_labels(outrig: &Outrig) -> ConfiguredLabels {
+    let image = outrig.primary().image_tag().as_str().to_string();
+    match crate::container::embedded::read_embedded_mcp_of(outrig.primary()).await {
+        Ok(servers) => ConfiguredLabels { image, servers },
+        Err(e) => {
+            tracing::warn!(
+                target: "outrig::harness",
+                "the primary image's org.outrig.mcp label was not read, so none of its servers \
+                 start: {e}"
+            );
+            ConfiguredLabels::default()
+        }
     }
 }
 
@@ -1103,7 +1437,9 @@ fn package_mounts(bindings: &Bindings, application: Option<&Prepared>) -> Vec<Co
 pub struct ContainerSpec {
     /// The container's description, to give [`SessionBuilder::container`].
     pub spec: LaunchSpec,
-    /// The configured MCP servers the container does not start.
+    /// The configured MCP servers the container itself does not start: a
+    /// session given `spec` starts them, under its MCP table's rules (see
+    /// [`SessionBuilder::mcp`]).
     pub left_out: Vec<String>,
 }
 
@@ -1127,13 +1463,16 @@ pub(crate) fn chosen_repo_root(root: Option<&Path>) -> Result<PathBuf, OutrigErr
 /// it is whatever the block names, which `from_config` pulls or builds under
 /// the block's name.
 ///
-/// **No MCP server and no sidecar starts**, including servers an image
-/// declares in its own `org.outrig.mcp` label. The model's one tool submits
-/// Python, so nothing could call them; and a server placed in the primary
-/// would run beside the interpreter as the same user, with whatever secrets
-/// its `env` resolved readable from Python wherever `/proc` allows. Not handing
-/// the model a tool does not put a credential out of reach; not starting the
-/// server does. The servers left out are named.
+/// **The launch starts no MCP server and no sidecar**, including servers an
+/// image declares in its own `org.outrig.mcp` label: the spec carries what the
+/// block declares, each sidecar's image built, pulled or found, and a session
+/// given it starts those servers through its MCP table, as services (see
+/// [`SessionBuilder::mcp`]). There a server that holds a credential -- a
+/// `${VAR}` in its `env` -- is never placed in the primary or a sidecar that
+/// shares its view: beside the interpreter as the same user, its resolved
+/// secrets would be readable from Python wherever `/proc` allows, so such a
+/// server does not start, and the session says why. The servers the launch
+/// leaves out are named.
 pub async fn container_spec(
     config: &Config,
     image: &str,
@@ -1141,8 +1480,11 @@ pub async fn container_spec(
     repo_root: &Path,
     log_dir: PathBuf,
 ) -> Result<ContainerSpec, OutrigError> {
-    // Sidecars go before lowering rather than after: lowering builds or pulls
-    // every sidecar image it plans, for containers that would never start.
+    // For the session's MCP table, read before the block is cleared or
+    // replaced below.
+    let configured = crate::outrig_::ConfiguredMcp::from_config(config, image, repo_root).await;
+    // Sidecars go before lowering rather than after: lowering would start
+    // them with the launch, and the session's MCP table starts them itself.
     let mut config = config.clone();
     config.sidecars.clear();
     let mut left_out = Vec::new();
@@ -1157,9 +1499,10 @@ pub async fn container_spec(
             None => block.mcp_mut().clear(),
         }
     }
-    let spec = LaunchSpec::from_config(&config, image, repo_root, log_dir)
+    let mut spec = LaunchSpec::from_config(&config, image, repo_root, log_dir)
         .await?
         .with_embedded_mcp_policy(EmbeddedMcpPolicy::Ignore);
+    spec.configured_mcp = Some(configured);
     Ok(ContainerSpec { spec, left_out })
 }
 

@@ -6,8 +6,6 @@
 //! args like `NODE_VERSION = "20"`. The `${VAR}` form uses the same syntax as
 //! `api-key` for consistency.
 
-use std::env::VarError;
-
 use std::borrow::Cow;
 use std::fmt;
 
@@ -27,6 +25,10 @@ pub enum EnvValueError {
 
     #[error("env var {var} value is not valid UTF-8")]
     NotUnicode { var: String },
+
+    /// A session's [`Secrets`](super::Secrets) had no value for it.
+    #[error("${{{var}}} has no value in this session's secrets")]
+    Unresolved { var: String },
 }
 
 /// A single entry of a config value table -- either a literal value passed
@@ -96,11 +98,25 @@ impl ResolvedEnvValue {
     /// reads `std::env::var` and maps `VarError` into a typed error naming the
     /// missing variable.
     pub fn resolve(source: EnvValue) -> Result<Self, EnvValueError> {
+        Self::resolve_with(source, &super::EnvSecrets)
+    }
+
+    /// Resolve `source` through `secrets`, keeping it: a `Literal` is its own
+    /// value, and an `EnvRef` is what `secrets` gives its variable. The
+    /// process environment is not read unless `secrets` reads it.
+    pub fn resolve_with(
+        source: EnvValue,
+        secrets: &(impl super::Secrets + ?Sized),
+    ) -> Result<Self, EnvValueError> {
         let value = match &source {
             EnvValue::Literal(s) => s.clone(),
-            EnvValue::EnvRef(var) => std::env::var(var).map_err(|err| match err {
-                VarError::NotPresent => EnvValueError::NotPresent { var: var.clone() },
-                VarError::NotUnicode(_) => EnvValueError::NotUnicode { var: var.clone() },
+            EnvValue::EnvRef(var) => secrets.resolve(var).map_err(|err| {
+                let var = var.clone();
+                match err {
+                    super::ApiKeyError::NotPresent { .. } => EnvValueError::NotPresent { var },
+                    super::ApiKeyError::NotUnicode { .. } => EnvValueError::NotUnicode { var },
+                    _ => EnvValueError::Unresolved { var },
+                }
             })?,
         };
         Ok(Self { value, source })
@@ -201,5 +217,40 @@ mod tests {
 
             assert_eq!(value.unlisted_ref(&[]), None, "{raw:?}");
         }
+    }
+
+    /// A reference is what the resolver says, read once per call and never
+    /// from the process environment; a literal asks it nothing; a resolver
+    /// with no value is an error naming the variable, not its value.
+    #[test]
+    fn a_reference_resolves_through_the_given_secrets() {
+        let asked = std::sync::Mutex::new(Vec::new());
+        let secrets = |var: &str| {
+            asked.lock().unwrap().push(var.to_string());
+            (var == "OUTRIG_TEST_ENV_VALUE_UNSET").then(|| "from-secrets".to_string())
+        };
+
+        let resolved = ResolvedEnvValue::resolve_with(
+            EnvValue::from_raw("${OUTRIG_TEST_ENV_VALUE_UNSET}".into()),
+            &secrets,
+        )
+        .expect("the resolver has it");
+        assert_eq!(resolved.value(), "from-secrets");
+        assert_eq!(resolved.source().to_raw(), "${OUTRIG_TEST_ENV_VALUE_UNSET}");
+        assert!(!format!("{resolved:?}").contains("from-secrets"));
+
+        let literal =
+            ResolvedEnvValue::resolve_with(EnvValue::from_raw("/a/path".into()), &secrets).unwrap();
+        assert_eq!(literal.value(), "/a/path");
+        assert_eq!(asked.lock().unwrap().len(), 1, "a literal asks nothing");
+
+        let missing =
+            ResolvedEnvValue::resolve_with(EnvValue::from_raw("${OTHER}".into()), &secrets)
+                .expect_err("the resolver has none");
+        assert!(matches!(&missing, EnvValueError::Unresolved { var } if var == "OTHER"));
+        assert_eq!(
+            missing.to_string(),
+            "${OTHER} has no value in this session's secrets"
+        );
     }
 }

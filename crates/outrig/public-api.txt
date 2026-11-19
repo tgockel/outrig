@@ -165,6 +165,10 @@ pub outrig::config::ConfigValidationError::McpCallTimeoutSecsTooLarge::value: u6
 pub outrig::config::ConfigValidationError::McpCallTimeoutSecsZero
 pub outrig::config::ConfigValidationError::McpCallTimeoutSecsZero::max: u64
 pub outrig::config::ConfigValidationError::McpCallTimeoutSecsZero::path: alloc::string::String
+pub outrig::config::ConfigValidationError::McpConnectBudgetSecsOutOfRange
+pub outrig::config::ConfigValidationError::McpConnectBudgetSecsOutOfRange::max: u64
+pub outrig::config::ConfigValidationError::McpConnectBudgetSecsOutOfRange::path: alloc::string::String
+pub outrig::config::ConfigValidationError::McpConnectBudgetSecsOutOfRange::value: u64
 #[non_exhaustive] pub outrig::config::ConfigValidationError::McpEnvKeyInvalid
 pub outrig::config::ConfigValidationError::McpEnvKeyInvalid::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::McpEnvKeyInvalid::image: alloc::string::String
@@ -394,6 +398,8 @@ pub outrig::config::EnvValueError::NotPresent
 pub outrig::config::EnvValueError::NotPresent::var: alloc::string::String
 pub outrig::config::EnvValueError::NotUnicode
 pub outrig::config::EnvValueError::NotUnicode::var: alloc::string::String
+pub outrig::config::EnvValueError::Unresolved
+pub outrig::config::EnvValueError::Unresolved::var: alloc::string::String
 #[non_exhaustive] pub enum outrig::config::EventsMode
 pub outrig::config::EventsMode::Off
 pub outrig::config::EventsMode::Record
@@ -637,6 +643,7 @@ pub outrig::config::Config::events: outrig::config::EventsConfig
 pub outrig::config::Config::host: outrig::config::HostConfig
 pub outrig::config::Config::images: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ImageConfig>
 pub outrig::config::Config::mcp_call_timeout_secs: core::option::Option<u64>
+pub outrig::config::Config::mcp_connect_budget_secs: core::option::Option<u64>
 pub outrig::config::Config::model_concurrency_max: core::option::Option<u32>
 pub outrig::config::Config::model_request_limit: core::option::Option<u32>
 pub outrig::config::Config::model_request_warnings: core::option::Option<alloc::vec::Vec<u32>>
@@ -799,6 +806,7 @@ pub struct outrig::config::ResolvedEnvValue
 impl outrig::config::ResolvedEnvValue
 pub fn outrig::config::ResolvedEnvValue::literal(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::config::ResolvedEnvValue::resolve(outrig::config::EnvValue) -> core::result::Result<Self, outrig::config::EnvValueError>
+pub fn outrig::config::ResolvedEnvValue::resolve_with(outrig::config::EnvValue, &impl outrig::config::Secrets + ?core::marker::Sized) -> core::result::Result<Self, outrig::config::EnvValueError>
 pub fn outrig::config::ResolvedEnvValue::source(&self) -> &outrig::config::EnvValue
 pub fn outrig::config::ResolvedEnvValue::value(&self) -> &str
 impl core::fmt::Debug for outrig::config::ResolvedEnvValue
@@ -837,6 +845,7 @@ pub fn outrig::config::Workspace::set_container_path(&mut self, impl core::conve
 pub fn outrig::config::Workspace::set_host_path(&mut self, impl core::convert::Into<std::path::PathBuf>)
 pub const outrig::config::DEFAULT_HOST_GRACE_SECS: u64
 pub const outrig::config::DEFAULT_MCP_CALL_TIMEOUT_SECS: u64
+pub const outrig::config::DEFAULT_MCP_CONNECT_BUDGET_SECS: u64
 pub const outrig::config::DEFAULT_RETRY_BUDGET_SECS: u64
 pub const outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX: u32
 pub const outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX: u32
@@ -1200,9 +1209,11 @@ pub fn outrig::error::OutrigError::from(tempfile::file::PersistError) -> Self
 pub outrig::error::McpSessionError::kind: outrig::error::McpFailureKind
 pub outrig::error::McpSessionError::message: alloc::string::String
 #[non_exhaustive] pub struct outrig::error::McpStartupFailure
+pub outrig::error::McpStartupFailure::classified: outrig::error::McpSessionError
 pub outrig::error::McpStartupFailure::command: alloc::string::String
 pub outrig::error::McpStartupFailure::declaration_source: core::option::Option<alloc::string::String>
 pub outrig::error::McpStartupFailure::exit: alloc::string::String
+pub outrig::error::McpStartupFailure::kind: outrig::error::McpFailureKind
 pub outrig::error::McpStartupFailure::name: alloc::string::String
 pub outrig::error::McpStartupFailure::source: alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>
 pub outrig::error::McpStartupFailure::stderr_path: std::path::PathBuf
@@ -1584,6 +1595,38 @@ pub outrig::harness::event::Payload::InventoryObserved::execid: outrig::harness:
 pub outrig::harness::event::Payload::InventoryObserved::more: u64
 pub outrig::harness::event::Payload::InventoryObserved::names: alloc::vec::Vec<outrig::harness::event::Held>
 pub outrig::harness::event::Payload::InventoryObserved::total: u64
+#[non_exhaustive] pub outrig::harness::event::Payload::McpServiceFailed
+pub outrig::harness::event::Payload::McpServiceFailed::attempts: u32
+pub outrig::harness::event::Payload::McpServiceFailed::cause: outrig::harness::McpStartupCause
+pub outrig::harness::event::Payload::McpServiceFailed::duration: core::time::Duration
+pub outrig::harness::event::Payload::McpServiceFailed::outcome: outrig::harness::McpOutcomeKind
+pub outrig::harness::event::Payload::McpServiceFailed::service: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::McpServicePaused
+pub outrig::harness::event::Payload::McpServicePaused::calls: alloc::vec::Vec<outrig::harness::event::ServiceCallId>
+pub outrig::harness::event::Payload::McpServicePaused::how: outrig::harness::McpPauseHow
+pub outrig::harness::event::Payload::McpServicePaused::proven: bool
+pub outrig::harness::event::Payload::McpServicePaused::service: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::McpServiceResumed
+pub outrig::harness::event::Payload::McpServiceResumed::proven: bool
+pub outrig::harness::event::Payload::McpServiceResumed::service: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::McpServiceRetry
+pub outrig::harness::event::Payload::McpServiceRetry::attempt: u32
+pub outrig::harness::event::Payload::McpServiceRetry::cause: outrig::harness::McpRetryCause
+pub outrig::harness::event::Payload::McpServiceRetry::delay: core::time::Duration
+pub outrig::harness::event::Payload::McpServiceRetry::service: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::McpServiceStarted
+pub outrig::harness::event::Payload::McpServiceStarted::attempts: u32
+pub outrig::harness::event::Payload::McpServiceStarted::declared_in: outrig::harness::McpDeclaredIn
+pub outrig::harness::event::Payload::McpServiceStarted::duration: core::time::Duration
+pub outrig::harness::event::Payload::McpServiceStarted::listing: u64
+pub outrig::harness::event::Payload::McpServiceStarted::placement: outrig::harness::McpPlacementKind
+pub outrig::harness::event::Payload::McpServiceStarted::server: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::McpServiceStarted::service: alloc::string::String
+pub outrig::harness::event::Payload::McpServiceStarted::tools: usize
+#[non_exhaustive] pub outrig::harness::event::Payload::McpServiceStopped
+pub outrig::harness::event::Payload::McpServiceStopped::how: outrig::harness::McpStopHow
+pub outrig::harness::event::Payload::McpServiceStopped::proven: bool
+pub outrig::harness::event::Payload::McpServiceStopped::service: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::MemoryExhausted
 pub outrig::harness::event::Payload::MemoryExhausted::execid: outrig::harness::event::ExecId
 #[non_exhaustive] pub outrig::harness::event::Payload::MessageReceived
@@ -1739,6 +1782,7 @@ pub outrig::harness::event::Payload::SessionReport::channels: alloc::vec::Vec<ou
 pub outrig::harness::event::Payload::SessionReport::closed_by: outrig::harness::ClosedBy
 pub outrig::harness::event::Payload::SessionReport::executions: alloc::vec::Vec<outrig::harness::ExecutionOutcome>
 pub outrig::harness::event::Payload::SessionReport::hosted: alloc::vec::Vec<outrig::harness::HostedCall>
+pub outrig::harness::event::Payload::SessionReport::mcp_services: alloc::vec::Vec<outrig::harness::McpServiceStop>
 pub outrig::harness::event::Payload::SessionReport::requests: alloc::vec::Vec<outrig::harness::RequestOutcome>
 pub outrig::harness::event::Payload::SessionReport::services: alloc::vec::Vec<outrig::harness::ServiceCall>
 pub outrig::harness::event::Payload::SessionReport::stopped: outrig::harness::Stopped
@@ -1828,6 +1872,7 @@ pub outrig::harness::event::ReturnWhen::FirstException
 pub outrig::harness::event::Role::Assistant
 pub outrig::harness::event::Role::User
 #[non_exhaustive] pub enum outrig::harness::event::ServiceKind
+pub outrig::harness::event::ServiceKind::Mcp
 pub outrig::harness::event::ServiceKind::Rust
 #[non_exhaustive] pub enum outrig::harness::event::ServiceOutcome
 pub outrig::harness::event::ServiceOutcome::Cancelled
@@ -1841,7 +1886,9 @@ pub outrig::harness::event::ServiceReason::Closed
 pub outrig::harness::event::ServiceReason::Deadline
 pub outrig::harness::event::ServiceReason::Interrupted
 pub outrig::harness::event::ServiceReason::InvalidArguments
+pub outrig::harness::event::ServiceReason::Paused
 pub outrig::harness::event::ServiceReason::ResultTooLarge
+pub outrig::harness::event::ServiceReason::Stopped
 pub outrig::harness::event::ServiceReason::UnknownMethod
 #[non_exhaustive] pub enum outrig::harness::event::SessionState
 pub outrig::harness::event::SessionState::Closing
@@ -2165,6 +2212,54 @@ pub outrig::harness::ItemKind::Message
 pub outrig::harness::ItemKind::Request
 impl core::fmt::Display for outrig::harness::ItemKind
 pub fn outrig::harness::ItemKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum outrig::harness::McpDeclaredIn
+pub outrig::harness::McpDeclaredIn::Config
+pub outrig::harness::McpDeclaredIn::ImageLabel
+pub outrig::harness::McpDeclaredIn::Owner
+#[non_exhaustive] pub enum outrig::harness::McpOutcomeKind
+pub outrig::harness::McpOutcomeKind::Misconfigured
+pub outrig::harness::McpOutcomeKind::Ready
+pub outrig::harness::McpOutcomeKind::Refused
+pub outrig::harness::McpOutcomeKind::Unavailable
+pub outrig::harness::McpOutcomeKind::Unclassified
+impl outrig::harness::McpOutcomeKind
+pub fn outrig::harness::McpOutcomeKind::as_str(self) -> &'static str
+#[non_exhaustive] pub enum outrig::harness::McpPauseHow
+pub outrig::harness::McpPauseHow::Hold
+pub outrig::harness::McpPauseHow::Refuse
+#[non_exhaustive] pub enum outrig::harness::McpPlacement
+#[non_exhaustive] pub outrig::harness::McpPlacement::Command
+pub outrig::harness::McpPlacement::Command::command: alloc::vec::Vec<alloc::string::String>
+pub outrig::harness::McpPlacement::Command::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
+#[non_exhaustive] pub outrig::harness::McpPlacement::PrimaryView
+pub outrig::harness::McpPlacement::PrimaryView::args: alloc::vec::Vec<alloc::string::String>
+pub outrig::harness::McpPlacement::PrimaryView::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
+pub outrig::harness::McpPlacement::PrimaryView::image: alloc::string::String
+pub outrig::harness::McpPlacement::Sidecar(outrig::SidecarSpec)
+#[non_exhaustive] pub enum outrig::harness::McpPlacementKind
+pub outrig::harness::McpPlacementKind::Command
+pub outrig::harness::McpPlacementKind::PrimaryView
+pub outrig::harness::McpPlacementKind::Sidecar
+#[non_exhaustive] pub enum outrig::harness::McpServiceOutcome
+pub outrig::harness::McpServiceOutcome::Misconfigured(outrig::harness::McpStartupCause)
+#[non_exhaustive] pub outrig::harness::McpServiceOutcome::Ready
+pub outrig::harness::McpServiceOutcome::Ready::attempts: u32
+pub outrig::harness::McpServiceOutcome::Ready::listing: u64
+pub outrig::harness::McpServiceOutcome::Ready::tools: usize
+pub outrig::harness::McpServiceOutcome::Refused(outrig::harness::McpStartupCause)
+pub outrig::harness::McpServiceOutcome::Unavailable(outrig::harness::McpStartupCause)
+pub outrig::harness::McpServiceOutcome::Unclassified(outrig::harness::McpStartupCause)
+impl outrig::harness::McpServiceOutcome
+pub fn outrig::harness::McpServiceOutcome::cause(&self) -> core::option::Option<&outrig::harness::McpStartupCause>
+pub fn outrig::harness::McpServiceOutcome::kind(&self) -> outrig::harness::McpOutcomeKind
+#[non_exhaustive] pub enum outrig::harness::McpStopHow
+pub outrig::harness::McpStopHow::NotStarted
+pub outrig::harness::McpStopHow::Stopped
+pub outrig::harness::McpStopHow::WithPrimary
+#[non_exhaustive] pub enum outrig::harness::McpWrites
+pub outrig::harness::McpWrites::Nothing
+pub outrig::harness::McpWrites::Paths(alloc::vec::Vec<std::path::PathBuf>)
+pub outrig::harness::McpWrites::PrimaryFilesystem
 #[non_exhaustive] pub enum outrig::harness::OutboundState
 pub outrig::harness::OutboundState::Ending
 pub outrig::harness::OutboundState::Sending
@@ -2182,6 +2277,22 @@ pub outrig::harness::Position::Unread
 #[non_exhaustive] pub enum outrig::harness::Progress
 pub outrig::harness::Progress::Finished(outrig::harness::Step)
 pub outrig::harness::Progress::Started(outrig::harness::Step)
+#[non_exhaustive] pub enum outrig::harness::Quiesce
+pub outrig::harness::Quiesce::Pause
+#[non_exhaustive] pub outrig::harness::Quiesce::PauseHolding
+pub outrig::harness::Quiesce::PauseHolding::until: std::time::Instant
+pub outrig::harness::Quiesce::Stop
+impl outrig::harness::Quiesce
+pub fn outrig::harness::Quiesce::pause_holding(std::time::Instant) -> Self
+#[non_exhaustive] pub enum outrig::harness::QuiesceOutcome
+#[non_exhaustive] pub outrig::harness::QuiesceOutcome::InFlight
+pub outrig::harness::QuiesceOutcome::InFlight::calls: alloc::vec::Vec<outrig::harness::event::ServiceCallId>
+pub outrig::harness::QuiesceOutcome::InFlight::services: alloc::vec::Vec<alloc::string::String>
+#[non_exhaustive] pub outrig::harness::QuiesceOutcome::Quiesced
+pub outrig::harness::QuiesceOutcome::Quiesced::how: outrig::harness::Quiesce
+pub outrig::harness::QuiesceOutcome::Quiesced::services: alloc::vec::Vec<alloc::string::String>
+#[non_exhaustive] pub outrig::harness::QuiesceOutcome::Uncontrolled
+pub outrig::harness::QuiesceOutcome::Uncontrolled::why: alloc::string::String
 #[non_exhaustive] pub enum outrig::harness::RootError
 pub outrig::harness::RootError::Budget(alloc::string::String)
 pub outrig::harness::RootError::Cancelled(alloc::string::String)
@@ -2497,6 +2608,60 @@ pub outrig::harness::LogLoss::path: std::path::PathBuf
 pub outrig::harness::LogLoss::records: u64
 impl core::fmt::Display for outrig::harness::LogLoss
 pub fn outrig::harness::LogLoss::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::McpPolicy
+pub outrig::harness::McpPolicy::connect_budget: core::time::Duration
+pub outrig::harness::McpPolicy::reconnect_max: u32
+impl outrig::harness::McpPolicy
+pub fn outrig::harness::McpPolicy::with_connect_budget(self, core::time::Duration) -> Self
+pub fn outrig::harness::McpPolicy::with_reconnect_max(self, u32) -> Self
+impl core::default::Default for outrig::harness::McpPolicy
+pub fn outrig::harness::McpPolicy::default() -> Self
+#[non_exhaustive] pub struct outrig::harness::McpRetryCause
+pub outrig::harness::McpRetryCause::kind: core::option::Option<outrig::error::McpFailureKind>
+pub outrig::harness::McpRetryCause::message: alloc::string::String
+#[non_exhaustive] pub struct outrig::harness::McpServiceSpec
+pub outrig::harness::McpServiceSpec::call_timeout_secs: core::option::Option<u64>
+pub outrig::harness::McpServiceSpec::description: core::option::Option<alloc::string::String>
+pub outrig::harness::McpServiceSpec::placement: outrig::harness::McpPlacement
+impl outrig::harness::McpServiceSpec
+pub fn outrig::harness::McpServiceSpec::command(impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
+pub fn outrig::harness::McpServiceSpec::primary_view(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::harness::McpServiceSpec::sidecar(outrig::SidecarSpec) -> Self
+pub fn outrig::harness::McpServiceSpec::with_args(self, impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
+pub fn outrig::harness::McpServiceSpec::with_call_timeout_secs(self, u64) -> Self
+pub fn outrig::harness::McpServiceSpec::with_description(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::harness::McpServiceSpec::with_env(self, impl core::convert::Into<alloc::string::String>, outrig::config::EnvValue) -> Self
+#[non_exhaustive] pub struct outrig::harness::McpServiceStop
+pub outrig::harness::McpServiceStop::how: outrig::harness::McpStopHow
+pub outrig::harness::McpServiceStop::outcome: outrig::harness::McpOutcomeKind
+pub outrig::harness::McpServiceStop::placement: outrig::harness::McpPlacementKind
+pub outrig::harness::McpServiceStop::proven: bool
+pub outrig::harness::McpServiceStop::service: alloc::string::String
+pub struct outrig::harness::McpServices(_)
+impl outrig::harness::McpServices
+pub fn outrig::harness::McpServices::outcomes(&self) -> alloc::vec::Vec<(alloc::string::String, outrig::harness::McpServiceOutcome)>
+pub async fn outrig::harness::McpServices::quiesce(&self, &str, outrig::harness::Quiesce, core::time::Duration) -> outrig::harness::QuiesceOutcome
+pub async fn outrig::harness::McpServices::resume(&self, &str) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, alloc::string::String>
+pub fn outrig::harness::McpServices::writers(&self) -> alloc::vec::Vec<outrig::harness::McpWriter>
+impl core::fmt::Debug for outrig::harness::McpServices
+pub fn outrig::harness::McpServices::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::McpStartupCause
+pub outrig::harness::McpStartupCause::attempts: u32
+pub outrig::harness::McpStartupCause::command: core::option::Option<alloc::string::String>
+pub outrig::harness::McpStartupCause::declared_in: outrig::harness::McpDeclaredIn
+pub outrig::harness::McpStartupCause::exit: core::option::Option<alloc::string::String>
+pub outrig::harness::McpStartupCause::kind: core::option::Option<outrig::error::McpFailureKind>
+pub outrig::harness::McpStartupCause::message: alloc::string::String
+pub outrig::harness::McpStartupCause::placement: outrig::harness::McpPlacementKind
+pub outrig::harness::McpStartupCause::server: core::option::Option<alloc::string::String>
+pub outrig::harness::McpStartupCause::service: alloc::string::String
+pub outrig::harness::McpStartupCause::stderr_tail: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub struct outrig::harness::McpWriter
+pub outrig::harness::McpWriter::placement: outrig::harness::McpPlacementKind
+pub outrig::harness::McpWriter::service: alloc::string::String
+pub outrig::harness::McpWriter::writes: outrig::harness::McpWrites
+impl outrig::harness::McpWriter
+pub fn outrig::harness::McpWriter::is_writer(&self) -> bool
 #[non_exhaustive] pub struct outrig::harness::MethodDescription
 pub outrig::harness::MethodDescription::description: alloc::string::String
 pub outrig::harness::MethodDescription::extras: serde_json::map::Map<alloc::string::String, serde_json::value::Value>
@@ -2675,6 +2840,7 @@ pub fn outrig::harness::Session::constructed(&self) -> core::option::Option<outr
 pub fn outrig::harness::Session::container_name(&self) -> &str
 pub fn outrig::harness::Session::id(&self) -> &str
 pub fn outrig::harness::Session::interrupter(&self) -> core::option::Option<impl core::ops::function::Fn() -> core::option::Option<alloc::string::String> + core::marker::Send + core::marker::Sync + 'static>
+pub fn outrig::harness::Session::mcp(&self) -> &outrig::harness::McpServices
 pub fn outrig::harness::Session::model(&self) -> core::option::Option<&str>
 pub fn outrig::harness::Session::model_requests(&self, &str) -> core::option::Option<outrig::harness::ModelRequests>
 pub fn outrig::harness::Session::python_version(&self) -> &str
@@ -2698,6 +2864,9 @@ pub fn outrig::harness::SessionBuilder::channel(self, outrig::harness::ChannelDe
 pub fn outrig::harness::SessionBuilder::check(&self) -> core::result::Result<(), outrig::harness::SessionError>
 pub fn outrig::harness::SessionBuilder::construct(self, outrig::harness::ConstructSpec) -> Self
 pub fn outrig::harness::SessionBuilder::container(self, outrig::LaunchSpec) -> Self
+pub fn outrig::harness::SessionBuilder::mcp(self, impl core::convert::Into<alloc::string::String>, outrig::harness::McpServiceSpec) -> Self
+pub fn outrig::harness::SessionBuilder::mcp_identity<K, V>(self, impl core::iter::traits::collect::IntoIterator<Item = (K, V)>) -> Self where K: core::convert::Into<alloc::string::String>, V: core::convert::Into<alloc::string::String>
+pub fn outrig::harness::SessionBuilder::mcp_policy(self, outrig::harness::McpPolicy) -> Self
 pub fn outrig::harness::SessionBuilder::new(outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> Self
 pub fn outrig::harness::SessionBuilder::no_primary(self) -> Self
 pub fn outrig::harness::SessionBuilder::progress(self, impl core::ops::function::FnMut(outrig::harness::Progress) + core::marker::Send + 'static) -> Self
@@ -2723,6 +2892,7 @@ pub outrig::harness::ShutdownReport::closed_by: outrig::harness::ClosedBy
 pub outrig::harness::ShutdownReport::events: outrig::harness::EventDelivery
 pub outrig::harness::ShutdownReport::executions: alloc::vec::Vec<outrig::harness::ExecutionOutcome>
 pub outrig::harness::ShutdownReport::hosted: alloc::vec::Vec<outrig::harness::HostedCall>
+pub outrig::harness::ShutdownReport::mcp_services: alloc::vec::Vec<outrig::harness::McpServiceStop>
 pub outrig::harness::ShutdownReport::requests: alloc::vec::Vec<outrig::harness::RequestOutcome>
 pub outrig::harness::ShutdownReport::services: alloc::vec::Vec<outrig::harness::ServiceCall>
 pub outrig::harness::ShutdownReport::stopped: outrig::harness::Stopped

@@ -274,6 +274,8 @@ pub enum Payload {
         /// Each external channel the session declared, and what the close left
         /// on it.
         channels: Vec<super::ChannelClose>,
+        /// Each MCP service the session declared, and how it was stopped.
+        mcp_services: Vec<super::McpServiceStop>,
         /// What the report adds up to.
         verdict: super::Verdict,
     },
@@ -1562,6 +1564,91 @@ pub enum Payload {
         /// session's service policy records bodies; otherwise `None`.
         body: Option<String>,
     },
+    /// An MCP service started: placed, its `initialize` answered and its tools
+    /// listed. Its `service.bound` follows.
+    #[non_exhaustive]
+    McpServiceStarted {
+        /// The name agents reach it by.
+        service: String,
+        /// The server's own name in the configuration, where it differs.
+        server: Option<String>,
+        /// Where it runs.
+        placement: super::McpPlacementKind,
+        /// Who declared it.
+        declared_in: super::McpDeclaredIn,
+        /// How many tools its listing holds.
+        tools: usize,
+        /// The listing's generation: 1.
+        listing: u64,
+        /// How many attempts it took.
+        attempts: u32,
+        /// How long it took to start, every attempt included.
+        #[serde(serialize_with = "seconds")]
+        duration: Duration,
+    },
+    /// An attempt to start an MCP service failed in a way that may pass, and
+    /// it is tried again after `delay`.
+    #[non_exhaustive]
+    McpServiceRetry {
+        /// The service.
+        service: String,
+        /// The attempt that failed, from 1.
+        attempt: u32,
+        /// How long until the next.
+        #[serde(serialize_with = "seconds")]
+        delay: Duration,
+        /// What went wrong.
+        cause: super::McpRetryCause,
+    },
+    /// An MCP service did not start: the session starts without it.
+    #[non_exhaustive]
+    McpServiceFailed {
+        /// The service.
+        service: String,
+        /// Which way its start ended.
+        outcome: super::McpOutcomeKind,
+        /// Why.
+        cause: super::McpStartupCause,
+        /// How many attempts were made: 0 for a declaration that could not
+        /// start as written.
+        attempts: u32,
+        /// How long its start took.
+        #[serde(serialize_with = "seconds")]
+        duration: Duration,
+    },
+    /// An MCP service was paused: its new calls held, and its container
+    /// frozen when `proven`.
+    #[non_exhaustive]
+    McpServicePaused {
+        /// The service.
+        service: String,
+        /// How its new calls are held.
+        how: super::McpPauseHow,
+        /// Whether its container is frozen.
+        proven: bool,
+        /// The calls of its container's services still running when the wait
+        /// ran out, which left it unfrozen.
+        calls: Vec<ServiceCallId>,
+    },
+    /// A paused MCP service was resumed: thawed, its held calls let go on.
+    #[non_exhaustive]
+    McpServiceResumed {
+        /// The service.
+        service: String,
+        /// Whether its container thawed.
+        proven: bool,
+    },
+    /// An MCP service was stopped: its transport closed and its container
+    /// stopped, by a quiesce or by the session's close.
+    #[non_exhaustive]
+    McpServiceStopped {
+        /// The service.
+        service: String,
+        /// How.
+        how: super::McpStopHow,
+        /// Whether its container is proven stopped.
+        proven: bool,
+    },
 }
 
 impl Payload {
@@ -1650,6 +1737,12 @@ impl Payload {
             Payload::ServiceCallDispatched { .. } => "service.call.dispatched",
             Payload::ServiceCallCancelSent { .. } => "service.call.cancel.sent",
             Payload::ServiceCallEnded { .. } => "service.call.ended",
+            Payload::McpServiceStarted { .. } => "mcp.service.started",
+            Payload::McpServiceRetry { .. } => "mcp.service.retry",
+            Payload::McpServiceFailed { .. } => "mcp.service.failed",
+            Payload::McpServicePaused { .. } => "mcp.service.paused",
+            Payload::McpServiceResumed { .. } => "mcp.service.resumed",
+            Payload::McpServiceStopped { .. } => "mcp.service.stopped",
             Payload::ChannelAttached { .. } => "channel.attached",
             Payload::ChannelConsumed { .. } => "channel.consumed",
             Payload::ChannelClosed { .. } => "channel.closed",
@@ -1681,7 +1774,13 @@ impl Payload {
             | Self::AgentConstructFailed { .. }
             | Self::SkillDiscovered { .. }
             | Self::ServiceBound { .. }
-            | Self::ServiceDescribed { .. } => None,
+            | Self::ServiceDescribed { .. }
+            | Self::McpServiceStarted { .. }
+            | Self::McpServiceRetry { .. }
+            | Self::McpServiceFailed { .. }
+            | Self::McpServicePaused { .. }
+            | Self::McpServiceResumed { .. }
+            | Self::McpServiceStopped { .. } => None,
             // An import is the agent's whose code made it, which may be none.
             Self::SkillImported { agent, .. } => agent.as_deref().map(Subject::agent),
             Self::HostedReceived { agent, .. }
@@ -1869,6 +1968,9 @@ pub enum ServiceKind {
     /// A [`Service`](super::Service) the owner bound with
     /// [`SessionBuilder::serve`](super::SessionBuilder::serve).
     Rust,
+    /// An MCP server the session placed: see
+    /// [`SessionBuilder::mcp`](super::SessionBuilder::mcp).
+    Mcp,
 }
 
 /// What became of an item an agent sent on an external channel.
@@ -1951,6 +2053,11 @@ pub enum ServiceReason {
     Interrupted,
     /// The session's drain ended with it still running.
     Closed,
+    /// Its service was paused, outside a cut, or stayed paused past the cut's
+    /// deadline: see [`McpServices::quiesce`](super::McpServices::quiesce).
+    Paused,
+    /// Its service was stopped.
+    Stopped,
 }
 
 /// The methods a service's new description added, removed and changed, each

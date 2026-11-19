@@ -393,7 +393,8 @@ impl From<tempfile::PersistError> for OutrigError {
 /// MCP SDK's own error enums, which would make an SDK upgrade a break for
 /// every consumer of this crate. The SDK's own wording is kept verbatim in
 /// [`McpSessionError::message`]; this is the part outrig commits to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum McpFailureKind {
     /// The transport carrying the session failed or closed under it. Nothing
@@ -470,8 +471,22 @@ pub struct McpStartupFailure {
     pub exit: String,
     pub stderr_path: PathBuf,
     pub stderr_tail: String,
+    /// What class of failure the handshake met, as [`McpSessionError::kind`]
+    /// says of a failure mid-session: the classification to branch on.
+    pub kind: McpFailureKind,
+    /// The failure as outrig's own type: [`kind`](Self::kind) and the SDK's
+    /// rendering of what went wrong.
+    pub classified: McpSessionError,
+    /// What went wrong, as it was raised: the MCP SDK's own handshake error,
+    /// or an [`McpSessionError`] when no answer came within the bound.
+    /// Rendered, it reads as [`classified`](Self::classified) does; its type
+    /// is the SDK's and changes with it, so downcasting it is not a supported
+    /// surface -- branch on [`kind`](Self::kind).
     #[source]
     pub source: Box<dyn std::error::Error + Send + Sync>,
+    /// What the failure means for trying again, which the session's MCP table
+    /// reads.
+    pub(crate) class: crate::mcp::StartupClass,
 }
 
 /// One obligation a network teardown owed and did not discharge, named to the

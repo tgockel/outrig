@@ -166,6 +166,14 @@ pub(crate) fn shown_value(value: &str, source: Option<&EnvValue>) -> String {
     }
 }
 
+/// Whether `value`, set as `key`, would reach podman's command line as a
+/// value: a `${VAR}` reference under a key podman reads itself, which
+/// [`push_keyed`] cannot pass by name. A literal is written as given, and is
+/// never one.
+pub(crate) fn reference_on_command_line(key: &str, value: &EnvValue) -> bool {
+    matches!(value, EnvValue::EnvRef(var) if !by_name(key, var))
+}
+
 /// Whether a reference's value can go through the client's environment.
 ///
 /// The key has to be a plain variable name besides -- [`is_env_key`], the same

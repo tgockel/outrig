@@ -65,6 +65,8 @@ pub(crate) mod channels;
 mod error;
 pub mod event;
 pub(crate) mod lifecycle;
+pub(crate) mod mcp;
+pub(crate) mod mcp_placement;
 mod registry;
 mod report;
 mod root;
@@ -88,6 +90,11 @@ pub use self::channels::{
     Settle, SettleError, Settled, Settlement, Wake, WithdrawAnswer, WithdrawEnd, Withdrawal,
 };
 pub use self::error::{Closed, ClosedBy, Failure, SessionError};
+pub use self::mcp::{
+    McpDeclaredIn, McpOutcomeKind, McpPauseHow, McpPlacement, McpPlacementKind, McpPolicy,
+    McpRetryCause, McpServiceOutcome, McpServiceSpec, McpServiceStop, McpServices, McpStartupCause,
+    McpStopHow, McpWriter, McpWrites, Quiesce, QuiesceOutcome,
+};
 pub use self::registry::{
     ChannelSnapshot, InboundItem, OutboundState, OutstandingRequest, Positions, ReceivedRequest,
     SentInRound, UncertainItem,
@@ -122,6 +129,8 @@ mod bindings_tests;
 #[path = "services_tests.rs"]
 pub(crate) mod services_tests;
 
+#[cfg(test)]
+mod mcp_tests;
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod session_tests;

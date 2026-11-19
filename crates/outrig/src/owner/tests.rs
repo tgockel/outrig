@@ -78,7 +78,16 @@ pub(crate) struct Sessions {
     pub(crate) settling: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     /// What each `${VAR}` its model calls need resolves to, in place of the environment.
     pub(crate) secrets: Option<Resolver>,
+    /// What places each session's MCP servers, in place of containers.
+    pub(crate) mcp: Option<Placer>,
 }
+
+/// What places a session's MCP servers.
+pub(crate) type Placer = Arc<
+    dyn Fn(&crate::harness::mcp::HostPlan) -> Arc<dyn crate::harness::mcp_placement::Placement>
+        + Send
+        + Sync,
+>;
 
 /// What a secret's name resolves to, if anything.
 pub(crate) type Resolver = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
@@ -122,6 +131,10 @@ impl Sessions {
         if let Some(secrets) = &self.secrets {
             let secrets = Arc::clone(secrets);
             builder = builder.secrets(move |var: &str| secrets(var));
+        }
+        if let Some(place) = &self.mcp {
+            let place = Arc::clone(place);
+            builder = builder.mcp_placements(move |planned| place(planned));
         }
         builder
     }
@@ -2922,4 +2935,193 @@ mod e2e {
             }
         }
     }
+}
+
+/// A program's sidecar that asks for the workspace starts seeing the session's working directory
+/// at its host path, `ro` or `rw` as it asks; asking with no `cwd`, or for `rw` of a directory the
+/// session mounts read-only, fails the entry. `McpPolicy` refuses a budget out of range.
+#[tokio::test]
+async fn a_programs_sidecar_sees_its_working_directory() {
+    let bed = Bed::new();
+    let shared = bed.dir.join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    bed.write(
+        "workspace.py",
+        r#"
+        import asyncio, json, outrig
+
+        def sidecar(name, workspace):
+            return outrig.McpSidecar(name, "mcp-image", command=["fs-server"], workspace=workspace)
+
+        async def entered(session):
+            try:
+                async with session:
+                    return {name: o.outcome for name, o in session.mcp.items()}
+            except RuntimeError as e:
+                return str(e)
+
+        def policy(**inputs):
+            try:
+                outrig.McpPolicy(**inputs)
+                return "made"
+            except (TypeError, ValueError) as e:
+                return str(e)
+
+        async def main():
+            rw = outrig.Mount("shared", "read-write")
+            print(json.dumps([
+                await entered(outrig.Session(
+                    mounts=[rw], cwd="shared", mcp=[sidecar("rw", "rw"), sidecar("ro", "ro")],
+                )),
+                await entered(outrig.Session(mounts=[rw], mcp=[sidecar("rw", "rw")])),
+                await entered(outrig.Session(
+                    mounts=["shared"], cwd="shared", mcp=[sidecar("rw", "rw")],
+                )),
+                policy(connect_budget_secs=-1),
+                policy(connect_budget_secs=0),
+                policy(connect_budget_secs=True),
+                policy(reconnect_max=-1),
+                policy(connect_budget_secs=30, reconnect_max=0),
+            ]))
+
+        asyncio.run(main())
+        "#,
+    );
+    let placed = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&placed);
+    let mut sessions = bed.sessions();
+    sessions.mcp = Some(Arc::new(move |planned: &crate::harness::mcp::HostPlan| {
+        if let crate::harness::mcp::HostPlan::Sidecar(spec) = planned {
+            seen.lock().unwrap().push((**spec).clone());
+        }
+        Arc::new(crate::harness::mcp_placement::fake::Fake::default())
+    }));
+    let program = bed
+        .start("workspace.py", bed.config("", false), sessions, |p| p)
+        .await;
+    let ran = bed.finish(program).await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    let said = &ran.json()[0];
+    assert_eq!(said[0], serde_json::json!({"rw": "ready", "ro": "ready"}));
+    let said: Vec<&str> = said.as_array().unwrap()[1..]
+        .iter()
+        .map(|said| said.as_str().unwrap())
+        .collect();
+    assert!(said[0].contains("has no `cwd`"), "{}", said[0]);
+    assert!(said[1].contains("mounts read-only"), "{}", said[1]);
+    for refused in &said[2..4] {
+        assert!(refused.contains("from 1 to 3600 seconds"), "{refused}");
+    }
+    assert!(said[4].contains("a number of seconds"), "{}", said[4]);
+    assert!(said[5].contains("a count from 0"), "{}", said[5]);
+    assert_eq!(said[6], "made");
+    let placed = placed.lock().unwrap();
+    for (name, access) in [
+        ("mcp-rw", crate::config::MountAccess::ReadWrite),
+        ("mcp-ro", crate::config::MountAccess::ReadOnly),
+    ] {
+        let spec = placed
+            .iter()
+            .find(|spec| spec.name == name)
+            .unwrap_or_else(|| panic!("{name} was placed"));
+        assert_eq!(spec.workspace, crate::config::SidecarWorkspaceAccess::None);
+        let mounts: Vec<_> = spec
+            .mounts
+            .iter()
+            .map(|mount| (mount.host.clone(), mount.container.clone(), mount.access))
+            .collect();
+        assert_eq!(mounts, [(shared.clone(), shared.clone(), access)], "{name}");
+    }
+}
+
+/// A program declares MCP servers as data, its session places them -- fake placements here --
+/// and `session.mcp` holds one outcome each, as the engine answered: one ready, one refused its
+/// credential. No value of a `${VAR}` reaches the program, in an outcome, an event or the report.
+#[tokio::test]
+async fn a_program_declares_mcp_servers_and_reads_their_outcomes() {
+    let bed = Bed::new();
+    bed.write(
+        "mcp.py",
+        r#"
+        import asyncio, json, outrig
+
+        TOKEN = {"TOKEN": "${OUTRIG_TEST_MCP_PROGRAM_TOKEN}"}
+
+        DECLARED = [
+            outrig.McpSidecar("gh", "mcp-image", command=["gh-server"], env=TOKEN),
+            outrig.McpCommand("leaky", ["fs-server"], env=TOKEN),
+        ]
+
+        async def main():
+            session = outrig.Session(
+                mcp=(declared for declared in DECLARED),
+                mcp_policy=outrig.McpPolicy(connect_budget_secs=30),
+                mcp_identity={"X-Fence": "fence-1"},
+            )
+
+            def refused(name):
+                try:
+                    session.inject(name, object())
+                except ValueError as e:
+                    return str(e)
+
+            print(json.dumps(refused("gh")), flush=True)
+            records = session.events()
+            async with session:
+                outcomes = {
+                    name: [o.outcome, o.tools, o.cause and o.cause.placement]
+                    for name, o in session.mcp.items()
+                }
+                print(json.dumps(outcomes), flush=True)
+                print(json.dumps(repr(session.mcp["leaky"].cause)), flush=True)
+                print(json.dumps(refused("leaky")), flush=True)
+            seen = [record async for record in records]
+            print(json.dumps([[r.type, r.data] for r in seen]), flush=True)
+            report = session.shutdown_report
+            print(json.dumps([[m.service, m.how, m.proven] for m in report.mcp_services]))
+
+        asyncio.run(main())
+        "#,
+    );
+    let mut sessions = bed.sessions();
+    sessions.secrets = Some(Arc::new(|var: &str| {
+        (var == "OUTRIG_TEST_MCP_PROGRAM_TOKEN").then(|| "sk-program-7a1e".to_string())
+    }));
+    sessions.mcp = Some(Arc::new(|_| {
+        Arc::new(crate::harness::mcp_placement::fake::Fake::default())
+    }));
+    let program = bed
+        .start("mcp.py", bed.config("", false), sessions, |p| p)
+        .await;
+    let ran = bed.finish(program).await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    let lines = ran.json();
+    // Declared through a generator, and reserved before entry and after.
+    assert_eq!(lines[0], "the session already binds 'gh'");
+    assert_eq!(
+        lines[1],
+        serde_json::json!({
+            "gh": ["ready", 3, null],
+            "leaky": ["misconfigured", null, "command"],
+        })
+    );
+    assert_eq!(lines[3], "the session already binds 'leaky'");
+    assert!(
+        lines[2]
+            .as_str()
+            .unwrap()
+            .contains("${OUTRIG_TEST_MCP_PROGRAM_TOKEN}"),
+        "{}",
+        lines[2]
+    );
+    assert_eq!(
+        lines[5],
+        serde_json::json!([["gh", "stopped", true], ["leaky", "not_started", true]])
+    );
+    assert!(
+        !ran.stdout.contains("sk-program") && !ran.stderr.contains("sk-program"),
+        "a value reached the program: {}",
+        ran.stdout
+    );
+    assert!(ran.stdout.contains("mcp.service.started"), "{}", ran.stdout);
 }
