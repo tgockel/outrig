@@ -22,7 +22,7 @@ use outrig::config::Config;
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image;
 use outrig_cli::image_setup::add::run_with;
-use outrig_cli::image_setup::render::{self, BaseImage, Toolchain};
+use outrig_cli::image_setup::render::{self, BaseImage, McpServer, Toolchain};
 
 use common::scripted_prompt;
 
@@ -197,6 +197,51 @@ npm --version
 async fn generated_node_toolchain_is_nodesources_node() {
     common::init_tracing();
     assert_toolchain_probe(Toolchain::Node, NODE_PROBE, &["v24."]).await;
+}
+
+/// A generated Debian image without a Node toolchain must still run the
+/// current filesystem server, not just install it under Debian's Node 18.
+#[tokio::test]
+async fn generated_debian_fs_server_starts() {
+    common::init_tracing();
+    let project = tempfile::tempdir().expect("tempdir");
+    let dockerfile = render::render(BaseImage::DebianBookwormSlim, &[], &[McpServer::Fs]);
+    std::fs::write(project.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
+    let tag = timeout(
+        TOOLCHAIN_BUILD_TIMEOUT,
+        image::ensure_image(&common::fixture_build_config(), project.path(), false),
+    )
+    .await
+    .expect("image build must not hang")
+    .expect("generated image must build")
+    .tag;
+
+    let host_ws = tempfile::tempdir().expect("tempdir");
+    let mut container = Container::start(
+        &tag,
+        ContainerLaunchSpec::workspace(host_ws.path(), Path::new("/workspace")),
+    )
+    .await
+    .expect("Container::start");
+    container.bootstrap_user().await.expect("bootstrap_user");
+    let probe = r#"node --version && printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}' | timeout 15 mcp-server-filesystem /workspace"#;
+    let out = timeout(
+        TEST_TIMEOUT,
+        container.exec_capture(
+            &["sh".into(), "-c".into(), probe.into()],
+            &ExecOptions::new(),
+        ),
+    )
+    .await;
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+    let out = out.expect("probe must not hang").expect("exec_capture");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("v24.") && stdout.contains("serverInfo"),
+        "filesystem server failed to initialize: {}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        out.status,
+    );
 }
 
 /// A `curl` ahead of the real one on `PATH` that cannot fetch NodeSource's

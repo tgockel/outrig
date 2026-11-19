@@ -200,6 +200,8 @@ keeps its registry cache in `CARGO_HOME`, and rustup installs any toolchain a pr
 `cargo install` -- extend that `RUN` ahead of its `chmod`; a `RUN` of its own leaves what it adds
 writable by root alone.
 
+The Debian filesystem MCP recipe uses this same Node 24 install even when no `node`
+toolchain is selected: the current npm server requires Node 24, not the distro's Node 18.
 The `node` toolchain checks its own result. NodeSource's setup script exits 0 even when one of
 its steps failed, and `apt-get install nodejs` then takes the distro's Node 18, which has no
 `npm`; the build passes and the image is cached. So the `RUN` ends by requiring `node` to report

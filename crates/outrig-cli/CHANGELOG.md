@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Generated Debian images with the filesystem MCP server but no Node toolchain now install
+  checked Node 24 rather than the distro's Node 18, which cannot run the current server. (#1001)
+
 - Registry-entry build-context errors now advise moving `--session-root` or ignoring
   its file-shaped entries, rather than suggesting the ineffective `--session-dir` remedy. (#919)
 

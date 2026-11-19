@@ -235,12 +235,17 @@ fn mcp_block(
         && !base.has_python()
         && !toolchains.contains(&Toolchain::Python);
 
+    let mut out = String::new();
+    if need_node && family == Family::Debian {
+        // Debian's Node 18 can install the unpinned filesystem server
+        // but cannot run it. Reuse the checked Node 24 toolchain recipe.
+        out.push_str("# Node runtime for MCP servers\n");
+        push_section(&mut out, NODE_DEBIAN);
+        out.push('\n');
+    }
+
     let mut lines: Vec<String> = Vec::new();
-    if need_node {
-        // Bookworm and Alpine both ship a usable `nodejs npm` in the
-        // default repos -- older than NodeSource's setup_24.x (bookworm
-        // ships 18) but enough to run `npm install -g`. Saves the
-        // curl-and-pipe-bash dance.
+    if need_node && family == Family::Alpine {
         lines.push(ensure_pkgs(family, "nodejs npm"));
     }
     if need_python {
@@ -254,7 +259,7 @@ fn mcp_block(
         lines.push(m.install_cmd().to_string());
     }
 
-    let mut out = String::from("# MCP servers\nRUN ");
+    out.push_str("# MCP servers\nRUN ");
     for (i, line) in lines.iter().enumerate() {
         if i > 0 {
             out.push_str(" \\\n && ");
