@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- E2e container-cleanup checks now fail with Podman stderr when `podman ps` cannot query the
+  container store, rather than mistaking a failed query for an empty store. (#970)
+
 - Generated Debian images with the filesystem MCP server but no Node toolchain now install
   checked Node 24 rather than the distro's Node 18, which cannot run the current server. (#1001)
 

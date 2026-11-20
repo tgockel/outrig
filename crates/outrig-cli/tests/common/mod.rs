@@ -4,7 +4,7 @@
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -229,6 +229,18 @@ pub async fn podman_names(filter: &str) -> Vec<String> {
         .output()
         .await
         .expect("podman ps");
+    parse_podman_names(&out)
+}
+
+/// Interpret a `podman ps` result only when the query succeeded.
+#[allow(dead_code)]
+pub fn parse_podman_names(out: &Output) -> Vec<String> {
+    assert!(
+        out.status.success(),
+        "podman ps failed ({}): {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(str::to_string)

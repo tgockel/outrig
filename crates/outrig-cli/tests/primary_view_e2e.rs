@@ -51,7 +51,7 @@ use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 
 mod common;
-use common::stream_lines;
+use common::{podman_names, stream_lines};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(180);
 const MCP_FS_IMAGE: &str = "docker.io/mcp/filesystem:latest";
@@ -81,19 +81,6 @@ async fn ensure_mcp_fs_image() {
             .expect("podman pull");
         assert!(status.success(), "failed to pull {MCP_FS_IMAGE}");
     }
-}
-
-async fn podman_names(filter: &str) -> Vec<String> {
-    let out = Command::new("podman")
-        .args(["ps", "-a", "--filter", filter, "--format", "{{.Names}}"])
-        .output()
-        .await
-        .expect("podman ps");
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::to_string)
-        .filter(|l| !l.is_empty())
-        .collect()
 }
 
 async fn wait_until_gone(names: &[String]) {
