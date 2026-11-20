@@ -82,8 +82,16 @@ fn podman_takes_verbatim(path: &Path) -> bool {
         .is_some_and(|path| !path.contains([',', '"', ':']))
 }
 
+/// Stderr recovered from the log, and whether entries before the read window were skipped.
+#[derive(Debug)]
+pub(crate) struct StderrRead {
+    pub(crate) text: String,
+    pub(crate) truncated: bool,
+}
+
 /// What the container wrote to its stderr, from the last [`TAIL`] bytes of the log at `path`.
-pub(crate) async fn stderr_text(path: &Path) -> std::io::Result<String> {
+/// An empty result proves silence only when `truncated` is false.
+pub(crate) async fn stderr_text(path: &Path) -> std::io::Result<StderrRead> {
     let mut file = tokio::fs::File::open(path).await?;
     let start = file.metadata().await?.len().saturating_sub(TAIL);
     // From one byte early when that is not the start of the file: it is a newline exactly when
@@ -97,7 +105,10 @@ pub(crate) async fn stderr_text(path: &Path) -> std::io::Result<String> {
         None if start > 0 => &[],
         _ => &tail[..],
     };
-    Ok(stderr_text_of(entries))
+    Ok(StderrRead {
+        text: stderr_text_of(entries),
+        truncated: start > 0,
+    })
 }
 
 /// The stderr text in `log`, which holds podman's `k8s-file` entries:
@@ -236,14 +247,18 @@ mod tests {
             .concat(),
         );
 
-        assert_eq!(stderr_text(log.path()).await.unwrap(), "boom\n");
+        let read = stderr_text(log.path()).await.unwrap();
+        assert_eq!(read.text, "boom\n");
+        assert!(!read.truncated);
     }
 
     #[tokio::test]
     async fn a_log_with_nothing_in_it_has_no_stderr() {
         let log = log_holding("");
 
-        assert_eq!(stderr_text(log.path()).await.unwrap(), "");
+        let read = stderr_text(log.path()).await.unwrap();
+        assert_eq!(read.text, "");
+        assert!(!read.truncated);
     }
 
     /// conmon makes the file when the container is initialized; until then there is nothing to read.
@@ -277,8 +292,9 @@ mod tests {
             ),
         ));
 
-        let text = stderr_text(log.path()).await.unwrap();
-        let lines: Vec<&str> = text.lines().collect();
+        let read = stderr_text(log.path()).await.unwrap();
+        assert!(read.truncated);
+        let lines: Vec<&str> = read.text.lines().collect();
 
         let kept = (TAIL / 64) as usize - 1;
         assert_eq!(lines.len(), kept, "the entry the window cut is not here");
@@ -295,8 +311,9 @@ mod tests {
         let entries = (TAIL / 64) as usize + 7;
         let log = log_holding(&(0..entries).map(whole_entry).collect::<String>());
 
-        let text = stderr_text(log.path()).await.unwrap();
-        let lines: Vec<&str> = text.lines().collect();
+        let read = stderr_text(log.path()).await.unwrap();
+        assert!(read.truncated);
+        let lines: Vec<&str> = read.text.lines().collect();
 
         assert_eq!(lines.len(), (TAIL / 64) as usize);
         assert_eq!(lines[0], format!("line {:013}", 7));

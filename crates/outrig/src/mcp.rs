@@ -687,7 +687,16 @@ async fn restore_lost_stderr(name: &str, stderr_path: &Path, ctr_log: &Path) -> 
         return LogLookup::NotNeeded;
     }
     let text = match crate::container::ctr_log::stderr_text(ctr_log).await {
-        Ok(text) if !text.is_empty() => text,
+        Ok(read) if !read.text.is_empty() => read.text,
+        Ok(read) if read.truncated => {
+            tracing::debug!(
+                target: "outrig::mcp",
+                server = name,
+                "mcp server {name:?}: no stderr in the container log's last 64 KiB; earlier \
+                 stderr may have been skipped"
+            );
+            return LogLookup::Inconclusive;
+        }
         Ok(_) => {
             tracing::info!(
                 target: "outrig::mcp",
@@ -742,7 +751,7 @@ enum LogLookup {
     NotNeeded,
     /// The log held stderr the client did not relay, and the file holds it now.
     Restored,
-    /// The log is readable and carries no stderr of its own. conmon logs
+    /// The entire log is readable and carries no stderr of its own. conmon logs
     /// everything the container writes, so the server wrote nothing and the
     /// empty file is the whole story.
     ConfirmedSilent,
@@ -1764,6 +1773,25 @@ pub(crate) mod tests {
 
         // Which is the answer that lets the empty file be reported as the server's silence.
         assert_eq!(lookup, LogLookup::ConfirmedSilent);
+        assert_eq!(std::fs::read_to_string(&stderr_path).unwrap(), "");
+    }
+
+    /// An empty tail of the log does not prove the container was silent: stderr may have
+    /// scrolled out of the window behind a large stdout stream.
+    #[tokio::test]
+    async fn stderr_before_the_log_window_is_not_reported_as_silence() {
+        let dir = tempfile::tempdir().unwrap();
+        let stderr_path = dir.path().join("svc.stderr");
+        std::fs::write(&stderr_path, b"").unwrap();
+        let log = log_holding(&format!(
+            "{}{}",
+            entry("stderr", "F", "early diagnostic"),
+            entry("stdout", "F", &"x".repeat(64 * 1024)),
+        ));
+
+        let lookup = restore_lost_stderr("svc", &stderr_path, log.path()).await;
+
+        assert_eq!(lookup, LogLookup::Inconclusive);
         assert_eq!(std::fs::read_to_string(&stderr_path).unwrap(), "");
     }
 

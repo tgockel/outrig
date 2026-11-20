@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Startup failures no longer claim an entrypoint-stdio MCP server was silent when its stderr
+  may have scrolled out of the container log's 64 KiB recovery window. (#945)
+
 - A rejected nft redirect transaction no longer reports an incomplete network attach rollback
   when its table was never created. By-name cleanup accepts confirmed absence, while failed
   listings and tables still present remain cleanup errors. Cancelling this shell-based cleanup
