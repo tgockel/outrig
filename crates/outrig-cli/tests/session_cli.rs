@@ -597,6 +597,61 @@ async fn logs_substring_resolves_uniquely() {
     );
 }
 
+/// A legacy record can hold a path relative to the launch cwd, not this
+/// process's cwd. Substring lookup must use the store's resolved directory
+/// for both logs and discard's live-owner check (#976).
+#[tokio::test]
+async fn substring_lookup_uses_resolved_dir_for_logs_and_live_discard() {
+    for linked in [false, true] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(tmp.path().join("store"));
+        let sid = SessionId("20260501T134412-3f2a".into());
+        let mut session = sample_session(&sid);
+        let explicit = tmp.path().join("explicit");
+        let (dir, owner) = store
+            .create(&sid, linked.then_some(explicit.as_path()), &mut session)
+            .expect("create");
+        let _owner = owner.expect("live owner lock");
+        session.session_dir = PathBuf::from("missing-launch-cwd").join(sid.as_str());
+        assert!(!session.session_dir.exists());
+        std::fs::write(
+            dir.join("session.json"),
+            serde_json::to_vec(&session).expect("serialize"),
+        )
+        .expect("write stale record");
+        write_log(&dir, "fs.stderr", b"live log\n");
+
+        let (resolved, _) =
+            outrig_cli::cli::resolve_session_arg(&store, "1344").expect("substring logs lookup");
+        assert_eq!(resolved, dir);
+        let (mut sw, stdout_r) = duplex(4096);
+        let (mut ew, _stderr_r) = duplex(4096);
+        logs::execute_with(&mut sw, &mut ew, &resolved.join("logs"), Some("fs"), false)
+            .await
+            .expect("logs");
+        drop(sw);
+        assert_eq!(drain(stdout_r).await, "live log\n");
+
+        let (mut ew, _stderr_r) = duplex(4096);
+        let stdin = tokio::io::BufReader::new(tokio::io::empty());
+        let args = args_for_id("1344", true);
+        let err = discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+            .await
+            .expect_err("live session must not be discarded via substring");
+        assert!(err.to_string().contains("still running"), "{err}");
+        assert!(
+            err.to_string().contains(&dir.display().to_string()),
+            "{err}"
+        );
+        assert!(dir.join("session.json").exists());
+        assert_eq!(
+            std::fs::read(dir.join("logs/fs.stderr")).unwrap(),
+            b"live log\n"
+        );
+        assert!(store.symlink_path(&sid).exists());
+    }
+}
+
 /// An entry that exists but can't be parsed must not be reported as absent --
 /// "no session matching" sends the user looking for a record that is right
 /// there on disk. Before the listing learned to skip, the parse error at least
