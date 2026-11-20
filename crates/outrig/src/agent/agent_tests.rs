@@ -4685,6 +4685,91 @@ async fn a_rate_limited_call_is_retried_and_the_retry_recorded() {
     );
 }
 
+/// A transport failure after success headers is still the HTTP loop's:
+/// retry the same request, name the cause, and bill only the complete reply.
+#[tokio::test]
+async fn a_cut_off_body_is_retried_and_recorded() {
+    let dir = tempfile::tempdir().expect("a log dir");
+    let (mut agent, mut requests) = retrying_agent(
+        "OUTRIG_TEST_AGENT_RETRY_CUT_OFF",
+        events::opened(dir.path()).await,
+        vec![
+            text_reply("lost").cut_off().header("Retry-After", 1),
+            text_reply("ok"),
+        ],
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    assert_eq!(round(&mut agent, "hi").await, "ok");
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    shut_down(agent).await;
+
+    let requests = mock_http::drain(&mut requests);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body, requests[1].body);
+    let records = events::recorded(dir.path());
+    let retries = events::of_kind(&records, "model.retry");
+    assert_eq!(retries.len(), 1);
+    assert_eq!(retries[0]["delay"], 1.0);
+    let error = retries[0]["error"].as_str().unwrap();
+    assert!(
+        error.contains("end of file before message length reached"),
+        "{error}"
+    );
+    let attempts = events::of_kind(&records, "model.attempt");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["error"], error);
+    assert_eq!(attempts[0]["usage"], serde_json::Value::Null);
+    assert_eq!(attempts[1]["usage"], usage_json(12, 7));
+    assert_eq!(
+        events::of_kind(&records, "model.round.completed")[0]["usage"],
+        usage_json(12, 7)
+    );
+    assert_eq!(
+        super::ledger::replay(&records)
+            .session_total()
+            .unwrap()
+            .total_tokens,
+        19
+    );
+}
+
+#[tokio::test]
+async fn a_cut_off_body_with_retries_disabled_is_not_retried() {
+    let dir = tempfile::tempdir().expect("a log dir");
+    let (addr, mut requests) =
+        mock_http::start(vec![text_reply("lost").cut_off(), text_reply("no")]).await;
+    let cfg = config_in(
+        Style::Messages,
+        addr,
+        "OUTRIG_TEST_AGENT_CUT_OFF_ONCE",
+        MODEL,
+        "",
+        "",
+    );
+    let mut agent = agent_of(
+        &cfg,
+        "OUTRIG_TEST_AGENT_CUT_OFF_ONCE",
+        events::opened(dir.path()).await,
+    )
+    .await;
+    post(&agent, "hi").await;
+    let error = within(agent.round())
+        .await
+        .expect_err("body read fails")
+        .to_string();
+    assert!(
+        error.contains("end of file before message length reached"),
+        "{error}"
+    );
+    shut_down(agent).await;
+    assert_eq!(mock_http::drain(&mut requests).len(), 1);
+    let records = events::recorded(dir.path());
+    assert!(events::of_kind(&records, "model.retry").is_empty());
+    assert_eq!(events::of_kind(&records, "model.attempt").len(), 1);
+}
+
 /// A `200` rig cannot use is retried below the round: the call is made again
 /// with what it carried, so the Python an earlier call ran does not run again.
 /// It is recorded as a retry like any other.
@@ -7007,8 +7092,26 @@ async fn a_cloudflare_status_is_retried_rather_than_left() {
 /// A head that answers `status` once and then replies: the call is asked of
 /// the head again after the wait, and does not move to the tail.
 async fn assert_retried_rather_than_left(vars: &str, status: u16) {
+    assert_response_retried_rather_than_left(vars, failure(status), &status.to_string()).await;
+}
+
+#[tokio::test]
+async fn a_cut_off_body_is_retried_rather_than_left() {
+    assert_response_retried_rather_than_left(
+        "OUTRIG_TEST_AGENT_CHAIN_CUT_OFF",
+        text_reply("lost").cut_off(),
+        "end of file before message length reached",
+    )
+    .await;
+}
+
+async fn assert_response_retried_rather_than_left(
+    vars: &str,
+    response: CannedResponse,
+    cause: &str,
+) {
     let (head, mut head_requests) = mock_http::start(vec![
-        failure(status).header("Retry-After", 0),
+        response.header("Retry-After", 0),
         text_reply("from the head"),
     ])
     .await;
@@ -7033,7 +7136,7 @@ async fn assert_retried_rather_than_left(vars: &str, status: u16) {
     assert!(
         retries[0]["error"]
             .as_str()
-            .is_some_and(|error| error.contains(&status.to_string())),
+            .is_some_and(|error| error.contains(cause)),
         "{}",
         retries[0]
     );

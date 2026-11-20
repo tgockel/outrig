@@ -1,8 +1,9 @@
 //! Transient-error retry, in two layers.
 //!
 //! [`RetryingHttpClient`] handles failures the transport can see -- a status
-//! code or a dead connection. [`RetryingModel`] handles the one it cannot: a
-//! `200 OK` whose body carries no usable content, which is a success to the
+//! code or a dead connection, including a failed response-body read.
+//! [`RetryingModel`] handles the one it cannot: a `200 OK` whose complete body
+//! carries no usable content, which is a success to the
 //! transport and a [`ProviderError::Response`] to rig.
 //!
 //! Both are safe to retry for the same reason. rig runs tools *between*
@@ -62,8 +63,8 @@
 //!   `model.retry` event in the agent's log ([`Retries`]).
 //! - Each request sent is an attempt of its own, recorded once as a
 //!   `model.attempt` event ([`super::ledger`]): this loop records those that
-//!   fail, and [`RetryingModel`] those that came back `2xx`, since only it
-//!   learns whether the body was usable.
+//!   fail, and [`RetryingModel`] those whose `2xx` bodies were read whole,
+//!   since only it learns whether the body was usable.
 //! - Once the session's token budget is spent, neither layer sends another
 //!   request, and what it returns instead ([`BudgetSpent`]) neither retries.
 //! - The predicates the CLI's REPL classifies a failed turn with are not here.
@@ -97,7 +98,7 @@ use rig::operation::Completion;
 use rig::wasm_compat::WasmCompatSend;
 use serde::Deserialize;
 
-use super::ledger::{AnsweredBody, CallSlot, Pending, reported};
+use super::ledger::{CallSlot, Pending, reported};
 use crate::events::Events;
 use crate::harness::event::{AttemptId, CallId, Payload, Usage};
 
@@ -596,8 +597,9 @@ impl RetryingModel {
             let (message, ids) = match self.attempt(request.clone()).await {
                 (Err(ProviderError::Response(message)), ids, false) => (message, ids),
                 // A success, or a failure this layer cannot fix: one the HTTP
-                // client already retried, or a terminal one -- a bad key's
-                // `401`, or a content-policy refusal, which resending cannot fix.
+                // client already retried (including body reads), or a terminal
+                // one -- a bad key's `401`, or a content-policy refusal,
+                // which resending cannot fix.
                 (outcome, ids, _) => return (outcome, ids),
             };
 
@@ -1097,10 +1099,25 @@ where
 
         let (err, retry_after) = match sent {
             Ok(response) if response.status().is_success() => {
-                // Outside a call nothing records the attempt, and nothing
-                // holds the place past here.
-                let answered = pending.map(|pending| pending.answered(place));
-                return into_lazy_response(response, answered);
+                answered = true;
+                let status = response.status();
+                let headers = response.headers().clone();
+                let retry_after = headers
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| parse_retry_after(value, jiff::Timestamp::now()));
+                match response.bytes().await {
+                    Ok(bytes) => {
+                        // Only a complete body moves to the model layer, which
+                        // records its usage and whether rig could use it.
+                        // Outside a call nothing holds the place past here.
+                        if let Some(answered) = pending.map(|pending| pending.answered(place)) {
+                            answered.arrived(&bytes);
+                        }
+                        return into_lazy_response(status, headers, bytes);
+                    }
+                    Err(error) => (HttpError::instance(error), retry_after),
+                }
             }
             Ok(response) => {
                 answered = true;
@@ -1190,34 +1207,23 @@ fn settle_failed(pending: Option<Pending>, err: &HttpError) -> Option<(CallId, A
     pending.map(|pending| pending.failed(failure_label(err)))
 }
 
-/// Repackage a successful `reqwest::Response` as the `http::Response` rig
-/// expects, with the body left lazy. Mirrors rig-reqwest's `into_response`,
-/// less the binding of the body to rig's own runtime, which a process on
-/// tokio does not need. rig exposes no public converter for this, so it is a
-/// copy by necessity rather than by choice.
-///
-/// `answered` is told the body once it is read: this future is the last place
-/// it is in hand before rig turns it into a completion or, when it cannot, an
-/// error that is only a string. It is how a response rig cannot use still has
-/// its usage counted.
+/// Repackage a successful response whose body was read inside the retry loop.
+/// rig expects a lazy body, but awaiting it performs no more I/O: transport
+/// failures have already been retried, and the usage hook has seen the whole
+/// body even if rig cannot turn it into a completion.
 fn into_lazy_response<U>(
-    response: reqwest::Response,
-    answered: Option<AnsweredBody>,
+    status: StatusCode,
+    headers: HeaderMap,
+    bytes: Bytes,
 ) -> rig::http_client::Result<Response<LazyBody<U>>>
 where
     U: From<Bytes> + WasmCompatSend + 'static,
 {
-    let mut res = Response::builder().status(response.status());
+    let mut res = Response::builder().status(status);
     if let Some(hs) = res.headers_mut() {
-        *hs = response.headers().clone();
+        *hs = headers;
     }
-    let body: LazyBody<U> = Box::pin(async move {
-        let bytes = response.bytes().await.map_err(HttpError::instance)?;
-        if let Some(answered) = &answered {
-            answered.arrived(&bytes);
-        }
-        Ok(U::from(bytes))
-    });
+    let body: LazyBody<U> = Box::pin(async move { Ok(U::from(bytes)) });
     res.body(body).map_err(HttpError::Protocol)
 }
 
@@ -2514,6 +2520,74 @@ mod tests {
         .await;
         let err = result.err().expect("the endpoint never succeeds");
         (started.elapsed(), failure_label(&err))
+    }
+
+    /// Headers and partial bytes buy the full budget, even when every body
+    /// stalls until the request timeout. Use real time: paused time can race
+    /// socket I/O and fire a timeout before the headers arrive.
+    #[tokio::test]
+    async fn a_stalled_body_spends_the_full_retry_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                connections.spawn(async move {
+                    let mut buf = [0; 1];
+                    socket.read_exact(&mut buf).await.unwrap();
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n{\"partial\":")
+                        .await
+                        .unwrap();
+                    // Keep the body open until the test drops this connection.
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        let policy = RetryPolicy {
+            budget: Duration::from_millis(650),
+            connect_budget: Duration::from_millis(1),
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            chain_deadline: Arc::default(),
+        };
+        let started = tokio::time::Instant::now();
+        let result = send_with_retry::<Bytes>(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_millis(100))
+                .build()
+                .unwrap(),
+            policy.clone(),
+            Retries::default(),
+            Method::POST,
+            format!("http://{addr}/v1/messages").parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        server.abort();
+        let label = failure_label(&result.err().expect("the body never completes"));
+        assert!(label.contains("timed out"), "{label}");
+        assert!(
+            requests.load(Ordering::SeqCst) >= 2,
+            "body failures must retry"
+        );
+        assert!(
+            elapsed >= policy.budget - MIN_DELAY,
+            "full budget, not {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(2), "bounded, not {elapsed:?}");
     }
 
     /// Confirm nothing answers on [`REFUSED_PORT`], so a test that reads a

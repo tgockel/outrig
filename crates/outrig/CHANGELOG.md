@@ -1225,6 +1225,10 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Fixed
 
+- The library agent retries connection failures while reading a successful response body,
+  honoring `Retry-After` and the full retry budget before failing over. Incomplete bodies are
+  recorded as failed attempts, and complete responses retain their usage accounting (#676).
+
 - `Container::stop` counts a container removed while it ran as stopped. An entrypoint sidecar
   whose server had just exited could be removed by its `--rm` between podman looking it up and
   stopping it, and podman then reported it missing past `--ignore`, which left a session not

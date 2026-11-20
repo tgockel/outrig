@@ -66,6 +66,8 @@ impl RecordedRequest {
 pub(crate) struct CannedResponse {
     status: u16,
     body: Value,
+    /// Close after sending only half of the declared body.
+    cut_off: bool,
     /// Sent in place of `body` when it is not JSON.
     text: Option<String>,
     /// Sent besides the content type, length, and `Connection: close`.
@@ -77,9 +79,16 @@ impl CannedResponse {
         Self {
             status,
             body,
+            cut_off: false,
             text: None,
             headers: Vec::new(),
         }
+    }
+
+    /// Drop the connection halfway through this response's body.
+    pub(super) fn cut_off(mut self) -> Self {
+        self.cut_off = true;
+        self
     }
 
     /// The same response, reporting `usage` -- in the provider's own shape --
@@ -907,12 +916,18 @@ async fn respond(sock: &mut TcpStream, canned: &CannedResponse) {
         .collect();
     let response = format!(
         "HTTP/1.1 {} MOCK\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\nConnection: close\r\n{headers}\r\n{}",
+         Content-Length: {}\r\nConnection: close\r\n{headers}\r\n",
         canned.status,
         body.len(),
-        body,
     );
     let _ = sock.write_all(response.as_bytes()).await;
+    let bytes = body.as_bytes();
+    let sent = if canned.cut_off {
+        &bytes[..bytes.len() / 2]
+    } else {
+        bytes
+    };
+    let _ = sock.write_all(sent).await;
     let _ = sock.flush().await;
     let _ = sock.shutdown().await;
 }
