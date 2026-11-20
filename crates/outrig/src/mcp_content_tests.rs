@@ -481,3 +481,34 @@ fn an_unnameable_icon_theme_is_dropped_rather_than_guessed() {
     assert_eq!(out.src, "https://example.invalid/i.png");
     assert_eq!(out.theme, None);
 }
+
+/// What the interpreter is sent keeps a block, and resource contents, the SDK
+/// cannot name as the JSON it was, where the proxy's leg has to degrade them;
+/// everything else is the SDK's wire form.
+#[test]
+fn the_wire_keeps_what_the_sdk_cannot_name() {
+    let video = json!({"type": "video", "data": "dmlk"});
+    let contents = json!({"uri": "file:///x", "shape": "unknown"});
+    let mut result = McpToolResult::from_content(vec![
+        McpContent::text("first"),
+        McpContent::Other {
+            kind: "video".to_string(),
+            raw: video.clone(),
+        },
+        McpContent::Resource(McpEmbeddedResource::new(McpResourceContents::Other {
+            raw: contents.clone(),
+        })),
+    ]);
+    result.structured_content = Some(json!({"n": 1}));
+
+    let wire = result_to_wire(result).expect("serializes");
+
+    assert_eq!(wire["content"][0], json!({"type": "text", "text": "first"}));
+    assert_eq!(wire["content"][1], video);
+    assert_eq!(
+        wire["content"][2],
+        json!({"type": "resource", "resource": contents})
+    );
+    assert_eq!(wire["structuredContent"], json!({"n": 1}));
+    assert_eq!(wire["isError"], json!(false));
+}

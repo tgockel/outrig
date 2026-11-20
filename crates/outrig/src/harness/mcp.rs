@@ -12,20 +12,22 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::future::join_all;
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::event::{Payload, ServiceCallId, ServiceKind, ServiceReason};
 use super::mcp_placement::{Launch, Placement, SHARES_THE_PRIMARY, Server};
 use super::services::{
-    CallContext, Hold, MethodDescription, Service, ServiceDescription, ServiceError,
-    ServiceErrorCategory, ServiceFuture, Services,
+    CallContext, Failed as Refusal, Hold, MethodDescription, Service, ServiceDescription,
+    ServiceError, ServiceErrorCategory, ServiceFuture, Services, failed,
 };
 use crate::config::{
     ApiKeyError, EnvValue, McpServerSpec, MountAccess, ResolvedEnvValue, Secrets, SidecarView,
@@ -34,9 +36,11 @@ use crate::config::{
 use crate::container::embedded::McpDeclarationSource;
 use crate::error::{McpFailureKind, OutrigError};
 use crate::events::Events;
-use crate::mcp::{McpClient, StartupClass};
-use crate::mcp_content::{McpTool, result_to_rmcp, tool_to_rmcp};
+use crate::mcp::{Listing, McpClient, STARTUP_TIMEOUT, StartupClass};
+use crate::mcp_content::{McpTool, McpUndecodedTool, result_to_wire, tool_to_rmcp};
 use crate::outrig_::{ConfiguredMcp, SidecarServerSpec, SidecarSpec};
+use crate::python::host::Interpreter;
+use crate::python::hosted::ToInterpreter;
 
 /// An MCP server a session places and binds as a service: where it runs, and
 /// what the session tells agents of it. Given to
@@ -330,6 +334,9 @@ pub enum McpServiceOutcome {
         tools: usize,
         /// That listing's generation: 1.
         listing: u64,
+        /// The tools its server listed that did not decode, each left out
+        /// rather than costing the service the rest.
+        undecoded: Vec<McpUndecodedTool>,
         /// How many times it was tried.
         attempts: u32,
     },
@@ -1039,6 +1046,9 @@ struct Table {
     hosts: BTreeMap<String, Host>,
     /// The service table each ready service is bound into, once it is.
     services: OnceLock<Services>,
+    /// The interpreter's writer, once the services are bound: what relists
+    /// are answered on and listing changes told on.
+    to_interpreter: OnceLock<ToInterpreter>,
     /// Held for the URL services an owner declares, and never read, logged
     /// or shown.
     #[expect(dead_code, reason = "the URL placement (`0003-57`) stamps them")]
@@ -1071,8 +1081,16 @@ enum HostState {
 struct Entry {
     planned: Planned,
     outcome: McpServiceOutcome,
-    /// Its first listing.
-    tools: Vec<McpTool>,
+    /// Its listing: the first, until an agent relists.
+    tools: Mutex<Vec<McpTool>>,
+    /// Held while it is relisted, so one relist's generation follows
+    /// another's.
+    relisting: tokio::sync::Mutex<()>,
+    /// How many times its server has been heard to say its listing changed.
+    heard: AtomicU64,
+    /// What its server has said of its listing since its first listing was
+    /// asked for, until `listen` takes it at bind.
+    changes: Mutex<Option<watch::Receiver<()>>>,
     /// The first line of what its server said of itself.
     instructions: Option<String>,
     /// How it was started, its values resolved once: what a reconnect starts
@@ -1123,8 +1141,38 @@ pub(crate) struct Start {
 struct Started {
     outcome: McpServiceOutcome,
     client: Option<McpClient>,
+    /// Its client's listing changes, from before its first listing was asked
+    /// for: a change announced before bind is still heard.
+    changes: Option<watch::Receiver<()>>,
     tools: Vec<McpTool>,
     instructions: Option<String>,
+}
+
+/// What an MCP server's result held, as a call's `service.call.ended` says:
+/// read from the result's JSON, for the service table, which keeps MCP's
+/// shapes here.
+#[derive(Debug, Clone)]
+pub(crate) struct McpReply {
+    pub(crate) is_error: bool,
+    /// How many content blocks of each kind, by the kind's wire name.
+    pub(crate) blocks: BTreeMap<String, u64>,
+    pub(crate) structured: bool,
+}
+
+impl McpReply {
+    /// What `result`, an MCP service's call's result as JSON, holds.
+    pub(crate) fn of(result: &Value) -> Self {
+        let mut blocks = BTreeMap::new();
+        for block in result["content"].as_array().into_iter().flatten() {
+            let kind = block["type"].as_str().unwrap_or("unknown");
+            *blocks.entry(kind.to_string()).or_insert(0) += 1;
+        }
+        Self {
+            is_error: result["isError"].as_bool().unwrap_or(false),
+            blocks,
+            structured: !result["structuredContent"].is_null(),
+        }
+    }
 }
 
 impl Started {
@@ -1132,6 +1180,7 @@ impl Started {
         Self {
             outcome,
             client: None,
+            changes: None,
             tools: Vec::new(),
             instructions: None,
         }
@@ -1254,7 +1303,10 @@ impl McpServices {
                         && (planned.host == PRIMARY || unstopped.contains(&planned.host)),
                     planned,
                     outcome: started.outcome,
-                    tools: started.tools,
+                    tools: Mutex::new(started.tools),
+                    relisting: tokio::sync::Mutex::new(()),
+                    heard: AtomicU64::new(0),
+                    changes: Mutex::new(started.changes),
                     instructions: started.instructions,
                     server: launch.ok(),
                     client: Mutex::new(started.client.map(Arc::new)),
@@ -1266,6 +1318,7 @@ impl McpServices {
             entries,
             hosts,
             services: OnceLock::new(),
+            to_interpreter: OnceLock::new(),
             identity,
         }))
     }
@@ -1284,9 +1337,23 @@ impl McpServices {
     }
 
     /// The service table the ready services were bound into, for the control
-    /// to hold and stop their calls in.
-    pub(crate) fn bind(&self, services: &Services) {
+    /// to hold and stop their calls in and a relist to describe them again
+    /// through; and `interpreter`, whose kernels ask to relist them. Each
+    /// ready service's server is listened to from now on for its listing's
+    /// changes.
+    pub(crate) fn bind(&self, services: &Services, interpreter: &Interpreter) {
         let _ = self.0.services.set(services.clone());
+        if !self.0.entries.iter().any(|entry| entry.started()) {
+            return;
+        }
+        let _ = self.0.to_interpreter.set(interpreter.relay_line());
+        for entry in self.0.entries.iter().filter(|entry| entry.started()) {
+            self.0.listen(entry);
+        }
+        // Strong: the interpreter's reader holds the table for as long as it
+        // can ask, so every ask is answered.
+        let table = Arc::clone(&self.0);
+        interpreter.attach_mcp(Arc::new(move |line: Value| table.line(line)));
     }
 
     /// Each declared service, in the order declared, and how its start
@@ -1592,6 +1659,142 @@ impl Table {
         self.entries.iter().find(|entry| entry.name() == name)
     }
 
+    /// Hear `entry`'s server say its listing changed, for as long as its
+    /// client is connected: each time, the change is counted and evented, and
+    /// the interpreter is told the count, which makes the service stale until
+    /// a relist that began after it. Nothing is relisted for it. A change
+    /// said after its first listing was asked for and before now is heard
+    /// first.
+    fn listen(self: &Arc<Self>, entry: &Arc<Entry>) {
+        let Some(mut changes) = entry.changes.lock().expect("entry lock").take() else {
+            return;
+        };
+        let table = Arc::downgrade(self);
+        let entry = Arc::clone(entry);
+        tokio::spawn(async move {
+            // Ends once the client's connection does, its sender with it.
+            while changes.changed().await.is_ok() {
+                let heard = entry.heard.fetch_add(1, Ordering::SeqCst) + 1;
+                let Some(table) = table.upgrade() else {
+                    return;
+                };
+                let service = entry.name().to_string();
+                table.events.emit(Payload::McpServiceListChanged {
+                    service: service.clone(),
+                });
+                // A count rather than a flag, so the interpreter reads this and
+                // a relist's answer the same in either order.
+                table.tell(json!({"t": "mcp.list_changed", "service": service, "heard": heard}));
+            }
+        });
+    }
+
+    /// Send the interpreter `line`, once the services are bound.
+    fn tell(&self, line: Value) {
+        if let Some(to_interpreter) = self.to_interpreter.get() {
+            to_interpreter(line);
+        }
+    }
+
+    /// One line the interpreter sent about an MCP service. Called by the
+    /// reader of its output, which must never wait.
+    fn line(self: &Arc<Self>, line: Value) {
+        match line["t"].as_str() {
+            Some("mcp.relist") => {
+                let (Some(agent), Some(ask)) = (line["agent"].as_str(), line["id"].as_u64()) else {
+                    tracing::warn!(
+                        "ignored an MCP relist from the interpreter with no agent or id"
+                    );
+                    return;
+                };
+                let agent = agent.to_string();
+                let service = line["service"].as_str().unwrap_or_default().to_string();
+                let table = Arc::clone(self);
+                tokio::spawn(async move {
+                    // Answered as a call is, so the asker reads it as one.
+                    let answer = match table.relist(&service, &agent).await {
+                        Ok(ok) => json!({"t": "service", "id": ask, "ok": ok}),
+                        Err(refused) => failed(ask, None, refused),
+                    };
+                    table.tell(answer);
+                });
+            }
+            kind => tracing::warn!("ignored a {kind:?} line from the interpreter"),
+        }
+    }
+
+    /// List `service`'s tools again, for `agent`, and describe it from the
+    /// new listing, under the next generation when anything changed. What
+    /// changed, by exact name, the listing's generation, the tools that did
+    /// not decode, and how many of its server's listing changes the relist
+    /// covers -- those heard before it began; or, as the interpreter reads a
+    /// failed call, why not.
+    async fn relist(&self, service: &str, agent: &str) -> Result<Value, Refusal> {
+        let unknown = || {
+            Refusal::refused(
+                ServiceReason::UnknownMethod,
+                format!("the session has no MCP service {service:?}"),
+            )
+        };
+        let services = self.services.get().ok_or_else(unknown)?;
+        if services.closed() {
+            return Err(Refusal::refused(
+                ServiceReason::AdmissionClosed,
+                "the session is closed to new work, so the tools were not listed again".into(),
+            ));
+        }
+        let entry = self
+            .entry(service)
+            .filter(|entry| entry.started())
+            .ok_or_else(unknown)?;
+        let _relisting = entry.relisting.lock().await;
+        let began = entry.heard.load(Ordering::SeqCst);
+        let Some(client) = entry.client() else {
+            return Err(Refusal::raised(
+                ServiceErrorCategory::Unavailable,
+                format!("{NOT_CONNECTED}, so its tools were not listed again"),
+            ));
+        };
+        let listing = client
+            .list_tools_tolerant_within(STARTUP_TIMEOUT)
+            .await
+            .map_err(|e| {
+                tracing::warn!(target: "outrig::mcp", "relisting {service:?}: {e}");
+                // The listing's own message, not the server's stderr, which is
+                // the server's text.
+                let (category, message) = match &e {
+                    OutrigError::McpToolsListFailed { source, .. } => {
+                        (category(source.kind), source.message.clone())
+                    }
+                    _ => (ServiceErrorCategory::Failed, e.to_string()),
+                };
+                Refusal::raised(
+                    category,
+                    format!("the tools were not listed again: {message}"),
+                )
+            })?;
+        let Listing { tools, undecoded } = listing;
+        *entry.tools.lock().expect("tools lock") = tools;
+        let (listing, changes) = services
+            .redescribe(service, |listing| {
+                self.events.emit(Payload::McpServiceRelisted {
+                    service: service.to_string(),
+                    agent: agent.to_string(),
+                    listing,
+                    undecoded: undecoded.clone(),
+                });
+            })
+            .ok_or_else(unknown)?;
+        Ok(json!({
+            "added": changes.added,
+            "removed": changes.removed,
+            "changed": changes.changed,
+            "listing": listing,
+            "undecoded": undecoded,
+            "relisted": began,
+        }))
+    }
+
     /// The started services `host` runs, in the order declared.
     fn siblings(&self, host: &str) -> Vec<&Arc<Entry>> {
         self.entries
@@ -1713,9 +1916,13 @@ async fn start_one(
         let attempt = async {
             let within = policy.attempt.min(left.saturating_sub(REPORT_MARGIN));
             let client = placement.connect(server, within).await?;
+            let changes = client.list_changes();
             let left = deadline.saturating_duration_since(Instant::now());
-            match client.list_tools_within(policy.attempt.min(left)).await {
-                Ok(tools) => Ok((client, tools)),
+            match client
+                .list_tools_tolerant_within(policy.attempt.min(left))
+                .await
+            {
+                Ok(listing) => Ok((client, changes, listing)),
                 Err(e) => {
                     unlisted = Some(Failed::of(&e));
                     let _ = client.shutdown().await;
@@ -1732,11 +1939,12 @@ async fn start_one(
             () = cancel.cancelled() => break Failed::abandoned(),
         };
         let failed = match attempted {
-            Ok(Ok((client, tools))) => {
+            Ok(Ok((client, changes, Listing { tools, undecoded }))) => {
                 let started = Started {
                     outcome: McpServiceOutcome::Ready {
                         tools: tools.len(),
                         listing: 1,
+                        undecoded: undecoded.clone(),
                         attempts,
                     },
                     instructions: client.instructions(),
@@ -1746,6 +1954,7 @@ async fn start_one(
                     // it ended. A deadline of the client's own would end it
                     // first, inside the grace, as a failure.
                     client: Some(client.with_call_timeout(Duration::MAX)),
+                    changes: Some(changes),
                     tools,
                 };
                 events.emit(Payload::McpServiceStarted {
@@ -1755,6 +1964,7 @@ async fn start_one(
                     declared_in: planned.declared_in,
                     tools: started.tools.len(),
                     listing: 1,
+                    undecoded,
                     attempts,
                     duration: since.elapsed(),
                 });
@@ -2008,7 +2218,12 @@ impl Service for McpService {
             .unwrap_or_else(|| format!("The MCP server {:?}.", entry.name()));
         let mut description = ServiceDescription::new(line).of_kind(ServiceKind::Mcp);
         description.call_deadline = entry.planned.call_deadline;
-        for tool in &entry.tools {
+        // Where it runs, and nothing else of its declaration: no `env`, no
+        // headers.
+        description
+            .extras
+            .insert("placement".into(), json!(entry.planned.placement));
+        for tool in entry.tools.lock().expect("tools lock").iter() {
             let mut method = MethodDescription::new(
                 tool.name.clone(),
                 tool.description.clone().unwrap_or_default(),
@@ -2031,22 +2246,14 @@ impl Service for McpService {
             let Some(client) = client else {
                 return Err(ServiceError::new(
                     ServiceErrorCategory::Unavailable,
-                    "the server is not connected",
+                    NOT_CONNECTED,
                 ));
             };
             match client.call_tool(&method, args).await {
-                Ok(result) => serde_json::to_value(result_to_rmcp(result))
+                Ok(result) => result_to_wire(result)
                     .map_err(|e| ServiceError::new(ServiceErrorCategory::Failed, e.to_string())),
                 Err(OutrigError::McpCallToolFailed { source, .. }) => {
-                    let category = match source.kind {
-                        McpFailureKind::Transport | McpFailureKind::Timeout => {
-                            ServiceErrorCategory::Unavailable
-                        }
-                        McpFailureKind::Canceled => ServiceErrorCategory::Cancelled,
-                        McpFailureKind::Protocol => ServiceErrorCategory::Failed,
-                        _ => ServiceErrorCategory::Other,
-                    };
-                    Err(ServiceError::new(category, source.message))
+                    Err(ServiceError::new(category(source.kind), source.message))
                 }
                 Err(e) => Err(ServiceError::new(
                     ServiceErrorCategory::Failed,
@@ -2068,6 +2275,19 @@ fn extras(tool: &McpTool) -> Map<String, Value> {
         .filter(|(key, _)| matches!(key.as_str(), "title" | "annotations" | "icons" | "_meta"))
         .collect()
 }
+
+/// What a service's error says of an MCP failure of `kind`.
+fn category(kind: McpFailureKind) -> ServiceErrorCategory {
+    match kind {
+        McpFailureKind::Transport | McpFailureKind::Timeout => ServiceErrorCategory::Unavailable,
+        McpFailureKind::Canceled => ServiceErrorCategory::Cancelled,
+        McpFailureKind::Protocol => ServiceErrorCategory::Failed,
+        _ => ServiceErrorCategory::Other,
+    }
+}
+
+/// Why a call or a relist reached no server: its client is gone.
+const NOT_CONNECTED: &str = "the server is not connected";
 
 /// Whether a declaration's `headers` name one of the owner's identity
 /// headers, which no declaration may: they are the owner's to stamp, on the

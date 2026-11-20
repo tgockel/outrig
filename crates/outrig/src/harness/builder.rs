@@ -104,7 +104,7 @@ pub struct SessionBuilder {
     /// Channels given through [`SessionBuilder::channel`], in order.
     channels: Vec<(ChannelDefinition, Arc<dyn ChannelBackend>)>,
     /// How the session's services are called.
-    service_policy: ServicePolicy,
+    service_policy: Option<ServicePolicy>,
     /// MCP services given through [`SessionBuilder::mcp`], in order.
     mcp: Vec<(String, McpServiceSpec)>,
     /// How they start, when the owner said.
@@ -184,7 +184,7 @@ impl SessionBuilder {
             bound: Vec::new(),
             served: Vec::new(),
             channels: Vec::new(),
-            service_policy: ServicePolicy::default(),
+            service_policy: None,
             mcp: Vec::new(),
             mcp_policy: None,
             mcp_identity: Vec::new(),
@@ -385,9 +385,10 @@ impl SessionBuilder {
     }
 
     /// Call the session's services under `policy`, in place of
-    /// [`ServicePolicy::default`].
+    /// [`ServicePolicy::default`] with the configuration's
+    /// `service-result-max-bytes`.
     pub fn service_policy(mut self, policy: ServicePolicy) -> Self {
-        self.service_policy = policy;
+        self.service_policy = Some(policy);
         self
     }
 
@@ -552,6 +553,14 @@ impl SessionBuilder {
             .collect()
     }
 
+    /// How the session's services are called: the owner's policy, or the
+    /// default with the configuration's result bound.
+    pub(super) fn service_policy_or_default(&self) -> ServicePolicy {
+        self.service_policy
+            .clone()
+            .unwrap_or_else(|| ServicePolicy::for_config(&self.config))
+    }
+
     /// How the session's MCP services start: the owner's policy, or the
     /// default with the configuration's budget.
     pub(super) fn mcp_policy_or_default(&self) -> McpPolicy {
@@ -692,9 +701,10 @@ impl SessionBuilder {
         interpreter: &Interpreter,
         lifecycle: &Arc<Lifecycle>,
     ) -> Services {
+        let policy = self.service_policy_or_default();
         Services::serve(
             std::mem::take(&mut self.served),
-            self.service_policy.clone(),
+            policy,
             interpreter,
             lifecycle,
         )
@@ -873,7 +883,7 @@ impl SessionBuilder {
         bindings.declare(&interpreter, bindings::container_path);
         skills::serve(&catalog, &interpreter, &events);
         let services = self.serve_services(&interpreter, &lifecycle);
-        mcp.bind(&services);
+        mcp.bind(&services, &interpreter);
         let channels = self.channels(&interpreter, &lifecycle, &catalog);
         self.report(Progress::Finished(Step::Python));
 
@@ -1139,7 +1149,7 @@ impl SessionBuilder {
         bindings.declare(&interpreter, Path::to_path_buf);
         skills::serve(&catalog, &interpreter, &events);
         let services = self.serve_services(&interpreter, &lifecycle);
-        mcp.bind(&services);
+        mcp.bind(&services, &interpreter);
         let channels = self.channels(&interpreter, &lifecycle, &catalog);
         self.report(Progress::Finished(Step::Python));
         let workspace = self.host_workspace.take().or(self.workdir.clone());

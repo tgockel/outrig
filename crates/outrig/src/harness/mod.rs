@@ -130,6 +130,8 @@ mod bindings_tests;
 pub(crate) mod services_tests;
 
 #[cfg(test)]
+mod mcp_presenter_tests;
+#[cfg(test)]
 mod mcp_tests;
 #[cfg(test)]
 #[path = "session_tests.rs"]

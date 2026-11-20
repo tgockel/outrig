@@ -1502,6 +1502,10 @@ pub enum Payload {
         /// A preview of its arguments, cut to 1,024 characters, when the
         /// session's service policy records bodies; otherwise `None`.
         arguments: Option<String>,
+        /// What an MCP service's call adds; `None`, and no field, for any
+        /// other kind.
+        #[serde(flatten)]
+        mcp: Option<McpCallReceived>,
     },
     /// A call's service is about to be called: published before it is.
     #[non_exhaustive]
@@ -1552,7 +1556,7 @@ pub enum Payload {
         /// `None`.
         reason: Option<ServiceReason>,
         /// The failing JSON path of arguments refused as invalid, or what a
-        /// result refused as too large measured; otherwise `None`.
+        /// result too large to hand over measured; otherwise `None`.
         detail: Option<String>,
         /// The size of the result its service returned, as JSON, or `None`
         /// when it returned none.
@@ -1563,6 +1567,10 @@ pub enum Payload {
         /// A preview of its result, cut to 1,024 characters, when the
         /// session's service policy records bodies; otherwise `None`.
         body: Option<String>,
+        /// What an MCP service's call adds; `None`, and no field, for any
+        /// other kind.
+        #[serde(flatten)]
+        mcp: Option<McpCallEnded>,
     },
     /// An MCP service started: placed, its `initialize` answered and its tools
     /// listed. Its `service.bound` follows.
@@ -1580,6 +1588,8 @@ pub enum Payload {
         tools: usize,
         /// The listing's generation: 1.
         listing: u64,
+        /// The tools its server listed that did not decode, each left out.
+        undecoded: Vec<crate::McpUndecodedTool>,
         /// How many attempts it took.
         attempts: u32,
         /// How long it took to start, every attempt included.
@@ -1648,6 +1658,27 @@ pub enum Payload {
         how: super::McpStopHow,
         /// Whether its container is proven stopped.
         proven: bool,
+    },
+    /// An agent relisted an MCP service's tools. When the listing changed,
+    /// its `service.described` follows.
+    #[non_exhaustive]
+    McpServiceRelisted {
+        /// The service.
+        service: String,
+        /// The agent whose code asked.
+        agent: String,
+        /// The listing's generation now: the next one when anything changed,
+        /// else the one it had.
+        listing: u64,
+        /// The tools its server listed that did not decode, each left out.
+        undecoded: Vec<crate::McpUndecodedTool>,
+    },
+    /// An MCP service's server said its tool listing changed. Nothing is
+    /// relisted for it: the service is marked stale until an agent relists.
+    #[non_exhaustive]
+    McpServiceListChanged {
+        /// The service.
+        service: String,
     },
 }
 
@@ -1743,6 +1774,8 @@ impl Payload {
             Payload::McpServicePaused { .. } => "mcp.service.paused",
             Payload::McpServiceResumed { .. } => "mcp.service.resumed",
             Payload::McpServiceStopped { .. } => "mcp.service.stopped",
+            Payload::McpServiceRelisted { .. } => "mcp.service.relisted",
+            Payload::McpServiceListChanged { .. } => "mcp.service.list.changed",
             Payload::ChannelAttached { .. } => "channel.attached",
             Payload::ChannelConsumed { .. } => "channel.consumed",
             Payload::ChannelClosed { .. } => "channel.closed",
@@ -1780,7 +1813,9 @@ impl Payload {
             | Self::McpServiceFailed { .. }
             | Self::McpServicePaused { .. }
             | Self::McpServiceResumed { .. }
-            | Self::McpServiceStopped { .. } => None,
+            | Self::McpServiceStopped { .. }
+            | Self::McpServiceRelisted { .. }
+            | Self::McpServiceListChanged { .. } => None,
             // An import is the agent's whose code made it, which may be none.
             Self::SkillImported { agent, .. } => agent.as_deref().map(Subject::agent),
             Self::HostedReceived { agent, .. }
@@ -2015,13 +2050,13 @@ pub enum Resolved {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ServiceOutcome {
-    /// Its service was called and returned a result.
+    /// Its service was called and returned a result: handed to its caller,
+    /// or, with the reason [`ServiceReason::ResultTooLarge`], not.
     Returned,
     /// Its service was called and returned an error, whose category the
     /// event's `category` is.
     Raised,
-    /// Its service was never called, but for a result too large, which it
-    /// returned and its caller was not given: the reason says which.
+    /// Its service was never called: the reason says why.
     Refused,
     /// Its service was never called: its caller was interrupted, or the
     /// session closed, before it was dispatched.
@@ -2044,8 +2079,9 @@ pub enum ServiceReason {
     /// The arguments did not match the method's schema; `detail` is the
     /// first failing JSON path.
     InvalidArguments,
-    /// The result was larger, as JSON, than the session's policy lets one
-    /// cross; `detail` says how large.
+    /// The service returned a result larger, as JSON, than the session's
+    /// policy lets one cross, so its caller was not given it; `detail` says
+    /// how large. The call's outcome is `returned`: the work was done.
     ResultTooLarge,
     /// The call's deadline passed.
     Deadline,
@@ -2058,6 +2094,48 @@ pub enum ServiceReason {
     Paused,
     /// Its service was stopped.
     Stopped,
+}
+
+/// What an MCP service's `service.call.received` adds: the tool, and the
+/// listing its method came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct McpCallReceived {
+    /// The tool, by its exact name: the method.
+    pub tool: String,
+    /// The listing the caller's method came from: the generation.
+    pub listing: u64,
+}
+
+/// What an MCP service's `service.call.ended` adds: the tool, the listing,
+/// where in the call's flow it ended, and what the server's result held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct McpCallEnded {
+    /// The tool, by its exact name: the method.
+    pub tool: String,
+    /// The listing the caller's method came from: the generation.
+    pub listing: u64,
+    /// `response_received` when the server answered with a result, whether
+    /// or not its caller was given it; otherwise `None`.
+    pub state: Option<McpDispatchState>,
+    /// The server's own `isError`, for a result; otherwise `None`.
+    pub is_error: Option<bool>,
+    /// How many content blocks of each kind the result held, by the kind's
+    /// wire name; `None` without a result.
+    pub blocks: Option<std::collections::BTreeMap<String, u64>>,
+    /// Whether the result held structured content; `None` without one.
+    pub structured: Option<bool>,
+}
+
+/// Where in an MCP call's flow it ended: what it says of whether the server
+/// saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum McpDispatchState {
+    /// The server answered: its effects are as its answer says.
+    ResponseReceived,
 }
 
 /// The methods a service's new description added, removed and changed, each

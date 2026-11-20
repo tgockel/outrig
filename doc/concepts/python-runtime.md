@@ -489,7 +489,8 @@ instructions name it beside the bindings.
 - **Names.** `tracker.call("file-issue", {"title": "..."})` calls a method by its exact name,
   `tracker.method(name)` gives one, and `tracker.methods` lists them. A method's attribute is its
   name with `-` as `_`, and a trailing `_` for a keyword or a name the class already uses; two
-  names that would meet one attribute leave it to neither, and reading it says so.
+  names that would meet one attribute leave it to neither, and reading it says so. A schema that
+  sets `additionalProperties` takes any other argument by name too, as `**arguments`.
 - **Checked on the host.** The host checks a call's arguments against the method's schema before
   the service sees them, and refuses those that do not match, naming the first failing JSON path.
   A schema the checker cannot compile leaves its method unchecked, and `service.bound` says so.
@@ -501,15 +502,23 @@ instructions name it beside the bindings.
   grace later -- five seconds -- is abandoned, and its outcome is unknown: what it did may stand,
   and nothing calls it again.
 - **What a call raises.** A call that returns no result raises `outrig.ServiceError`: `outcome`
-  is `refused` (never made, or its result larger than the policy lets one be -- 16 MiB by
-  default), `raised` (the service said it failed, with its `category`), `cancelled` or `unknown`,
-  and `category`, `reason`, `path` and `message` say the rest. A call whose line would be longer
-  than the host reads, 16 MiB, raises `ValueError` and sends nothing.
+  is `refused` (never made), `returned` with the category `result_too_large` (made, and its
+  result larger than the policy lets one be -- 64 MiB by default, or the configuration's
+  `service-result-max-bytes`), `raised` (the service said it failed, with its `category`),
+  `cancelled` or `unknown`, and `category`, `reason`, `path` and `message` say the rest. A call
+  whose line would be longer than the host reads, 16 MiB, raises `ValueError` and sends nothing.
 
 A method that starts long work should return at once, with a ticket: the call returns a value,
 the owner delivers the completion on a channel -- the user channel, say -- and the agent waits
 for it with `runtime.wait`, holding no call meanwhile. A call that waits inside the service holds
 its caller's thread, and at the close the session's drain.
+
+An MCP server the session places is a service of its own kind: an `outrig.McpService`, a method
+per tool by the tool's exact name, whose calls return an `outrig.McpResult` -- the server's
+content blocks in order, its structured content, its `_meta` -- rather than JSON data, and raise
+`outrig.ToolError` for a result the server marks as an error. `tool(name)`, `tools`, `relist()`
+and `stale` are what an MCP server has and a Rust service does not; see
+[MCP Servers](mcp-servers.md#in-a-session-mcp-services).
 
 Each call is recorded as `service.call.*` events, with the agent that made it, and one that ended
 after the close is in `session.report`'s `services`. Its arguments and result are not recorded

@@ -106,7 +106,6 @@ phase.
 
 | Task      | What it settles                                     |
 | --------- | ----------------------------------------------------|
-| `0003-55` | MCP tools are Python objects by exact name          |
 | `0003-56` | An MCP call has three dispatch states               |
 | `0003-57` | An MCP service over HTTP                            |
 

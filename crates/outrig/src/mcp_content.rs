@@ -79,6 +79,33 @@ impl McpTool {
     }
 }
 
+/// A tool a server listed that this build could not decode -- one whose
+/// `inputSchema` is not an object, say -- left out of a session's listing
+/// rather than costing the server every other tool.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
+pub struct McpUndecodedTool {
+    /// Its name, when it had one that is a string.
+    pub name: Option<String>,
+    /// Why it did not decode, as the decoder said.
+    pub reason: String,
+}
+
+impl McpUndecodedTool {
+    pub(crate) fn new(name: Option<String>, reason: String) -> Self {
+        Self { name, reason }
+    }
+}
+
+impl std::fmt::Display for McpUndecodedTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.name {
+            Some(name) => write!(f, "{name:?}: {}", self.reason),
+            None => write!(f, "a tool with no name: {}", self.reason),
+        }
+    }
+}
+
 /// Behavioral hints a server attaches to a tool. Every one is advisory and
 /// unverified -- a client may use them to decide what to confirm with a user,
 /// not to decide what a tool is allowed to do.
@@ -513,6 +540,42 @@ pub(crate) fn result_to_rmcp(result: McpToolResult) -> CallToolResult {
     out.structured_content = result.structured_content;
     out.meta = result.meta.map(MetaObject::from);
     out
+}
+
+/// `tools/call` result, outrig -> the interpreter: the wire form
+/// [`result_to_rmcp`] gives, except that a block, or an embedded resource's
+/// contents, of a kind this build does not model is written as the JSON it
+/// arrived as, where [`result_to_rmcp`] has to fit it to a kind the SDK names.
+pub(crate) fn result_to_wire(mut result: McpToolResult) -> serde_json::Result<Value> {
+    enum Kept {
+        Block(Value),
+        Contents(Value),
+    }
+    // Moved out, so the SDK's leg turns what is left -- `null` -- into its
+    // placeholder at once, which the raw JSON then replaces.
+    let kept: Vec<(usize, Kept)> = result
+        .content
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(i, block)| match block {
+            McpContent::Other { raw, .. } => Some((i, Kept::Block(std::mem::take(raw)))),
+            McpContent::Resource(McpEmbeddedResource {
+                resource: McpResourceContents::Other { raw },
+                ..
+            }) => Some((i, Kept::Contents(std::mem::take(raw)))),
+            _ => None,
+        })
+        .collect();
+    let mut wire = serde_json::to_value(result_to_rmcp(result))?;
+    if let Some(Value::Array(content)) = wire.get_mut("content") {
+        for (i, kept) in kept {
+            match kept {
+                Kept::Block(raw) => content[i] = raw,
+                Kept::Contents(raw) => content[i]["resource"] = raw,
+            }
+        }
+    }
+    Ok(wire)
 }
 
 fn content_from_rmcp(block: ContentBlock) -> McpContent {

@@ -43,12 +43,13 @@ class ServiceError(Exception):
 
     `outcome` says how it ended, as the session's events do:
 
-    - `refused`: the service was not called, or its result was not handed over. `category` says
-      why: `admission_closed`, the session is closing; `unknown_method`, the service's description
-      has no method of that name, which a method held from an earlier description meets once the
-      service has changed; `invalid_arguments`, the arguments do not match the method's schema,
-      `path` the first JSON path that failed; `result_too_large`, the service returned more than a
-      result may carry, so what it did was done.
+    - `refused`: the service was not called. `category` says why: `admission_closed`, the session
+      is closing; `unknown_method`, the service's description has no method of that name, which a
+      method held from an earlier description meets once the service has changed;
+      `invalid_arguments`, the arguments do not match the method's schema, `path` the first JSON
+      path that failed.
+    - `returned`, with the category `result_too_large`: the service was called and returned more
+      than a result may carry, so its result was not handed over -- what the call did is done.
     - `raised`: the service was called and said it failed. `category` is its: `invalid_arguments`,
       `not_found`, `refused`, `unavailable`, `failed`, `cancelled`, `other`.
     - `cancelled`: the service was not called; `reason` says what stopped it.
@@ -77,7 +78,8 @@ class ServiceError(Exception):
     def __str__(self):
         why = self.category or self.reason
         how = f"{self.outcome}, {why}" if why else self.outcome
-        return f"{self.service}.{self.method} ({how}): {self.message}"
+        where = self.service if self.method is None else f"{self.service}.{self.method}"
+        return f"{where} ({how}): {self.message}"
 
     def __reduce__(self):
         return _rebuilt, (type(self), self.message, self._fields())
@@ -89,6 +91,33 @@ class ServiceError(Exception):
 
 def _rebuilt(cls, message, fields):
     return cls(message, **fields)
+
+
+def _failure(cls, service, method, error, **more):
+    """The `cls` -- `ServiceError` or a subclass -- a call of `service`'s `method` raises, from the
+    `error` of the host's answer, with `more` fields of the subclass's."""
+    return cls(
+        error.get("message") or "",
+        outcome=error.get("outcome"),
+        service=service,
+        method=method,
+        call=error.get("call"),
+        category=error.get("category"),
+        reason=error.get("reason"),
+        path=error.get("path"),
+        **more,
+    )
+
+
+def _decoded(service, method, text):
+    """The result of a call of `service`'s `method`, from `text`, the JSON the host answered:
+    read here rather than by the reader thread, so a result this interpreter cannot read raises in
+    its caller."""
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError) as e:
+        raise ValueError(f"the result of {service}.{method} is JSON this interpreter cannot "
+                         f"read") from e
 
 
 class ServiceMethod(collections.namedtuple(
@@ -164,11 +193,34 @@ class Service:
         return (f"<outrig service {cls._service!r}: {_line(cls._description)} "
                 f"({count} method{'' if count == 1 else 's'})>")
 
+    def _answered(self, method, answer):
+        """What a call of `method` gives its caller, from the host's `answer`: the result as
+        Python data, or `ServiceError`. A presenter of another kind presents it otherwise."""
+        error = answer.get("error")
+        if error is not None:
+            raise _failure(ServiceError, type(self)._service, method, error)
+        return _decoded(type(self)._service, method, answer["ok"])
+
+    @classmethod
+    def _namespace(cls, entry):
+        """What a presenter of this kind adds to the class of the service `entry` describes,
+        beside its methods, which take no name it adds."""
+        return {}
+
+    @classmethod
+    def _about(cls, entry):
+        """What the class docstring says of the service `entry` describes after its own
+        description: what it is, and how it is called."""
+        return ("A service the host runs: each method is a call to the host, by value, which "
+                "blocks until it answers. `call(name, arguments)` calls any method by its exact "
+                "name, `method(name)` gives one, and `methods` lists them. A call that returns "
+                "no result raises outrig.ServiceError.")
+
 
 # Each presenter -- the class a service's object is made from -- by the kind its description
-# names. A kind OutRig does not know is presented by the generic one. An MCP service is presented
-# by the generic class until its own presenter, which shows a result as content blocks, is written.
-_PRESENTERS = {"service": Service, "mcp": Service}
+# names. A kind OutRig does not know is presented by the generic one; `outrig._mcp` adds the MCP
+# presenter, which shows a result as content blocks.
+_PRESENTERS = {"service": Service}
 
 
 def _made(cls, name, kernel):
@@ -209,7 +261,8 @@ def generated(entry):
     name = entry["name"]
     generation = entry["generation"]
     base = _PRESENTERS.get(entry.get("presenter"), Service)
-    taken = set(dir(base))
+    added = base._namespace(entry)
+    taken = set(dir(base)) | set(added)
     described = {}  # each method by its exact name, the first described under it
     for method in entry["methods"]:
         if isinstance(method["name"], str):
@@ -226,10 +279,11 @@ def generated(entry):
         "__module__": "outrig.services",
         "__qualname__": name,
         "__slots__": (),
-        "__doc__": _class_doc(entry, described, attribute_of),
+        "__doc__": _class_doc(entry, described, attribute_of, base),
         "_service": name,
         "_description": entry.get("description") or "",
         "_generation": generation,
+        **added,
     }
     methods = {}
     functions = {}
@@ -276,12 +330,15 @@ def _function(service, method, generation, attribute):
         notes = None
     else:
         signature, notes = rendered
+        more = any(parameter.kind is inspect.Parameter.VAR_KEYWORD
+                   for parameter in signature.parameters.values())
 
         def function(self, *args, **kwargs):
             # What the caller passed, and nothing else: a parameter left out is left out.
             bound = signature.bind(self, *args, **kwargs).arguments
             del bound["self"]
-            return _call(self, exact, dict(bound), None, generation)
+            others = bound.pop("arguments", {}) if more else {}
+            return _call(self, exact, {**bound, **others}, None, generation)
 
     shown = attribute or exact
     function.__name__ = shown
@@ -317,13 +374,11 @@ def _method_doc(method, notes, attribute):
     return "\n\n".join(parts)
 
 
-def _class_doc(entry, described, attribute_of):
-    """The docstring of `entry`'s class: what the service is, and how its methods are reached."""
+def _class_doc(entry, described, attribute_of, base):
+    """The docstring of `entry`'s class, presented by `base`: what the service is, and how its
+    methods are reached."""
     lines = [(entry.get("description") or "").strip() or f"The service {entry['name']!r}.", ""]
-    lines.append("A service the host runs: each method is a call to the host, by value, which "
-                 "blocks until it answers. `call(name, arguments)` calls any method by its exact "
-                 "name, `method(name)` gives one, and `methods` lists them. A call that returns "
-                 "no result raises outrig.ServiceError.")
+    lines.append(base._about(entry))
     unreached = [exact for exact in described if exact not in attribute_of]
     if unreached:
         lines.append("")
@@ -356,7 +411,9 @@ def _rendered(params):
     Required properties are parameters in the schema's order, positional or by keyword; the rest
     are keyword-only, each with its schema's default, or with none and left out of the call when
     not passed. A property whose type the renderer cannot spell is a parameter with no
-    annotation."""
+    annotation. A schema that sets `additionalProperties` to anything but `false` takes any other
+    argument by name too, as `**arguments`; one that leaves it out does not, as a schema with no
+    properties meaning no arguments usually does."""
     if params is True or params == {}:
         return inspect.Signature([_SELF]), []
     if not isinstance(params, dict) or set(params) - _TOP:
@@ -365,11 +422,17 @@ def _rendered(params):
         return None
     properties = params.get("properties", {})
     required = params.get("required", [])
-    if not isinstance(properties, dict) or not isinstance(required, list):
+    if (not isinstance(properties, dict) or not isinstance(required, list)
+            or not all(isinstance(name, str) for name in required)):
         return None
-    names = list(properties) + [name for name in required if name not in properties]
+    names = list(dict.fromkeys([*properties, *required]))
     if not all(isinstance(name, str) and name.isidentifier() and not keyword.iskeyword(name)
                and name != "self" for name in names):
+        return None
+    others = params.get("additionalProperties", False)
+    more = others is not False
+    if more and "arguments" in names:
+        # Its `**arguments` would take a property's name: the whole call takes them instead.
         return None
     needed, optional, notes = [], [], []
     for name in names:
@@ -389,7 +452,14 @@ def _rendered(params):
             told.append(f"default {described['default']!r}")
         note = f"{name} ({_shown(annotation)}{', required' if name in required else ''})"
         notes.append(f"{note}: {'; '.join(told)}" if told else note)
-    return inspect.Signature([_SELF, *needed, *optional]), notes
+    parameters = [_SELF, *needed, *optional]
+    if more:
+        annotation = (_annotation(others, params) if isinstance(others, dict)
+                      else inspect.Parameter.empty)
+        parameters.append(inspect.Parameter("arguments", inspect.Parameter.VAR_KEYWORD,
+                                            annotation=annotation))
+        notes.append(f"**arguments ({_shown(annotation)}): any other argument, by name")
+    return inspect.Signature(parameters), notes
 
 
 def _shown(annotation):
@@ -446,6 +516,8 @@ def _annotation(schema, root, seen=(), depth=0, visits=None):
 
 
 def _typed(kind, schema, root, seen, depth, visits):
+    if not isinstance(kind, str):
+        return inspect.Parameter.empty
     if kind in _SCALARS:
         return _SCALARS[kind]
     if kind == "array":

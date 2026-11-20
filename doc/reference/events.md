@@ -812,7 +812,9 @@ between a child's failed rounds is in that read and has no event of its own.
   `generation`, the description the caller's method came from; `agent`; `execid` and
   `invocation`, as the interpreter said them, diagnostic context the agent's own code can change;
   `deadline`, seconds the service has to answer it, from its receipt; and `arguments`, a preview,
-  or `null` unless the session's service policy records bodies.
+  or `null` unless the session's service policy records bodies. A call of an MCP service's tool
+  adds `tool`, its exact name, and `listing`, the listing it came from: the same as `method` and
+  `generation`, in MCP's words.
 - `service.call.dispatched` -- `call`, `service`, `method`, `agent`: the service is about to be
   called, published before it is. A call whose service is never called has none.
 - `service.call.cancel.sent` -- a dispatched call was told to stop, its cancellation token
@@ -822,18 +824,22 @@ between a child's failed rounds is in that read and has no event of its own.
 - `service.call.ended` -- how a call ended: `call`, `service`, `kind`, `method`, `agent`,
   `execid`; `outcome`; `category`, the service's own, for a `raised` call, else `null`; `reason`,
   for an outcome that has one, else `null`; `detail`, the first failing JSON path of arguments
-  refused as invalid, or what a result refused as too large measured, else `null`; `bytes`, the
+  refused as invalid, or what a result too large to hand over measured, else `null`; `bytes`, the
   size of the result the service returned, as JSON, or `null`; `duration`, seconds from its
   receipt; and `body`, a preview of the result, or `null` unless the session's service policy
-  records bodies. `outcome` is:
-  - `returned` -- the service was called and returned its result.
+  records bodies. A call of an MCP service's tool adds `tool` and `listing`, as on
+  `service.call.received`; `state`, `response_received` when its server answered with a result,
+  handed over or not, else `null`; and, of that result, `is_error`, the server's own flag,
+  `blocks`, how many content blocks of each kind it held (`{"text": 2, "image": 1}`), and
+  `structured`, whether it held structured content, each `null` without one. `outcome` is:
+  - `returned` -- the service was called and returned its result. With the reason
+    `result_too_large`, the result was larger as JSON than the policy lets one be, and its caller
+    was not given it: `detail` says how large. What the call did is done.
   - `raised` -- the service was called and returned an error, whose `category` is
     `invalid_arguments`, `not_found`, `refused`, `unavailable`, `failed`, `cancelled` or `other`.
   - `refused` -- the service was never called: `admission_closed`, the session was closed to new
     work; `unknown_method`, its description, as it stands, has no method of that name; or
-    `invalid_arguments`, the arguments did not match the method's schema. Or it was, and its
-    result was not handed over: `result_too_large`, larger as JSON than the policy lets a result
-    be -- the one refusal after a dispatch, whose `detail` says the service returned.
+    `invalid_arguments`, the arguments did not match the method's schema.
   - `cancelled` -- the service was never called: `interrupted` or `closed` reached the call
     before its dispatch.
   - `unknown` -- the service was called, told to stop, and still running when its grace ended, so
@@ -853,7 +859,10 @@ between a child's failed rounds is in that read and has no event of its own.
   as `my_fs` -- else `null`; `placement`, `command` (exec'd in the session's container),
   `sidecar` or `primary_view` (a sidecar that sees the session container's filesystem);
   `declared_in`, `owner`, `config` or `image_label`; `tools`, how many its listing holds;
-  `listing`, 1; `attempts`; and `duration`, seconds its start took. Its `service.bound` follows.
+  `listing`, 1; `undecoded`, each tool its server listed that did not decode -- one whose
+  `inputSchema` is not an object, say -- as `{name, reason}`, left out of the listing rather than
+  costing the server the rest; `attempts`; and `duration`, seconds its start took. Its
+  `service.bound` follows.
 - `mcp.service.retry` -- an attempt to start a server failed in a way that may pass -- its
   transport failed, or its handshake did not answer within its bound -- and it is tried again:
   `service`; `attempt`, the one that failed, from 1; `delay`, seconds until the next; and
@@ -878,6 +887,12 @@ between a child's failed rounds is in that read and has no event of its own.
 - `mcp.service.stopped` -- a service's transport was closed and what it ran in stopped, by a
   quiesce or the session's close: `service`; `how`, `stopped` or `with_primary`; and `proven`,
   whether its container is proven stopped. A service that never started has none.
+- `mcp.service.relisted` -- an agent listed a service's tools again: `service`; `agent`, whose
+  code asked; `listing`, the generation it is described at now, the next one when anything
+  changed; and `undecoded`, as `mcp.service.started` has it. When the listing changed, its
+  `service.described` follows. A relist that failed has none.
+- `mcp.service.list.changed` -- a service's server said its tool listing changed: `service`.
+  Nothing is relisted for it; agent code reads the service as stale until a relist.
 
 **Totals.** What a session spent is the sum of its `model.attempt` usage, each `attempt_id`
 counted once, with a `model.usage.replaced` taking the place of its attempt's `null` and a

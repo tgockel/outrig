@@ -34,10 +34,11 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::event::{
-    ExecId, InvocationId, Payload, ServiceCallId, ServiceChanges, ServiceKind, ServiceOutcome,
-    ServiceReason,
+    ExecId, InvocationId, McpCallEnded, McpCallReceived, McpDispatchState, Payload, ServiceCallId,
+    ServiceChanges, ServiceKind, ServiceOutcome, ServiceReason,
 };
 use super::lifecycle::Lifecycle;
+use super::mcp::McpReply;
 use super::report::ServiceCall;
 use crate::events::Events;
 use crate::python::host::Interpreter;
@@ -90,6 +91,9 @@ pub struct ServiceDescription {
     /// [`ServicePolicy::call_deadline`]: for a service whose calls
     /// legitimately run long.
     pub call_deadline: Option<Duration>,
+    /// What a presenter of the service's kind may read of the service; the
+    /// generic one ignores it.
+    pub extras: Map<String, Value>,
     /// What kind of service it is, which decides the class agents get.
     pub(crate) kind: ServiceKind,
 }
@@ -101,6 +105,7 @@ impl ServiceDescription {
             description: description.into(),
             methods: Vec::new(),
             call_deadline: None,
+            extras: Map::new(),
             kind: ServiceKind::Rust,
         }
     }
@@ -308,8 +313,10 @@ pub struct ServicePolicy {
     /// How long a call told to stop has to end before it is aborted and
     /// reported `unknown`: five seconds.
     pub cancel_grace: Duration,
-    /// The largest result, in bytes of JSON, that reaches the caller: 16 MiB.
-    /// A larger one is refused, its caller told how large it was.
+    /// The largest result, in bytes of JSON, that reaches the caller: 64 MiB,
+    /// or the configuration's `service-result-max-bytes`. A larger one is
+    /// not handed over -- the call ended `returned`, the work done -- and its
+    /// caller is told how large it was.
     pub result_max: usize,
     /// Whether `service.call.received` and `service.call.ended` carry
     /// previews of a call's arguments and result, each cut to 1,024
@@ -322,9 +329,21 @@ impl Default for ServicePolicy {
         Self {
             call_deadline: Duration::from_secs(crate::config::DEFAULT_MCP_CALL_TIMEOUT_SECS),
             cancel_grace: Duration::from_secs(5),
-            result_max: 16 << 20,
+            result_max: crate::config::DEFAULT_SERVICE_RESULT_MAX_BYTES as usize,
             record_bodies: false,
         }
+    }
+}
+
+impl ServicePolicy {
+    /// The default policy, with `config`'s `service-result-max-bytes` as the
+    /// result bound when it sets one.
+    pub(crate) fn for_config(config: &crate::config::Config) -> Self {
+        let mut policy = Self::default();
+        if let Some(max) = config.service_result_max_bytes {
+            policy.result_max = usize::try_from(max).unwrap_or(usize::MAX);
+        }
+        policy
     }
 }
 
@@ -373,11 +392,13 @@ pub(crate) fn name_taken<'a>(
 /// The longest a preview in an event is, in characters, as a child's inputs'.
 const PREVIEW_MAX: usize = 1024;
 
-/// What the orientation says of a service: its name and its description.
+/// What the orientation says of a service: its name, its description, and
+/// what kind of service it is.
 #[derive(Debug, Clone)]
 pub(crate) struct ServiceBrief {
     pub(crate) name: String,
     pub(crate) description: String,
+    pub(crate) kind: ServiceKind,
 }
 
 /// A session's services and their calls. Cheap to clone.
@@ -494,8 +515,10 @@ struct End {
     path: Option<String>,
     detail: Option<String>,
     bytes: Option<u64>,
-    /// The result, as JSON text.
+    /// The result, as JSON text, when its caller is given it.
     result: Option<String>,
+    /// What an MCP server's result held, when the service returned one.
+    reply: Option<McpReply>,
 }
 
 impl End {
@@ -509,6 +532,7 @@ impl End {
             detail: None,
             bytes: None,
             result: None,
+            reply: None,
         }
     }
 
@@ -632,6 +656,7 @@ impl Services {
             .map(|served| ServiceBrief {
                 name: served.name.clone(),
                 description: served.current.description.description.clone(),
+                kind: served.current.description.kind,
             })
             .collect()
     }
@@ -644,26 +669,26 @@ impl Services {
     /// Ask `name`'s service for its description again and, when it changed,
     /// make it the next generation: publish `service.described` and tell the
     /// interpreter. A call made from an older generation's method that the
-    /// new one lacks is refused. Whether anything changed; `false` for a name
-    /// the session does not serve.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "a test calls it; the MCP presenter's relisting will"
-        )
-    )]
-    pub(crate) fn redescribe(&self, name: &str) -> bool {
+    /// new one lacks is refused. `announce` is given the generation the
+    /// service is described at from now on -- the next one, or, when nothing
+    /// changed, the one it had -- before anything is published, so what
+    /// prompted the asking is evented first. That generation and what
+    /// changed; `None` for a name the session does not serve.
+    pub(crate) fn redescribe(
+        &self,
+        name: &str,
+        announce: impl FnOnce(u64),
+    ) -> Option<(u64, ServiceChanges)> {
         let table = &self.0;
-        let Some((service, old)) = table.served(name) else {
-            return false;
-        };
+        let (service, old) = table.served(name)?;
         let next = Described::new(service.describe(), old.generation + 1);
         let changes = changes(&old.description, &next.description);
         if changes == ServiceChanges::default() {
-            return false;
+            announce(old.generation);
+            return Some((old.generation, changes));
         }
         let next = Arc::new(next);
+        announce(next.generation);
         let mut line = None;
         table.with(|s| {
             if let Some(served) = s.served.iter_mut().find(|served| served.name == name) {
@@ -674,13 +699,19 @@ impl Services {
         table.events.emit(Payload::ServiceDescribed {
             service: name.to_string(),
             generation: next.generation,
-            changes,
+            changes: changes.clone(),
             unchecked: next.unchecked.clone(),
         });
         if let Some(entry) = line {
             (table.to_interpreter)(json!({"t": "service.described", "service": entry}));
         }
-        true
+        Some((next.generation, changes))
+    }
+
+    /// Whether the session is closed to new work, as a call's admission reads
+    /// it.
+    pub(crate) fn closed(&self) -> bool {
+        self.0.lifecycle.closed().is_some()
     }
 
     /// Resolves once no call is in flight.
@@ -829,6 +860,7 @@ impl Table {
         json!({
             "name": served.name,
             "description": described.description.description,
+            "extras": described.description.extras,
             "presenter": presenter(described.description.kind),
             "deadline": self.ceiling(&described.description).as_secs_f64(),
             "generation": described.generation,
@@ -965,6 +997,10 @@ impl Table {
             invocation: request.invocation,
             deadline,
             arguments: record.then(|| cut(&arguments)),
+            mcp: (kind == ServiceKind::Mcp).then(|| McpCallReceived {
+                tool: request.method.clone(),
+                listing: request.generation,
+            }),
         });
         let arguments = serde_json::from_str::<Value>(&arguments);
         let ended = |end: End| self.end(call, &agent, ask, &request, kind, since, end);
@@ -1097,7 +1133,7 @@ impl Table {
                 }
             }
         };
-        ended(self.outcome(finished))
+        ended(self.outcome(kind, finished))
     }
 
     /// Wait out any hold on `request`'s service, marking `call` dispatched in
@@ -1188,34 +1224,45 @@ impl Table {
         }
     }
 
-    /// How a call whose service's task finished ended.
-    fn outcome(&self, finished: Result<Result<Value, ServiceError>, JoinError>) -> End {
+    /// How a call of a service of `kind` whose task finished ended.
+    fn outcome(
+        &self,
+        kind: ServiceKind,
+        finished: Result<Result<Value, ServiceError>, JoinError>,
+    ) -> End {
         match finished {
             Ok(Ok(result)) => {
+                let reply = (kind == ServiceKind::Mcp).then(|| McpReply::of(&result));
                 // Sent as JSON text, which the caller reads: a value its parser
                 // refuses then raises there rather than leaving the answer unread.
                 let result = result.to_string();
                 let bytes = result.len() as u64;
                 let max = self.policy.result_max;
-                if bytes > max as u64 {
-                    let detail = format!("returned {bytes} bytes, past the {max} allowed");
+                let end = if bytes > max as u64 {
+                    // Returned, not refused: the service did the work, and only
+                    // its result was kept from its caller.
                     End {
-                        bytes: Some(bytes),
-                        detail: Some(detail),
-                        ..End::refused(
+                        detail: Some(format!("returned {bytes} bytes, past the {max} allowed")),
+                        ..End::stopped(
+                            ServiceOutcome::Returned,
                             ServiceReason::ResultTooLarge,
                             format!(
                                 "the service returned a result of {bytes} bytes as JSON, past the \
-                                 {max} a result may take, so it was not handed over"
+                                 {max} a result may take, so it was not handed over: what the call \
+                                 did is done"
                             ),
                         )
                     }
                 } else {
                     End {
-                        bytes: Some(bytes),
                         result: Some(result),
                         ..End::new(ServiceOutcome::Returned, String::new())
                     }
+                };
+                End {
+                    bytes: Some(bytes),
+                    reply,
+                    ..end
                 }
             }
             Ok(Err(error)) => End::raised(error.category, error.message),
@@ -1267,6 +1314,17 @@ impl Table {
                 bytes: end.bytes,
                 duration: since.elapsed(),
                 body: end.result.as_deref().filter(|_| record).map(cut),
+                mcp: (kind == ServiceKind::Mcp).then(|| McpCallEnded {
+                    tool: request.method.clone(),
+                    listing: request.generation,
+                    state: end
+                        .reply
+                        .as_ref()
+                        .map(|_| McpDispatchState::ResponseReceived),
+                    is_error: end.reply.as_ref().map(|reply| reply.is_error),
+                    blocks: end.reply.as_ref().map(|reply| reply.blocks.clone()),
+                    structured: end.reply.as_ref().map(|reply| reply.structured),
+                }),
             });
         }
         (self.to_interpreter)(answer(ask, call, end));
@@ -1326,7 +1384,6 @@ impl Described {
 }
 
 /// Which methods differ between two descriptions, by exact name.
-#[cfg_attr(not(test), expect(dead_code, reason = "`redescribe` calls it"))]
 fn changes(old: &ServiceDescription, new: &ServiceDescription) -> ServiceChanges {
     fn find<'a>(description: &'a ServiceDescription, name: &str) -> Option<&'a MethodDescription> {
         description
@@ -1386,12 +1443,15 @@ fn said(reason: ServiceReason) -> &'static str {
 /// The answer to the call the interpreter asked as `ask`: its result, moved
 /// into the line, or why there is none.
 fn answer(ask: u64, call: ServiceCallId, end: End) -> Value {
-    if end.outcome == ServiceOutcome::Returned {
-        return json!({"t": "service", "id": ask, "ok": end.result});
+    if let Some(result) = end.result {
+        let mut line = json!({"t": "service", "id": ask, "call": call});
+        line["ok"] = Value::String(result);
+        return line;
     }
-    // A refusal's category is its reason, as agent code reads it.
-    let category = match end.outcome {
-        ServiceOutcome::Refused => end.reason.map(name),
+    // A refusal's category is its reason, as agent code reads it, and so is
+    // that of a result too large to hand over.
+    let category = match (end.outcome, end.reason) {
+        (ServiceOutcome::Refused | ServiceOutcome::Returned, reason) => reason.map(name),
         _ => end.category.map(|category| category.as_str().to_string()),
     };
     failed(
@@ -1407,17 +1467,43 @@ fn answer(ask: u64, call: ServiceCallId, end: End) -> Value {
     )
 }
 
-/// What agent code reads of a call that returned no result.
-struct Failed {
-    outcome: String,
-    category: Option<String>,
-    reason: Option<String>,
-    message: String,
-    path: Option<String>,
+/// What agent code reads of a call that returned no result, or of another
+/// ask a service's object makes of the host that was refused.
+pub(crate) struct Failed {
+    pub(crate) outcome: String,
+    pub(crate) category: Option<String>,
+    pub(crate) reason: Option<String>,
+    pub(crate) message: String,
+    pub(crate) path: Option<String>,
 }
 
-/// The answer to the call asked as `ask`, which ended as `failed` says.
-fn failed(ask: u64, call: Option<ServiceCallId>, failed: Failed) -> Value {
+impl Failed {
+    /// Refused for `reason`: never done.
+    pub(crate) fn refused(reason: ServiceReason, message: String) -> Self {
+        Self {
+            outcome: name(ServiceOutcome::Refused),
+            category: Some(name(reason)),
+            reason: Some(name(reason)),
+            message,
+            path: None,
+        }
+    }
+
+    /// Done, and failed as `category` says.
+    pub(crate) fn raised(category: ServiceErrorCategory, message: String) -> Self {
+        Self {
+            outcome: name(ServiceOutcome::Raised),
+            category: Some(category.as_str().to_string()),
+            reason: None,
+            message,
+            path: None,
+        }
+    }
+}
+
+/// The answer to what the interpreter asked as `ask` -- the call `call`, or
+/// another ask of a service's object -- which ended as `failed` says.
+pub(crate) fn failed(ask: u64, call: Option<ServiceCallId>, failed: Failed) -> Value {
     json!({
         "t": "service",
         "id": ask,
@@ -1440,37 +1526,35 @@ fn name(value: impl Serialize) -> String {
     }
 }
 
-/// The answer to a call the table did not accept: one from an agent whose
-/// kernel the host did not open, or one when the session serves no service.
+/// The answer to an ask no table took -- a call, or a relist of an MCP
+/// service -- from an agent whose kernel the host did not open, or when the
+/// session serves nothing it could be of.
 pub(crate) fn unserved(line: &Value, opened: bool) -> Option<Value> {
-    if line["t"] != "service.call" {
+    if line["t"] != "service.call" && line["t"] != "mcp.relist" {
         return None;
     }
     let ask = line["id"].as_u64()?;
-    let (reason, message) = match opened {
-        true => (
-            name(ServiceReason::UnknownMethod),
-            "the session serves no services".to_string(),
+    let refused = match opened {
+        true => Failed::refused(
+            ServiceReason::UnknownMethod,
+            "the session serves no such service".to_string(),
         ),
-        false => (
-            "unknown_agent".to_string(),
-            format!(
-                "agent {} has no kernel open on the host, so its call was not made",
-                line["agent"]
-            ),
-        ),
+        false => {
+            let reason = "unknown_agent".to_string();
+            Failed {
+                category: Some(reason.clone()),
+                reason: Some(reason),
+                ..Failed::refused(
+                    ServiceReason::UnknownMethod,
+                    format!(
+                        "agent {} has no kernel open on the host, so its ask was not taken",
+                        line["agent"]
+                    ),
+                )
+            }
+        }
     };
-    Some(failed(
-        ask,
-        None,
-        Failed {
-            outcome: name(ServiceOutcome::Refused),
-            category: Some(reason.clone()),
-            reason: Some(reason),
-            message,
-            path: None,
-        },
-    ))
+    Some(failed(ask, None, refused))
 }
 
 /// `text`, JSON, cut to [`PREVIEW_MAX`] characters, saying how many more it
@@ -1509,7 +1593,10 @@ mod tests {
                         result: Some(r#"{"x":1}"#.into()),
                         ..End::new(outcome, String::new())
                     };
-                    (end, json!({"t": "service", "id": 3, "ok": r#"{"x":1}"#}))
+                    (
+                        end,
+                        json!({"t": "service", "id": 3, "call": 7, "ok": r#"{"x":1}"#}),
+                    )
                 }
                 ServiceOutcome::Raised => (
                     End::raised(ServiceErrorCategory::NotFound, "no such".into()),

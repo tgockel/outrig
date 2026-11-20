@@ -19,9 +19,9 @@ use super::children_tests::{
 };
 use super::instance_tests::{launching, subject};
 use super::mock_http::{RecordedRequest, Responder, submit, system_text, text_reply};
-use crate::harness::Service;
 use crate::harness::event::Event;
 use crate::harness::services_tests::Fixture;
+use crate::harness::{McpServiceSpec, Service};
 use crate::python::testing::{Flag, pip_env, py, wheel_links, within};
 
 /// The fixture library bound twice, where no approval is asked for.
@@ -626,4 +626,112 @@ except runtime.MessageAvailable:
         "{'ticket': 't-1'}\nanswered t-1 says 42\n"
     );
     assert_eq!(fixture.calls(), 1);
+}
+
+/// The primary's code for an MCP service and a Rust one given together: a `Caller` given both by
+/// reference, ready and released.
+const MCP_SERVED: &str = r#"
+import outrig
+class Caller(outrig.Agent):
+    """ROLE caller. Call what you were given."""
+    @outrig.agent
+    async def go(self, q: str) -> str:
+        """Do `q`."""
+c = Caller(facilities={'fs': outrig.facility('fs'), 'svc': outrig.facility('svc')})
+await c.ready()
+await c.release()
+"#;
+
+/// The caller's launch round: a call of each service it was given, in one execution.
+const MCP_CALLER: &str = r#"
+print(fs.echo(text='c').content[0].text, svc.echo(x=3))
+"#;
+
+/// A call of an MCP service's tool from a child's kernel is the child's, in its execution, as a
+/// Rust service's call beside it is: the same correlation fields, its kind and its tool told
+/// apart. The primary and the child are each told the MCP service is one, and what its calls
+/// return, by the instructions their model calls carry.
+#[tokio::test]
+async fn an_mcp_service_is_attributed_as_a_rust_one_is() {
+    let fixture = Fixture::new();
+    let given = Arc::clone(&fixture) as Arc<dyn Service>;
+    let mut tree = tree_built(
+        "OUTRIG_TEST_MCP_FACILITIES_KEY",
+        "",
+        vec![
+            ("ROLE caller", serving(MCP_CALLER)),
+            ("", primary_runs(MCP_SERVED)),
+        ],
+        None,
+        move |builder| {
+            builder
+                .serve("svc", given)
+                .mcp("fs", McpServiceSpec::command(["fs-server"]))
+        },
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_report, events, requests) = tree.end().await;
+
+    let callers = instances(&events, "Caller");
+    let (caller, _) = &callers[0];
+    assert_eq!(
+        exec_outputs(&events, &format!("agent/{caller}"))[0],
+        "c {'x': 3}\n"
+    );
+    let received: Vec<Value> = kind(&events, "service.call.received", None)
+        .iter()
+        .map(|event| data(event))
+        .filter(|data| data["agent"] == caller.as_str())
+        .collect();
+    assert_eq!(received.len(), 2, "{received:?}");
+    let (mcp, rust) = (&received[0], &received[1]);
+    assert_eq!(
+        (&mcp["kind"], &mcp["service"], &mcp["tool"], &mcp["listing"]),
+        (&json!("mcp"), &json!("fs"), &json!("echo"), &json!(1))
+    );
+    assert_eq!(
+        (&rust["kind"], &rust["service"]),
+        (&json!("rust"), &json!("svc"))
+    );
+    assert!(rust.get("tool").is_none(), "{rust}");
+    assert!(mcp["execid"].is_u64(), "{mcp}");
+    assert_eq!(mcp["execid"], rust["execid"], "one execution made both");
+    let ended: Vec<Value> = kind(&events, "service.call.ended", None)
+        .iter()
+        .map(|event| data(event))
+        .filter(|data| data["agent"] == caller.as_str())
+        .collect();
+    assert_eq!(
+        ended
+            .iter()
+            .map(|data| (data["kind"].clone(), data["execid"].clone()))
+            .collect::<Vec<_>>(),
+        [
+            (json!("mcp"), mcp["execid"].clone()),
+            (json!("rust"), mcp["execid"].clone())
+        ]
+    );
+
+    let instructions = kind(&events, "model.instructions", None);
+    let preamble = |event: &Event| data(event)["preamble"].as_str().map(str::to_string);
+    let primary = instructions
+        .iter()
+        .find_map(|event| preamble(event).filter(|text| text.contains("- `svc`: ")))
+        .expect("the primary's instructions");
+    for said in [
+        "- `fs`, an MCP server: ",
+        "A call of an MCP server's tool returns an `outrig.McpResult`",
+        "OutRig never repeats one",
+    ] {
+        assert!(primary.contains(said), "{said}: {primary}");
+    }
+    let caller_told = system_text(&of_agent(&requests, "ROLE caller")[0].body);
+    for said in [
+        "- `fs`, an MCP server the host runs: ",
+        "- `svc`, a service the host runs: The test service.",
+        "returns an `outrig.McpResult`",
+    ] {
+        assert!(caller_told.contains(said), "{said}: {caller_told}");
+    }
 }

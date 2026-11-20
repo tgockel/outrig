@@ -977,7 +977,8 @@ class McpCause:
 class McpOutcome:
     """How a declared MCP service's start ended: `session.mcp[name]` after entry. `outcome` is
     `"ready"` -- started and bound, with `tools` tools in its first listing, generation `listing`,
-    after `attempts` attempts -- or `"unavailable"`, `"refused"`, `"misconfigured"` or
+    after `attempts` attempts, and in `undecoded` each tool its server listed that did not decode,
+    left out, as `(name, reason)` -- or `"unavailable"`, `"refused"`, `"misconfigured"` or
     `"unclassified"`, with the `McpCause` in `cause`. The session starts with the ready ones; what
     the others mean is this program's to decide."""
 
@@ -986,6 +987,7 @@ class McpOutcome:
     tools: int | None = None
     listing: int | None = None
     attempts: int | None = None
+    undecoded: tuple[tuple[str | None, str], ...] = ()
     cause: McpCause | None = None
 
 
@@ -994,6 +996,9 @@ def _mcp_outcome(row):
     row = dict(row)
     outcome = row.pop("outcome")
     if outcome == "ready":
+        row["undecoded"] = tuple(
+            (each.get("name"), each.get("reason")) for each in row.get("undecoded", ())
+        )
         return McpOutcome(outcome=outcome, **row)
     return McpOutcome(service=row["service"], outcome=outcome, cause=McpCause(**row))
 

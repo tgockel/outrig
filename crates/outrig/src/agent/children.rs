@@ -54,7 +54,7 @@ use crate::harness::channels::{Channels, Rounds};
 use crate::harness::event::{
     AgentInstanceId, AgentRequestId, ChannelBrief, ChildKind, ContributionBrief, FacilityBrief,
     FacilityKind, InputBrief, InstanceRelease, InvocationEnd, InvocationId, ParamsBy, Payload,
-    RequestEnd, Subject, Usage,
+    RequestEnd, ServiceKind, Subject, Usage,
 };
 use crate::harness::lifecycle::Lifecycle;
 use crate::harness::roster::{AgentKind, AgentRow, Outstanding, Parent, Roster, RosterState};
@@ -1331,9 +1331,15 @@ impl Inner {
         );
         let bindings = [settings.bindings.clone(), self.injected.briefs()].concat();
         for facility in given.iter_mut().flatten() {
-            facility.serialize =
-                facility.brief.target.as_ref().is_some_and(|target| {
-                    bindings.iter().any(|b| &b.name == target && b.serialize)
+            let target = facility.brief.target.as_ref();
+            facility.serialize = target
+                .is_some_and(|target| bindings.iter().any(|b| &b.name == target && b.serialize));
+            facility.mcp = facility.brief.kind == FacilityKind::Service
+                && target.is_some_and(|target| {
+                    settings
+                        .services
+                        .iter()
+                        .any(|s| &s.name == target && s.kind == ServiceKind::Mcp)
                 });
         }
         let view = given.as_deref().map_or(
@@ -2578,6 +2584,7 @@ fn given(facilities: &Value) -> Option<Vec<Given>> {
                     brief,
                     description: text(&facility["description"]),
                     serialize: false,
+                    mcp: false,
                 }
             })
             .collect(),

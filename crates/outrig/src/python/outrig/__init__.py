@@ -28,7 +28,10 @@ and its `receive` when the channel was closed: see `help(outrig.ChannelError)`.
 
 Each service the session's owner serves from Rust is an `outrig.Service`, its methods calls to
 the host by value; a call that returns no result raises `outrig.ServiceError`: see
-`help(outrig.Service)`.
+`help(outrig.Service)`. Each MCP server the session places is an `outrig.McpService`, a method per
+tool by the tool's exact name, whose calls return an `outrig.McpResult` -- content blocks in
+order, structured content -- and raise `outrig.ToolError` for a result the server marked an
+error: see `help(outrig.McpService)` and `help(outrig.McpResult)`.
 
 `outrig.skills` reaches the session's skills, whose code imports as `outrig_skills.<name>`: see
 `help(outrig.skills)`.
@@ -60,6 +63,21 @@ from ._agents import (
     agent,
     facility,
 )
+from ._mcp import (
+    McpAudio,
+    McpBlock,
+    McpError,
+    McpImage,
+    McpOther,
+    McpRelisted,
+    McpResource,
+    McpResourceLink,
+    McpResult,
+    McpService,
+    McpText,
+    McpTool,
+    ToolError,
+)
 from ._services import Service, ServiceError, ServiceMethod
 
 __all__ = [
@@ -75,6 +93,18 @@ __all__ = [
     "ChannelError",
     "CompletionRejected",
     "Facility",
+    "McpAudio",
+    "McpBlock",
+    "McpError",
+    "McpImage",
+    "McpOther",
+    "McpRelisted",
+    "McpResource",
+    "McpResourceLink",
+    "McpResult",
+    "McpService",
+    "McpText",
+    "McpTool",
     "Request",
     "RequestCancelled",
     "RequestEnded",
@@ -88,6 +118,7 @@ __all__ = [
     "ServiceMethod",
     "SessionClosing",
     "Status",
+    "ToolError",
     "UnreadableDelivery",
     "agent",
     "facility",

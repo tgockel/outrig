@@ -237,6 +237,11 @@ pub outrig::config::ConfigValidationError::RetryBudgetSecsTooLarge
 pub outrig::config::ConfigValidationError::RetryBudgetSecsTooLarge::max: u64
 pub outrig::config::ConfigValidationError::RetryBudgetSecsTooLarge::path: alloc::string::String
 pub outrig::config::ConfigValidationError::RetryBudgetSecsTooLarge::value: u64
+pub outrig::config::ConfigValidationError::ServiceResultMaxBytesOutOfRange
+pub outrig::config::ConfigValidationError::ServiceResultMaxBytesOutOfRange::max: u64
+pub outrig::config::ConfigValidationError::ServiceResultMaxBytesOutOfRange::min: u64
+pub outrig::config::ConfigValidationError::ServiceResultMaxBytesOutOfRange::path: alloc::string::String
+pub outrig::config::ConfigValidationError::ServiceResultMaxBytesOutOfRange::value: u64
 pub outrig::config::ConfigValidationError::SessionRootNotAbsolute
 pub outrig::config::ConfigValidationError::SessionRootNotAbsolute::path: std::path::PathBuf
 pub outrig::config::ConfigValidationError::SidecarArgsWithoutEntrypoint
@@ -653,6 +658,7 @@ pub outrig::config::Config::providers: alloc::collections::btree::map::BTreeMap<
 pub outrig::config::Config::repo: outrig::config::RepoPolicy
 pub outrig::config::Config::requests_max: core::option::Option<u32>
 pub outrig::config::Config::retry_budget_secs: core::option::Option<u64>
+pub outrig::config::Config::service_result_max_bytes: core::option::Option<u64>
 pub outrig::config::Config::session_root: core::option::Option<std::path::PathBuf>
 pub outrig::config::Config::sidecars: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::SidecarConfig>
 pub outrig::config::Config::subagent_depth_max: core::option::Option<u32>
@@ -847,6 +853,7 @@ pub const outrig::config::DEFAULT_HOST_GRACE_SECS: u64
 pub const outrig::config::DEFAULT_MCP_CALL_TIMEOUT_SECS: u64
 pub const outrig::config::DEFAULT_MCP_CONNECT_BUDGET_SECS: u64
 pub const outrig::config::DEFAULT_RETRY_BUDGET_SECS: u64
+pub const outrig::config::DEFAULT_SERVICE_RESULT_MAX_BYTES: u64
 pub const outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX: u32
 pub const outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX: u32
 pub const outrig::config::DEFAULT_TOOL_CALL_MAX: u32
@@ -856,6 +863,8 @@ pub const outrig::config::MCP_CALL_TIMEOUT_SECS_CEILING: u64
 pub const outrig::config::MODEL_ALIAS_DEPTH_MAX: usize
 pub const outrig::config::REQUEST_TIMEOUT_SECS_CEILING: u64
 pub const outrig::config::RETRY_BUDGET_SECS_CEILING: u64
+pub const outrig::config::SERVICE_RESULT_MAX_CEILING_BYTES: u64
+pub const outrig::config::SERVICE_RESULT_MAX_FLOOR_BYTES: u64
 pub const outrig::config::SUBAGENT_DEPTH_MAX_CEILING: u32
 pub const outrig::config::SUBAGENT_WIDTH_MAX_CEILING: u32
 pub const outrig::config::TOOL_CALL_MAX_LIMIT: u32
@@ -1310,6 +1319,8 @@ pub outrig::harness::event::ItemOutcome::Accepted
 pub outrig::harness::event::ItemOutcome::NotAccepted
 pub outrig::harness::event::ItemOutcome::Refused
 pub outrig::harness::event::ItemOutcome::Uncertain
+#[non_exhaustive] pub enum outrig::harness::event::McpDispatchState
+pub outrig::harness::event::McpDispatchState::ResponseReceived
 #[non_exhaustive] pub enum outrig::harness::event::Operation
 pub outrig::harness::event::Operation::Buffiter
 pub outrig::harness::event::Operation::Call
@@ -1601,11 +1612,18 @@ pub outrig::harness::event::Payload::McpServiceFailed::cause: outrig::harness::M
 pub outrig::harness::event::Payload::McpServiceFailed::duration: core::time::Duration
 pub outrig::harness::event::Payload::McpServiceFailed::outcome: outrig::harness::McpOutcomeKind
 pub outrig::harness::event::Payload::McpServiceFailed::service: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::McpServiceListChanged
+pub outrig::harness::event::Payload::McpServiceListChanged::service: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::McpServicePaused
 pub outrig::harness::event::Payload::McpServicePaused::calls: alloc::vec::Vec<outrig::harness::event::ServiceCallId>
 pub outrig::harness::event::Payload::McpServicePaused::how: outrig::harness::McpPauseHow
 pub outrig::harness::event::Payload::McpServicePaused::proven: bool
 pub outrig::harness::event::Payload::McpServicePaused::service: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::McpServiceRelisted
+pub outrig::harness::event::Payload::McpServiceRelisted::agent: alloc::string::String
+pub outrig::harness::event::Payload::McpServiceRelisted::listing: u64
+pub outrig::harness::event::Payload::McpServiceRelisted::service: alloc::string::String
+pub outrig::harness::event::Payload::McpServiceRelisted::undecoded: alloc::vec::Vec<outrig::McpUndecodedTool>
 #[non_exhaustive] pub outrig::harness::event::Payload::McpServiceResumed
 pub outrig::harness::event::Payload::McpServiceResumed::proven: bool
 pub outrig::harness::event::Payload::McpServiceResumed::service: alloc::string::String
@@ -1623,6 +1641,7 @@ pub outrig::harness::event::Payload::McpServiceStarted::placement: outrig::harne
 pub outrig::harness::event::Payload::McpServiceStarted::server: core::option::Option<alloc::string::String>
 pub outrig::harness::event::Payload::McpServiceStarted::service: alloc::string::String
 pub outrig::harness::event::Payload::McpServiceStarted::tools: usize
+pub outrig::harness::event::Payload::McpServiceStarted::undecoded: alloc::vec::Vec<outrig::McpUndecodedTool>
 #[non_exhaustive] pub outrig::harness::event::Payload::McpServiceStopped
 pub outrig::harness::event::Payload::McpServiceStopped::how: outrig::harness::McpStopHow
 pub outrig::harness::event::Payload::McpServiceStopped::proven: bool
@@ -1756,6 +1775,7 @@ pub outrig::harness::event::Payload::ServiceCallEnded::detail: core::option::Opt
 pub outrig::harness::event::Payload::ServiceCallEnded::duration: core::time::Duration
 pub outrig::harness::event::Payload::ServiceCallEnded::execid: core::option::Option<outrig::harness::event::ExecId>
 pub outrig::harness::event::Payload::ServiceCallEnded::kind: outrig::harness::event::ServiceKind
+pub outrig::harness::event::Payload::ServiceCallEnded::mcp: core::option::Option<outrig::harness::event::McpCallEnded>
 pub outrig::harness::event::Payload::ServiceCallEnded::method: alloc::string::String
 pub outrig::harness::event::Payload::ServiceCallEnded::outcome: outrig::harness::event::ServiceOutcome
 pub outrig::harness::event::Payload::ServiceCallEnded::reason: core::option::Option<outrig::harness::event::ServiceReason>
@@ -1769,6 +1789,7 @@ pub outrig::harness::event::Payload::ServiceCallReceived::execid: core::option::
 pub outrig::harness::event::Payload::ServiceCallReceived::generation: u64
 pub outrig::harness::event::Payload::ServiceCallReceived::invocation: core::option::Option<outrig::harness::event::InvocationId>
 pub outrig::harness::event::Payload::ServiceCallReceived::kind: outrig::harness::event::ServiceKind
+pub outrig::harness::event::Payload::ServiceCallReceived::mcp: core::option::Option<outrig::harness::event::McpCallReceived>
 pub outrig::harness::event::Payload::ServiceCallReceived::method: alloc::string::String
 pub outrig::harness::event::Payload::ServiceCallReceived::service: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::ServiceDescribed
@@ -2008,6 +2029,16 @@ pub fn outrig::harness::event::InvocationId::fmt(&self, &mut core::fmt::Formatte
 pub outrig::harness::event::LeftOut::message: u64
 pub outrig::harness::event::LeftOut::part: u64
 pub outrig::harness::event::LeftOut::turn: u64
+#[non_exhaustive] pub struct outrig::harness::event::McpCallEnded
+pub outrig::harness::event::McpCallEnded::blocks: core::option::Option<alloc::collections::btree::map::BTreeMap<alloc::string::String, u64>>
+pub outrig::harness::event::McpCallEnded::is_error: core::option::Option<bool>
+pub outrig::harness::event::McpCallEnded::listing: u64
+pub outrig::harness::event::McpCallEnded::state: core::option::Option<outrig::harness::event::McpDispatchState>
+pub outrig::harness::event::McpCallEnded::structured: core::option::Option<bool>
+pub outrig::harness::event::McpCallEnded::tool: alloc::string::String
+#[non_exhaustive] pub struct outrig::harness::event::McpCallReceived
+pub outrig::harness::event::McpCallReceived::listing: u64
+pub outrig::harness::event::McpCallReceived::tool: alloc::string::String
 pub struct outrig::harness::event::MessageId(_)
 impl outrig::harness::event::MessageId
 pub fn outrig::harness::event::MessageId::get(self) -> u64
@@ -2246,6 +2277,7 @@ pub outrig::harness::McpServiceOutcome::Misconfigured(outrig::harness::McpStartu
 pub outrig::harness::McpServiceOutcome::Ready::attempts: u32
 pub outrig::harness::McpServiceOutcome::Ready::listing: u64
 pub outrig::harness::McpServiceOutcome::Ready::tools: usize
+pub outrig::harness::McpServiceOutcome::Ready::undecoded: alloc::vec::Vec<outrig::McpUndecodedTool>
 pub outrig::harness::McpServiceOutcome::Refused(outrig::harness::McpStartupCause)
 pub outrig::harness::McpServiceOutcome::Unavailable(outrig::harness::McpStartupCause)
 pub outrig::harness::McpServiceOutcome::Unclassified(outrig::harness::McpStartupCause)
@@ -2808,6 +2840,7 @@ pub outrig::harness::ServiceCall::service: alloc::string::String
 #[non_exhaustive] pub struct outrig::harness::ServiceDescription
 pub outrig::harness::ServiceDescription::call_deadline: core::option::Option<core::time::Duration>
 pub outrig::harness::ServiceDescription::description: alloc::string::String
+pub outrig::harness::ServiceDescription::extras: serde_json::map::Map<alloc::string::String, serde_json::value::Value>
 pub outrig::harness::ServiceDescription::methods: alloc::vec::Vec<outrig::harness::MethodDescription>
 impl outrig::harness::ServiceDescription
 pub fn outrig::harness::ServiceDescription::new(impl core::convert::Into<alloc::string::String>) -> Self
@@ -3273,6 +3306,11 @@ pub fn outrig::McpToolResult::error(impl core::convert::Into<alloc::string::Stri
 pub fn outrig::McpToolResult::from_content(alloc::vec::Vec<outrig::McpContent>) -> Self
 pub fn outrig::McpToolResult::ok(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::McpToolResult::render_text(&self) -> alloc::string::String
+#[non_exhaustive] pub struct outrig::McpUndecodedTool
+pub outrig::McpUndecodedTool::name: core::option::Option<alloc::string::String>
+pub outrig::McpUndecodedTool::reason: alloc::string::String
+impl core::fmt::Display for outrig::McpUndecodedTool
+pub fn outrig::McpUndecodedTool::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::MountSpec
 pub outrig::MountSpec::access: outrig::config::MountAccess
 pub outrig::MountSpec::container: std::path::PathBuf

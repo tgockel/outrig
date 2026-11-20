@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::bindings_tests::{output, start, stop, taken};
-use super::event::{Event, ServiceOutcome, ServiceReason, Subscription};
+use super::event::{Event, ServiceChanges, ServiceOutcome, ServiceReason, Subscription};
 use super::{
     CallContext, MethodDescription, Service, ServiceDescription, ServiceError,
     ServiceErrorCategory, ServiceFuture, ServicePolicy, Session, SessionBuilder, Verdict,
@@ -752,18 +752,22 @@ async fn the_close_drains_then_abandons() {
 }
 
 /// A result larger than the policy's bound is not handed over: the caller is told its size,
-/// and the event records that the service returned it.
+/// and both it and the event say the service returned -- the call did its work.
 #[tokio::test]
-async fn a_result_past_the_bound_is_refused() {
+async fn a_result_past_the_bound_returns_without_it() {
     let fixture = Fixture::new();
-    let (session, mut events) = served(&fixture, ServicePolicy::default()).await;
+    let tight = ServicePolicy {
+        result_max: 16 << 20,
+        ..ServicePolicy::default()
+    };
+    let (session, mut events) = served(&fixture, tight).await;
     let said = output(
         &session,
         "try:\n    svc.big()\nexcept outrig.ServiceError as e:\n    print(e.outcome, e.category, e)",
     )
     .await;
     assert!(
-        said.starts_with("refused result_too_large ")
+        said.starts_with("returned result_too_large ")
             && said.contains("20971522 bytes")
             && said.contains("16777216"),
         "{said}"
@@ -774,7 +778,7 @@ async fn a_result_past_the_bound_is_refused() {
     assert_eq!(
         (&ended["outcome"], &ended["reason"], &ended["bytes"]),
         (
-            &json!("refused"),
+            &json!("returned"),
             &json!("result_too_large"),
             &json!(20_971_522)
         )
@@ -868,10 +872,25 @@ async fn a_description_changes_under_the_session() {
         methods.retain(|method| method.name != "echo");
         methods.push(MethodDescription::new("new", "Newly here.", json!({})));
     });
-    assert!(session.services().redescribe("svc"));
-    assert!(
-        !session.services().redescribe("svc"),
+    let mut announced = Vec::new();
+    let (generation, changes) = session
+        .services()
+        .redescribe("svc", |generation| announced.push(generation))
+        .expect("served");
+    assert_eq!((generation, changes.removed), (2, vec!["echo".to_string()]));
+    let (generation, changes) = session
+        .services()
+        .redescribe("svc", |generation| announced.push(generation))
+        .expect("served");
+    assert_eq!(
+        (generation, changes),
+        (2, ServiceChanges::default()),
         "nothing changed since"
+    );
+    assert_eq!(
+        announced,
+        [2, 2],
+        "announced before each publishes, changed or not"
     );
     assert_eq!(
         output(
@@ -1134,4 +1153,120 @@ async fn an_argument_named_self_is_an_argument() {
         "{'self': 1} {'self': 2} (**arguments)\n"
     );
     stop(session).await;
+}
+
+/// A schema that sets `additionalProperties` takes any other argument by name, as
+/// `**arguments` after the ones it names, and they reach the service beside them; one that names
+/// an argument `arguments` takes them all as the plain `(**arguments)`; and one that leaves
+/// `additionalProperties` out takes no others, an argument named `arguments` among its own.
+#[tokio::test]
+async fn additional_properties_take_any_other_argument() {
+    let more = json!({
+        "type": "object",
+        "properties": {"x": {"type": "integer"}},
+        "required": ["x"],
+        "additionalProperties": true,
+    });
+    let named = json!({
+        "type": "object",
+        "properties": {"arguments": {"type": "string"}},
+        "additionalProperties": {"type": "integer"},
+    });
+    let plain = json!({"type": "object", "properties": {"arguments": {"type": "string"}}});
+    let fixture = Fixture::described(vec![
+        MethodDescription::new("more", "Take more.", more),
+        MethodDescription::new("named", "Take one named arguments.", named),
+        MethodDescription::new("plain", "Take an argument named arguments.", plain),
+        MethodDescription::new("closed", "Take none.", json!({"type": "object"})),
+    ]);
+    let builder = builder().serve("svc", fixture as Arc<dyn Service>);
+    let (session, _events) = served_with(builder, ServicePolicy::default()).await;
+    assert_eq!(
+        output(
+            &session,
+            "import inspect\n\
+             print(inspect.signature(svc.more), svc.more(1, y=2), svc.method('more')(x=3))\n\
+             print(inspect.signature(svc.named), svc.named(arguments='a', z=1))\n\
+             print(inspect.signature(svc.plain), svc.plain(arguments='b'))\n\
+             print(inspect.signature(svc.closed))\n\
+             try:\n    svc.closed(y=1)\nexcept TypeError as e:\n    print('TypeError')",
+        )
+        .await,
+        "(x: int, **arguments) {'x': 1, 'y': 2} {'x': 3}\n\
+         (**arguments) {'arguments': 'a', 'z': 1}\n\
+         (*, arguments: str = ...) {'arguments': 'b'}\n\
+         ()\n\
+         TypeError\n"
+    );
+    stop(session).await;
+}
+
+/// A schema the renderer cannot read costs its method only its signature, never the service or
+/// the services declared beside it: a type list holding an object, in a property and in
+/// `additionalProperties`; `required` holding a non-string; and a name required twice. Each
+/// compiles to no check on the host, which calls the method unchecked.
+#[tokio::test]
+async fn a_schema_past_the_renderer_costs_only_a_signature() {
+    let typed = json!({
+        "type": "object",
+        "properties": {"x": {"type": [{}]}},
+        "additionalProperties": {"type": [{}]},
+    });
+    let odd = json!({"type": "object", "properties": {"x": {}}, "required": [{}]});
+    let twice = json!({"type": "object", "properties": {"x": {}}, "required": ["x", "x"]});
+    let fixture = Fixture::described(vec![
+        MethodDescription::new("typed", "Take a typed x.", typed),
+        MethodDescription::new("odd", "Take an odd x.", odd),
+        MethodDescription::new("twice", "Take x, required twice.", twice),
+    ]);
+    let builder = builder()
+        .serve("svc", fixture as Arc<dyn Service>)
+        .serve("other", Fixture::new() as Arc<dyn Service>);
+    let (session, _events) = served_with(builder, ServicePolicy::default()).await;
+    assert_eq!(
+        output(
+            &session,
+            "import inspect\n\
+             print(inspect.signature(svc.typed), svc.typed(x=1, y=2))\n\
+             print(inspect.signature(svc.odd), svc.odd(x=1))\n\
+             print(inspect.signature(svc.twice), svc.twice(1))\n\
+             print(other.echo(x=4))",
+        )
+        .await,
+        "(*, x=..., **arguments) {'x': 1, 'y': 2}\n\
+         (**arguments) {'x': 1}\n\
+         (x: Any) {'x': 1}\n\
+         {'x': 4}\n"
+    );
+    stop(session).await;
+}
+
+/// A session that sets no service policy holds results to the configuration's bound, 64 MiB
+/// when it sets none; the owner's policy wins; and a bound outside 1 KiB to 4 GiB is refused.
+#[test]
+fn the_configured_result_bound_is_the_default_policys() {
+    let mut config = config();
+    let default = SessionBuilder::new(config.clone(), Some("coding"), None);
+    assert_eq!(default.service_policy_or_default().result_max, 64 << 20);
+    config.service_result_max_bytes = Some(2048);
+    config.validate(None).expect("in range");
+    let configured = SessionBuilder::new(config.clone(), Some("coding"), None);
+    assert_eq!(configured.service_policy_or_default().result_max, 2048);
+    let chosen = configured.service_policy(ServicePolicy {
+        result_max: 4096,
+        ..ServicePolicy::default()
+    });
+    assert_eq!(
+        chosen.service_policy_or_default().result_max,
+        4096,
+        "the owner's policy wins"
+    );
+    for out in [1023, (4 << 30) + 1] {
+        config.service_result_max_bytes = Some(out);
+        let refused = config.validate(None).expect_err("out of range");
+        assert!(
+            refused.to_string().contains("service-result-max-bytes"),
+            "{refused}"
+        );
+    }
 }

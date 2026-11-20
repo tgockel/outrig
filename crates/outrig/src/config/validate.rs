@@ -27,10 +27,10 @@ use super::{
     ImageConfig, ImageSourceRef, LlmProvider, MCP_CALL_TIMEOUT_SECS_CEILING,
     MODEL_CONCURRENCY_MAX_CEILING, McpServerSpec, Model, ModelSourceRef, NetworkMode,
     PRIMARY_VIEW_ADDED_CAPS, PRIMARY_VIEW_DEFAULT_CAPS, REQUEST_TIMEOUT_SECS_CEILING,
-    REQUESTS_MAX_CEILING, RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING,
-    SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES,
-    TOOL_RESULT_MAX_FLOOR_BYTES, canonical_capability_name, is_env_key, lexical,
-    normalize_capability_name,
+    REQUESTS_MAX_CEILING, RETRY_BUDGET_SECS_CEILING, SERVICE_RESULT_MAX_CEILING_BYTES,
+    SERVICE_RESULT_MAX_FLOOR_BYTES, SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING,
+    TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES,
+    canonical_capability_name, is_env_key, lexical, normalize_capability_name,
 };
 
 /// Renders the trailing `(declared in <file>)` note, or nothing when the entry
@@ -479,6 +479,17 @@ pub enum ConfigValidationError {
          start an MCP server and every wait between them"
     )]
     McpConnectBudgetSecsOutOfRange { path: String, value: u64, max: u64 },
+
+    #[error(
+        "{path} must be between {min} and {max} bytes; got {value}: it bounds the result, as \
+         JSON, a service call hands agent code"
+    )]
+    ServiceResultMaxBytesOutOfRange {
+        path: String,
+        value: u64,
+        min: u64,
+        max: u64,
+    },
 
     #[error("{message}")]
     NetworkPolicyInvalid { message: String },
@@ -1028,6 +1039,16 @@ pub(super) fn validate_with_options(
             path: "top-level mcp-connect-budget-secs".into(),
             value,
             max: MCP_CALL_TIMEOUT_SECS_CEILING,
+        });
+    }
+    if let Some(value) = cfg.service_result_max_bytes
+        && !(SERVICE_RESULT_MAX_FLOOR_BYTES..=SERVICE_RESULT_MAX_CEILING_BYTES).contains(&value)
+    {
+        return Err(ConfigValidationError::ServiceResultMaxBytesOutOfRange {
+            path: "top-level service-result-max-bytes".into(),
+            value,
+            min: SERVICE_RESULT_MAX_FLOOR_BYTES,
+            max: SERVICE_RESULT_MAX_CEILING_BYTES,
         });
     }
     validate_network_policy(cfg)?;

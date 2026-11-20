@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 /// The fake placements of a session, by the container each stands for: [`PRIMARY`], or a
 /// sidecar's name -- `mcp-<service>` for an owner's.
 #[derive(Clone, Default)]
-struct Fakes {
+pub(super) struct Fakes {
     placed: Arc<Mutex<HashMap<String, Arc<Fake>>>>,
     /// Each sidecar placed, by name, and the image it was placed from.
     images: Arc<Mutex<Vec<(String, String)>>>,
@@ -38,7 +38,7 @@ struct Fakes {
 
 impl Fakes {
     /// The fake for `host`, made if there is none yet.
-    fn of(&self, host: &str) -> Arc<Fake> {
+    pub(super) fn of(&self, host: &str) -> Arc<Fake> {
         Arc::clone(
             self.placed
                 .lock()
@@ -49,7 +49,7 @@ impl Fakes {
     }
 
     /// `builder`, its MCP servers placed by these fakes.
-    fn place(&self, builder: SessionBuilder) -> SessionBuilder {
+    pub(super) fn place(&self, builder: SessionBuilder) -> SessionBuilder {
         let fakes = self.clone();
         builder.mcp_placements(move |planned| {
             let host = match planned {
@@ -66,7 +66,7 @@ impl Fakes {
 }
 
 /// A policy whose attempts take at most `attempt`, within `budget`.
-fn policy(attempt: Duration, budget: Duration) -> McpPolicy {
+pub(super) fn policy(attempt: Duration, budget: Duration) -> McpPolicy {
     McpPolicy {
         attempt,
         ..McpPolicy::default().with_connect_budget(budget)
@@ -76,10 +76,26 @@ fn policy(attempt: Duration, budget: Duration) -> McpPolicy {
 /// A session started from `builder`, its servers placed by `fakes`, with quick calls and the
 /// policy's attempts quick too; its events subscribed to, and `err` defined in its primary.
 async fn placed(fakes: &Fakes, builder: SessionBuilder) -> (Session, Subscription) {
+    placed_under(
+        fakes,
+        builder,
+        quick(Duration::from_secs(3)),
+        policy(Duration::from_millis(500), Duration::from_secs(5)),
+    )
+    .await
+}
+
+/// [`placed`], its calls under `calls` and its starts under `starts`.
+pub(super) async fn placed_under(
+    fakes: &Fakes,
+    builder: SessionBuilder,
+    calls: ServicePolicy,
+    starts: McpPolicy,
+) -> (Session, Subscription) {
     let mut builder = fakes
         .place(builder)
-        .service_policy(quick(Duration::from_secs(3)))
-        .mcp_policy(policy(Duration::from_millis(500), Duration::from_secs(5)));
+        .service_policy(calls)
+        .mcp_policy(starts);
     let events = builder.subscribe();
     let session = start(builder).await;
     output(&session, ERR).await;
@@ -98,7 +114,7 @@ fn viewing(env: &[(&str, &str)]) -> SidecarSpec {
 }
 
 /// A sidecar of `mcp-image` hosting one exec'd server, with `env`.
-fn sidecar(env: &[(&str, &str)]) -> SidecarSpec {
+pub(super) fn sidecar(env: &[(&str, &str)]) -> SidecarSpec {
     let env = env
         .iter()
         .map(|(key, value)| (key.to_string(), EnvValue::from_raw(value.to_string())))
@@ -111,7 +127,7 @@ fn sidecar(env: &[(&str, &str)]) -> SidecarSpec {
 }
 
 /// `name`'s outcome in `session`.
-fn outcome(session: &Session, name: &str) -> McpServiceOutcome {
+pub(super) fn outcome(session: &Session, name: &str) -> McpServiceOutcome {
     session
         .mcp()
         .outcomes()
@@ -122,7 +138,7 @@ fn outcome(session: &Session, name: &str) -> McpServiceOutcome {
 }
 
 /// The `data` of each `mcp.service.*` event of `kind` naming `service`.
-fn of_service(events: &[Arc<Event>], kind: &str, service: &str) -> Vec<Value> {
+pub(super) fn of_service(events: &[Arc<Event>], kind: &str, service: &str) -> Vec<Value> {
     of_kind(events, kind)
         .into_iter()
         .filter(|data| data["service"] == service)
@@ -130,7 +146,7 @@ fn of_service(events: &[Arc<Event>], kind: &str, service: &str) -> Vec<Value> {
 }
 
 /// Where in `events` the first event of `kind` naming `service` is.
-fn position(events: &[Arc<Event>], kind: &str, service: &str) -> usize {
+pub(super) fn position(events: &[Arc<Event>], kind: &str, service: &str) -> usize {
     events
         .iter()
         .position(|event| {
@@ -162,6 +178,7 @@ async fn three_placements_start_through_one_facility() {
             McpServiceOutcome::Ready {
                 tools: 3,
                 listing: 1,
+                undecoded: Vec::new(),
                 attempts: 1
             },
             "{name}"
@@ -174,8 +191,8 @@ async fn three_placements_start_through_one_facility() {
     assert_eq!(
         output(
             &session,
-            "print(outrig.bindings['side'].echo(text='hi')['content'][0]['text'], \
-             view.call('echo', {'text': 'there'})['content'][0]['text'])",
+            "print(outrig.bindings['side'].echo(text='hi').content[0].text, \
+             view.call('echo', {'text': 'there'}).content[0].text)",
         )
         .await,
         "hi there\n"
@@ -337,6 +354,7 @@ async fn transient_failures_are_retried_within_the_budget() {
         McpServiceOutcome::Ready {
             tools: 3,
             listing: 1,
+            undecoded: Vec::new(),
             attempts: 2
         }
     );
@@ -410,6 +428,7 @@ async fn a_listing_is_held_to_the_attempts_bound() {
         McpServiceOutcome::Ready {
             tools: 3,
             listing: 1,
+            undecoded: Vec::new(),
             attempts: 2
         }
     );
@@ -941,11 +960,7 @@ async fn a_pause_holds_dispatch_and_freezes() {
     assert_eq!(mcp.resume("side").await, Ok(vec!["side".to_string()]));
     assert_eq!(fake.thaws(), 1);
     assert_eq!(
-        output(
-            &session,
-            "print(side.echo(text='back')['content'][0]['text'])"
-        )
-        .await,
+        output(&session, "print(side.echo(text='back').content[0].text)").await,
         "back\n"
     );
 
@@ -960,7 +975,7 @@ async fn a_pause_holds_dispatch_and_freezes() {
     assert!(matches!(held, QuiesceOutcome::Quiesced { .. }), "{held:?}");
     let mut call = session
         .interpreter()
-        .submit("print(side.echo(text='held')['content'][0]['text'])")
+        .submit("print(side.echo(text='held').content[0].text)")
         .unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(300), call.outcome())
@@ -1193,11 +1208,7 @@ async fn a_pause_given_up_on_is_resumed() {
     within(sleeping.outcome()).await;
     assert_eq!(mcp.resume("side").await, Ok(vec!["side".to_string()]));
     assert_eq!(
-        output(
-            &session,
-            "print(side.echo(text='back')['content'][0]['text'])"
-        )
-        .await,
+        output(&session, "print(side.echo(text='back').content[0].text)").await,
         "back\n"
     );
     stop(session).await;
@@ -1261,11 +1272,7 @@ async fn a_resume_waits_for_a_pause_given_up_on() {
         }
         assert_eq!(mcp.resume("side").await, Ok(vec!["side".to_string()]));
         assert_eq!(
-            output(
-                &session,
-                "print(side.echo(text='back')['content'][0]['text'])"
-            )
-            .await,
+            output(&session, "print(side.echo(text='back').content[0].text)").await,
             "back\n"
         );
         assert!(!fakes.of("mcp-side").frozen.load(Ordering::SeqCst));

@@ -469,6 +469,8 @@ struct Table {
     skills: Option<SkillLines>,
     /// Where the lines about services go, once the session serves any.
     services: Option<ServiceLines>,
+    /// Where the lines about MCP services go, once the session has any ready.
+    mcp: Option<ServiceLines>,
     /// Where the lines about the session's channels go, once it declares any.
     channels: Option<ChannelLines>,
     /// The writer's queue, held weakly, for the close's own line to the
@@ -1148,6 +1150,13 @@ impl Interpreter {
     /// Until then each call is answered that the session serves none.
     pub(crate) fn attach_services(&self, lines: ServiceLines) {
         lock(&self.table).services = Some(lines);
+    }
+
+    /// Hand each line a kernel sends about MCP services in particular -- a
+    /// relist -- to `lines`, from now on. Until then each is answered that
+    /// the session has none ready.
+    pub(crate) fn attach_mcp(&self, lines: ServiceLines) {
+        lock(&self.table).mcp = Some(lines);
     }
 
     /// An id from the interpreter's one counter, which no request, message or execution shares:
@@ -2545,23 +2554,29 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
         }
         return;
     }
-    // A line about services is the session's, and names the kernel whose
-    // agent made the call: one the host did not open is answered at once, as
-    // is any when nothing serves them, since the thread that sent it waits for
-    // its answer with no bound of its own.
+    // A line about services, or about MCP services in particular, is the
+    // session's, and names the kernel whose agent made the call: one the host
+    // did not open is answered at once, as is any when nothing serves them,
+    // since the thread that sent it waits for its answer with no bound of its
+    // own.
     if let Some(kind) = value["t"].as_str()
-        && kind.starts_with("service.")
+        && (kind.starts_with("service.") || kind.starts_with("mcp."))
     {
+        let mcp = kind.starts_with("mcp.");
         // Its own statement, so the table is not locked while the hook runs.
-        let (services, opened) = {
+        let (hook, opened) = {
             let table = lock(table);
             let opened = value["agent"]
                 .as_str()
                 .is_some_and(|agent| table.kernels.contains_key(agent));
-            (table.services.clone(), opened)
+            let hook = match mcp {
+                true => table.mcp.clone(),
+                false => table.services.clone(),
+            };
+            (hook, opened)
         };
-        match services {
-            Some(services) if opened => services(value),
+        match hook {
+            Some(hook) if opened => hook(value),
             _ => {
                 if !opened {
                     tracing::warn!(

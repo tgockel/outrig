@@ -52,6 +52,7 @@ model-request-warnings = [20, 1]                      # optional; no warning whe
 retry-budget-secs     = 600                           # optional; defaults to 600
 mcp-call-timeout-secs = 600                           # optional; defaults to 600
 mcp-connect-budget-secs = 120                         # optional; defaults to 120
+service-result-max-bytes = 67108864                   # optional; defaults to 64 MiB
 
 [network]
 mode = "default"                                      # optional: default, audit, or filter
@@ -88,6 +89,7 @@ env-allow = ["GITHUB_TOKEN"]                          # optional; global only
 | `retry-budget-secs`       | integer | no                     | global | LLM retry budget (secs). |
 | `mcp-call-timeout-secs`   | integer | no                     | either | MCP tools/call deadline. |
 | `mcp-connect-budget-secs` | integer | no                     | either | MCP start budget (secs). |
+| `service-result-max-bytes`| integer | no                     | either | Service result byte max. |
 | `network.mode`            | string  | no                     | either | Network mode.            |
 | `network.default`         | string  | no                     | global | Filter fallback action.  |
 | `network.allow`           | array   | no                     | global | Filter allow entries.    |
@@ -120,6 +122,12 @@ wait between them, together -- 1 to 3600, default 120. A failure that may pass i
 within it; past it the server is `unavailable`, and the session starts without it (see
 [MCP Servers](../concepts/mcp-servers.md#in-a-session-mcp-services)). `outrig run` does not read
 it: it tries each server once. In either file the repo value wins.
+`service-result-max-bytes` is the largest result, in bytes of JSON, a session's service call --
+an MCP service's tool included -- hands agent Python -- 1024 to 4294967296, default 67108864
+(64 MiB). A larger result is not handed over: the call raises, naming the size and the limit,
+and is recorded as returned, since the service did the work. The bound is the interpreter's,
+which reads a result whole into the memory every agent shares; what a model sees of it is what
+agent code prints. `outrig run` does not read it. In either file the repo value wins.
 `session-root` is global-only: it chooses where this machine writes session records, and so
 where `outrig clean` and `outrig discard` delete. A repo config that sets it is rejected at
 load.
@@ -160,8 +168,9 @@ set any value from `1` through `2000`.
 `outrig run --max-tool-calls <n>` overrides both for one invocation.
 
 `tool-result-max` is the default maximum byte size for one MCP tool result before it is added to
-the LLM-visible conversation history. The compiled-in default is `262144` bytes (256 KiB);
-config may set any value from `1024` through `16777216` bytes.
+the LLM-visible conversation history, in `outrig run`; a session's agents, which call tools from
+Python, are held to `service-result-max-bytes` instead. The compiled-in default is `262144`
+bytes (256 KiB); config may set any value from `1024` through `16777216` bytes.
 `[agents.<name>].tool-result-max` overrides the top-level value for one agent, and
 `outrig run --max-tool-result-bytes <n>` overrides both for one invocation. Results larger than
 the max are truncated at a UTF-8 boundary and end with an `[outrig: tool result truncated]`
@@ -538,8 +547,8 @@ These apply:
   constructs runs on -- its `model=`, else `default-model`.
 - The top-level `children-max`, `model-concurrency-max`, `requests-max`, `token-budget`,
   `model-request-limit`, `model-request-warnings`, `subagent-depth-max`, `tool-call-max`,
-  `tool-result-max`, `retry-budget-secs`, `mcp-call-timeout-secs` and
-  `mcp-connect-budget-secs`.
+  `tool-result-max`, `retry-budget-secs`, `mcp-call-timeout-secs`, `mcp-connect-budget-secs`
+  and `service-result-max-bytes`.
 - `[images.<name>.mcp]`, the `[sidecars.<sc>]` blocks they name, and the image's
   `org.outrig.mcp` label under `[repo] env-allow`: each server starts with the session as a
   service, as for `outrig run-new` (see
@@ -1814,6 +1823,7 @@ model-request-warnings = [20, 1]                 # optional; no warning when uns
 retry-budget-secs  = 600                         # optional; default = 600
 mcp-call-timeout-secs = 600                      # optional; default = 600
 mcp-connect-budget-secs = 120                    # optional; default = 120
+service-result-max-bytes = 67108864              # optional; default = 64 MiB
 
 [network]
 mode = "default"                                 # optional; default, audit, or filter
@@ -2025,6 +2035,7 @@ image-config in the merged config but does not require agent/model/provider wiri
   must be between `1` and `3600` seconds. `0` is not legal, for the same reason as
   `request-timeout-secs`. `outrig build` checks both too.
 - `mcp-connect-budget-secs`, if set, must be between `1` and `3600` seconds.
+- `service-result-max-bytes`, if set, must be between `1024` and `4294967296` bytes.
 - `[network].mode`, if set, must be `default`, `audit`, or `filter`. `filter` additionally
   requires at least one global `allow` or `deny` entry.
 - A repo config may set `[network].mode` only; `[network].default`, `[network].allow`, and

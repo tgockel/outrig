@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`run-new`'s agent gets an MCP tool's result as data.** A call returns the server's content
+  blocks in order and its structured content, for the agent's Python to filter, and raises for
+  a result the server marks as an error: see the library's changelog. A server listing a tool
+  whose schema is malformed starts without that tool, and its startup line names it --
+  `[outrig] MCP service fs: ready, 2 tools; left out, not decoded: "bad": ...`. The new top-level
+  `service-result-max-bytes` bounds a result agent code is handed, 64 MiB by default.
+
 - **`run-new` starts the configuration's MCP servers, as services.** The image's
   `[images.<name>.mcp]` servers, the sidecars they name and its `org.outrig.mcp` label start with
   the session, and agent code calls each as `outrig.bindings[name]`; startup prints one line per

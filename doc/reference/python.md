@@ -42,7 +42,10 @@ and its `receive` when the channel was closed: see `help(outrig.ChannelError)`.
 
 Each service the session's owner serves from Rust is an `outrig.Service`, its methods calls to
 the host by value; a call that returns no result raises `outrig.ServiceError`: see
-`help(outrig.Service)`.
+`help(outrig.Service)`. Each MCP server the session places is an `outrig.McpService`, a method per
+tool by the tool's exact name, whose calls return an `outrig.McpResult` -- content blocks in
+order, structured content -- and raise `outrig.ToolError` for a result the server marked an
+error: see `help(outrig.McpService)` and `help(outrig.McpResult)`.
 
 `outrig.skills` reaches the session's skills, whose code imports as `outrig_skills.<name>`: see
 `help(outrig.skills)`.
@@ -511,12 +514,14 @@ class McpOutcome:
     tools: int | None = None
     listing: int | None = None
     attempts: int | None = None
+    undecoded: tuple[tuple[str | None, str], ...] = ()
     cause: McpCause | None = None
 ```
 
 How a declared MCP service's start ended: `session.mcp[name]` after entry. `outcome` is
 `"ready"` -- started and bound, with `tools` tools in its first listing, generation `listing`,
-after `attempts` attempts -- or `"unavailable"`, `"refused"`, `"misconfigured"` or
+after `attempts` attempts, and in `undecoded` each tool its server listed that did not decode,
+left out, as `(name, reason)` -- or `"unavailable"`, `"refused"`, `"misconfigured"` or
 `"unclassified"`, with the `McpCause` in `cause`. The session starts with the ready ones; what
 the others mean is this program's to decide.
 
@@ -1313,6 +1318,19 @@ describes; a program on the host has no use for them. What a program meets if it
 - `outrig.Service` -- the class of a service's object, which only a kernel holds.
 - `outrig.ServiceError` -- what a call of a service's method raises, which only a kernel makes.
 - `outrig.ServiceMethod` -- what a service's object lists of its methods, which only a kernel holds.
+- `outrig.McpService` -- the class of an MCP service's object, which only a kernel holds.
+- `outrig.McpTool` -- what an MCP service's `tool` returns, which only a kernel holds.
+- `outrig.McpRelisted` -- what an MCP service's `relist` returns, which only a kernel holds.
+- `outrig.McpResult` -- what a call of an MCP service's tool returns, which only a kernel makes.
+- `outrig.McpBlock` -- the base of an `McpResult`'s content blocks, which only a kernel makes.
+- `outrig.McpText` -- an `McpResult`'s text block, which only a kernel makes.
+- `outrig.McpImage` -- an `McpResult`'s image block, which only a kernel makes.
+- `outrig.McpAudio` -- an `McpResult`'s audio block, which only a kernel makes.
+- `outrig.McpResource` -- an `McpResult`'s embedded resource block, which only a kernel makes.
+- `outrig.McpResourceLink` -- an `McpResult`'s resource link block, which only a kernel makes.
+- `outrig.McpOther` -- an `McpResult`'s block of a kind not modeled, which only a kernel makes.
+- `outrig.McpError` -- what a call of an MCP service's tool raises, which only a kernel makes.
+- `outrig.ToolError` -- what a call raises for a result its MCP server marked an error, in a kernel.
 - `outrig.ChannelError` -- the base of what an external channel raises, which only a kernel holds.
 - `outrig.ChannelClosed` -- what an external channel raises once closed, which only a kernel holds.
 - `outrig.SendRefused` -- what an external channel's `send` raises, which only a kernel holds.

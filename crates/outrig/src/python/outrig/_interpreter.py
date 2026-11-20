@@ -1756,6 +1756,9 @@ _skills = None
 _serve = None
 # `outrig._services`, from the same package: the class each service's object is made from.
 _services_mod = None
+# `outrig._mcp`, from the same package: the presenter of an MCP service, which counts the
+# listing changes the host tells it of.
+_mcp_mod = None
 # The vendored RPyC, imported by `main` from the directory it is given, and the connection class
 # built over it; `None` when the interpreter was started without one.
 _rpyc = None
@@ -2475,10 +2478,11 @@ def _load_outrig(directory):
     """Import OutRig's own package from `directory`, and give it this process's executions:
     `outrig.runtime` and `outrig.bindings` are those of the execution reading them. Its skills
     module gets the way to ask the host for a skill's files, and puts its finder in place."""
-    global _schema, _agents, _skills, _serve, _services_mod
+    global _schema, _agents, _skills, _serve, _services_mod, _mcp_mod
     sys.path.append(directory)
     import outrig._agents
     import outrig._kernel
+    import outrig._mcp
     import outrig._serve
     import outrig._services
     import outrig.schema
@@ -2492,6 +2496,7 @@ def _load_outrig(directory):
         "channel" if name in _CHANNELS else getattr(_SESSION.get(name), "kind", "binding")
     )
     outrig._services._call = _service_call
+    outrig._mcp._relist = _mcp_relist
     outrig.skills._install(
         _ask_host, _notify, _compiled_cause, lambda: next(_ids), _refuse_closing,
         lambda: _observing,
@@ -2501,6 +2506,7 @@ def _load_outrig(directory):
     _skills = outrig.skills
     _serve = outrig._serve
     _services_mod = outrig._services
+    _mcp_mod = outrig._mcp
 
 
 def _calling():
@@ -5286,11 +5292,12 @@ _answers = {}
 _asking = threading.local()
 
 
-def _ask_host(line):
-    """Send `line`, a request about a skill, and return the host's answer to it, a line with `ok`
-    or with `error`, waiting at most `ASK_TIMEOUT` (`_await_host`)."""
+def _ask_host(line, timeout=ASK_TIMEOUT):
+    """Send `line`, a request of the host, and return its answer, a line with `ok` or with
+    `error`, waiting at most `timeout` seconds -- `ASK_TIMEOUT` unless given, `None` leaving it to
+    the host (`_await_host`)."""
     ask_id = line["id"] = next(_ids)
-    return _await_host(ask_id, _encode(line), ASK_TIMEOUT)
+    return _await_host(ask_id, _encode(line), timeout)
 
 
 def _await_host(ask_id, line, timeout):
@@ -7799,16 +7806,8 @@ def _service_call(obj, method, arguments, timeout, generation):
     that kernel's own object; one from an agent that was released; arguments that are not JSON
     data (`TypeError`, or `ValueError` for a NaN); a `timeout` past the service's deadline; and a
     line longer than the host reads."""
-    name, kernel = _services_mod._state(obj)
+    name, kernel, execution = _service_caller(obj)
     served = _SERVICES[name]
-    if kernel.ended:
-        raise RuntimeError(f"agent {kernel.agent!r} was released, and its object of service "
-                           f"{name!r} with it")
-    execution = _CURRENT.get()
-    if execution is not None and execution.kernel is not kernel:
-        raise TypeError(f"this object of service {name!r} is agent {kernel.agent!r}'s, and agent "
-                        f"{execution.kernel.agent!r} calls it: its own is "
-                        f"outrig.bindings[{name!r}]")
     if arguments is None:
         arguments = {}
     elif not isinstance(arguments, dict):
@@ -7846,25 +7845,44 @@ def _service_call(obj, method, arguments, timeout, generation):
         raise
     if answer.get("t") != "service":
         raise RuntimeError(answer["error"]["message"])
-    error = answer.get("error")
-    if error is None:
-        # JSON text, read here rather than by the reader thread, so a result this interpreter
-        # cannot read raises in its caller.
-        try:
-            return json.loads(answer["ok"])
-        except (ValueError, RecursionError) as e:
-            raise ValueError(f"the result of {name}.{method} is JSON this interpreter cannot "
-                             f"read") from e
-    raise _services_mod.ServiceError(
-        error.get("message") or "",
-        outcome=error.get("outcome"),
-        service=name,
-        method=method,
-        call=error.get("call"),
-        category=error.get("category"),
-        reason=error.get("reason"),
-        path=error.get("path"),
-    )
+    # Its result, or what it raises, as the object's presenter shows it.
+    return type(obj)._answered(obj, method, answer)
+
+
+def _service_caller(obj):
+    """`(name, kernel, execution)` of a call made on `obj`, a kernel's object of the service
+    `name`, from `execution`, the calling one or `None`. A call from another kernel's execution,
+    which belongs on that kernel's own object, raises `TypeError`, and one on the object of an
+    agent that was released `RuntimeError`."""
+    name, kernel = _services_mod._state(obj)
+    if kernel.ended:
+        raise RuntimeError(f"agent {kernel.agent!r} was released, and its object of service "
+                           f"{name!r} with it")
+    execution = _CURRENT.get()
+    if execution is not None and execution.kernel is not kernel:
+        raise TypeError(f"this object of service {name!r} is agent {kernel.agent!r}'s, and agent "
+                        f"{execution.kernel.agent!r} calls it: its own is "
+                        f"outrig.bindings[{name!r}]")
+    return name, kernel, execution
+
+
+def _mcp_relist(obj):
+    """Ask the host to list again the tools of the MCP service `obj` -- a kernel's object of it
+    -- stands for, from that kernel, and return its answer, a line with `ok` or with `error`. The
+    calling thread waits; an interrupt that reaches it stops the wait, and the host's answer, when
+    it comes, is dropped."""
+    name, kernel, execution = _service_caller(obj)
+    line = {
+        "t": "mcp.relist",
+        "agent": kernel.agent,
+        "exec": None if execution is None else execution.id,
+        "service": name,
+    }
+    # Answered as a call is; bounded by the host, which lists within its own bound.
+    answer = _ask_host(line, None)
+    if answer.get("t") != "service":
+        raise RuntimeError(answer["error"]["message"])
+    return answer
 
 
 # ---------------------------------------------------------------------------- application code
@@ -8930,6 +8948,9 @@ def _route(line):
     if kind == "service.described":
         _declare_services([message["service"]])
         return
+    if kind == "mcp.list_changed":
+        _mcp_mod._list_changed(message["service"], message["heard"])
+        return
     if kind == "channels":
         _declare_channels(message)
         return
@@ -8947,8 +8968,8 @@ def _route(line):
         _OWNER_ROUTES[kind](message)
         return
     if kind in ("skill", "service"):
-        # The answer to a request about a skill, or to a call of a service, for the thread still
-        # waiting for it.
+        # The answer to a request about a skill, or to a call of a service or another ask of one's
+        # object, for the thread still waiting for it.
         answers = _answers.pop(message.get("id"), None)
         if answers is not None:
             answers.put(message)

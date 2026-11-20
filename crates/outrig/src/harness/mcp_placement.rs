@@ -343,13 +343,17 @@ pub(crate) mod fake {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use std::sync::Arc;
+
     use futures_util::future::BoxFuture;
     use rmcp::model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-        InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, ServerConfig, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ClientNotification, ClientRequest,
+        ContentBlock, CustomResult, ErrorData, InitializeRequestParams, InitializeResult,
+        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, ServerResult,
+        Tool,
     };
-    use rmcp::service::{RequestContext, RoleServer};
+    use rmcp::service::{NotificationContext, RequestContext, RoleServer};
+    use serde_json::Value;
 
     use super::*;
 
@@ -373,6 +377,8 @@ pub(crate) mod fake {
         Unlisted,
         /// Run this shell script, a server that is a real process.
         Script(&'static str),
+        /// Answer as this [`Toolbox`] says, which the test keeps.
+        Toolbox(Arc<Toolbox>),
     }
 
     /// A placement that runs no container: each connect does what its
@@ -476,6 +482,10 @@ pub(crate) mod fake {
                             .await;
                     }
                     Behavior::Wedged => return std::future::pending().await,
+                    Behavior::Toolbox(toolbox) => {
+                        return McpClient::handshake_in_memory(&server.name, Raw(toolbox), within)
+                            .await;
+                    }
                     Behavior::Unlisted => {
                         return McpClient::handshake_in_memory(&server.name, Unlisting, within)
                             .await;
@@ -599,6 +609,146 @@ pub(crate) mod fake {
                     .to_string(),
             };
             Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
+        }
+    }
+
+    /// A server whose `tools/list` page and `tools/call` results are JSON a
+    /// test sets, sent as they are -- what no typed server can send, such as a
+    /// tool whose `inputSchema` is not an object. It records each call under
+    /// the name it was made by, and can tell its client its listing changed.
+    #[derive(Default)]
+    pub(crate) struct Toolbox {
+        /// The one page `tools/list` answers: `{"tools": [...]}`, and whatever
+        /// else a test puts beside it.
+        page: Mutex<Value>,
+        /// What a call of each tool answers; one not here echoes its `text`.
+        results: Mutex<HashMap<String, Value>>,
+        /// Each call, by its exact name, with its arguments.
+        calls: Mutex<Vec<(String, Value)>>,
+        /// The client, once it has asked anything.
+        peer: Mutex<Option<rmcp::Peer<RoleServer>>>,
+        /// Whether the next `tools/list` is answered after announcing a change.
+        announce: AtomicBool,
+    }
+
+    impl Toolbox {
+        /// A server listing `tools`, each a descriptor as the wire has it.
+        pub(crate) fn new(tools: Value) -> Arc<Self> {
+            let toolbox = Self::default();
+            toolbox.list(tools);
+            Arc::new(toolbox)
+        }
+
+        /// List `tools` from now on.
+        pub(crate) fn list(&self, tools: Value) {
+            self.page_as(serde_json::json!({ "tools": tools }));
+        }
+
+        /// Answer `tools/list` with `page`, whole.
+        pub(crate) fn page_as(&self, page: Value) {
+            *self.page.lock().unwrap() = page;
+        }
+
+        /// Answer each call of `tool` with `result`.
+        pub(crate) fn answer(&self, tool: &str, result: Value) {
+            self.results
+                .lock()
+                .unwrap()
+                .insert(tool.to_string(), result);
+        }
+
+        /// The calls made, in order, each by the name it was made under.
+        pub(crate) fn calls(&self) -> Vec<String> {
+            let calls = self.calls.lock().unwrap();
+            calls.iter().map(|(name, _)| name.clone()).collect()
+        }
+
+        /// The arguments of each call made, in order.
+        pub(crate) fn arguments(&self) -> Vec<Value> {
+            let calls = self.calls.lock().unwrap();
+            calls.iter().map(|(_, args)| args.clone()).collect()
+        }
+
+        /// Send the client `notifications/tools/list_changed` while answering
+        /// the next `tools/list`, before its page.
+        pub(crate) fn announce_while_listing(&self) {
+            self.announce.store(true, Ordering::SeqCst);
+        }
+
+        /// Send the client `notifications/tools/list_changed`.
+        pub(crate) async fn list_changed(&self) {
+            let peer = self.peer.lock().unwrap().clone();
+            peer.expect("the client has asked something")
+                .notify_tool_list_changed()
+                .await
+                .expect("notify the client");
+        }
+    }
+
+    /// A [`Toolbox`] as rmcp serves it: its own answers for `tools/list` and
+    /// `tools/call`, and a plain server's for everything else.
+    pub(crate) struct Raw(pub(crate) Arc<Toolbox>);
+
+    /// What a [`Raw`] server is besides its tools.
+    struct Plain;
+
+    impl rmcp::ServerHandler for Plain {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(
+                ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_tool_list_changed()
+                    .build(),
+            )
+        }
+    }
+
+    impl rmcp::Service<RoleServer> for Raw {
+        async fn handle_request(
+            &self,
+            request: ClientRequest,
+            context: RequestContext<RoleServer>,
+        ) -> std::result::Result<ServerResult, ErrorData> {
+            *self.0.peer.lock().unwrap() = Some(context.peer.clone());
+            match request {
+                ClientRequest::ListToolsRequest(_) => {
+                    if self.0.announce.swap(false, Ordering::SeqCst) {
+                        context
+                            .peer
+                            .notify_tool_list_changed()
+                            .await
+                            .expect("notify the client");
+                    }
+                    Ok(ServerResult::CustomResult(CustomResult(
+                        self.0.page.lock().unwrap().clone(),
+                    )))
+                }
+                ClientRequest::CallToolRequest(call) => {
+                    let name = call.params.name.to_string();
+                    let arguments = Value::Object(call.params.arguments.unwrap_or_default());
+                    let text = arguments["text"].as_str().unwrap_or_default().to_string();
+                    self.0.calls.lock().unwrap().push((name.clone(), arguments));
+                    let result = self.0.results.lock().unwrap().get(&name).cloned();
+                    Ok(ServerResult::CustomResult(CustomResult(
+                        result.unwrap_or_else(
+                            || serde_json::json!({"content": [{"type": "text", "text": text}]}),
+                        ),
+                    )))
+                }
+                other => rmcp::Service::handle_request(&Plain, other, context).await,
+            }
+        }
+
+        async fn handle_notification(
+            &self,
+            notification: ClientNotification,
+            context: NotificationContext<RoleServer>,
+        ) -> std::result::Result<(), ErrorData> {
+            rmcp::Service::handle_notification(&Plain, notification, context).await
+        }
+
+        fn get_info(&self) -> ServerConfig {
+            rmcp::Service::get_info(&Plain)
         }
     }
 

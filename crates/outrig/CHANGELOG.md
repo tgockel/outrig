@@ -19,6 +19,25 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **An MCP service's tools are Python objects, its results data.** A placed MCP server's object
+  is an `outrig.McpService`: a method per tool by its exact name, `tool(name)` giving one with the
+  descriptor its server listed, `tools` listing them, and a call returning an `outrig.McpResult`
+  -- the server's content blocks in order (`McpText`, `McpImage`, `McpAudio`, `McpResource`,
+  `McpResourceLink`, `McpOther` for a kind this build does not model), its structured content,
+  its `_meta`, `is_error`, and `text`, the lossy view `McpToolResult::render_text` gives. A
+  result the server marks as an error raises `outrig.ToolError`, and any other failure
+  `outrig.McpError`, both `outrig.ServiceError`s. `relist()` lists the tools again under the next
+  generation, a held method or tool keeping the name it was resolved by, and a server's
+  `tools/list_changed` marks the service `stale` and relists nothing. A tool whose descriptor
+  does not decode -- an `inputSchema` that is not an object -- is left out of a session's listing
+  rather than costing the server, and `McpServiceOutcome::Ready` names each in `undecoded`
+  (`McpUndecodedTool`); `McpClient::list_tools` still fails the listing, now naming the tool.
+  `ServiceDescription` gains `extras`, which the MCP service fills with its placement.
+  `service.call.received` and `service.call.ended` carry `tool`, `listing` and, on the end,
+  `state`, `is_error`, `blocks` and `structured` for an MCP call (`McpCallReceived`,
+  `McpCallEnded`, `McpDispatchState`); `mcp.service.started` carries `undecoded`; and
+  `mcp.service.relisted` and `mcp.service.list.changed` are new. A service's result bound is the
+  new top-level `service-result-max-bytes` when the owner sets no `ServicePolicy`.
 - **A session places MCP servers as services.** `SessionBuilder::mcp(name, McpServiceSpec)` --
   `McpServiceSpec::command`, `sidecar(SidecarSpec)` or `primary_view(image)`, each with `env`
   values a literal or a `${VAR}` the session's `Secrets` resolve once -- starts a server with the
@@ -1009,6 +1028,17 @@ without touching each other, from one ensured image. [The container facade besid
   window. A child agent is not given them. `outrig run` ignores the key. (#672)
 
 ### Changed
+
+- **A service's result past the bound ends `returned`.** The service did the work, so
+  `service.call.ended` records `outcome: returned` with the reason `result_too_large`, where it
+  recorded `refused`, and agent code's `outrig.ServiceError` says the same; `refused` now always
+  means the service was never called. `ServicePolicy::result_max` defaults to 64 MiB, where it
+  was 16 MiB, the bound on the other direction's lines: a result's cost is the interpreter's
+  memory, which every agent shares, and 64 MiB of small JSON objects decodes to about 700 MiB.
+
+- **A schema with `additionalProperties` takes other arguments by name.** A service method whose
+  `params` sets `additionalProperties` to anything but `false` renders `**arguments` after its
+  named parameters, and what it takes reaches the service beside them.
 
 - **Agent calls and requests end.** The preview events `agent.call.settled` and
   `agent.request.settled` are now `agent.call.ended` and `agent.request.ended`, with payload

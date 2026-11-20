@@ -196,6 +196,19 @@ pub const MCP_CALL_TIMEOUT_SECS_CEILING: u64 = 3600;
 /// [`MCP_CALL_TIMEOUT_SECS_CEILING`] allows.
 pub const DEFAULT_MCP_CONNECT_BUDGET_SECS: u64 = 120;
 
+/// The largest result a service call hands agent code, in bytes of JSON: 64
+/// MiB. The bound is the interpreter's, which reads a result whole into the
+/// memory every agent shares, where it takes from three times its size, for
+/// large strings, to eleven, for small objects; it is not the bound on what a
+/// model is sent, which is `tool-result-max`. The top-level
+/// `service-result-max-bytes` overrides it, from
+/// [`SERVICE_RESULT_MAX_FLOOR_BYTES`] to [`SERVICE_RESULT_MAX_CEILING_BYTES`].
+pub const DEFAULT_SERVICE_RESULT_MAX_BYTES: u64 = 64 << 20;
+/// Lower bound accepted for `service-result-max-bytes`: 1 KiB.
+pub const SERVICE_RESULT_MAX_FLOOR_BYTES: u64 = 1024;
+/// Upper bound accepted for `service-result-max-bytes`: 4 GiB.
+pub const SERVICE_RESULT_MAX_CEILING_BYTES: u64 = 4 << 30;
+
 /// The `tools/call` deadline for one server: its own `call-timeout-secs`, else
 /// the session's `mcp-call-timeout-secs`, else
 /// [`DEFAULT_MCP_CALL_TIMEOUT_SECS`]. Most specific wins, and the values are
@@ -461,6 +474,11 @@ pub struct Config {
     /// [`DEFAULT_MCP_CONNECT_BUDGET_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_connect_budget_secs: Option<u64>,
+    /// The largest result a service call -- an MCP service's tool included --
+    /// hands agent code, in bytes of JSON. See
+    /// [`DEFAULT_SERVICE_RESULT_MAX_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_result_max_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "NetworkConfig::is_default")]
     pub network: NetworkConfig,
     #[serde(default, skip_serializing_if = "EventsConfig::is_default")]

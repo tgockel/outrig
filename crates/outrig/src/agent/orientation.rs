@@ -40,7 +40,7 @@ use std::time::Duration;
 use super::history::Window;
 use super::instructions::Instructions;
 use crate::harness::bindings::Brief;
-use crate::harness::event::{FacilityBrief, FacilityKind, InputBrief};
+use crate::harness::event::{FacilityBrief, FacilityKind, InputBrief, ServiceKind};
 use crate::harness::services::ServiceBrief;
 use crate::harness::skills::{Catalog, SkillBrief};
 use crate::harness::{ChannelKind, Direction, Wake};
@@ -296,12 +296,13 @@ pub(crate) enum View<'a> {
 
 /// One facility a child was given, as its instructions describe it: what its
 /// events say of it, its description -- the operator's for a binding, the
-/// first line of its class's docstring for an object -- and whether a binding
-/// runs one call at a time.
+/// first line of its class's docstring for an object -- whether a binding
+/// runs one call at a time, and whether a service is an MCP server.
 pub(crate) struct Given {
     pub(crate) brief: FacilityBrief,
     pub(crate) description: String,
     pub(crate) serialize: bool,
+    pub(crate) mcp: bool,
 }
 
 /// What every agent is told after how it is reached: its conversation, a
@@ -680,12 +681,23 @@ fn held(bindings: &[Brief], services: &[ServiceBrief]) -> String {
              {SERVICE_IS}, and `help(name)` describes its methods."
         );
         for service in services {
+            let what = match service.kind {
+                ServiceKind::Mcp => ", an MCP server",
+                _ => "",
+            };
             let _ = write!(
                 text,
-                "\n- `{}`: {}",
+                "\n- `{}`{what}: {}",
                 service.name,
                 service.description.trim()
             );
+        }
+        if services
+            .iter()
+            .any(|service| service.kind == ServiceKind::Mcp)
+        {
+            text.push_str("\n\n");
+            text.push_str(MCP_RESULTS);
         }
     }
     text.push_str("\n\n");
@@ -704,6 +716,17 @@ fn held(bindings: &[Brief], services: &[ServiceBrief]) -> String {
     text.push_str(" a name your code bound before it came, nor a builtin.");
     text
 }
+
+/// What an agent holding an MCP server's service is told of what a call of
+/// its tool returns, and of one that fails: once, however many it holds.
+const MCP_RESULTS: &str = "A call of an MCP server's tool returns an `outrig.McpResult`: `content`, \
+                           the server's blocks in order -- text, images, resources -- \
+                           `structured`, its structured data, and `text`, a view of the blocks \
+                           that drops what is not text. Filter it in Python and print what you \
+                           need. A result the server marks as an error raises \
+                           `outrig.ToolError`, carrying it. A call that fails may still have \
+                           reached the server, and OutRig never repeats one: before repeating a \
+                           call that changes something, check whether it happened.";
 
 /// What a service is, as an agent holding one is told.
 const SERVICE_IS: &str = "an object whose methods are calls to the host, by value -- the \
@@ -759,11 +782,11 @@ fn facility_entries(given: &[Given]) -> String {
                 }
             }
             FacilityKind::Service => {
-                let _ = write!(
-                    text,
-                    "\n- `{}`, a service the host runs: {description}",
-                    brief.name
-                );
+                let what = match facility.mcp {
+                    true => "an MCP server the host runs",
+                    false => "a service the host runs",
+                };
+                let _ = write!(text, "\n- `{}`, {what}: {description}", brief.name);
             }
             _ => {
                 let _ = write!(
@@ -806,6 +829,10 @@ fn facility_rules(given: &[Given]) -> String {
             text,
             "A service is {SERVICE_IS} and `help(name)` describes its methods. "
         );
+    }
+    if given.iter().any(|facility| facility.mcp) {
+        text.push_str(MCP_RESULTS);
+        text.push(' ');
     }
     if binding.is_some() || service.is_some() {
         text.push_str(&rules(binding, service));
@@ -1129,6 +1156,7 @@ mod tests {
             },
             description: description.into(),
             serialize: false,
+            mcp: false,
         }
     }
 
@@ -1200,6 +1228,69 @@ mod tests {
         assert!(session.contains("- `repo`: The repository."), "{session}");
     }
 
+    /// An MCP service is listed as one, and an agent holding any is told once what a call of a
+    /// tool returns and that a failed call may have reached the server; one holding only a Rust
+    /// service hears neither. A child given an MCP service is told the same.
+    #[test]
+    fn an_mcp_service_is_told_what_its_calls_return() {
+        fn told(view: View<'_>) -> String {
+            child_preamble(
+                None,
+                view,
+                Window::DEFAULT,
+                "Review.",
+                &[],
+                &ChildBrief::Work,
+                &[],
+            )
+        }
+        let brief = |name: &str, kind| ServiceBrief {
+            name: name.into(),
+            description: "A server.".into(),
+            kind,
+        };
+        let services = [
+            brief("fs", ServiceKind::Mcp),
+            brief("gh", ServiceKind::Mcp),
+            brief("tracker", ServiceKind::Rust),
+        ];
+        let both = told(View::Session {
+            bindings: &[],
+            services: &services,
+        });
+        for said in [
+            "- `fs`, an MCP server: A server.",
+            "- `tracker`: A server.",
+            "returns an `outrig.McpResult`",
+            "raises `outrig.ToolError`",
+            "OutRig never repeats one",
+        ] {
+            assert!(both.contains(said), "{said}: {both}");
+        }
+        assert_eq!(both.matches("outrig.McpResult").count(), 1, "{both}");
+
+        let rust = told(View::Session {
+            bindings: &[],
+            services: &services[2..],
+        });
+        assert!(!rust.contains("MCP"), "{rust}");
+
+        let mut fs = given(
+            "fs",
+            FacilityKind::Service,
+            "outrig.services.fs",
+            "A server.",
+        );
+        fs.mcp = true;
+        let given_one = told(View::Given(&[fs]));
+        for said in [
+            "- `fs`, an MCP server the host runs: A server.",
+            "returns an `outrig.McpResult`",
+        ] {
+            assert!(given_one.contains(said), "{said}: {given_one}");
+        }
+    }
+
     /// A session's services are listed beside its bindings, by name and description, with the
     /// blocking rule said once for both and the ticket sentence; a child given a service is told
     /// of it, and of the same rules, and one given none hears nothing of services.
@@ -1225,6 +1316,7 @@ mod tests {
         let services = [ServiceBrief {
             name: "tracker".into(),
             description: "The issue tracker.".into(),
+            kind: ServiceKind::Rust,
         }];
         let both = told(View::Session {
             bindings: &bindings,

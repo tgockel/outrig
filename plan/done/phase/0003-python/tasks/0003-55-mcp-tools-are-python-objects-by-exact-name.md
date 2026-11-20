@@ -61,9 +61,13 @@ without moving a resolved tool, and a listing that survives one malformed descri
   class, instantiated per kernel as every service's object is, adding `tools` -- the descriptors as
   the protocol has them, from `extras` and the schemas -- `tool(name)`, the exact-name lookup
   returning a `Tool` (the generic `method(name)` with its descriptor and `listing` beside it,
-  callable by the name it was resolved with), `listing`, `stale`, `relist()` and `reconnect()`
-  (`0003-56` fills the second). `repr` and `help()` add the placement kind and nothing of `env`,
-  `headers` or a URL's userinfo.
+  callable by the name it was resolved with), `listing`, `stale` and `relist()`; `reconnect()` is
+  `0003-56`'s, added with what it does (the user, 2026-11-20). `repr` and `help()` add the
+  placement kind and nothing of `env`, `headers` or a URL's userinfo.
+- **`**arguments` in a signature** (the user, 2026-11-20): for every service, a schema whose
+  `additionalProperties` is anything but `false` renders `**arguments` after its named
+  parameters, reversing `0003-44`'s "`additionalProperties` adds no `**`"; an omitted one adds
+  nothing, and a property named `arguments` keeps the `(**arguments)` fallback.
 - **Results as data.** The presenter wraps a call's JSON into a result class holding `content` --
   `Text`, `Image`, `Audio`, `Resource`, `ResourceLink` and `Other(kind, raw)` blocks, each with its
   annotations and `meta` -- `structured` as Python data or `None`, `meta`, `is_error`, and `text`,
@@ -84,12 +88,19 @@ without moving a resolved tool, and a listing that survives one malformed descri
   and one the typed decode refused is decoded tool by tool from `CustomResult`'s value, keeping
   what decodes and recording the rest by name and reason in the outcome and the events. Confirmed
   with a fake server before anything is built on it; if the seam does not hold, the task records
-  the limit in `## Decisions` and the listing fails as today. A tool whose `inputSchema` decodes
+  the limit in `## Decisions` and the listing fails as today. The 0.2 facade's
+  `McpClient::list_tools` -- `outrig run`, `outrig mcp`, `Outrig::launch` -- keeps failing a
+  listing with a tool that does not decode (A-08), its error naming the tool and why (the user,
+  2026-11-20). A tool whose `inputSchema` decodes
   but does not compile in the validator is dispatched unchecked and never dropped (`services.md`,
   "The table").
 - **The result bound's key** (fork 3): a top-level config key for the service policy's
   `result_max`, so `run-new` can set it; `tool-result-max` (`config/mod.rs:41`) is untouched and its
-  doc says which bound it is.
+  doc says which bound it is. The default rises from 16 MiB to 64 MiB, measured, for every service
+  (the user, 2026-11-20): nothing on a result's path is bounded at 16 MiB.
+- **A result past the bound ends `returned`** (the user, 2026-11-20), with the reason
+  `result_too_large`, in `service.call.ended` and in the Python error, for every service, so
+  `refused` always means never called.
 - **The orientation.** The services paragraph `0003-44` adds to the primary's preamble
   (`crates/outrig/src/agent/orientation.rs:66`, `rest` at `:111`) gains, for an MCP service, that a
   result is blocks and structured data to filter in Python, and that a call's outcome may be
@@ -98,7 +109,7 @@ without moving a resolved tool, and a listing that survives one malformed descri
 - **Events**, integration audit, in `doc/reference/events.md`: the MCP fields on
   `service.call.received` and `service.call.ended` -- `tool`, `listing`, `state`, `failure`,
   `is_error`, `blocks`, `structured` -- with `state` filled as `response_received` for a result and
-  as `0003-56` decides for a failure; `mcp.service.relisted` and `mcp.service.list_changed`.
+  as `0003-56` decides for a failure; `mcp.service.relisted` and `mcp.service.list.changed`.
 - **A-08.** `McpToolResult`, `McpTool` and `ToolHandle` are read, never changed; the result class
   is the interpreter's.
 - **Docs.** `doc/concepts/mcp-servers.md` gains the Python surface; the Python runtime concept page
@@ -143,7 +154,7 @@ interpreter's tests drive agent code.
   `added` and `removed`, `listing` is 2, `mcp.service.relisted` then `service.described` with
   generation 2 carry the changes; the `Tool` held for `read_file` raises unknown method before
   dispatch and the fake sees no call; a `Tool` held for `read-file` still calls `read-file`. A
-  `tools/list_changed` notification sets `stale`, records `mcp.service.list_changed`, and changes
+  `tools/list_changed` notification sets `stale`, records `mcp.service.list.changed`, and changes
   the listing in nothing.
 - **A tolerant listing.** The fake lists one tool with `"inputSchema": []` beside two sound ones;
   the service is `Ready` with two tools, and the outcome and `mcp.service.started` name the tool
@@ -195,3 +206,112 @@ service, and a tool whose schema does not compile is dispatched unchecked.
   `plan/next/tool-descriptor-is-shaped-twice.md`, `plan/next/rmcp-list-result-spec-gaps.md`.
 - `crates/outrig/src/mcp_content.rs`; `crates/outrig/src/agent/orientation.rs`;
   `crates/outrig/src/python/outrig/_interpreter.py`.
+
+## Decisions
+
+- **The end of the waiting, for presentation.** `mcp-wrappers.md` says the presenting mechanism
+  "is `services.md` (`0003-44`), with MCP as its first service (`mcp-presenter.md`); until they
+  land, `run-new` starts no MCP server". `0003-54` ended it for placement; this task ends it for
+  presentation: a placed server is an `outrig.McpService`, its results data. The pointer edits to
+  the plan pages are the integrator's.
+- **Forks, as recommended.** 1: a result with `isError` raises `outrig.ToolError`, its `outcome`
+  `returned`, its `state` `response_received`, the `McpResult` in `result`; the event records
+  `returned` with `is_error: true`. 2: a binary block's `data` is its bytes, decoded from `base64`
+  on first use (`functools.cached_property`), the string kept beside. 3: a top-level key,
+  `service-result-max-bytes`, 1 KiB to 4 GiB, either file with the repo's winning, read by
+  `ServicePolicy::for_config` when the owner gives no `ServicePolicy`, as `McpPolicy::for_config`
+  is; `tool-result-max`'s doc says it is `outrig run`'s.
+- **The user's calls (2026-11-20).**
+  - `**arguments`: a schema whose `additionalProperties` is anything but `false` renders
+    `**arguments` after its named parameters, for every service, reversing `0003-44`'s
+    "`additionalProperties` adds no `**`": a tool taking anything rendered `()`, and
+    `svc.tool(x=1)` raised `TypeError` before anything was sent. An omitted
+    `additionalProperties` adds nothing, since a bare `{"type": "object"}` usually means no
+    arguments; a property named `arguments` keeps the `(**arguments)` fallback.
+  - A result past the bound ends `returned`, reason `result_too_large`, in the event and in
+    `outrig.ServiceError`, for every service: `refused` was read as never called, which invites
+    repeating a write that happened.
+  - The bound's default is 64 MiB. 16 MiB was borrowed from the host's bound on lines it reads;
+    nothing on a result's path, host to interpreter, is bounded. Measured once, release build, a
+    ~250 MiB result through a Rust service: of 250 strings of 1 MiB, 2.7 s and the interpreter's
+    peak RSS 42 -> 789 MiB (3x); of ten million `{"id": n, "ok": true}`, 18.7 s and 38 -> 2,796
+    MiB (11x). The estimate had been 1 to 1.3 GiB; the small-object case put a 256 MiB default
+    past a 4 GiB machine's 2 GiB ceiling, so the user chose 64 MiB (about 700 MiB, 5 s, at
+    worst). The decode runs on the caller's thread; the memory is the one ceiling every agent
+    shares.
+  - `reconnect()` is `0003-56`'s, added with what it does: until then it could only raise, and
+    `help()` and `dir()` would offer it.
+  - `McpClient::list_tools` -- `outrig run`, `outrig mcp`, `Outrig::launch` -- keeps failing a
+    listing with an undecodable tool (A-08), its message now naming each and why; only a
+    session's listing is tolerant.
+- **The `CustomResult` seam holds, but for one shape.** A fake server confirms
+  (`a_page_the_typed_decode_refuses_arrives_whole`) that a page with a tool whose `inputSchema` is
+  `[]` reaches the client as `ServerResult::CustomResult` through `send_request_with_option`. A page
+  that also carries `_meta` decodes as `CallToolResult` first -- its decoder takes any object with
+  one of `content`, `structuredContent`, `isError` or `_meta` -- and its tools are lost; such a page
+  fails the listing as a response of the wrong kind, as before. `list_every_page` reads every page
+  this way, which also skips rmcp's list cache, and decodes a refused page's tools one by one as
+  `rmcp::model::Tool`, keeping what decodes; `tests/reviewed_rmcp.rs` names the seam among what an
+  rmcp upgrade reviews.
+- **`McpError` comes before `0003-56` defines it.** `0003-56` depends on this task, so this task
+  adds a minimal `outrig.McpError(ServiceError)` -- `tool` (the `method`) and `state` -- and
+  `ToolError(McpError)` with `result`; `0003-56` adds `failure` and the state subclasses and moves
+  `ToolError` under `ResponseReceived`. The presenter raises `McpError` for every failure of an
+  MCP call, so `except outrig.ServiceError` still catches each.
+- **`state` is filled only where it is known.** `response_received` for a call whose server
+  answered with a result -- handed over or too large -- on `service.call.ended` and in Python;
+  `null` otherwise, and the event's `failure` field is `0003-56`'s: once a failure crosses the
+  `Service` trait the table no longer knows its `McpFailureKind`. The answer line carries no
+  `state`: the presenter reads it from the outcome (`ok`, or `outcome: returned`), so the
+  generic line gains only `call` on a result, for `ToolError.call`.
+- **The MCP fields on the call events** are `Option`s flattened into `ServiceCallReceived` and
+  `ServiceCallEnded` (`McpCallReceived`, `McpCallEnded`, `McpDispatchState`), so a Rust service's
+  events are as they were. `blocks` counts each kind by its wire name; `harness::mcp::McpReply`
+  reads them from the result's JSON for the table. `mcp.service.relisted` is a session event with
+  `agent` a field, as the other `mcp.service.*` are.
+- **The listing-change event is `mcp.service.list.changed`**, not the design's `list_changed`:
+  every event kind is dot-separated words, which the renderer's catalog and `events.md` are read
+  by.
+- **Relisting.** `relist()` sends an `mcp.relist` line, routed as `service.` lines are -- the
+  opened-kernel check, a hook the MCP table attaches in `bind`, `services::unserved` for one no
+  table takes -- and answered as a call is, `t: "service"`, refusals built with the service
+  table's `Failed`. The MCP table runs `tools/list` again (bounded by `STARTUP_TIMEOUT`), swaps the
+  entry's tools, and calls `Services::redescribe(name, announce)`, whose `announce` gets the
+  generation it is described at before anything is published, so `mcp.service.relisted` comes
+  before `service.described`; an unchanged listing keeps its generation and publishes nothing.
+  Relists of one service are serialized. A relist that fails raises `McpError` and emits no event.
+- **`stale` is counts, not a flag.** The client's `Notices` handler (in place of `()`, its
+  `get_info` the trait's, so the handshake is unchanged) wakes a listener per ready service, which
+  counts each announcement on the entry, emits the event and tells the interpreter the count; a
+  relist's answer carries the count when it began. The presenter keeps the highest of each and is
+  stale while the first is ahead, so the two lines read alike in either order -- a flag set by one
+  and cleared by the other lost an announcement that raced the answer.
+- **An announcement before bind is heard.** A `watch` receiver hears only what is sent after it
+  is made, so each start attempt takes its client's receiver before it asks for the first listing,
+  and the entry keeps it until bind, where the listener takes it. One said while the first listing
+  was answered marks the service stale, since that page may not reflect it.
+- **The signature renderer reads any JSON.** The host calls a method whose schema does not
+  compile unchecked, so any JSON reaches the renderer, and one raise there lost the whole
+  `services` line, the services beside it with it. A type member that is not a string gets no
+  annotation, `required` holding one falls back to `(**arguments)`, and a name required twice is
+  one parameter.
+- **`tool(name)` for a name the listing lacks raises `AttributeError`**, as `method(name)` does;
+  `call("missing", ...)` is refused `unknown_method` by the host.
+- **`ServiceDescription::extras`**, a service-level map beside `MethodDescription::extras`, carries
+  the MCP service's `placement`, which `repr` and `help()` show; nothing else of a declaration is
+  in the description.
+- **Unmodeled blocks.** rmcp 3.4.1 declares no block kind outrig does not model, so no server's
+  result can carry one; `result_to_wire` writes `McpContent::Other` and `McpResourceContents::Other`
+  as their raw JSON where `result_to_rmcp` must fit them to a kind the SDK names, and
+  `a_block_this_build_does_not_model_crosses_as_one` checks the crossing with an `mcp`-kind
+  service. `McpToolResult`, `McpTool` and `ToolHandle` are unchanged (A-08).
+- **Python spellings.** `outrig/_mcp.py`, exported at the top level: `McpService`, `McpTool`,
+  `McpResult`, `McpBlock` and `McpText`, `McpImage`, `McpAudio`, `McpResource`,
+  `McpResourceLink`, `McpOther` (each with `kind` and `raw`), `McpRelisted`, `McpError`,
+  `ToolError`. The generic class gains three presenter hooks: `_answered` (what an answer becomes,
+  moved out of `_service_call`), `_namespace` (class attributes, whose names no method takes) and
+  `_about` (the class docstring's paragraph). `McpResult.text` matches `render_text` exactly and
+  is built once.
+- **The orientation** marks each MCP service and says once what its calls return and that a
+  failed call may have reached the server; a dict-constructed child given one is told the same,
+  its `Given` marked from the session's service briefs, which gain `kind`.

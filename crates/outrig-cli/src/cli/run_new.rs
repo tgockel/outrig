@@ -828,30 +828,38 @@ fn mcp_lines(outcomes: &[(String, McpServiceOutcome)]) -> Vec<String> {
     outcomes
         .iter()
         .map(|(name, outcome)| {
-            let tools = match outcome {
-                McpServiceOutcome::Ready { tools, .. } => *tools,
-                _ => 0,
+            let (tools, left) = match outcome {
+                McpServiceOutcome::Ready {
+                    tools, undecoded, ..
+                } => (*tools, undecoded.iter().map(ToString::to_string).collect()),
+                _ => (0, Vec::new()),
             };
             let cause = outcome
                 .cause()
                 .map(|cause| (cause.message.as_str(), cause.exit.as_deref()));
-            mcp_line(name, outcome.kind(), tools, cause)
+            mcp_line(name, outcome.kind(), tools, &left, cause)
         })
         .collect()
 }
 
 /// The line for service `name`, whose start ended as `kind`: with `tools`
-/// tools when it is ready, or for `cause`, a message and how its transport
-/// ended.
+/// tools when it is ready, and those its server listed that did not decode,
+/// `left` out, each named with why; or for `cause`, a message and how its
+/// transport ended.
 fn mcp_line(
     name: &str,
     kind: McpOutcomeKind,
     tools: usize,
+    left: &[String],
     cause: Option<(&str, Option<&str>)>,
 ) -> String {
     let Some((message, exit)) = cause else {
         let plural = if tools == 1 { "" } else { "s" };
-        return format!("[outrig] MCP service {name}: ready, {tools} tool{plural}");
+        let left = match left {
+            [] => String::new(),
+            left => format!("; left out, not decoded: {}", left.join("; ")),
+        };
+        return format!("[outrig] MCP service {name}: ready, {tools} tool{plural}{left}");
     };
     let kind = kind.as_str();
     let exit = exit
@@ -1057,11 +1065,22 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
     #[test]
     fn each_mcp_outcome_is_one_line() {
         assert_eq!(
-            mcp_line("fs", McpOutcomeKind::Ready, 12, None),
+            mcp_line("fs", McpOutcomeKind::Ready, 12, &[], None),
             "[outrig] MCP service fs: ready, 12 tools"
         );
         assert_eq!(
-            mcp_line("one", McpOutcomeKind::Ready, 1, None),
+            mcp_line(
+                "fs",
+                McpOutcomeKind::Ready,
+                2,
+                &["\"bad\": invalid type: sequence, expected a map".to_string()],
+                None
+            ),
+            "[outrig] MCP service fs: ready, 2 tools; left out, not decoded: \"bad\": invalid \
+             type: sequence, expected a map"
+        );
+        assert_eq!(
+            mcp_line("one", McpOutcomeKind::Ready, 1, &[], None),
             "[outrig] MCP service one: ready, 1 tool"
         );
         assert_eq!(
@@ -1069,6 +1088,7 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
                 "leaky",
                 McpOutcomeKind::Misconfigured,
                 0,
+                &[],
                 Some(("it holds a credential", None))
             ),
             "[outrig] MCP service leaky: misconfigured, not started: it holds a credential"
@@ -1078,6 +1098,7 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
                 "gh",
                 McpOutcomeKind::Unavailable,
                 0,
+                &[],
                 Some(("connection closed", Some("code 1")))
             ),
             "[outrig] MCP service gh: unavailable, not started: connection closed (exit: code 1)"

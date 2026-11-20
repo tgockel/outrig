@@ -24,17 +24,21 @@ use std::time::Duration;
 
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest,
-    PaginatedRequestParams, RequestId, ServerResult,
+    CustomResult, ListToolsRequest, PaginatedRequestParams, RequestId, ServerResult,
 };
 use rmcp::service::{
-    Peer, PeerRequestOptions, RoleClient, RunningService, ServiceError, serve_client,
+    NotificationContext, Peer, PeerRequestOptions, RoleClient, RunningService, ServiceError,
+    serve_client,
 };
 use serde_json::Value;
+use tokio::sync::watch;
 
 use crate::config::{EnvValue, McpServerSpec, ResolvedEnvValue, effective_mcp_call_timeout};
 use crate::container::{Container, ExecOptions, ExecTarget, embedded::McpDeclarationSource};
 use crate::error::{IoPathExt, McpFailureKind, McpSessionError, OutrigError, Result};
-use crate::mcp_content::{McpTool, McpToolResult, result_from_rmcp, tool_from_rmcp};
+use crate::mcp_content::{
+    McpTool, McpToolResult, McpUndecodedTool, result_from_rmcp, tool_from_rmcp,
+};
 use crate::process::{Cmd, Owned, StdioSpec, Transcript};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
@@ -83,7 +87,7 @@ const ABANDONED_REASON: &str = "outrig stopped waiting for this call";
 #[derive(Debug)]
 pub struct McpClient {
     name: String,
-    service: RunningService<RoleClient, ()>,
+    service: RunningService<RoleClient, Notices>,
     /// The transport's host-side process; `None` for a transport with no
     /// process of its own, as a test's in-memory one.
     child: Option<Owned>,
@@ -311,7 +315,8 @@ impl McpClient {
         // `IntoTransport for (R, W)` impl. Going through
         // `rmcp::transport::TokioChildProcess::new` would spawn its own child
         // internally, leaving us no `Child` handle for graceful shutdown.
-        let handshake = tokio::time::timeout_at(by, serve_client((), (stdout, stdin))).await;
+        let handshake =
+            tokio::time::timeout_at(by, serve_client(Notices::default(), (stdout, stdin))).await;
         // A handshake that failed is classified already: what diagnosing it
         // waits for is bounded by what its own bound left, so the caller's
         // bound does not end it as out of time. One that ran out of time is
@@ -376,7 +381,7 @@ impl McpClient {
         initialize_within: Duration,
     ) -> Result<Self>
     where
-        S: rmcp::ServerHandler,
+        S: rmcp::Service<rmcp::RoleServer>,
     {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
@@ -384,20 +389,24 @@ impl McpClient {
                 let _ = running.waiting().await;
             }
         });
-        let failed =
-            match tokio::time::timeout(initialize_within, serve_client((), client_io)).await {
-                Ok(Ok(service)) => {
-                    return Ok(Self {
-                        name: name.to_string(),
-                        service,
-                        child: None,
-                        stderr_path: PathBuf::new(),
-                        call_timeout: effective_mcp_call_timeout(None, None),
-                    });
-                }
-                Ok(Err(source)) => Handshake::failed(source),
-                Err(_) => Handshake::timed_out(initialize_within),
-            };
+        let failed = match tokio::time::timeout(
+            initialize_within,
+            serve_client(Notices::default(), client_io),
+        )
+        .await
+        {
+            Ok(Ok(service)) => {
+                return Ok(Self {
+                    name: name.to_string(),
+                    service,
+                    child: None,
+                    stderr_path: PathBuf::new(),
+                    call_timeout: effective_mcp_call_timeout(None, None),
+                });
+            }
+            Ok(Err(source)) => Handshake::failed(source),
+            Err(_) => Handshake::timed_out(initialize_within),
+        };
         Err(startup_failure(
             name,
             None,
@@ -448,14 +457,24 @@ impl McpClient {
         &self.name
     }
 
+    /// What changes with each `notifications/tools/list_changed` its server
+    /// sends, for as long as it is connected, from now: one sent before this
+    /// is not heard. Nothing relists on its own: the change is for whoever
+    /// decides to.
+    pub(crate) fn list_changes(&self) -> watch::Receiver<()> {
+        self.service.service().0.subscribe()
+    }
+
     /// Issue an MCP `tools/list`, following its pages until the server stops
     /// sending a `nextCursor`, and translate the results into our own
     /// [`McpTool`] type. Every page together gets the same fixed bound
     /// `initialize` does, 120 seconds; a listing that outlives it fails with
     /// [`McpFailureKind::Timeout`]. One whose pages would never end -- a
     /// `nextCursor` an earlier page already sent, or a server still paging
-    /// after 1000 pages -- fails at once with [`McpFailureKind::Protocol`]. A
-    /// failure carries the server's stderr tail.
+    /// after 1000 pages -- fails at once with [`McpFailureKind::Protocol`], as
+    /// does one holding a tool this client cannot decode, such as one whose
+    /// `inputSchema` is not an object, which the failure names. A failure
+    /// carries the server's stderr tail.
     pub async fn list_tools(&self) -> Result<Vec<McpTool>> {
         self.list_tools_within(STARTUP_TIMEOUT).await
     }
@@ -464,22 +483,47 @@ impl McpClient {
     /// timeout without waiting out the real one. No cancel goes upstream on
     /// expiry: every caller abandons a server whose listing failed.
     pub(crate) async fn list_tools_within(&self, bound: Duration) -> Result<Vec<McpTool>> {
+        let Listing { tools, undecoded } = self.list_tools_tolerant_within(bound).await?;
+        if undecoded.is_empty() {
+            return Ok(tools);
+        }
+        let named: Vec<String> = undecoded.iter().map(McpUndecodedTool::to_string).collect();
+        Err(self
+            .list_failed(McpSessionError::new(
+                McpFailureKind::Protocol,
+                format!(
+                    "tools/list holds tools this client cannot decode: {}",
+                    named.join("; ")
+                ),
+            ))
+            .await)
+    }
+
+    /// A `tools/list` as [`Self::list_tools_within`] bounds and pages it, that
+    /// keeps every tool that decodes and names each that does not, rather
+    /// than failing for one: a server's malformed tool costs that tool alone.
+    pub(crate) async fn list_tools_tolerant_within(&self, bound: Duration) -> Result<Listing> {
         let source = match tokio::time::timeout(bound, self.list_every_page()).await {
-            Ok(Ok(tools)) => return Ok(tools.into_iter().map(tool_from_rmcp).collect()),
+            Ok(Ok(listing)) => return Ok(listing),
             Ok(Err(source)) => source,
             Err(_) => McpSessionError::new(
                 McpFailureKind::Timeout,
                 format!("no tools/list response within {bound:?}"),
             ),
         };
-        Err(OutrigError::McpToolsListFailed {
+        Err(self.list_failed(source).await)
+    }
+
+    /// A listing that failed for `source`, with what the server wrote.
+    async fn list_failed(&self, source: McpSessionError) -> OutrigError {
+        OutrigError::McpToolsListFailed {
             name: self.name.clone(),
             source,
             stderr_path: self.stderr_path.clone(),
             // Read once: the server may still be running, and the settle wait
             // exists for a writer that has just exited.
             stderr_tail: read_stderr_tail_settling_for(&self.stderr_path, Duration::ZERO).await,
-        })
+        }
     }
 
     /// Every page of `tools/list`, in order. rmcp's `list_all_tools` pages
@@ -488,21 +532,43 @@ impl McpClient {
     /// already sent -- the echo, or a longer cycle -- is refused before it is
     /// requested again, and so is a listing past [`TOOLS_LIST_PAGE_CEILING`].
     /// Neither message quotes the cursor: the server chose it.
-    async fn list_every_page(
-        &self,
-    ) -> std::result::Result<Vec<rmcp::model::Tool>, McpSessionError> {
-        let mut tools = Vec::new();
+    ///
+    /// Each page is asked for through `send_request_with_option` rather than
+    /// rmcp's `list_tools`, which caches and fails a page whole for one tool
+    /// its typed decode refuses. Such a page arrives as `CustomResult`, the
+    /// last of rmcp's untagged `ServerResult` variants, and its tools are
+    /// decoded one by one. A page that also carries `_meta` decodes as a
+    /// `CallToolResult` before it gets there, its tools lost, and fails as a
+    /// response of the wrong kind.
+    async fn list_every_page(&self) -> std::result::Result<Listing, McpSessionError> {
+        let mut listing = Listing::default();
         let mut seen = HashSet::new();
         let mut cursor = None;
         for page in 1..=TOOLS_LIST_PAGE_CEILING {
-            let listed = self
+            let request = ClientRequest::ListToolsRequest(ListToolsRequest::with_param(
+                PaginatedRequestParams::default().with_cursor(cursor),
+            ));
+            let answered = self
                 .service
-                .list_tools(Some(PaginatedRequestParams::default().with_cursor(cursor)))
+                .send_request_with_option(request, PeerRequestOptions::no_options())
+                .await
+                .map_err(|source| session_error_from_rmcp(&source))?
+                .await_response()
                 .await
                 .map_err(|source| session_error_from_rmcp(&source))?;
-            tools.extend(listed.tools);
-            let Some(next) = listed.next_cursor else {
-                return Ok(tools);
+            let next = match answered {
+                ServerResult::ListToolsResult(listed) => {
+                    let tools = listed.tools.into_iter().map(tool_from_rmcp);
+                    listing.tools.extend(tools);
+                    listed.next_cursor
+                }
+                ServerResult::CustomResult(CustomResult(listed)) => {
+                    listing.read_page(page, listed)?
+                }
+                _ => return Err(session_error_from_rmcp(&ServiceError::UnexpectedResponse)),
+            };
+            let Some(next) = next else {
+                return Ok(listing);
             };
             if !seen.insert(next.clone()) {
                 return Err(McpSessionError::new(
@@ -679,6 +745,66 @@ impl Drop for CancelOnDrop {
                 CancelledNotificationParam::new(Some(id), Some(ABANDONED_REASON.to_string()));
             let _ = tokio::time::timeout(SHUTDOWN_GRACE, peer.notify_cancelled(notice)).await;
         });
+    }
+}
+
+/// A `tools/list`, as far as it decoded: the tools that did, in the server's
+/// order, and each that did not.
+#[derive(Debug, Default)]
+pub(crate) struct Listing {
+    pub(crate) tools: Vec<McpTool>,
+    pub(crate) undecoded: Vec<McpUndecodedTool>,
+}
+
+impl Listing {
+    /// Take in page `page`, which rmcp's typed decode refused and handed over
+    /// as the JSON it was: each of its `tools` that decodes is kept, and each
+    /// that does not is named with why. Its `nextCursor`, if it has one.
+    fn read_page(
+        &mut self,
+        page: usize,
+        listed: Value,
+    ) -> std::result::Result<Option<String>, McpSessionError> {
+        let unreadable = |what: &str| {
+            McpSessionError::new(
+                McpFailureKind::Protocol,
+                format!("tools/list page {page} is not a listing: {what}"),
+            )
+        };
+        let Value::Object(mut listed) = listed else {
+            return Err(unreadable("it is not an object"));
+        };
+        let next = match listed.remove("nextCursor") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(next)) => Some(next),
+            Some(_) => return Err(unreadable("its nextCursor is not a string")),
+        };
+        let Some(Value::Array(tools)) = listed.remove("tools") else {
+            return Err(unreadable("its tools are not a list"));
+        };
+        for tool in tools {
+            let name = tool.get("name").and_then(Value::as_str).map(str::to_string);
+            match serde_json::from_value::<rmcp::model::Tool>(tool) {
+                Ok(tool) => self.tools.push(tool_from_rmcp(tool)),
+                Err(e) => self
+                    .undecoded
+                    .push(McpUndecodedTool::new(name, e.to_string())),
+            }
+        }
+        Ok(next)
+    }
+}
+
+/// What a client hears from its server unasked: here only that its tool
+/// listing changed, for whoever watches [`McpClient::list_changes`]. Its
+/// `get_info` is the trait's own, as `()`'s is, so the handshake is the one a
+/// client with no handler makes.
+#[derive(Debug, Default)]
+pub(crate) struct Notices(watch::Sender<()>);
+
+impl rmcp::ClientHandler for Notices {
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        self.0.send_replace(());
     }
 }
 
@@ -1416,9 +1542,12 @@ pub(crate) mod tests {
 
     /// `server` on one end of an in-memory pipe and a bare rmcp client on the
     /// other, handshake done; the task serves until the client goes away.
-    pub(crate) async fn serve_in_memory<S: rmcp::ServerHandler>(
+    pub(crate) async fn serve_in_memory<S: rmcp::Service<rmcp::RoleServer>>(
         server: S,
-    ) -> (RunningService<RoleClient, ()>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        RunningService<RoleClient, Notices>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let serving = tokio::spawn(async move {
             let running = rmcp::service::serve_server(server, server_io)
@@ -1426,7 +1555,7 @@ pub(crate) mod tests {
                 .expect("serve in memory");
             let _ = running.waiting().await;
         });
-        let client = serve_client((), client_io)
+        let client = serve_client(Notices::default(), client_io)
             .await
             .expect("connect in memory");
         (client, serving)
@@ -1495,7 +1624,9 @@ pub(crate) mod tests {
     /// An [`McpClient`] whose transport is an in-memory pipe to `server`
     /// rather than a podman child, with the directory its stderr file lives
     /// in. The client still owes a child, so it gets one that does nothing.
-    async fn client_against<S: rmcp::ServerHandler>(server: S) -> (McpClient, tempfile::TempDir) {
+    async fn client_against<S: rmcp::Service<rmcp::RoleServer>>(
+        server: S,
+    ) -> (McpClient, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let stderr_path = dir.path().join("svc.stderr");
         std::fs::write(&stderr_path, "still indexing\n").expect("write stderr");
@@ -1669,6 +1800,94 @@ pub(crate) mod tests {
             "{source}"
         );
         assert_eq!(asked, TOOLS_LIST_PAGE_CEILING);
+    }
+
+    /// The seam a tolerant listing stands on. rmcp's typed decode of a
+    /// `tools/list` page fails the whole page for one tool whose `inputSchema`
+    /// is not an object; sent through `send_request_with_option`, such a page
+    /// arrives whole as `CustomResult`, the last of `ServerResult`'s untagged
+    /// variants. One that also carries `_meta` arrives as a `CallToolResult`
+    /// instead, its tools lost: that variant's decoder takes any object holding
+    /// one of its fields, and it comes first.
+    #[tokio::test]
+    async fn a_page_the_typed_decode_refuses_arrives_whole() {
+        use crate::harness::mcp_placement::fake::{Raw, Toolbox};
+
+        let tools = serde_json::json!([
+            {"name": "bad", "inputSchema": []},
+            {"name": "good", "inputSchema": {"type": "object"}},
+        ]);
+        let toolbox = Toolbox::new(tools.clone());
+        let (client, _serving) = serve_in_memory(Raw(std::sync::Arc::clone(&toolbox))).await;
+        let ask = || async {
+            client
+                .send_request_with_option(
+                    ClientRequest::ListToolsRequest(Default::default()),
+                    PeerRequestOptions::no_options(),
+                )
+                .await
+                .expect("sent")
+                .await_response()
+                .await
+                .expect("answered")
+        };
+
+        let ServerResult::CustomResult(page) = ask().await else {
+            panic!("a page the typed decode refuses is a custom result");
+        };
+        assert_eq!(page.0["tools"], tools);
+
+        toolbox.page_as(serde_json::json!({"tools": tools, "_meta": {"k": 1}}));
+        assert!(matches!(ask().await, ServerResult::CallToolResult(_)));
+    }
+
+    /// A malformed tool costs a session's listing that tool alone, named with why; the facade's
+    /// listing still fails for it, now naming it; and a page whose `_meta` hides its tools from
+    /// the seam fails as a response of the wrong kind, as before.
+    #[tokio::test]
+    async fn a_malformed_tool_costs_the_tolerant_listing_that_tool() {
+        use crate::harness::mcp_placement::fake::{Raw, Toolbox};
+
+        let tools = serde_json::json!([
+            {"name": "first", "inputSchema": {"type": "object"}},
+            {"name": "bad", "inputSchema": []},
+            {"inputSchema": 7},
+            {"name": "last", "inputSchema": {"type": "object"}},
+        ]);
+        let toolbox = Toolbox::new(tools.clone());
+        let (client, _dir) = client_against(Raw(std::sync::Arc::clone(&toolbox))).await;
+
+        let Listing {
+            tools: kept,
+            undecoded,
+        } = client
+            .list_tools_tolerant_within(STARTUP_TIMEOUT)
+            .await
+            .expect("the listing is kept");
+        let names: Vec<&str> = kept.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(names, ["first", "last"]);
+        let named: Vec<Option<&str>> = undecoded.iter().map(|u| u.name.as_deref()).collect();
+        assert_eq!(named, [Some("bad"), None]);
+        assert!(
+            undecoded[0].reason.contains("invalid type"),
+            "{undecoded:?}"
+        );
+
+        let source = list_failure(client.list_tools().await, McpFailureKind::Protocol);
+        assert!(
+            source.message.contains("cannot decode")
+                && source.message.contains("\"bad\": invalid type")
+                && source.message.contains("a tool with no name"),
+            "{source}"
+        );
+
+        toolbox.page_as(serde_json::json!({"tools": tools, "_meta": {"k": 1}}));
+        let Err(OutrigError::McpToolsListFailed { source, .. }) =
+            client.list_tools_tolerant_within(STARTUP_TIMEOUT).await
+        else {
+            panic!("a page decoded as another result fails the listing");
+        };
+        assert_eq!(source.kind, McpFailureKind::Protocol, "{source}");
     }
 
     /// Past its deadline a call fails as a timeout *and* the server hears

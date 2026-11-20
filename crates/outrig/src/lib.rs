@@ -72,6 +72,7 @@ pub use mcp::{McpClient, resolve_mcp_env};
 pub use mcp_content::{
     McpAnnotations, McpContent, McpEmbeddedResource, McpIcon, McpMediaContent, McpResourceContents,
     McpResourceLink, McpRole, McpTextContent, McpTool, McpToolAnnotations, McpToolResult,
+    McpUndecodedTool,
 };
 pub use outrig_::{
     CapabilitySpec, EmbeddedMcpPolicy, LaunchSpec, MountSpec, NetworkSpec, Outrig, SecuritySpec,

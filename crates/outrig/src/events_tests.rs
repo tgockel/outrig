@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::*;
+use crate::McpUndecodedTool;
 use crate::agent::rig_json;
 use crate::error::McpFailureKind;
 use crate::harness::event::*;
@@ -442,6 +443,7 @@ fn each_event_has_exactly_its_data_fields() {
                 invocation: None,
                 deadline: Duration::from_secs(600),
                 arguments: None,
+                mcp: None,
             },
             "service.call.received",
             &[
@@ -492,6 +494,7 @@ fn each_event_has_exactly_its_data_fields() {
                 bytes: None,
                 duration: Duration::from_millis(40),
                 body: None,
+                mcp: None,
             },
             "service.call.ended",
             &[
@@ -507,6 +510,10 @@ fn each_event_has_exactly_its_data_fields() {
                 declared_in: McpDeclaredIn::Config,
                 tools: 3,
                 listing: 1,
+                undecoded: vec![McpUndecodedTool::new(
+                    Some(text("bad")),
+                    text("invalid type: sequence, expected a map"),
+                )],
                 attempts: 2,
                 duration: Duration::from_millis(900),
             },
@@ -518,6 +525,7 @@ fn each_event_has_exactly_its_data_fields() {
                 "declared_in",
                 "tools",
                 "listing",
+                "undecoded",
                 "attempts",
                 "duration",
             ],
@@ -583,6 +591,23 @@ fn each_event_has_exactly_its_data_fields() {
             },
             "mcp.service.stopped",
             &["service", "how", "proven"],
+        ),
+        (
+            Payload::McpServiceRelisted {
+                service: text("fs"),
+                agent: text("primary"),
+                listing: 2,
+                undecoded: Vec::new(),
+            },
+            "mcp.service.relisted",
+            &["service", "agent", "listing", "undecoded"],
+        ),
+        (
+            Payload::McpServiceListChanged {
+                service: text("fs"),
+            },
+            "mcp.service.list.changed",
+            &["service"],
         ),
         (
             Payload::BindingRefused {
@@ -1425,6 +1450,99 @@ fn each_event_has_exactly_its_data_fields() {
             keys(&data),
             fields.iter().copied().collect::<BTreeSet<_>>(),
             "{kind}"
+        );
+    }
+
+    // An MCP service's call is a call of the same kinds, with fields of its own beside theirs.
+    let mcp: [(Payload, &str, &[&str]); 2] = [
+        (
+            Payload::ServiceCallReceived {
+                call: ServiceCallId::new(3),
+                service: text("fs"),
+                kind: ServiceKind::Mcp,
+                method: text("read-file"),
+                generation: 2,
+                agent: text("primary"),
+                execid: Some(execid(3)),
+                invocation: None,
+                deadline: Duration::from_secs(600),
+                arguments: None,
+                mcp: Some(McpCallReceived {
+                    tool: text("read-file"),
+                    listing: 2,
+                }),
+            },
+            "service.call.received",
+            &[
+                "call",
+                "service",
+                "kind",
+                "method",
+                "generation",
+                "agent",
+                "execid",
+                "invocation",
+                "deadline",
+                "arguments",
+                "tool",
+                "listing",
+            ],
+        ),
+        (
+            Payload::ServiceCallEnded {
+                call: ServiceCallId::new(3),
+                service: text("fs"),
+                kind: ServiceKind::Mcp,
+                method: text("read-file"),
+                agent: text("primary"),
+                execid: Some(execid(3)),
+                outcome: ServiceOutcome::Returned,
+                category: None,
+                reason: None,
+                detail: None,
+                bytes: Some(120),
+                duration: Duration::from_millis(40),
+                body: None,
+                mcp: Some(McpCallEnded {
+                    tool: text("read-file"),
+                    listing: 2,
+                    state: Some(McpDispatchState::ResponseReceived),
+                    is_error: Some(false),
+                    blocks: Some([(text("text"), 1)].into()),
+                    structured: Some(true),
+                }),
+            },
+            "service.call.ended",
+            &[
+                "call",
+                "service",
+                "kind",
+                "method",
+                "agent",
+                "execid",
+                "outcome",
+                "category",
+                "reason",
+                "detail",
+                "bytes",
+                "duration",
+                "body",
+                "tool",
+                "listing",
+                "state",
+                "is_error",
+                "blocks",
+                "structured",
+            ],
+        ),
+    ];
+    for (payload, kind, fields) in &mcp {
+        assert_eq!(payload.kind(), *kind);
+        let data = serde_json::to_value(payload).expect("encodes");
+        assert_eq!(
+            keys(&data),
+            fields.iter().copied().collect::<BTreeSet<_>>(),
+            "{kind} of an MCP service"
         );
     }
 

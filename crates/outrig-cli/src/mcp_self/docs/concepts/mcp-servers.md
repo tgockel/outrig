@@ -507,7 +507,10 @@ with an outcome:
 
 A server that does not start does not stop the session: it starts with the servers that are
 ready. `run-new` prints one line per server; a host program reads `session.mcp`; a Rust program
-reads `Session::mcp().outcomes()`. The `mcp.service.*` events in
+reads `Session::mcp().outcomes()`. A tool the server lists that cannot be decoded -- one whose
+`inputSchema` is not an object, say -- is left out, and the server is ready with the rest; its
+outcome names each one left out and why. (`outrig run` and `outrig mcp` still refuse such a
+server.) The `mcp.service.*` events in
 [Events](https://tgockel.github.io/outrig/reference/events.html) record each start, retry and
 failure. A sidecar's `on-failure` is not consulted, and a `start = "manual"` sidecar's servers are
 `misconfigured`: a session starts every server it places.
@@ -522,6 +525,35 @@ asked after it waits for it and undoes what it did; one whose caller stopped wai
 began does nothing. A command placement cannot be frozen apart from the interpreter, and
 a stopped server is not paused; each says so. A container a configuration's block shares is
 paused or stopped for all of its servers at once.
+
+**In agent Python.** The service is an `outrig.McpService`: each tool is a method, by its exact
+name where that is an identifier -- `-` read as `_`, and a trailing `_` for a keyword -- and
+always through `fs.call("read-file", {...})` or `fs.tool("read-file")`, which gives the tool
+with the descriptor its server listed. `fs.tools` lists those descriptors, `title`,
+`annotations`, `icons` and `_meta` included, and `help(fs)` renders each tool's signature and
+docstring from its schema. A call returns an `outrig.McpResult`, the result as data rather than
+text:
+
+```python
+r = fs.read_file(path="data.json")
+r.content          # the blocks, in order: McpText, McpImage, McpResource, ...
+r.structured       # structured content, as Python data, or None
+r.content[1].data  # an image's bytes, decoded on first use
+r.text             # the blocks as one string -- a lossy view
+```
+
+Agent code filters a large result in Python and prints what it needs: what the model sees is
+what the code prints, never the result itself. A result the server marks as an error raises
+`outrig.ToolError`, carrying it, and a call that returns no result `outrig.McpError`, an
+`outrig.ServiceError`. A result larger than the session's bound -- 64 MiB of JSON, or the
+top-level `service-result-max-bytes` -- is not handed over: the call raises, and its event says it
+returned, since the server did the work. OutRig never calls a tool again.
+
+The tools are the server's listing as it started. `fs.relist()` asks the server again: a tool it
+added is a method from then on, one it removed is refused when called, and a method or tool
+already held keeps calling the tool it was resolved by, never another. A server that says its
+listing changed marks the service `stale`, and nothing is relisted until agent code does.
+`mcp.service.relisted` and `mcp.service.list.changed` record each.
 
 **The close.** At the session's close each server's transport is closed and its container
 stopped, a paused one thawed first, one a stop left unproven stopped again -- a server that never
