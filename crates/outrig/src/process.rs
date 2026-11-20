@@ -32,11 +32,11 @@
 //!
 //! A grace is worth something only while this runtime is alive. A runtime
 //! shutting down inside one drops the reap task, `kill_on_drop` escalates
-//! immediately, and the child is back to being killed outright. Ctrl-C is not
-//! covered by this mechanism at all and does not need to be: the terminal
-//! delivers `SIGINT` to the whole foreground process group, so the child has
-//! a catchable signal from the kernel before outrig does anything -- unless
-//! it was spawned out of that group; see [Process groups](#process-groups).
+//! immediately, and the child is back to being killed outright. Callers that
+//! cancel on a signal and then exit can use [`crate::image::with_build_cleanup`]
+//! to wait for graceful stops before shutting the runtime down. A terminal
+//! also delivers `SIGINT` to the whole foreground process group, unless the
+//! child was spawned out of that group; see [Process groups](#process-groups).
 //!
 //! So the bound a caller who never passes a stop signal gets is **terminated
 //! synchronously, reaped as soon as the runtime is next driven** -- measured
@@ -673,6 +673,25 @@ impl Owned {
     }
 }
 
+tokio::task_local! {
+    static GRACEFUL_REAPS: std::cell::RefCell<Vec<tokio::task::JoinHandle<()>>>;
+}
+
+/// Keep graceful child stops alive after `future` resolves (for example after
+/// a signal race has dropped a build), without imposing a fixed sleep.
+pub(crate) async fn with_graceful_cleanup<F: Future>(future: F) -> F::Output {
+    GRACEFUL_REAPS
+        .scope(std::cell::RefCell::new(Vec::new()), async {
+            let result = future.await;
+            let reaps = GRACEFUL_REAPS.with(|reaps| reaps.take());
+            for reap in reaps {
+                let _ = reap.await;
+            }
+            result
+        })
+        .await
+}
+
 impl Drop for Owned {
     fn drop(&mut self) {
         let Some(mut child) = self.child.take() else {
@@ -720,7 +739,7 @@ impl Drop for Owned {
         // is after the reap: a child asked to stop has to be able to write
         // until it is gone.
         let keepalive = std::mem::take(&mut self.keepalive);
-        self.handle.spawn(async move {
+        let reap = self.handle.spawn(async move {
             if let Some(grace) = grace
                 && tokio::time::timeout(grace, child.wait()).await.is_err()
             {
@@ -729,6 +748,11 @@ impl Drop for Owned {
             let _ = child.wait().await;
             drop(keepalive);
         });
+        if grace.is_some() {
+            // Outside a scope, dropping the handle keeps the existing detached
+            // behavior. Inside one, the caller waits before shutting down tokio.
+            let _ = GRACEFUL_REAPS.try_with(|reaps| reaps.borrow_mut().push(reap));
+        }
     }
 }
 
@@ -1152,6 +1176,7 @@ pub(crate) async fn run_streamed(
     let mut child = cmd.spawn_owned(StdioSpec::streamed(), termination)?;
     let stderr = child.take_stderr();
 
+    let dispatcher = tracing::dispatcher::get_default(Clone::clone);
     let log_task = Drain::spawn(async move {
         // Bytes then lossy, rather than `lines()`, because a drain that
         // stops early while the child is still writing is a hang. Nothing
@@ -1173,11 +1198,22 @@ pub(crate) async fn run_streamed(
                 Ok(_) => {}
             }
             let rendered = String::from_utf8_lossy(&line);
-            tracing::info!(
-                target: "outrig::process",
-                "[{prefix}] {}",
-                rendered.trim_end_matches(['\r', '\n'])
-            );
+            // A tracing subscriber may synchronously write to a full stderr
+            // pipe. Preserve per-line backpressure, but pay it on the blocking
+            // pool so cancellation can still drop this drain and its child.
+            // Carry a scoped subscriber explicitly across the thread boundary.
+            let dispatcher = dispatcher.clone();
+            let rendered = rendered.into_owned();
+            let _ = tokio::task::spawn_blocking(move || {
+                tracing::dispatcher::with_default(&dispatcher, || {
+                    tracing::info!(
+                        target: "outrig::process",
+                        "[{prefix}] {}",
+                        rendered.trim_end_matches(['\r', '\n'])
+                    );
+                });
+            })
+            .await;
         }
     });
 

@@ -15,7 +15,9 @@ use std::time::Instant;
 use clap::{ArgGroup, Parser};
 
 use crate::builtin_image;
+use crate::cli::signals::Signals;
 use crate::error::{OutrigError, Result};
+use crate::notice;
 use crate::paths::RepoConfig;
 use outrig::config::{Config, ImageConfig, ImageSourceRef};
 use outrig::image::{self, ImageTag};
@@ -42,8 +44,41 @@ pub async fn execute(
     global_cfg_path: Option<&Path>,
     args: &BuildArgs,
 ) -> Result<i32> {
+    // Install before the first engine operation. Dropping the whole invocation
+    // also stops `--all` before it can move on to another image; the library's
+    // process owner and temporary-tag guard handle the canceled build.
+    let mut signals = Signals::install()?;
+    notice::with_async_notices(async {
+        let result = image::with_build_cleanup(signals.race_ending("the build", async {
+            let result = execute_inner(repo, global_cfg_path, args).await;
+            notice::flush_async().await;
+            result
+        }))
+        .await;
+        // The interruption notice must not wait on a hub/stderr lock held by
+        // stalled output. Deliver it when possible, but never delay cleanup
+        // or exit indefinitely for a reader that is still open but not reading.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), notice::flush_async())
+            .await;
+        result
+    })
+    .await
+}
+
+async fn execute_inner(
+    repo: &RepoConfig,
+    global_cfg_path: Option<&Path>,
+    args: &BuildArgs,
+) -> Result<i32> {
     let repo_root = &repo.root;
-    let mut cfg = repo.load_for_build(global_cfg_path)?;
+    // Config warnings can write stderr too. Keep those synchronous reads and
+    // diagnostics off the signal-driving executor along with hash work.
+    let owned_repo = repo.clone();
+    let global_cfg_path = global_cfg_path.map(Path::to_path_buf);
+    let mut cfg =
+        tokio::task::spawn_blocking(move || owned_repo.load_for_build(global_cfg_path.as_deref()))
+            .await
+            .expect("build config task panicked")?;
 
     // `--all` means "every image-config *you* declared". outrig's built-in
     // default is not that, and pulling and building it in every repo that runs
@@ -74,7 +109,7 @@ pub async fn execute(
         .to_string();
     if builtin_image::is_reserved(&name) {
         for note in &builtin_image::inject(&mut cfg).notes {
-            eprintln!("[outrig] {note}");
+            notice::line_async(format!("[outrig] {note}")).await;
         }
     }
 
@@ -97,26 +132,28 @@ async fn build_single(
             let tag = image::ImageTag::new(image_name);
             let already_pulled = !no_cache && image::probe_pulled(&tag).await?;
             if already_pulled {
-                eprintln!("[outrig] image ready (already pulled: {tag})");
+                notice::line_async(format!("[outrig] image ready (already pulled: {tag})")).await;
                 return Ok(0);
             }
-            print_image_header(name, &tag);
+            print_image_header(name, &tag).await;
             image::pull_image(&tag).await?;
-            eprintln!("[outrig] image ready: {tag}");
+            notice::line_async(format!("[outrig] image ready: {tag}")).await;
             Ok(0)
         }
         ImageSourceRef::Build {
-            dockerfile, context, ..
+            dockerfile,
+            context,
+            ..
         } => {
             let tag = image::compute_tag_for(name, cc, repo_root).await?;
             let cache_hit = !no_cache && image::probe_cached(&tag).await?;
             if cache_hit {
-                eprintln!("[outrig] image ready (cache hit: {tag})");
+                notice::line_async(format!("[outrig] image ready (cache hit: {tag})")).await;
                 return Ok(0);
             }
-            print_build_header(name, dockerfile, context, &tag);
+            print_build_header(name, dockerfile, context, &tag).await;
             image::build_image_for(name, cc, repo_root, &tag, no_cache).await?;
-            eprintln!("[outrig] image ready: {tag}");
+            notice::line_async(format!("[outrig] image ready: {tag}")).await;
             Ok(0)
         }
         // `ImageSourceRef` is `#[non_exhaustive]`; a source kind this build
@@ -146,7 +183,10 @@ async fn build_all(cfg: &Config, repo_root: &Path, no_cache: bool) -> Result<i32
                     image::pull_image(&tag).await?;
                     format!("(pulled in {}s)", started.elapsed().as_secs())
                 };
-                eprintln!("[outrig] image-config: {name:<pad$} -> {tag} {suffix}");
+                notice::line_async(format!(
+                    "[outrig] image-config: {name:<pad$} -> {tag} {suffix}"
+                ))
+                .await;
             }
             ImageSourceRef::Build { .. } => {
                 let tag = image::compute_tag_for(name, cc, repo_root).await?;
@@ -158,12 +198,15 @@ async fn build_all(cfg: &Config, repo_root: &Path, no_cache: bool) -> Result<i32
                     image::build_image_for(name, cc, repo_root, &tag, no_cache).await?;
                     format!("(built in {}s)", started.elapsed().as_secs())
                 };
-                eprintln!("[outrig] image-config: {name:<pad$} -> {tag} {suffix}");
+                notice::line_async(format!(
+                    "[outrig] image-config: {name:<pad$} -> {tag} {suffix}"
+                ))
+                .await;
             }
             _ => return Err(unsupported_image_source(name).into()),
         }
     }
-    eprintln!("[outrig] all images ready");
+    notice::line_async("[outrig] all images ready".to_string()).await;
     Ok(0)
 }
 
@@ -171,18 +214,18 @@ async fn build_all(cfg: &Config, repo_root: &Path, no_cache: bool) -> Result<i32
 /// caller has already destructured [`ImageSourceRef::Build`], which is where
 /// the build shape is established. Reaching back through the config would have
 /// to re-assert it.
-fn print_build_header(name: &str, dockerfile: &Path, context: &Path, tag: &ImageTag) {
+async fn print_build_header(name: &str, dockerfile: &Path, context: &Path, tag: &ImageTag) {
     let mut buf = String::new();
     let _ = writeln!(buf, "[outrig] image-config: {name}");
     let _ = writeln!(buf, "[outrig] dockerfile:       {}", dockerfile.display());
     let _ = writeln!(buf, "[outrig] context:          {}", context.display());
     let _ = writeln!(buf, "[outrig] image tag:        {tag}");
-    eprint!("{buf}");
+    notice::write_async(buf).await;
 }
 
-fn print_image_header(name: &str, tag: &ImageTag) {
+async fn print_image_header(name: &str, tag: &ImageTag) {
     let mut buf = String::new();
     let _ = writeln!(buf, "[outrig] image-config: {name}");
     let _ = writeln!(buf, "[outrig] image:            {tag}");
-    eprint!("{buf}");
+    notice::write_async(buf).await;
 }

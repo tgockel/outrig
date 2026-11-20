@@ -56,9 +56,10 @@ const UNSUPPORTED_REMOTE_TRANSPORTS: &[&str] = &[
 /// stage container and escalated there; the build then fails and unwinds
 /// through its own stage cleanup. So the grace has to cover buildah's
 /// escalation *plus* the removal of every working container the build made,
-/// not merely the time to deliver a signal. Nothing waits on it -- the grace
-/// is paid by a detached task, and the drop that started it returns at once
-/// -- so erring long costs a process that lingers, and erring short costs the
+/// not merely the time to deliver a signal. The drop returns at once and a
+/// reap task pays the grace; [`with_build_cleanup`] waits for that task when
+/// the caller must keep its runtime alive. Erring long costs a process that
+/// lingers, and erring short costs the
 /// leak this exists to prevent. Measured on buildah 1.33.7, the whole unwind
 /// takes about 200 ms.
 const BUILD_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
@@ -94,6 +95,19 @@ fn build_termination() -> process::Termination {
         return process::Termination::Kill;
     }
     process::Termination::TermThenKill(BUILD_TERM_GRACE)
+}
+
+/// Run a future and wait for graceful build-process stops it initiates before
+/// returning its result. Wrap the cancellation race, not just the build: the
+/// race must drop the build while this scope is still active.
+///
+/// This lets a command shut its Tokio runtime down without cutting short the
+/// bounded grace given to buildah. Only builds polled directly in this task
+/// are covered, not builds in spawned tasks. Dropping this future itself
+/// retains the usual detached cleanup behavior; temporary-tag removal is
+/// detached independently and need not finish before this function returns.
+pub async fn with_build_cleanup<F: std::future::Future>(future: F) -> F::Output {
+    process::with_graceful_cleanup(future).await
 }
 
 /// Run `build` with a cancellation killing buildah outright, as it did before

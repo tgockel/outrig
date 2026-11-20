@@ -173,13 +173,18 @@ pub fn run() -> ExitCode {
     })
 }
 
-/// Drive a session command, then shut its runtime down without waiting on
-/// blocking work. A REPL or a stdio MCP transport can leave a blocking stdin
-/// read in flight that returns only when the other end writes or closes the
+/// Drive a session or build command, then shut its runtime down without
+/// waiting on abandoned blocking work. A REPL or a stdio MCP transport can
+/// leave a blocking stdin read in flight that returns only when the other end
+/// writes or closes the
 /// pipe, and dropping the runtime normally waits for it -- after a signal, a
 /// stopped container, or a second Ctrl-C, the session was torn down and the
 /// process sat there until someone pressed Enter. Every session has finished
-/// its own teardown by the time `fut` resolves.
+/// its own teardown by the time `fut` resolves. Direct builds likewise finish
+/// their graceful child reaping before returning, but may leave a canceled
+/// context hash, filesystem read, or terminal write in the blocking pool.
+/// Waiting for that abandoned work would make signals appear to hang during
+/// hashing or under output backpressure (#990).
 ///
 /// The runtime lives in a [`ShutdownOnDrop`] guard rather than a local
 /// binding so that a panic out of `fut` gets the same treatment as a normal
@@ -324,7 +329,23 @@ fn dispatch(cli: &Cli) -> Result<i32> {
         Cmd::Design(args) => design_prompt::execute(args),
         Cmd::Build(args) => {
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, true)?;
-            runtime.block_on(build::execute(&repo_config, global_config.as_deref(), args))
+            block_on_session(runtime, async {
+                let result = build::execute(&repo_config, global_config.as_deref(), args).await;
+                if let Err(e) = &result
+                    && !matches!(e, CliError::Interrupted(_))
+                {
+                    // The build has already failed. Do not fall back to the
+                    // synchronous top-level diagnostic: a stalled stderr may
+                    // still be locked by an abandoned build-output worker.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        crate::notice::line_async(format!("error: {e}")),
+                    )
+                    .await;
+                    return Ok(e.exit_code());
+                }
+                result
+            })
         }
         Cmd::Config(args) => match &args.cmd {
             ConfigCmd::Init { force } => {

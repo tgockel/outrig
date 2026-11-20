@@ -1179,6 +1179,7 @@ pub async fn outrig::image::read_image_labels(&outrig::image::ImageTag, core::op
 pub async fn outrig::image::read_remote_image_labels(&str) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
 pub async fn outrig::image::refuse_session_dir_in_build_context(&str, &outrig::config::ImageConfig, &std::path::Path, &std::path::Path, &std::path::Path) -> outrig::error::Result<()>
 pub async fn outrig::image::refuse_session_registry_entry_in_build_context(&str, &outrig::config::ImageConfig, &std::path::Path, &std::path::Path, &std::path::Path) -> outrig::error::Result<()>
+pub async fn outrig::image::with_build_cleanup<F: core::future::future::Future>(F) -> <F as core::future::future::Future>::Output
 pub mod outrig::mcp_proxy
 pub struct outrig::mcp_proxy::ProxyServer<C>
 impl<C: outrig::mcp_proxy::BackingClient> outrig::mcp_proxy::ProxyServer<C>

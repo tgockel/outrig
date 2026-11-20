@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Direct `outrig build`, including `--all`, now cancels on SIGINT, SIGTERM, and SIGHUP
+  through the build cleanup path, allowing buildah to unwind and removing the temporary
+  tag instead of exiting without running destructors. Runtime shutdown no longer waits
+  for abandoned blocking hashing reads after cancellation. A live stderr reader that stops
+  draining no longer blocks signal cancellation, child cleanup, or exit. (#990)
+
 - Substring `logs` and `discard` lookups now use the store-resolved session directory, so
   stale relative paths in records cannot misdirect logs or bypass the live-owner check. (#976)
 

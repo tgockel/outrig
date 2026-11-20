@@ -124,12 +124,18 @@ $ outrig build --no-cache
 
 ## Cancelling a build
 
-Ctrl-C, a timeout, or an abandoned MCP call stops a build in flight. outrig asks buildah to
-stop rather than killing it outright, and waits a bounded grace before escalating, because a
+Direct `outrig build` (including `--all`) handles Ctrl-C, SIGTERM, and SIGHUP by cancelling
+its active build; `--all` does not start any remaining images. A timeout or an abandoned MCP
+call also stops a build in flight. outrig asks buildah to stop rather than killing it outright,
+and waits a bounded grace before escalating, because a
 buildah that unwinds removes the per-stage *working containers* it created and a killed one
 does not. Those are the one engine resource outrig cannot name for itself: buildah derives
 their names from the base image and offers no way to label them, so the only process that can
 prove which belong to this build is buildah.
+
+Cancellation does not wait for a stalled stderr reader. Build progress and engine output apply
+backpressure during normal operation, but undeliverable output (including the interruption notice)
+may be abandoned so cleanup and exit can finish.
 
 What a cancelled build leaves:
 
@@ -147,7 +153,8 @@ with [`outrig clean --build-containers`](sessions.md#outrig-clean).
 ## Exit codes
 
 - `0` -- every selected image is built or cache-hit.
-- non-zero -- at least one image failed to build. The buildah stderr is reproduced with the
+- `129`, `130`, `143` -- cancelled by SIGHUP, SIGINT (Ctrl-C), or SIGTERM, respectively.
+- Other non-zero -- at least one image failed to build. The buildah stderr is reproduced with the
   `[buildah]` prefix, ending with the exact failing step.
 
 ## See also

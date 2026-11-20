@@ -21,8 +21,12 @@
 //!   terminal and ended the prompt's line, before the line typed is handed on and
 //!   the next prompt is drawn. A warning raised mid-prompt is late, not garbled.
 //!
-//! Nothing here can lose a line: [`release`] flushes whatever a read that never
-//! returned left held, and is the last thing the editor's teardown does.
+//! The ordinary prompt path does not lose a line: [`release`] flushes whatever
+//! a read that never returned left held, and is the last thing the editor's
+//! teardown does. Direct builds use [`with_async_notices`] instead: terminal
+//! writes run on blocking workers, waits are cancelable, and undeliverable
+//! output is abandoned on interruption. Incidental diagnostics in that scope
+//! are bounded; progress and engine output retain awaited backpressure.
 //!
 //! Everything that writes to the terminal on its own account while a session is
 //! live goes through [`notice!`]. Writers that cannot overlap a prompt -- setup
@@ -116,7 +120,60 @@ static HUB: LazyLock<Hub> = LazyLock::new(|| Hub::new(Box::new(std::io::stderr()
 /// Reach it through [`notice!`].
 pub(crate) fn line(args: fmt::Arguments<'_>) {
     // One buffer, one `write`: the line cannot be split by another writer.
-    HUB.write(format!("{args}\n").as_bytes());
+    write(format!("{args}\n").as_bytes());
+}
+
+// Direct builds must keep driving their signal race even if stderr's reader
+// stops draining. Incidental notices/tracing raised by that task are handed
+// to the blocking pool without taking the hub or stderr locks on the executor.
+// Streamed engine output and progress use awaited blocking writes instead, so
+// their ordinary backpressure is preserved, not turned into an unbounded log
+// queue. The scope does not propagate to spawned tasks or blocking workers.
+tokio::task_local! {
+    static ASYNC_NOTICES: std::cell::RefCell<Vec<tokio::task::JoinHandle<()>>>;
+}
+
+pub(crate) async fn with_async_notices<F: std::future::Future>(future: F) -> F::Output {
+    ASYNC_NOTICES
+        .scope(std::cell::RefCell::new(Vec::new()), future)
+        .await
+}
+
+fn write(bytes: &[u8]) {
+    if ASYNC_NOTICES
+        .try_with(|pending| {
+            let mut pending = pending.borrow_mut();
+            pending.retain(|task| !task.is_finished());
+            // Only incidental diagnostics use this path. If their writers are
+            // stalled, do not accumulate unbounded tasks waiting on the same lock.
+            if pending.len() < 32 {
+                let bytes = bytes.to_vec();
+                pending.push(tokio::task::spawn_blocking(move || HUB.write(&bytes)));
+            }
+        })
+        .is_err()
+    {
+        HUB.write(bytes);
+    }
+}
+
+/// An awaited progress write: dropping the wait abandons output, not the
+/// executor. Background runtime shutdown must not wait for its blocking task.
+pub(crate) async fn write_async(text: String) {
+    let _ = tokio::task::spawn_blocking(move || HUB.write(text.as_bytes())).await;
+}
+
+pub(crate) async fn line_async(text: String) {
+    write_async(format!("{text}\n")).await;
+}
+
+/// Await incidental notices raised so far. Call inside the signal race for
+/// normal completion; after interruption it is only a bounded best effort.
+pub(crate) async fn flush_async() {
+    let pending = ASYNC_NOTICES.with(|pending| pending.take());
+    for task in pending {
+        let _ = task.await;
+    }
 }
 
 /// Held while a prompt owns the terminal. Dropping it writes out the lines that
@@ -173,7 +230,7 @@ impl Write for Record {
 impl Drop for Record {
     fn drop(&mut self) {
         if !self.0.is_empty() {
-            HUB.write(&self.0);
+            write(&self.0);
         }
     }
 }

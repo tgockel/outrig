@@ -8,7 +8,9 @@
 //! installs [`Signals`] just before it writes the record -- the first thing a
 //! signal could orphan -- and every phase from there that waits on something
 //! slow is raced against it. `outrig image build` does the same from the
-//! moment it starts its validation container.
+//! moment it starts its validation container. `outrig build` races the whole
+//! invocation, including `--all`, so a signal drops the active build and its
+//! temporary-tag guard rather than bypassing cancellation cleanup.
 //!
 //! Two properties of tokio's listeners carry the design:
 //!

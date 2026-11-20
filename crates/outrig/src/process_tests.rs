@@ -255,6 +255,33 @@ fn run_streamed_forwards_stderr_to_tracing() {
     );
 }
 
+/// The thread handoff must carry a scoped subscriber and finish every record
+/// in order before returning; it is not a lossy fire-and-forget log queue.
+#[test]
+fn run_streamed_joins_all_transcript_writes_in_order() {
+    let (status, captured) = with_captured_tracing_at(tracing::Level::INFO, async {
+        super::run_streamed(
+            Cmd::new("/bin/sh").args([
+                "-c",
+                "i=0; while [ $i -lt 1024 ]; do echo line-$i >&2; i=$((i+1)); done",
+            ]),
+            "test",
+            Termination::Kill,
+        )
+        .await
+        .expect("streamed command")
+    });
+    assert!(status.success());
+    let lines: Vec<_> = captured
+        .lines()
+        .filter_map(|line| line.split_once("[test] ").map(|(_, line)| line))
+        .collect();
+    assert_eq!(lines.len(), 1024);
+    for (index, line) in lines.iter().enumerate() {
+        assert_eq!(*line, format!("line-{index}"));
+    }
+}
+
 #[test]
 fn try_capture_logged_traces_spawn_and_exit_at_debug() {
     let ((), captured) = with_captured_tracing_at(tracing::Level::DEBUG, async {
@@ -1081,6 +1108,51 @@ async fn a_graceful_child_that_ignores_the_stop_is_killed_at_the_grace() {
         "pid {pid} was gone in {took:?}, inside the {grace:?} grace it was owed"
     );
     println!("graceful escalation: pid {pid} gone in {took:?} (grace {grace:?})");
+}
+
+/// A command's cancellation race can finish before its buildah child does.
+/// The cleanup scope must hold the runtime open through either unwind or
+/// escalation, preserving the race's own result.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cleanup_scope_waits_for_graceful_reaps() {
+    for ignores in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = pid_file(&dir);
+        let marker = dir.path().join("caught");
+        let grace = if ignores {
+            Duration::from_millis(150)
+        } else {
+            Duration::from_secs(2)
+        };
+        let (pid, dropped) = tokio::time::timeout(
+            REAP_CEILING,
+            super::with_graceful_cleanup(async {
+                let cmd = if ignores {
+                    stop_ignoring_sleeper(&path)
+                } else {
+                    stop_catching_sleeper(&path, &marker)
+                };
+                let child = cmd
+                    .spawn_owned(
+                        super::StdioSpec::captured(),
+                        Termination::TermThenKill(grace),
+                    )
+                    .expect("spawn");
+                let pid = published_pid(&path).await;
+                let dropped = Instant::now();
+                drop(child);
+                (pid, dropped)
+            }),
+        )
+        .await
+        .expect("bounded cleanup");
+        assert!(!occupies_a_process_slot(pid), "scope returned before reap");
+        if ignores {
+            assert!(dropped.elapsed() >= grace, "scope skipped grace");
+        } else {
+            assert!(marker.exists(), "scope killed the child before unwind");
+        }
+    }
 }
 
 /// The awaited path runs the same sequence and returns only once the child is

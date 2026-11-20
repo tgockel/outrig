@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `image::with_build_cleanup` lets a command wait for graceful build-process stops after
+  its cancellation race resolves, before shutting down its Tokio runtime. (#990)
+
 ### Fixed
+
+- Streamed engine tracing runs on blocking workers, preserving output backpressure without
+  blocking the async executor that must drive build cancellation. (#990)
 
 - Startup failures no longer claim an entrypoint-stdio MCP server was silent when its stderr
   may have scrolled out of the container log's 64 KiB recovery window. (#945)
