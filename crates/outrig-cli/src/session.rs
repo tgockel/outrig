@@ -665,36 +665,47 @@ impl SessionStore {
     /// sweep `<root>` for any symlink whose target was `<dir>` and remove it
     /// too. O(n) over root entries; fine for v0.
     pub fn remove_by_path(&self, dir: &Path) -> Result<Vec<String>> {
-        // Resolve once *before* removing so we can match dangling symlinks
-        // even after the target is gone. The removal works on this path too:
-        // given a symlink, it is the directory the link names that holds the
-        // record.
-        let canon_dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        // Resolve before removing: after the directory is gone, even a
+        // relative registration can no longer be canonicalized. The prefix
+        // resolver also handles a directory already gone (and a relative
+        // root), so previously dangling registrations can still be swept.
+        let canon_dir = canonicalize_prefix(dir)
+            .map(|(resolved, _)| resolved)
+            .unwrap_or_else(|_| dir.to_path_buf());
+        let entries = match fs::read_dir(&self.root) {
+            Ok(e) => Some(e),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).path_ctx("read directory", &self.root).map_err(CliError::from),
+        };
+        let mut links = Vec::new();
+        if let Some(entries) = entries {
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                let Ok(meta) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if !meta.file_type().is_symlink() {
+                    continue;
+                }
+                let Ok(target) = fs::read_link(&path) else {
+                    continue;
+                };
+                // A relative symlink target is relative to the link's parent,
+                // not the process's working directory.
+                let target = path.parent().expect("root entry has parent").join(target);
+                if canonicalize_prefix(&target).is_ok_and(|(resolved, _)| resolved == canon_dir) {
+                    links.push(path);
+                }
+            }
+        }
         let left = if canon_dir.exists() {
             remove_record(&canon_dir)?
         } else {
             Vec::new()
         };
-        let entries = match fs::read_dir(&self.root) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(left),
-            Err(e) => return Err(e).path_ctx("read directory", &self.root).map_err(CliError::from),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            let Ok(meta) = fs::symlink_metadata(&path) else {
-                continue;
-            };
-            if !meta.file_type().is_symlink() {
-                continue;
-            }
-            let Ok(target) = fs::read_link(&path) else {
-                continue;
-            };
-            if self.root.join(target) == canon_dir {
-                fs::remove_file(&path).path_ctx("remove", &path)?;
-            }
+        for path in links {
+            fs::remove_file(&path).path_ctx("remove", &path)?;
         }
         Ok(left)
     }

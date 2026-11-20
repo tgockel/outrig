@@ -809,6 +809,94 @@ fn remove_by_path_through_the_link_removes_the_record_it_names() {
     );
 }
 
+/// Relative registrations resolve against their link's parent even when the
+/// store root and the path supplied to discard are relative to the cwd.
+#[test]
+fn remove_by_path_sweeps_relative_targets_with_a_relative_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let explicit = tmp.path().join("explicit");
+    let other = tmp.path().join("other");
+    std::fs::create_dir(&root).expect("root");
+    std::fs::create_dir(&explicit).expect("explicit");
+    std::fs::create_dir(&other).expect("other");
+    let relative_root = relative_to_cwd(&root);
+    let store = SessionStore::new(relative_root.clone());
+    let link = root.join("relative");
+    let extra = root.join("second");
+    let unrelated = root.join("unrelated");
+    std::os::unix::fs::symlink("../explicit", &link).expect("link");
+    std::os::unix::fs::symlink("../explicit", &extra).expect("extra link");
+    std::os::unix::fs::symlink("../other", &unrelated).expect("other link");
+    std::fs::write(explicit.join("session.json"), b"record").expect("record");
+
+    // Passing a link as the path must remove its target's record, not just
+    // the link itself; all aliases to that directory go with it.
+    let left = store
+        .remove_by_path(&relative_root.join("relative"))
+        .expect("discard link");
+    assert!(left.is_empty());
+    assert!(!explicit.exists());
+    for path in [&link, &extra] {
+        assert!(
+            std::fs::symlink_metadata(path).is_err(),
+            "{path:?} left behind"
+        );
+    }
+    assert!(std::fs::symlink_metadata(&unrelated).is_ok());
+    assert!(other.is_dir());
+}
+
+#[test]
+fn remove_by_path_sweeps_relative_target_given_directory_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let explicit = tmp.path().join("explicit");
+    std::fs::create_dir(&root).expect("root");
+    std::fs::create_dir(&explicit).expect("explicit");
+    let link = root.join("relative");
+    std::os::unix::fs::symlink("../explicit", &link).expect("link");
+    std::fs::write(explicit.join("session.json"), b"record").expect("record");
+    let store = SessionStore::new(relative_to_cwd(&root));
+    store
+        .remove_by_path(&relative_to_cwd(&explicit))
+        .expect("discard dir");
+    assert!(!explicit.exists());
+    assert!(std::fs::symlink_metadata(link).is_err());
+}
+
+#[test]
+fn remove_by_path_error_keeps_all_registrations() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    std::fs::create_dir(&root).expect("root");
+    // A file is not a removable session directory. remove_record fails at
+    // read_dir; the sweep must not unlink either registration first.
+    let explicit = tmp.path().join("not-a-directory");
+    std::fs::write(&explicit, b"not a session").expect("file");
+    let links = [root.join("first"), root.join("second")];
+    for link in &links {
+        std::os::unix::fs::symlink("../not-a-directory", link).expect("link");
+    }
+    let store = SessionStore::new(root);
+    assert!(store.remove_by_path(&explicit).is_err());
+    for link in &links {
+        assert!(
+            std::fs::symlink_metadata(link).is_ok(),
+            "{link:?} was unlinked"
+        );
+    }
+}
+
+fn relative_to_cwd(path: &std::path::Path) -> std::path::PathBuf {
+    let cwd = std::env::current_dir().expect("cwd");
+    let mut out = std::path::PathBuf::new();
+    for _ in 1..cwd.components().count() {
+        out.push("..");
+    }
+    out.join(path.strip_prefix("/").expect("absolute path"))
+}
+
 #[test]
 fn remove_by_path_cleans_dangling_symlink() {
     let root = tempfile::tempdir().expect("tempdir root");

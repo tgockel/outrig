@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Path-based `discard` now removes relative session registrations that point to the discarded
+  directory, without unlinking registrations when removal fails or is refused. (#972)
+
 - E2e container-cleanup checks now fail with Podman stderr when `podman ps` cannot query the
   container store, rather than mistaking a failed query for an empty store. (#970)
 

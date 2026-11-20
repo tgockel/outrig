@@ -1038,6 +1038,10 @@ async fn discard_preserves_session_when_running_probe_fails() {
                 let launcher = dir.join("outrig-enter");
                 std::fs::write(&launcher, b"session launcher").unwrap();
                 let record = std::fs::read(dir.join("session.json")).unwrap();
+                let relative_link = root.path().join("older-registration");
+                let relative_target = std::path::PathBuf::from("..")
+                    .join(explicit.path().file_name().expect("tempdir name"));
+                std::os::unix::fs::symlink(&relative_target, &relative_link).unwrap();
 
                 let (mut ew, stderr_r) = duplex(4096);
                 let stdin = tokio::io::BufReader::new(&b"y\n"[..]);
@@ -1069,6 +1073,7 @@ async fn discard_preserves_session_when_running_probe_fails() {
                 assert_eq!(std::fs::read(log).unwrap(), b"session log");
                 assert_eq!(std::fs::read(launcher).unwrap(), b"session launcher");
                 assert_eq!(std::fs::read_link(store.symlink_path(&sid)).unwrap(), dir);
+                assert_eq!(std::fs::read_link(&relative_link).unwrap(), relative_target);
                 drop(ew);
                 let stderr = drain(stderr_r).await;
                 if fail_at == 1 {
@@ -1123,16 +1128,35 @@ async fn discard_session_dir_path_works() {
         .expect("create")
         .0;
     assert!(target.exists());
+    let relative_link = root.path().join("legacy-relative");
+    let relative_target =
+        std::path::PathBuf::from("..").join(explicit.path().file_name().expect("tempdir name"));
+    std::os::unix::fs::symlink(&relative_target, &relative_link).expect("relative link");
 
     let (mut ew, _stderr_r) = duplex(4096);
     let stdin = tokio::io::BufReader::new(tokio::io::empty());
     let args = args_for_dir(&target, true);
+    let err = discard::execute_with(
+        &mut ew,
+        tokio::io::BufReader::new(tokio::io::empty()),
+        &store,
+        &args,
+        |_| async { Ok(true) },
+    )
+    .await
+    .expect_err("running session must be refused");
+    assert!(err.to_string().contains("still running"));
+    assert!(target.join("session.json").exists());
+    assert_eq!(std::fs::read_link(&relative_link).unwrap(), relative_target);
+    assert!(std::fs::symlink_metadata(store.symlink_path(&sid)).is_ok());
+
     discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
         .await
         .expect("discard");
     drop(ew);
 
     assert!(!target.exists(), "explicit dir should be removed");
+    assert!(std::fs::symlink_metadata(relative_link).is_err());
     let link = root.path().join(sid.as_str());
     assert!(
         std::fs::symlink_metadata(&link).is_err(),
