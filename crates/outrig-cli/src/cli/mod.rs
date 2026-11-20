@@ -87,7 +87,16 @@ pub fn resolve_found(store: &SessionStore, query: &str) -> Result<Found> {
         .collect();
     match matches.len() {
         0 => Err(OutrigError::Configuration(format!("no session matching {query:?}")).into()),
-        1 => Ok(matches.pop().expect("len == 1")),
+        1 => match matches.pop().expect("len == 1") {
+            Found::Session(_, session) => {
+                // `list` returns the persisted record, whose session_dir may be
+                // relative to a different cwd. Resolve the selected id through
+                // the store just as the exact-id path does.
+                let (dir, session) = store.get_by_id(&session.id)?;
+                Ok(Found::Session(dir, Box::new(session)))
+            }
+            other => Ok(other),
+        },
         _ => {
             let mut msg = format!("ambiguous session {query:?}; candidates:");
             for m in &matches {

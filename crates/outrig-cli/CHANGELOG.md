@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Substring `logs` and `discard` lookups now use the store-resolved session directory, so
+  stale relative paths in records cannot misdirect logs or bypass the live-owner check. (#976)
+
 - Path-based `discard` now removes relative session registrations that point to the discarded
   directory, without unlinking registrations when removal fails or is refused. (#972)
 
