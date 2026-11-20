@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for abandoned blocking hashing reads after cancellation. A live stderr reader that stops
   draining no longer blocks signal cancellation, child cleanup, or exit. (#990)
 
+- `build` now drops failed stderr diagnostics instead of panicking before an image build or pull.
+  Headers, cache-hit notices, and completion lines are written best-effort. (#986)
+
 - Substring `logs` and `discard` lookups now use the store-resolved session directory, so
   stale relative paths in records cannot misdirect logs or bypass the live-owner check. (#976)
 
