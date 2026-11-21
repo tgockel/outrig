@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use futures_util::future::join_all;
@@ -23,10 +23,11 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::event::{Payload, ServiceCallId, ServiceKind, ServiceReason};
+use super::event::{McpDispatchState, Payload, ServiceCallId, ServiceKind, ServiceReason};
 use super::mcp_placement::{Launch, Placement, SHARES_THE_PRIMARY, Server};
+use super::report::McpUncertainCall;
 use super::services::{
-    CallContext, Failed as Refusal, Hold, MethodDescription, Service, ServiceDescription,
+    CallContext, Failed as Refusal, Hold, McpEnd, MethodDescription, Service, ServiceDescription,
     ServiceError, ServiceErrorCategory, ServiceFuture, Services, failed,
 };
 use crate::config::{
@@ -34,9 +35,9 @@ use crate::config::{
     SidecarWorkspaceAccess,
 };
 use crate::container::embedded::McpDeclarationSource;
-use crate::error::{McpFailureKind, OutrigError};
+use crate::error::{McpFailureKind, McpSessionError, OutrigError};
 use crate::events::Events;
-use crate::mcp::{Listing, McpClient, STARTUP_TIMEOUT, StartupClass};
+use crate::mcp::{Listing, McpCallFailure, McpClient, STARTUP_TIMEOUT, StartupClass};
 use crate::mcp_content::{McpTool, McpUndecodedTool, result_to_wire, tool_to_rmcp};
 use crate::outrig_::{ConfiguredMcp, SidecarServerSpec, SidecarSpec};
 use crate::python::host::Interpreter;
@@ -190,8 +191,9 @@ pub struct McpPolicy {
     /// wait between them -- before it is [`McpServiceOutcome::Unavailable`]:
     /// two minutes, or the configuration's `mcp-connect-budget-secs`.
     pub connect_budget: Duration,
-    /// How many times one service is connected again after its transport
-    /// fails, in a session: three.
+    /// How many times one service may be connected again after its transport
+    /// fails, in a session, each try counted whether or not it connects:
+    /// three. Past it, a call of the service is refused, `unavailable`.
     pub reconnect_max: u32,
     /// The longest one attempt may take: `STARTUP_TIMEOUT`, which a test
     /// lowers.
@@ -377,7 +379,9 @@ impl McpServiceOutcome {
     }
 }
 
-/// What a transient startup failure was, as a retry's event says it.
+/// What a failure of an MCP service's transport was: a transient startup
+/// failure, as a retry's event says it, or the failure that disconnected a
+/// running service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct McpRetryCause {
@@ -1042,6 +1046,8 @@ impl std::fmt::Debug for McpServices {
 
 struct Table {
     events: Events,
+    /// How its services start, and are connected again.
+    policy: McpPolicy,
     entries: Vec<Arc<Entry>>,
     hosts: BTreeMap<String, Host>,
     /// The service table each ready service is bound into, once it is.
@@ -1061,6 +1067,9 @@ struct Host {
     /// How its servers end at a stop: [`McpStopHow::WithPrimary`] for the
     /// primary's, [`McpStopHow::Stopped`] for a sidecar's.
     stops: McpStopHow,
+    /// Whether it is a sidecar running one server, which starts again with it
+    /// between attempts.
+    alone: bool,
     /// Shared, so that a control step spawned to run to its end holds it from
     /// before it was spawned: see `Table::locked`.
     state: Arc<tokio::sync::Mutex<HostState>>,
@@ -1083,9 +1092,10 @@ struct Entry {
     outcome: McpServiceOutcome,
     /// Its listing: the first, until an agent relists.
     tools: Mutex<Vec<McpTool>>,
-    /// Held while it is relisted, so one relist's generation follows
-    /// another's.
-    relisting: tokio::sync::Mutex<()>,
+    /// Held while it is listed again -- by a relist, or a reconnect -- so one
+    /// listing's generation follows another's; it holds how many times the
+    /// service has been connected again, or tried to be.
+    relisting: tokio::sync::Mutex<u32>,
     /// How many times its server has been heard to say its listing changed.
     heard: AtomicU64,
     /// What its server has said of its listing since its first listing was
@@ -1096,11 +1106,23 @@ struct Entry {
     /// How it was started, its values resolved once: what a reconnect starts
     /// it with again. `None` when it could not be, and so never ran.
     server: Option<Server>,
-    /// Its client, until its transport is closed.
-    client: Mutex<Option<Arc<McpClient>>>,
+    /// Its connection to its server.
+    link: Mutex<Link>,
     /// What its attempts ran is not proven stopped: it ran in the primary,
     /// which runs on, or its sidecar would not stop once the start ended.
     unstopped: bool,
+}
+
+/// A service's connection to its server.
+enum Link {
+    /// Its calls are made on this client.
+    Up(Arc<McpClient>),
+    /// Its transport failed under a call: the next call, or `reconnect()`,
+    /// connects it again.
+    Down,
+    /// Its transport was closed -- by a stop or the session's close -- or it
+    /// never started: it is not connected again.
+    Closed,
 }
 
 impl Entry {
@@ -1119,13 +1141,33 @@ impl Entry {
         self.started() || self.unstopped
     }
 
+    /// Its client, while it is connected.
     fn client(&self) -> Option<Arc<McpClient>> {
-        self.client.lock().expect("entry lock").clone()
+        match &*self.link.lock().expect("entry lock") {
+            Link::Up(client) => Some(Arc::clone(client)),
+            Link::Down | Link::Closed => None,
+        }
     }
 
-    /// Its client, taken: no call made from now on reaches it.
+    /// Its client, taken: no call made from now on reaches it, and it is not
+    /// connected again.
     fn take_client(&self) -> Option<Arc<McpClient>> {
-        self.client.lock().expect("entry lock").take()
+        match std::mem::replace(&mut *self.link.lock().expect("entry lock"), Link::Closed) {
+            Link::Up(client) => Some(client),
+            Link::Down | Link::Closed => None,
+        }
+    }
+
+    /// Mark it disconnected when `client`, whose transport failed, is still
+    /// its own: whether it was, so that the calls one failure ends say so
+    /// once.
+    fn went_down(&self, client: &Arc<McpClient>) -> bool {
+        let mut link = self.link.lock().expect("entry lock");
+        let current = matches!(&*link, Link::Up(up) if Arc::ptr_eq(up, client));
+        if current {
+            *link = Link::Down;
+        }
+        current
     }
 }
 
@@ -1217,15 +1259,18 @@ impl McpServices {
                 None => resolve(planned, &secrets),
             })
             .collect();
+        // How many servers each container runs, of those that can be launched.
+        let launched = |key: &str| {
+            plan.services
+                .iter()
+                .zip(&launches)
+                .filter(|(planned, launch)| launch.is_ok() && planned.host == key)
+                .count()
+        };
         let hosts: BTreeMap<String, Host> = plan
             .hosts
             .iter()
-            .filter(|(key, _)| {
-                plan.services
-                    .iter()
-                    .zip(&launches)
-                    .any(|(planned, launch)| launch.is_ok() && planned.host == **key)
-            })
+            .filter(|(key, _)| launched(key) > 0)
             .map(|(key, host)| {
                 let stops = match host {
                     HostPlan::Primary => McpStopHow::WithPrimary,
@@ -1234,34 +1279,19 @@ impl McpServices {
                 let host = Host {
                     placement: place(host),
                     stops,
+                    alone: stops == McpStopHow::Stopped && launched(key) == 1,
                     state: Arc::new(tokio::sync::Mutex::new(HostState::Running)),
                 };
                 (key.clone(), host)
             })
             .collect();
-        // A sidecar that runs one server, which starts again with it.
-        let alone = |key: &str| {
-            hosts
-                .get(key)
-                .is_some_and(|host| host.stops == McpStopHow::Stopped)
-                && plan
-                    .services
-                    .iter()
-                    .zip(&launches)
-                    .filter(|(planned, launch)| launch.is_ok() && planned.host == key)
-                    .count()
-                    == 1
-        };
         let started = join_all(
             plan.services
                 .iter()
                 .zip(&launches)
                 .map(|(planned, launch)| {
-                    let placement = hosts.get(&planned.host).map(|host| &*host.placement);
-                    let alone = alone(&planned.host);
-                    start_one(
-                        &events, planned, launch, placement, alone, &policy, by, &cancel,
-                    )
+                    let host = hosts.get(&planned.host);
+                    start_one(&events, planned, launch, host, &policy, by, &cancel)
                 }),
         )
         .await;
@@ -1304,17 +1334,21 @@ impl McpServices {
                     planned,
                     outcome: started.outcome,
                     tools: Mutex::new(started.tools),
-                    relisting: tokio::sync::Mutex::new(()),
+                    relisting: tokio::sync::Mutex::new(0),
                     heard: AtomicU64::new(0),
                     changes: Mutex::new(started.changes),
                     instructions: started.instructions,
                     server: launch.ok(),
-                    client: Mutex::new(started.client.map(Arc::new)),
+                    link: Mutex::new(match started.client {
+                        Some(client) => Link::Up(Arc::new(client)),
+                        None => Link::Closed,
+                    }),
                 })
             })
             .collect();
         Self(Arc::new(Table {
             events,
+            policy,
             entries,
             hosts,
             services: OnceLock::new(),
@@ -1330,7 +1364,10 @@ impl McpServices {
             .iter()
             .filter(|entry| entry.started())
             .map(|entry| {
-                let service: Arc<dyn Service> = Arc::new(McpService(Arc::clone(entry)));
+                let service: Arc<dyn Service> = Arc::new(McpService {
+                    table: Arc::downgrade(&self.0),
+                    entry: Arc::clone(entry),
+                });
                 (entry.name().to_string(), service)
             })
             .collect()
@@ -1367,10 +1404,12 @@ impl McpServices {
     }
 
     /// Each service that started, and what it can write, from its declaration
-    /// alone: what a cut decides which to quiesce by. A service that never
-    /// started is listed only when what its attempts ran may still write --
-    /// it ran in the primary, or its sidecar would not stop once the start
-    /// ended -- and quiescing it says why it cannot be.
+    /// alone: what a cut decides which to quiesce by. One whose transport
+    /// failed is listed still: the server that transport spoke to may run on
+    /// until its container is stopped, and a reconnect does not stop it. A
+    /// service that never started is listed only when what its attempts ran
+    /// may still write -- it ran in the primary, or its sidecar would not stop
+    /// once the start ended -- and quiescing it says why it cannot be.
     pub fn writers(&self) -> Vec<McpWriter> {
         self.0
             .entries
@@ -1382,6 +1421,19 @@ impl McpServices {
                 writes: entry.planned.writes.clone(),
             })
             .collect()
+    }
+
+    /// Each call of a service's tool that ended may have dispatched, in the
+    /// order they ended -- its request handed to the transport and no answer
+    /// read -- by call, service, tool and agent: its server may have done what
+    /// it asked, and nothing called it again. A call in flight when the
+    /// session's report was read is among them.
+    pub fn uncertain(&self) -> Vec<McpUncertainCall> {
+        self.0
+            .services
+            .get()
+            .map(Services::uncertain)
+            .unwrap_or_default()
     }
 
     /// Quiesce `service` as `how` says, and with it every service its
@@ -1699,54 +1751,264 @@ impl Table {
     /// One line the interpreter sent about an MCP service. Called by the
     /// reader of its output, which must never wait.
     fn line(self: &Arc<Self>, line: Value) {
-        match line["t"].as_str() {
-            Some("mcp.relist") => {
-                let (Some(agent), Some(ask)) = (line["agent"].as_str(), line["id"].as_u64()) else {
-                    tracing::warn!(
-                        "ignored an MCP relist from the interpreter with no agent or id"
-                    );
-                    return;
-                };
-                let agent = agent.to_string();
-                let service = line["service"].as_str().unwrap_or_default().to_string();
-                let table = Arc::clone(self);
-                tokio::spawn(async move {
-                    // Answered as a call is, so the asker reads it as one.
-                    let answer = match table.relist(&service, &agent).await {
-                        Ok(ok) => json!({"t": "service", "id": ask, "ok": ok}),
-                        Err(refused) => failed(ask, None, refused),
-                    };
-                    table.tell(answer);
-                });
-            }
-            kind => tracing::warn!("ignored a {kind:?} line from the interpreter"),
+        let kind = line["t"].as_str();
+        let reconnect = match kind {
+            Some("mcp.relist") => false,
+            Some("mcp.reconnect") => true,
+            kind => return tracing::warn!("ignored a {kind:?} line from the interpreter"),
+        };
+        let (Some(agent), Some(ask)) = (line["agent"].as_str(), line["id"].as_u64()) else {
+            tracing::warn!("ignored an {kind:?} line from the interpreter with no agent or id");
+            return;
+        };
+        let agent = agent.to_string();
+        let service = line["service"].as_str().unwrap_or_default().to_string();
+        let table = Arc::clone(self);
+        tokio::spawn(async move {
+            let answered = match reconnect {
+                true => table.reconnect_asked(&service).await,
+                false => table.relist(&service, &agent).await,
+            };
+            // Answered as a call is, so the asker reads it as one.
+            let answer = match answered {
+                Ok(ok) => json!({"t": "service", "id": ask, "ok": ok}),
+                Err(refused) => failed(ask, None, refused),
+            };
+            table.tell(answer);
+        });
+    }
+
+    /// The service table, and `service`'s entry when the session started it;
+    /// or why there is none, as a call of an unknown method is refused.
+    fn started(&self, service: &str) -> Result<(&Services, &Arc<Entry>), Refusal> {
+        let services = self.services.get();
+        let entry = self.entry(service).filter(|entry| entry.started());
+        match (services, entry) {
+            (Some(services), Some(entry)) => Ok((services, entry)),
+            _ => Err(no_service(service)),
         }
     }
 
-    /// List `service`'s tools again, for `agent`, and describe it from the
-    /// new listing, under the next generation when anything changed. What
-    /// changed, by exact name, the listing's generation, the tools that did
-    /// not decode, and how many of its server's listing changes the relist
-    /// covers -- those heard before it began; or, as the interpreter reads a
-    /// failed call, why not.
-    async fn relist(&self, service: &str, agent: &str) -> Result<Value, Refusal> {
-        let unknown = || {
-            Refusal::refused(
-                ServiceReason::UnknownMethod,
-                format!("the session has no MCP service {service:?}"),
+    /// Connect `service` again, for agent code that asked: what its relist
+    /// found, as a relist's answer says it, or `null` when it is connected
+    /// and nothing was done; or why not.
+    async fn reconnect_asked(self: &Arc<Self>, service: &str) -> Result<Value, Refusal> {
+        let (_, entry) = self.started(service)?;
+        self.reconnect(entry)
+            .await
+            .map(|(_, relisted)| relisted)
+            .map_err(|(reason, message)| Refusal::refused(reason, message))
+    }
+
+    /// Mark `entry` disconnected, its transport having failed under `client`
+    /// for `cause`, unless something already has.
+    fn went_down(&self, entry: &Entry, client: &Arc<McpClient>, cause: &McpSessionError) {
+        if !entry.went_down(client) {
+            return;
+        }
+        tracing::warn!(target: "outrig::mcp", "service {:?}'s transport failed: {cause}", entry.name());
+        self.events.emit(Payload::McpServiceDisconnected {
+            service: entry.name().to_string(),
+            cause: McpRetryCause {
+                kind: Some(cause.kind),
+                message: cause.message.clone(),
+            },
+        });
+    }
+
+    /// Take `listing` as `entry`'s tools and describe it again, under the next
+    /// generation when anything changed, publishing what `announce` makes of
+    /// that generation and the tools that did not decode first. What changed,
+    /// by exact name, the listing's generation, the tools that did not decode,
+    /// and `began`, how many of its server's listing changes the listing
+    /// covers: a relist's answer. `None` for a service the session does not
+    /// serve.
+    fn listed(
+        &self,
+        services: &Services,
+        entry: &Entry,
+        listing: Listing,
+        began: u64,
+        announce: impl FnOnce(u64, Vec<McpUndecodedTool>) -> Payload,
+    ) -> Option<Value> {
+        let Listing { tools, undecoded } = listing;
+        *entry.tools.lock().expect("tools lock") = tools;
+        let (listing, changes) = services.redescribe(entry.name(), |listing| {
+            self.events.emit(announce(listing, undecoded.clone()));
+        })?;
+        Some(json!({
+            "added": changes.added,
+            "removed": changes.removed,
+            "changed": changes.changed,
+            "listing": listing,
+            "undecoded": undecoded,
+            "relisted": began,
+        }))
+    }
+
+    /// Connect `entry` again, its transport having failed: what it ran in
+    /// readied again, then placed as at the start, with the values resolved
+    /// then and its classification, all of it within the connect budget; then
+    /// listed and described again -- its `mcp.service.reconnected` before any
+    /// `service.described` -- and the interpreter told how many of its
+    /// server's listing changes the listing covers. One listing at a time for
+    /// a service, a relist's or a reconnect's, and as a control step on its
+    /// container, held until the new client is published, so a quiesce or the
+    /// close waits for it and closes that client. Its new client and what its
+    /// relist found; or the reason a call that asked for it is refused for,
+    /// and why. Nothing of an earlier call is sent again.
+    async fn reconnect(
+        self: &Arc<Self>,
+        entry: &Arc<Entry>,
+    ) -> Result<(Arc<McpClient>, Value), (ServiceReason, String)> {
+        let service = entry.name();
+        let stopped = || {
+            (
+                ServiceReason::Stopped,
+                format!("service {service:?} was stopped, and is not connected again"),
             )
         };
-        let services = self.services.get().ok_or_else(unknown)?;
+        let unavailable = |why: String| (ServiceReason::Unavailable, why);
+        let closed = || {
+            (
+                ServiceReason::AdmissionClosed,
+                format!(
+                    "the session is closed to new work, so service {service:?}, whose transport \
+                     failed, was not connected again"
+                ),
+            )
+        };
+        let mut tried = entry.relisting.lock().await;
+        match &*entry.link.lock().expect("entry lock") {
+            // Connected again by the reconnect this one waited for, or never
+            // disconnected.
+            Link::Up(client) => return Ok((Arc::clone(client), Value::Null)),
+            Link::Closed => return Err(stopped()),
+            Link::Down => {}
+        }
+        let (Some(services), Some(server), Some(host)) = (
+            self.services.get(),
+            entry.server.as_ref(),
+            self.hosts.get(&entry.planned.host),
+        ) else {
+            return Err(unavailable(format!("service {service:?}: {NOT_CONNECTED}")));
+        };
+        if services.closed() {
+            return Err(closed());
+        }
+        let max = self.policy.reconnect_max;
+        if *tried >= max {
+            return Err(unavailable(format!(
+                "service {service:?}'s transport failed, and the {max} reconnects the session \
+                 allows it are spent"
+            )));
+        }
+        let state = Arc::clone(&host.state).lock_owned().await;
+        match *state {
+            HostState::Running => {}
+            HostState::Held | HostState::Paused => {
+                return Err((
+                    ServiceReason::Paused,
+                    format!("service {service:?} is paused, so it was not connected again"),
+                ));
+            }
+            HostState::Stopped(_) => return Err(stopped()),
+        }
+        *tried += 1;
+        let began = entry.heard.load(Ordering::SeqCst);
+        let budget = self.policy.connect_budget;
+        let deadline = Instant::now() + budget;
+        let never = CancellationToken::new();
+        let reconnected = async {
+            host.placement.recover().await.map_err(|why| {
+                unavailable(format!(
+                    "service {service:?}'s transport failed, and what it ran in could not be \
+                     readied again: {why}"
+                ))
+            })?;
+            Ok(establish(
+                &self.events,
+                &entry.planned,
+                server,
+                host,
+                &self.policy,
+                deadline,
+                &never,
+            )
+            .await)
+        };
+        // Given up past the budget or at the close, and dropped as a start's
+        // attempt is: a container a stop did not finish is kept for the next.
+        let (attempts, established) = tokio::select! {
+            reconnected = tokio::time::timeout_at(deadline, reconnected) => {
+                reconnected.map_err(|_| {
+                    unavailable(format!(
+                        "service {service:?}'s transport failed, and it was not connected again \
+                         within its {budget:?} connect budget"
+                    ))
+                })??
+            }
+            () = services.closing() => return Err(closed()),
+        };
+        let (client, changes, listing) = established.map_err(|failure| {
+            unavailable(format!(
+                "service {service:?}'s transport failed, and connecting it again failed \
+                 ({attempts} attempt(s)): {}",
+                failure.message
+            ))
+        })?;
+        // Every close holds the container's lock, as this does: none comes
+        // between, and one before it -- at the session's close, of a server
+        // that ends with the primary -- is not undone.
+        let published = {
+            let mut link = entry.link.lock().expect("entry lock");
+            match *link {
+                Link::Closed => Err(client),
+                _ => {
+                    let client = Arc::new(client);
+                    *link = Link::Up(Arc::clone(&client));
+                    Ok(client)
+                }
+            }
+        };
+        let client = match published {
+            Ok(client) => client,
+            Err(unpublished) => {
+                let _ = unpublished.shutdown().await;
+                return Err(stopped());
+            }
+        };
+        *entry.changes.lock().expect("entry lock") = Some(changes);
+        self.listen(entry);
+        let relisted = self
+            .listed(services, entry, listing, began, |listing, undecoded| {
+                Payload::McpServiceReconnected {
+                    service: service.to_string(),
+                    attempts,
+                    listing,
+                    undecoded,
+                }
+            })
+            .ok_or_else(|| unavailable(format!("the session serves no service {service:?}")))?;
+        drop(state);
+        // As a relist's answer tells its asker, for a reconnect no one asked
+        // for: a call's.
+        self.tell(json!({"t": "mcp.relisted", "service": service, "relisted": began}));
+        Ok((client, relisted))
+    }
+
+    /// List `service`'s tools again, for `agent`, and describe it from the
+    /// new listing, under the next generation when anything changed: what
+    /// [`Table::listed`] says; or, as the interpreter reads a failed call, why
+    /// not.
+    async fn relist(&self, service: &str, agent: &str) -> Result<Value, Refusal> {
+        let (services, entry) = self.started(service)?;
         if services.closed() {
             return Err(Refusal::refused(
                 ServiceReason::AdmissionClosed,
                 "the session is closed to new work, so the tools were not listed again".into(),
             ));
         }
-        let entry = self
-            .entry(service)
-            .filter(|entry| entry.started())
-            .ok_or_else(unknown)?;
         let _relisting = entry.relisting.lock().await;
         let began = entry.heard.load(Ordering::SeqCst);
         let Some(client) = entry.client() else {
@@ -1773,26 +2035,15 @@ impl Table {
                     format!("the tools were not listed again: {message}"),
                 )
             })?;
-        let Listing { tools, undecoded } = listing;
-        *entry.tools.lock().expect("tools lock") = tools;
-        let (listing, changes) = services
-            .redescribe(service, |listing| {
-                self.events.emit(Payload::McpServiceRelisted {
-                    service: service.to_string(),
-                    agent: agent.to_string(),
-                    listing,
-                    undecoded: undecoded.clone(),
-                });
-            })
-            .ok_or_else(unknown)?;
-        Ok(json!({
-            "added": changes.added,
-            "removed": changes.removed,
-            "changed": changes.changed,
-            "listing": listing,
-            "undecoded": undecoded,
-            "relisted": began,
-        }))
+        self.listed(services, entry, listing, began, |listing, undecoded| {
+            Payload::McpServiceRelisted {
+                service: service.to_string(),
+                agent: agent.to_string(),
+                listing,
+                undecoded,
+            }
+        })
+        .ok_or_else(|| no_service(service))
     }
 
     /// The started services `host` runs, in the order declared.
@@ -1877,21 +2128,18 @@ impl Table {
     }
 }
 
-/// Start `planned`, as `launch` says, in `placement` -- `alone` when that is
-/// a sidecar running it and nothing else -- by `deadline`, where `policy`'s
-/// connect budget ends: what it came to.
-#[allow(clippy::too_many_arguments)]
+/// Start `planned`, as `launch` says, in `host`, by `deadline`, where
+/// `policy`'s connect budget ends: what it came to.
 async fn start_one(
     events: &Events,
     planned: &Planned,
     launch: &Result<Server, String>,
-    placement: Option<&dyn Placement>,
-    alone: bool,
+    host: Option<&Host>,
     policy: &McpPolicy,
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> Started {
-    let (Ok(server), Some(placement)) = (launch, placement) else {
+    let (Ok(server), Some(host)) = (launch, host) else {
         let why = launch.as_ref().err().cloned().unwrap_or_default();
         let cause = planned.cause(why);
         events.emit(Payload::McpServiceFailed {
@@ -1904,6 +2152,81 @@ async fn start_one(
         return Started::failed(McpServiceOutcome::Misconfigured(cause));
     };
     let since = Instant::now();
+    let (attempts, established) =
+        establish(events, planned, server, host, policy, deadline, cancel).await;
+    let failure = match established {
+        Ok((client, changes, Listing { tools, undecoded })) => {
+            let started = Started {
+                outcome: McpServiceOutcome::Ready {
+                    tools: tools.len(),
+                    listing: 1,
+                    undecoded: undecoded.clone(),
+                    attempts,
+                },
+                instructions: client.instructions(),
+                client: Some(client),
+                changes: Some(changes),
+                tools,
+            };
+            events.emit(Payload::McpServiceStarted {
+                service: planned.name.clone(),
+                server: planned.server.clone(),
+                placement: planned.placement,
+                declared_in: planned.declared_in,
+                tools: started.tools.len(),
+                listing: 1,
+                undecoded,
+                attempts,
+                duration: since.elapsed(),
+            });
+            return started;
+        }
+        Err(failure) => failure,
+    };
+    let cause = McpStartupCause {
+        exit: failure.exit,
+        stderr_tail: failure.stderr_tail,
+        kind: failure.kind,
+        attempts,
+        ..planned.cause(failure.message)
+    };
+    let outcome = match failure.class {
+        StartupClass::Transient => McpServiceOutcome::Unavailable(cause.clone()),
+        StartupClass::Refused => McpServiceOutcome::Refused(cause.clone()),
+        StartupClass::Misconfigured => McpServiceOutcome::Misconfigured(cause.clone()),
+        StartupClass::Unclassified => McpServiceOutcome::Unclassified(cause.clone()),
+    };
+    events.emit(Payload::McpServiceFailed {
+        service: planned.name.clone(),
+        outcome: outcome.kind(),
+        cause,
+        attempts,
+        duration: since.elapsed(),
+    });
+    Started::failed(outcome)
+}
+
+/// What a server that connected came to: its client, what it says of its
+/// listing's changes from before its first listing was asked for, and that
+/// listing.
+type Established = (McpClient, watch::Receiver<()>, Listing);
+
+/// Connect `planned`'s `server` in `host` and list its tools, by `deadline`,
+/// where `policy`'s connect budget ends: each attempt classified, a
+/// transient failure tried again after a wait, each one an
+/// `mcp.service.retry`, until `cancel` gives up on it. How many attempts were
+/// made, and the server connected or the last failure. What a start and a
+/// reconnect both do.
+async fn establish(
+    events: &Events,
+    planned: &Planned,
+    server: &Server,
+    host: &Host,
+    policy: &McpPolicy,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> (u32, Result<Established, Failed>) {
+    let placement = &*host.placement;
     let mut delay = BACKOFF_FIRST;
     let mut attempts = 0;
     let failure = loop {
@@ -1939,37 +2262,7 @@ async fn start_one(
             () = cancel.cancelled() => break Failed::abandoned(),
         };
         let failed = match attempted {
-            Ok(Ok((client, changes, Listing { tools, undecoded }))) => {
-                let started = Started {
-                    outcome: McpServiceOutcome::Ready {
-                        tools: tools.len(),
-                        listing: 1,
-                        undecoded: undecoded.clone(),
-                        attempts,
-                    },
-                    instructions: client.instructions(),
-                    // The service table bounds each call -- its deadline, then
-                    // the grace a call told to stop has, then dropping it,
-                    // which sends the server the cancel notice -- and says how
-                    // it ended. A deadline of the client's own would end it
-                    // first, inside the grace, as a failure.
-                    client: Some(client.with_call_timeout(Duration::MAX)),
-                    changes: Some(changes),
-                    tools,
-                };
-                events.emit(Payload::McpServiceStarted {
-                    service: planned.name.clone(),
-                    server: planned.server.clone(),
-                    placement: planned.placement,
-                    declared_in: planned.declared_in,
-                    tools: started.tools.len(),
-                    listing: 1,
-                    undecoded,
-                    attempts,
-                    duration: since.elapsed(),
-                });
-                return started;
-            }
+            Ok(Ok(established)) => return (attempts, Ok(established)),
             Ok(Err(e)) => Failed::of(&e),
             Err(_) => unlisted.unwrap_or_else(|| Failed::timed_out(left)),
         };
@@ -1979,7 +2272,7 @@ async fn start_one(
         // Its container starts again with it: what the failed attempt left
         // running -- a server that ignored its closed stdin -- does not run
         // beside the next.
-        if alone {
+        if host.alone {
             let stopped = tokio::select! {
                 stopped = placement.stop() => stopped,
                 () = cancel.cancelled() => break Failed::abandoned(),
@@ -2019,27 +2312,7 @@ async fn start_one(
         }
         delay = (delay * 2).min(BACKOFF_CAP);
     };
-    let cause = McpStartupCause {
-        exit: failure.exit,
-        stderr_tail: failure.stderr_tail,
-        kind: failure.kind,
-        attempts,
-        ..planned.cause(failure.message)
-    };
-    let outcome = match failure.class {
-        StartupClass::Transient => McpServiceOutcome::Unavailable(cause.clone()),
-        StartupClass::Refused => McpServiceOutcome::Refused(cause.clone()),
-        StartupClass::Misconfigured => McpServiceOutcome::Misconfigured(cause.clone()),
-        StartupClass::Unclassified => McpServiceOutcome::Unclassified(cause.clone()),
-    };
-    events.emit(Payload::McpServiceFailed {
-        service: planned.name.clone(),
-        outcome: outcome.kind(),
-        cause,
-        attempts,
-        duration: since.elapsed(),
-    });
-    Started::failed(outcome)
+    (attempts, Err(failure))
 }
 
 /// Close `entry`'s transport, once nothing calls it: a client a call still
@@ -2205,11 +2478,59 @@ impl Secrets for Once<'_> {
 }
 
 /// An MCP service, as the service table calls it.
-struct McpService(Arc<Entry>);
+struct McpService {
+    /// The table it is kept in, which connects it again; weak, since the
+    /// table holds the service table that holds this.
+    table: Weak<Table>,
+    entry: Arc<Entry>,
+}
+
+impl McpService {
+    /// A new client, its transport having failed: connected again for the call
+    /// of `method` with `args`, which waits for it until it is told to stop,
+    /// and which is checked again against what the server lists now -- the
+    /// table checked it against the listing before. Why not, as a call never
+    /// sent.
+    async fn reconnected(
+        &self,
+        cx: &CallContext,
+        method: &str,
+        args: &Value,
+    ) -> Result<Arc<McpClient>, ServiceError> {
+        let not_sent = |reason, message: String| {
+            ServiceError::new(ServiceErrorCategory::Unavailable, message)
+                .of_mcp(McpEnd::NotSent { reason, path: None })
+        };
+        let Some(table) = self.table.upgrade() else {
+            return Err(not_sent(
+                ServiceReason::Unavailable,
+                NOT_CONNECTED.to_string(),
+            ));
+        };
+        let client = tokio::select! {
+            reconnected = table.reconnect(&self.entry) => reconnected
+                .map(|(client, _)| client)
+                .map_err(|(reason, message)| not_sent(reason, message)),
+            // The table records it cancelled, for the reason it said.
+            () = cx.cancelled() => Err(not_sent(
+                ServiceReason::Unavailable,
+                format!(
+                    "the call was told to stop while service {:?} was connected again, so it \
+                     was not made",
+                    self.entry.name()
+                ),
+            )),
+        }?;
+        if let Some(services) = table.services.get() {
+            services.recheck(self.entry.name(), method, args)?;
+        }
+        Ok(client)
+    }
+}
 
 impl Service for McpService {
     fn describe(&self) -> ServiceDescription {
-        let entry = &self.0;
+        let entry = &self.entry;
         let line = entry
             .planned
             .description
@@ -2236,32 +2557,68 @@ impl Service for McpService {
         description
     }
 
-    fn call(&self, method: &str, args: Value, _cx: CallContext) -> ServiceFuture<'_> {
-        // The token is not watched here: the table abandons a call told to
-        // stop once its grace is out, and dropping the call is what sends the
-        // server the cancel notice.
-        let client = self.0.client();
+    /// The call, until its deadline or until it is told to stop: then its
+    /// server is sent the cancel notice and the call returns at once, may
+    /// have dispatched, rather than waiting out the table's grace.
+    fn call(&self, method: &str, args: Value, cx: CallContext) -> ServiceFuture<'_> {
         let method = method.to_string();
         Box::pin(async move {
-            let Some(client) = client else {
-                return Err(ServiceError::new(
-                    ServiceErrorCategory::Unavailable,
-                    NOT_CONNECTED,
-                ));
+            let client = match self.entry.client() {
+                Some(client) => client,
+                None => self.reconnected(&cx, &method, &args).await?,
             };
-            match client.call_tool(&method, args).await {
-                Ok(result) => result_to_wire(result)
-                    .map_err(|e| ServiceError::new(ServiceErrorCategory::Failed, e.to_string())),
-                Err(OutrigError::McpCallToolFailed { source, .. }) => {
-                    Err(ServiceError::new(category(source.kind), source.message))
+            // The table passes an object, its arguments checked.
+            let arguments = match args {
+                Value::Object(map) => Some(map),
+                _ => None,
+            };
+            let deadline = Instant::from_std(cx.deadline());
+            let called = client
+                .call_tool_within(&method, arguments, deadline, cx.cancelled())
+                .await;
+            let failed = match called {
+                Ok(result) => {
+                    return result_to_wire(result).map_err(|e| {
+                        ServiceError::new(ServiceErrorCategory::Failed, e.to_string()).of_mcp(
+                            McpEnd::Sent {
+                                state: McpDispatchState::ResponseReceived,
+                                failure: None,
+                            },
+                        )
+                    });
                 }
-                Err(e) => Err(ServiceError::new(
-                    ServiceErrorCategory::Failed,
-                    e.to_string(),
-                )),
+                Err(failed) => failed,
+            };
+            if failed.source.kind == McpFailureKind::Transport
+                && let Some(table) = self.table.upgrade()
+            {
+                table.went_down(&self.entry, &client, &failed.source);
             }
+            Err(call_failed(failed))
         })
     }
+}
+
+/// The JSON-RPC error codes a server answers a `tools/call` with for
+/// arguments it refuses, and for a method it does not have.
+const INVALID_PARAMS: i32 = rmcp::model::ErrorCode::INVALID_PARAMS.0;
+const METHOD_NOT_FOUND: i32 = rmcp::model::ErrorCode::METHOD_NOT_FOUND.0;
+
+/// What a service's error says of a `tools/call` that failed as `failed`
+/// says: one that may have reached its server is `Unknown`, which the table
+/// records as the outcome `unknown`; one its server answered with an error
+/// says what the error's code does.
+fn call_failed(failed: McpCallFailure) -> ServiceError {
+    let category = match (failed.state, failed.code) {
+        (McpDispatchState::MayHaveDispatched, _) => ServiceErrorCategory::Unknown,
+        (_, Some(INVALID_PARAMS)) => ServiceErrorCategory::InvalidArguments,
+        (_, Some(METHOD_NOT_FOUND)) => ServiceErrorCategory::NotFound,
+        _ => ServiceErrorCategory::Failed,
+    };
+    ServiceError::new(category, failed.source.message).of_mcp(McpEnd::Sent {
+        state: failed.state,
+        failure: Some(failed.source.kind),
+    })
 }
 
 /// What a tool's descriptor holds beyond its name, description and schemas,
@@ -2288,6 +2645,14 @@ fn category(kind: McpFailureKind) -> ServiceErrorCategory {
 
 /// Why a call or a relist reached no server: its client is gone.
 const NOT_CONNECTED: &str = "the server is not connected";
+
+/// The refusal of an ask of `service`, which the session has not started.
+fn no_service(service: &str) -> Refusal {
+    Refusal::refused(
+        ServiceReason::UnknownMethod,
+        format!("the session has no MCP service {service:?}"),
+    )
+}
 
 /// Whether a declaration's `headers` name one of the owner's identity
 /// headers, which no declaration may: they are the owner's to stamp, on the

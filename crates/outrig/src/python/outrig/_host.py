@@ -654,6 +654,23 @@ class McpServiceStop:
 
 
 @dataclasses.dataclass(frozen=True)
+class McpUncertainCall:
+    """A call of an MCP service's tool that ended may have dispatched at any point in a session:
+    its request was handed to the server and no answer was read, so the server may have done what
+    it asked. Its `call` id, the `service`, the `tool` by its exact name, the `agent` that made it,
+    the `failure` that cut it off -- `"transport"`, `"timeout"`, `"canceled"`, `"other"` -- and the
+    `reason` it was told to stop, such as `"deadline"` or `"closed"`; each `None` where there is
+    none. Nothing called it again."""
+
+    call: int
+    service: str
+    tool: str
+    agent: str
+    failure: str | None
+    reason: str | None
+
+
+@dataclasses.dataclass(frozen=True)
 class ShutdownReport:
     """What a session's shutdown found: `session.shutdown_report` after the exit.
 
@@ -661,7 +678,8 @@ class ShutdownReport:
 
     - `"clean"`: everything the session started is stopped, and every outcome is known.
     - `"stopped_with_unknown"`: everything is stopped, and some execution, hosted call or service
-      call was cut off. Its outcome is unknown, never failed: its effect may stand.
+      call was cut off, or an MCP call may have reached its server unanswered. Its outcome is
+      unknown, never failed: its effect may stand.
     - `"not_proven_stopped"`: something could not be confirmed stopped, and may still be acting;
       the exit raised `ShutdownException`. Do not reuse what the session ran on.
 
@@ -669,7 +687,8 @@ class ShutdownReport:
     everything is proven stopped; `executions`, each execution running when admission closed;
     `hosted`, each hosted call whose outcome came after admission closed; `services`, each
     `ServiceCall` whose outcome came after it; `mcp_services`, each `McpServiceStop`, every MCP
-    service and how it was stopped; `requests`, each
+    service and how it was stopped; `mcp_uncertain`, each `McpUncertainCall`, every MCP call that
+    may have reached its server unanswered during the session; `requests`, each
     `RequestOutcome`, a request made of a child agent that was open then; `bindings`, a
     `BindingStop`, how the process holding the bindings stopped, or `None` for a session with
     none; and `events`, an `EventDelivery`, how the session's events were delivered. It never
@@ -686,6 +705,7 @@ class ShutdownReport:
     bindings: BindingStop | None
     events: EventDelivery
     mcp_services: tuple[McpServiceStop, ...] = ()
+    mcp_uncertain: tuple[McpUncertainCall, ...] = ()
 
 
 def _report(raw, lost):
@@ -707,6 +727,7 @@ def _report(raw, lost):
         hosted=tuple(HostedCall(**row) for row in raw["hosted"]),
         services=tuple(ServiceCall(**row) for row in raw["services"]),
         mcp_services=tuple(McpServiceStop(**row) for row in raw.get("mcp_services", ())),
+        mcp_uncertain=tuple(McpUncertainCall(**row) for row in raw.get("mcp_uncertain", ())),
         requests=tuple(RequestOutcome(**row) for row in raw["requests"]),
         bindings=bindings,
         events=EventDelivery(

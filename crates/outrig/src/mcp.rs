@@ -18,6 +18,7 @@
 //! deadline (see [`McpClient::with_call_timeout`]).
 
 use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -30,12 +31,14 @@ use rmcp::service::{
     NotificationContext, Peer, PeerRequestOptions, RoleClient, RunningService, ServiceError,
     serve_client,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::sync::watch;
 
 use crate::config::{EnvValue, McpServerSpec, ResolvedEnvValue, effective_mcp_call_timeout};
 use crate::container::{Container, ExecOptions, ExecTarget, embedded::McpDeclarationSource};
-use crate::error::{IoPathExt, McpFailureKind, McpSessionError, OutrigError, Result};
+use crate::error::{
+    IoPathExt, McpDispatchState, McpFailureKind, McpSessionError, OutrigError, Result,
+};
 use crate::mcp_content::{
     McpTool, McpToolResult, McpUndecodedTool, result_from_rmcp, tool_from_rmcp,
 };
@@ -58,8 +61,12 @@ pub(crate) const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// tools, and would otherwise grow the listing until [`STARTUP_TIMEOUT`].
 const TOOLS_LIST_PAGE_CEILING: usize = 1000;
 
-/// The `reason` a dropped call's `notifications/cancelled` carries.
+/// The `reason` a stopped or dropped call's `notifications/cancelled` carries.
 const ABANDONED_REASON: &str = "outrig stopped waiting for this call";
+
+/// How far off a call's deadline is when its bound is past what the clock
+/// can hold: thirty years.
+const NO_DEADLINE: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
 
 /// On `Drop` without an explicit [`McpClient::shutdown`], the child is owned by
 /// outrig's process layer: it is SIGKILLed synchronously and reaped by the
@@ -383,10 +390,30 @@ impl McpClient {
     where
         S: rmcp::Service<rmcp::RoleServer>,
     {
+        let never = tokio_util::sync::CancellationToken::new();
+        Self::handshake_in_memory_until(name, server, initialize_within, never).await
+    }
+
+    /// [`Self::handshake_in_memory`], its server closing its end of the pipe
+    /// once `hang_up` is cancelled, as one whose process died does.
+    #[cfg(test)]
+    pub(crate) async fn handshake_in_memory_until<S>(
+        name: &str,
+        server: S,
+        initialize_within: Duration,
+        hang_up: tokio_util::sync::CancellationToken,
+    ) -> Result<Self>
+    where
+        S: rmcp::Service<rmcp::RoleServer>,
+    {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             if let Ok(running) = rmcp::service::serve_server(server, server_io).await {
-                let _ = running.waiting().await;
+                // Dropping the running service ends its loop, and the pipe with it.
+                tokio::select! {
+                    _ = running.waiting() => {}
+                    () = hang_up.cancelled() => {}
+                }
             }
         });
         let failed = match tokio::time::timeout(
@@ -611,55 +638,86 @@ impl McpClient {
                 });
             }
         };
+        let bound = self.call_timeout;
+        let now = tokio::time::Instant::now();
+        // A deadline past what the clock can hold is none at all.
+        let deadline = now.checked_add(bound).unwrap_or(now + NO_DEADLINE);
+        self.call_tool_within(name, arguments, deadline, std::future::pending())
+            .await
+            .map_err(|failed| {
+                let mut source = failed.source;
+                if source.kind == McpFailureKind::Timeout {
+                    // Read by the model as often as by a person, so it says what
+                    // happened to the work and where a longer deadline is set.
+                    source.message = format!(
+                        "no tools/call response within {bound:?}, so the call was cancelled; \
+                         the server's `call-timeout-secs` sets how long its calls may run"
+                    );
+                }
+                OutrigError::McpCallToolFailed {
+                    name: self.name.clone(),
+                    source,
+                }
+            })
+    }
 
+    /// Issue an MCP `tools/call` of `name` with `arguments`, until `deadline`
+    /// or until `cancelled` resolves, whichever is first; on failure, where in
+    /// the call's flow it ended, which is what says whether the server can
+    /// have seen it (see [`McpCallFailure`]).
+    ///
+    /// A call stopped by its deadline or by `cancelled` once its request was
+    /// handed over sends the server `notifications/cancelled` before it
+    /// returns, and is may have dispatched: the notice asks, and proves
+    /// nothing. An answer that comes after is discarded. One stopped while its
+    /// request was still being handed over has no request id to name, and is
+    /// may have dispatched too: a write cut off part-way proves nothing either.
+    pub(crate) async fn call_tool_within(
+        &self,
+        name: &str,
+        arguments: Option<Map<String, Value>>,
+        deadline: tokio::time::Instant,
+        cancelled: impl Future<Output = ()>,
+    ) -> std::result::Result<McpToolResult, McpCallFailure> {
         let mut params = CallToolRequestParams::new(name.to_string());
         if let Some(arguments) = arguments {
             params = params.with_arguments(arguments);
         }
-        let handle = self
-            .service
-            .send_request_with_option(
-                ClientRequest::CallToolRequest(CallToolRequest::new(params)),
-                PeerRequestOptions::no_options(),
-            )
-            .await
-            .map_err(|source| OutrigError::McpCallToolFailed {
-                name: self.name.clone(),
-                source: session_error_from_rmcp(&source),
-            })?;
-        // The deadline is ours rather than rmcp's: on expiry the dropped wait
-        // leaves the guard armed, and it sends the cancel -- the same path a
-        // caller's own drop takes, so there is one sender and one reason.
-        let guard = CancelOnDrop::new(handle.peer.clone(), handle.id.clone());
-        let bound = self.call_timeout;
-        let answered = tokio::time::timeout(bound, handle.await_response())
-            .await
-            .map_err(|_| {
-                // Read by the model as often as by a person, so it says what
-                // happened to the work and where a longer deadline is set.
-                OutrigError::McpCallToolFailed {
-                    name: self.name.clone(),
-                    source: McpSessionError::new(
-                        McpFailureKind::Timeout,
-                        format!(
-                            "no tools/call response within {bound:?}, so the call was \
-                             cancelled; the server's `call-timeout-secs` sets how long its \
-                             calls may run"
-                        ),
-                    ),
-                }
-            })?;
-        guard.disarm();
-        match answered.map_err(|source| OutrigError::McpCallToolFailed {
-            name: self.name.clone(),
+        let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+        // What stops the call, and as which failure: polled by the send and the wait alike.
+        let mut stop = std::pin::pin!(async {
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(deadline) => McpFailureKind::Timeout,
+                () = cancelled => McpFailureKind::Canceled,
+            }
+        });
+        let sent = tokio::select! {
+            biased;
+            sent = self
+                .service
+                .send_request_with_option(request, PeerRequestOptions::no_options()) => sent,
+            kind = &mut stop => return Err(McpCallFailure::stopped(kind, false)),
+        };
+        let handle = sent.map_err(|source| McpCallFailure {
+            state: McpDispatchState::MayHaveDispatched,
             source: session_error_from_rmcp(&source),
-        })? {
-            ServerResult::CallToolResult(result) => Ok(result_from_rmcp(result)),
-            _ => Err(OutrigError::McpCallToolFailed {
-                name: self.name.clone(),
-                source: session_error_from_rmcp(&ServiceError::UnexpectedResponse),
-            }),
-        }
+            code: None,
+        })?;
+        // The deadline is ours rather than rmcp's, and so is the cancel: a
+        // stopped wait sends the notice through the guard, as a caller's own
+        // drop does, so there is one sender and one reason.
+        let guard = CancelOnDrop::new(handle.peer.clone(), handle.id.clone());
+        let stopped = tokio::select! {
+            biased;
+            answered = handle.await_response() => {
+                guard.disarm();
+                return answered_call(answered);
+            }
+            kind = &mut stop => kind,
+        };
+        guard.send_now().await;
+        Err(McpCallFailure::stopped(stopped, true))
     }
 
     /// Cancel the rmcp service (which closes the child's stdin -- the MCP
@@ -726,6 +784,14 @@ impl CancelOnDrop {
     fn disarm(mut self) {
         self.owed = None;
     }
+
+    /// Send the notice now, and owe nothing after: what a call stopped on
+    /// purpose does, so that it has been sent when the call returns.
+    async fn send_now(mut self) {
+        if let Some((peer, id)) = self.owed.take() {
+            notify_cancelled(peer, id).await;
+        }
+    }
 }
 
 impl Drop for CancelOnDrop {
@@ -735,16 +801,94 @@ impl Drop for CancelOnDrop {
         };
         // `Drop` cannot await, so the notice goes on a task of its own -- and
         // spawning outside a runtime panics, so a drop during runtime teardown,
-        // with no one left to deliver it, owes nothing. Bounded like the rest
-        // of the transport's goodbyes: a wedged pipe must not keep it alive.
+        // with no one left to deliver it, owes nothing.
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        runtime.spawn(async move {
-            let notice =
-                CancelledNotificationParam::new(Some(id), Some(ABANDONED_REASON.to_string()));
-            let _ = tokio::time::timeout(SHUTDOWN_GRACE, peer.notify_cancelled(notice)).await;
-        });
+        runtime.spawn(notify_cancelled(peer, id));
+    }
+}
+
+/// Send the server `notifications/cancelled` for the request `id`. Bounded
+/// like the rest of the transport's goodbyes: a wedged pipe must not keep it
+/// alive.
+async fn notify_cancelled(peer: Peer<RoleClient>, id: RequestId) {
+    let notice = CancelledNotificationParam::new(Some(id), Some(ABANDONED_REASON.to_string()));
+    let _ = tokio::time::timeout(SHUTDOWN_GRACE, peer.notify_cancelled(notice)).await;
+}
+
+/// How a `tools/call` made with [`McpClient::call_tool_within`] failed:
+/// where in its flow it ended -- which is what says whether its server can
+/// have seen it -- and what failed there.
+#[derive(Debug)]
+pub(crate) struct McpCallFailure {
+    /// Where it ended: decided by where the failure happened, never read from
+    /// what failed.
+    pub(crate) state: McpDispatchState,
+    /// What failed.
+    pub(crate) source: McpSessionError,
+    /// The JSON-RPC error code, when the server answered with an error.
+    pub(crate) code: Option<i32>,
+}
+
+impl McpCallFailure {
+    /// Stopped by its deadline (`Timeout`) or by its caller (`Canceled`),
+    /// the server sent the notice when `noticed`.
+    fn stopped(kind: McpFailureKind, noticed: bool) -> Self {
+        let why = match kind {
+            McpFailureKind::Timeout => "its deadline passed",
+            _ => "it was told to stop",
+        };
+        let message = match noticed {
+            true => format!(
+                "{why} before the server answered, so the server was sent \
+                 notifications/cancelled, which asks it to stop and does not prove it did"
+            ),
+            false => format!(
+                "{why} while its request was being sent, so the server may have it; no \
+                 request id had been given yet for a cancel to name"
+            ),
+        };
+        Self {
+            state: McpDispatchState::MayHaveDispatched,
+            source: McpSessionError::new(kind, message),
+            code: None,
+        }
+    }
+}
+
+/// What a `tools/call` whose wait ended with `answered` came to.
+fn answered_call(
+    answered: std::result::Result<ServerResult, ServiceError>,
+) -> std::result::Result<McpToolResult, McpCallFailure> {
+    let source = match answered {
+        Ok(ServerResult::CallToolResult(result)) => return Ok(result_from_rmcp(result)),
+        Ok(_) => ServiceError::UnexpectedResponse,
+        Err(source) => source,
+    };
+    let code = match &source {
+        ServiceError::McpError(error) => Some(error.code.0),
+        _ => None,
+    };
+    Err(McpCallFailure {
+        state: wait_state(&source),
+        source: session_error_from_rmcp(&source),
+        code,
+    })
+}
+
+/// Where a `tools/call` whose wait failed with `source` ended. The server
+/// answered when it sent an error or a message the protocol does not allow
+/// there; anything else -- the transport closed, a failure this build does
+/// not classify -- came after the request was handed over and before any
+/// answer was read, so the server may have it. Decided by position, so a
+/// variant an SDK upgrade adds is may have dispatched, never guessed at.
+fn wait_state(source: &ServiceError) -> McpDispatchState {
+    match source {
+        ServiceError::McpError(_)
+        | ServiceError::UnexpectedResponse
+        | ServiceError::InputRequiredRoundsExceeded { .. } => McpDispatchState::ResponseReceived,
+        _ => McpDispatchState::MayHaveDispatched,
     }
 }
 
@@ -1281,6 +1425,121 @@ pub(crate) mod tests {
                 "the SDK's own wording is what a human reads"
             );
         }
+    }
+
+    /// Where a `tools/call` whose wait failed ended, for all eight `ServiceError` variants rmcp
+    /// 3.4.1 declares: an error the server answered, or a message it may not send there, is a
+    /// response; everything else came after the request was handed over and before any answer,
+    /// so the server may have it -- a variant this build files as `Other` included, which is how
+    /// one an SDK upgrade adds is read.
+    #[rustfmt::skip]
+    #[test]
+    fn a_failed_wait_is_placed_by_position() {
+        use rmcp::model::ErrorData;
+        use rmcp::service::ServiceError as E;
+
+        use McpDispatchState as S;
+
+        for (source, expected) in [
+            (E::TransportSend(transport_error()), S::MayHaveDispatched),
+            (E::TransportClosed, S::MayHaveDispatched),
+            (E::McpError(ErrorData::internal_error("upstream said no", None)), S::ResponseReceived),
+            (E::UnexpectedResponse, S::ResponseReceived),
+            (E::InputRequiredRoundsExceeded { max_rounds: 3 }, S::ResponseReceived),
+            (E::Timeout { timeout: Duration::from_secs(5) }, S::MayHaveDispatched),
+            (E::Cancelled { reason: None }, S::MayHaveDispatched),
+            (E::SubscriptionLagged { capacity: 16 }, S::MayHaveDispatched),
+        ] {
+            assert_eq!(wait_state(&source), expected, "placing {source}");
+        }
+        let Err(failed) = answered_call(Err(E::SubscriptionLagged { capacity: 16 })) else {
+            panic!("a lagged wait is a failure")
+        };
+        assert_eq!(
+            (failed.state, failed.source.kind),
+            (S::MayHaveDispatched, McpFailureKind::Other)
+        );
+        let Err(failed) = answered_call(Err(E::McpError(ErrorData::invalid_params("no", None))))
+        else {
+            panic!("an error answered is a failure")
+        };
+        assert_eq!(failed.code, Some(rmcp::model::ErrorCode::INVALID_PARAMS.0));
+    }
+
+    /// A call made once its server has closed the transport may have reached it -- a failed
+    /// write proves nothing -- and is the transport's failure.
+    #[tokio::test]
+    async fn a_call_on_a_closed_transport_may_have_dispatched() {
+        let hang_up = tokio_util::sync::CancellationToken::new();
+        let (cancels, _heard) = tokio::sync::mpsc::unbounded_channel();
+        let stalling = Stalling {
+            calls: Default::default(),
+            cancels,
+        };
+        let client = McpClient::handshake_in_memory_until(
+            "svc",
+            stalling,
+            Duration::from_secs(5),
+            hang_up.clone(),
+        )
+        .await
+        .expect("connects");
+        hang_up.cancel();
+        // Once the client has heard the pipe close, so the call is made after it.
+        crate::python::testing::until("the transport's close", || {
+            client.service.is_transport_closed()
+        })
+        .await;
+        let far = tokio::time::Instant::now() + Duration::from_secs(5);
+        let failed = client
+            .call_tool_within("quick", None, far, std::future::pending())
+            .await
+            .expect_err("nothing answers");
+        assert_eq!(
+            (failed.state, failed.source.kind),
+            (
+                McpDispatchState::MayHaveDispatched,
+                McpFailureKind::Transport
+            )
+        );
+    }
+
+    /// A call told to stop is sent its cancel before it returns, and may have dispatched, the
+    /// failure `Canceled`; one past its deadline is the same, `Timeout`.
+    #[tokio::test]
+    async fn a_stopped_call_sends_its_cancel_before_it_returns() {
+        let (client, mut heard, _dir) = client_against_stalling_server().await;
+        let far = tokio::time::Instant::now() + Duration::from_secs(30);
+        let failed = client
+            .call_tool_within(
+                "slow",
+                None,
+                far,
+                tokio::time::sleep(Duration::from_millis(100)),
+            )
+            .await
+            .expect_err("told to stop");
+        assert_eq!(
+            (failed.state, failed.source.kind),
+            (
+                McpDispatchState::MayHaveDispatched,
+                McpFailureKind::Canceled
+            )
+        );
+        assert!(
+            failed.source.message.contains("notifications/cancelled"),
+            "{}",
+            failed.source.message
+        );
+        assert_eq!(next_cancel(&mut heard).await, "slow");
+
+        let soon = tokio::time::Instant::now() + Duration::from_millis(100);
+        let failed = client
+            .call_tool_within("slow", None, soon, std::future::pending())
+            .await
+            .expect_err("past its deadline");
+        assert_eq!(failed.source.kind, McpFailureKind::Timeout);
+        assert_eq!(next_cancel(&mut heard).await, "slow");
     }
 
     /// All eleven `ClientInitializeError` variants rmcp 3.4.1 declares, named

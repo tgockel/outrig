@@ -47,15 +47,16 @@ class ServiceError(Exception):
       is closing; `unknown_method`, the service's description has no method of that name, which a
       method held from an earlier description meets once the service has changed;
       `invalid_arguments`, the arguments do not match the method's schema, `path` the first JSON
-      path that failed.
+      path that failed; `paused` or `stopped`, the service is; `unavailable`, an MCP server whose
+      transport failed could not be connected again.
     - `returned`, with the category `result_too_large`: the service was called and returned more
       than a result may carry, so its result was not handed over -- what the call did is done.
     - `raised`: the service was called and said it failed. `category` is its: `invalid_arguments`,
       `not_found`, `refused`, `unavailable`, `failed`, `cancelled`, `other`.
     - `cancelled`: the service was not called; `reason` says what stopped it.
-    - `unknown`: the service was called and abandoned -- told to stop, given a grace, and left --
-      so what it did is not known; `reason` is `deadline`, `interrupted` or `closed`. Nothing
-      calls it again for you.
+    - `unknown`: the service was called and may have done the work: it said so, or it was
+      abandoned -- told to stop, given a grace, and left. `reason`, when it was told to stop, is
+      `deadline`, `interrupted`, `closed` or `stopped`. Nothing calls it again for you.
 
     `service` and `method` name what was called, `call` is the id the session's events give the
     call, and `message` says what went wrong in words.

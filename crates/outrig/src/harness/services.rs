@@ -39,7 +39,8 @@ use super::event::{
 };
 use super::lifecycle::Lifecycle;
 use super::mcp::McpReply;
-use super::report::ServiceCall;
+use super::report::{McpUncertainCall, ServiceCall};
+use crate::error::McpFailureKind;
 use crate::events::Events;
 use crate::python::host::Interpreter;
 use crate::python::hosted::ToInterpreter;
@@ -71,10 +72,12 @@ pub trait Service: Send + Sync + 'static {
     ///
     /// `cx` says whose call it is and until when it may run. When
     /// [`CallContext::cancelled`] resolves -- the deadline passed, the caller
-    /// was interrupted, or the session's drain ended -- return promptly, with [`ServiceErrorCategory::Cancelled`] if the work was not
-    /// done: a future still running a grace later is dropped at its next await
-    /// point, and its call reported `unknown`. Work on a blocking thread is not
-    /// stopped by that; bounding it is the service's.
+    /// was interrupted, or the session's drain ended -- return promptly, with
+    /// [`ServiceErrorCategory::Cancelled`] if the work was not done, or
+    /// [`ServiceErrorCategory::Unknown`] if it may have been: a future still
+    /// running a grace later is dropped at its next await point, and its call
+    /// reported `unknown`. Work on a blocking thread is not stopped by that;
+    /// bounding it is the service's.
     fn call(&self, method: &str, args: Value, cx: CallContext) -> ServiceFuture<'_>;
 }
 
@@ -244,6 +247,9 @@ pub struct ServiceError {
     pub category: ServiceErrorCategory,
     /// What went wrong, for the agent reading it.
     pub message: String,
+    /// Where an MCP service's call ended, as the MCP service says: what the
+    /// table records beside the outcome, and maps it by.
+    pub(crate) mcp: Option<McpEnd>,
 }
 
 impl ServiceError {
@@ -252,6 +258,49 @@ impl ServiceError {
         Self {
             category,
             message: message.into(),
+            mcp: None,
+        }
+    }
+
+    /// The failure, of an MCP service's call that ended as `end` says.
+    pub(crate) fn of_mcp(mut self, end: McpEnd) -> Self {
+        self.mcp = Some(end);
+        self
+    }
+}
+
+/// Where an MCP service's call ended and what failed, carried by its
+/// [`ServiceError`]: the table records the state and the failure on the
+/// call's `service.call.ended` and in its answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum McpEnd {
+    /// Never sent: `refused` for `reason` -- its arguments failing first at
+    /// `path`, when they did -- or `cancelled` when the call was told to stop
+    /// first.
+    NotSent {
+        reason: ServiceReason,
+        path: Option<String>,
+    },
+    /// Sent, and ended at `state`, `failure` failing: `unknown` when the
+    /// error's category is, else `raised`.
+    Sent {
+        state: McpDispatchState,
+        failure: Option<McpFailureKind>,
+    },
+}
+
+impl McpEnd {
+    fn state(&self) -> McpDispatchState {
+        match self {
+            Self::NotSent { .. } => McpDispatchState::NotDispatched,
+            Self::Sent { state, .. } => *state,
+        }
+    }
+
+    fn failure(&self) -> Option<McpFailureKind> {
+        match self {
+            Self::NotSent { .. } => None,
+            Self::Sent { failure, .. } => *failure,
         }
     }
 }
@@ -281,6 +330,9 @@ pub enum ServiceErrorCategory {
     Failed,
     /// The call was told to stop, and did.
     Cancelled,
+    /// Whether the work was done is not known: it may have been. The call
+    /// ends `unknown`, never `raised`, and nothing calls it again.
+    Unknown,
     /// Anything else.
     Other,
 }
@@ -295,6 +347,7 @@ impl ServiceErrorCategory {
             Self::Unavailable => "unavailable",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
             Self::Other => "other",
         }
     }
@@ -430,6 +483,8 @@ struct State {
     /// Set once the report is read: nothing more is published.
     sealed: bool,
     after_close: Vec<ServiceCall>,
+    /// Each MCP call that ended may have dispatched, in the order they ended.
+    uncertain: Vec<McpUncertainCall>,
 }
 
 struct Served {
@@ -462,6 +517,8 @@ struct Flight {
     ask: u64,
     service: String,
     method: String,
+    /// What kind of service it calls, when the session serves it.
+    kind: Option<ServiceKind>,
     /// Past every check and any hold: on its way to its service, or there.
     dispatched: bool,
 }
@@ -484,6 +541,24 @@ impl Flight {
     /// Whether it calls one of `services`.
     fn of(&self, services: &[String]) -> bool {
         services.contains(&self.service)
+    }
+
+    /// Its row among the MCP calls that ended may have dispatched, as `call`,
+    /// ended as said.
+    fn uncertain(
+        &self,
+        call: ServiceCallId,
+        failure: Option<McpFailureKind>,
+        reason: Option<ServiceReason>,
+    ) -> McpUncertainCall {
+        McpUncertainCall {
+            call,
+            service: self.service.clone(),
+            tool: self.method.clone(),
+            agent: self.agent.to_string(),
+            failure,
+            reason,
+        }
     }
 
     /// The report's row for the call `call`, ended as said.
@@ -519,6 +594,11 @@ struct End {
     result: Option<String>,
     /// What an MCP server's result held, when the service returned one.
     reply: Option<McpReply>,
+    /// Where an MCP call ended, as its service said; `end` fills it from the
+    /// outcome otherwise.
+    state: Option<McpDispatchState>,
+    /// What failed, as an MCP service said.
+    failure: Option<McpFailureKind>,
 }
 
 impl End {
@@ -533,6 +613,8 @@ impl End {
             bytes: None,
             result: None,
             reply: None,
+            state: None,
+            failure: None,
         }
     }
 
@@ -551,6 +633,44 @@ impl End {
         Self {
             category: Some(category),
             ..Self::new(ServiceOutcome::Raised, message)
+        }
+    }
+
+    /// Its service may have done the work, and said so or was told to stop
+    /// for `reason`.
+    fn unknown(reason: Option<ServiceReason>, message: String) -> Self {
+        Self {
+            reason,
+            ..Self::new(ServiceOutcome::Unknown, message)
+        }
+    }
+
+    /// How a call whose service failed with `error` ended, told to stop for
+    /// `told` if it was.
+    fn failed(error: ServiceError, told: Option<ServiceReason>) -> Self {
+        let ServiceError {
+            category,
+            message,
+            mcp,
+        } = error;
+        let state = mcp.as_ref().map(McpEnd::state);
+        let failure = mcp.as_ref().and_then(McpEnd::failure);
+        let end = match (mcp, told, category) {
+            (Some(McpEnd::NotSent { .. }), Some(told), _) => {
+                Self::stopped(ServiceOutcome::Cancelled, told, message)
+            }
+            (Some(McpEnd::NotSent { reason, path }), None, _) => Self {
+                detail: path.clone(),
+                path,
+                ..Self::refused(reason, message)
+            },
+            (_, told, ServiceErrorCategory::Unknown) => Self::unknown(told, message),
+            _ => Self::raised(category, message),
+        };
+        Self {
+            state,
+            failure,
+            ..end
         }
     }
 }
@@ -812,6 +932,10 @@ impl Services {
                 if let Some(abort) = &flight.abort {
                     abort.abort();
                 }
+                if flight.kind == Some(ServiceKind::Mcp) && flight.dispatched {
+                    let uncertain = flight.uncertain(call, None, Some(ServiceReason::Closed));
+                    s.uncertain.push(uncertain);
+                }
                 let row = flight.row(
                     call,
                     ServiceOutcome::Unknown,
@@ -823,6 +947,59 @@ impl Services {
             report = s.after_close.clone();
         });
         report
+    }
+
+    /// Each call of an MCP service's tool that ended may have dispatched, in
+    /// the order they ended: one still in flight when the report was read is
+    /// among them.
+    pub(crate) fn uncertain(&self) -> Vec<McpUncertainCall> {
+        self.0.state.borrow().uncertain.clone()
+    }
+
+    /// Whether `service`, as described now, has `method` and `arguments` match
+    /// its schema: a call of an MCP service admitted under the listing its
+    /// server had before its transport failed, checked again against the one
+    /// it was connected again with. Why not, as a call never sent, refused as
+    /// its admission refuses one.
+    pub(crate) fn recheck(
+        &self,
+        service: &str,
+        method: &str,
+        arguments: &Value,
+    ) -> Result<(), ServiceError> {
+        let refused = |category, reason, message: String, path| {
+            ServiceError::new(category, format!("{message} -- {RECONNECTED}"))
+                .of_mcp(McpEnd::NotSent { reason, path })
+        };
+        let Some((_, described)) = self.0.served(service) else {
+            return Ok(());
+        };
+        if !described.checks.contains_key(method) {
+            return Err(refused(
+                ServiceErrorCategory::NotFound,
+                ServiceReason::UnknownMethod,
+                no_method(service, method),
+                None,
+            ));
+        }
+        described
+            .check(method, arguments)
+            .map_err(|(path, problem)| {
+                refused(
+                    ServiceErrorCategory::InvalidArguments,
+                    ServiceReason::InvalidArguments,
+                    mismatch(&path, &problem),
+                    Some(path),
+                )
+            })
+    }
+
+    /// Resolves once the session is closed to new work.
+    pub(crate) fn closing(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut state = self.0.state.subscribe();
+        async move {
+            let _ = state.wait_for(|s| s.closed).await;
+        }
     }
 }
 
@@ -914,6 +1091,9 @@ impl Table {
             _ => String::new(),
         };
         let call = ServiceCallId::new(self.ids.fetch_add(1, Ordering::Relaxed) + 1);
+        let kind = self
+            .served(&request.service)
+            .map(|(_, described)| described.description.kind);
         let (stop, stopped) = watch::channel(None);
         let stop = Arc::new(stop);
         let sealed = self.with(|s| {
@@ -929,6 +1109,7 @@ impl Table {
                     ask,
                     service: request.service.clone(),
                     method: request.method.clone(),
+                    kind,
                     dispatched: false,
                 },
             );
@@ -1017,10 +1198,7 @@ impl Table {
             ));
         }
         if !described.checks.contains_key(&request.method) {
-            let mut message = format!(
-                "service {:?} has no method {:?}",
-                request.service, request.method
-            );
+            let mut message = no_method(&request.service, &request.method);
             if request.generation != described.generation {
                 message.push_str(&format!(
                     ": it was described at generation {}, and is described at generation {} now",
@@ -1043,17 +1221,11 @@ impl Table {
             }
         };
         if let Err((path, problem)) = described.check(&request.method, &arguments) {
-            let at = match path.as_str() {
-                "" => "the arguments".to_string(),
-                path => format!("the argument at {path}"),
-            };
+            let message = mismatch(&path, &problem);
             return ended(End {
                 path: Some(path.clone()),
                 detail: Some(path),
-                ..End::refused(
-                    ServiceReason::InvalidArguments,
-                    format!("{at} does not match the method's schema: {problem}"),
-                )
+                ..End::refused(ServiceReason::InvalidArguments, message)
             });
         }
         if let Some(end) = self
@@ -1102,8 +1274,8 @@ impl Table {
             () = tokio::time::sleep_until(since + deadline) => Err(ServiceReason::Deadline),
             reason = told(&mut stopped) => Err(reason),
         };
-        let finished = match finished {
-            Ok(finished) => finished,
+        let (finished, told) = match finished {
+            Ok(finished) => (finished, None),
             Err(reason) => {
                 let reason = self.stop(call, reason).unwrap_or(reason);
                 token.cancel();
@@ -1114,7 +1286,7 @@ impl Table {
                     reason,
                 });
                 match tokio::time::timeout(self.policy.cancel_grace, &mut task).await {
-                    Ok(finished) => finished,
+                    Ok(finished) => (finished, Some(reason)),
                     Err(_) => {
                         // Dropped at its next await point; one blocking a thread runs on, and
                         // nothing here waits for it.
@@ -1133,7 +1305,7 @@ impl Table {
                 }
             }
         };
-        ended(self.outcome(kind, finished))
+        ended(self.outcome(kind, finished, told))
     }
 
     /// Wait out any hold on `request`'s service, marking `call` dispatched in
@@ -1224,11 +1396,13 @@ impl Table {
         }
     }
 
-    /// How a call of a service of `kind` whose task finished ended.
+    /// How a call of a service of `kind` whose task finished ended, told to
+    /// stop for `told` if it was.
     fn outcome(
         &self,
         kind: ServiceKind,
         finished: Result<Result<Value, ServiceError>, JoinError>,
+        told: Option<ServiceReason>,
     ) -> End {
         match finished {
             Ok(Ok(result)) => {
@@ -1265,7 +1439,7 @@ impl Table {
                     ..end
                 }
             }
-            Ok(Err(error)) => End::raised(error.category, error.message),
+            Ok(Err(error)) => End::failed(error, told),
             Err(_) => End::raised(
                 ServiceErrorCategory::Failed,
                 "the service's call panicked".into(),
@@ -1286,12 +1460,33 @@ impl Table {
         since: Instant,
         end: End,
     ) {
+        // Where an MCP call ended, which its service said or its outcome does:
+        // a call never sent was refused or cancelled, one whose service had it
+        // and was abandoned may have been sent, and one that returned was
+        // answered. A raised one says it, or panicked and is `None`.
+        let state = (kind == ServiceKind::Mcp)
+            .then(|| {
+                end.state.or(match end.outcome {
+                    ServiceOutcome::Refused | ServiceOutcome::Cancelled => {
+                        Some(McpDispatchState::NotDispatched)
+                    }
+                    ServiceOutcome::Unknown => Some(McpDispatchState::MayHaveDispatched),
+                    ServiceOutcome::Returned => Some(McpDispatchState::ResponseReceived),
+                    _ => None,
+                })
+            })
+            .flatten();
+        let end = End { state, ..end };
         let closed = self.lifecycle.closed().is_some();
         let sealed = self.with(|s| {
             // Gone when the report took it already.
             let Some(flight) = s.flights.remove(&call) else {
                 return true;
             };
+            if state == Some(McpDispatchState::MayHaveDispatched) {
+                s.uncertain
+                    .push(flight.uncertain(call, end.failure, end.reason));
+            }
             if closed {
                 let row = flight.row(call, end.outcome, end.category, end.reason);
                 s.after_close.push(row);
@@ -1317,10 +1512,8 @@ impl Table {
                 mcp: (kind == ServiceKind::Mcp).then(|| McpCallEnded {
                     tool: request.method.clone(),
                     listing: request.generation,
-                    state: end
-                        .reply
-                        .as_ref()
-                        .map(|_| McpDispatchState::ResponseReceived),
+                    state,
+                    failure: end.failure,
                     is_error: end.reply.as_ref().map(|reply| reply.is_error),
                     blocks: end.reply.as_ref().map(|reply| reply.blocks.clone()),
                     structured: end.reply.as_ref().map(|reply| reply.structured),
@@ -1330,6 +1523,24 @@ impl Table {
         (self.to_interpreter)(answer(ask, call, end));
     }
 }
+
+/// Why a call of `method` of `service`, which has none, is refused.
+fn no_method(service: &str, method: &str) -> String {
+    format!("service {service:?} has no method {method:?}")
+}
+
+/// Why a call whose arguments failed its method's schema first at `path`, for
+/// `problem`, is refused.
+fn mismatch(path: &str, problem: &str) -> String {
+    let at = match path {
+        "" => "the arguments".to_string(),
+        path => format!("the argument at {path}"),
+    };
+    format!("{at} does not match the method's schema: {problem}")
+}
+
+/// What a call [`Services::recheck`] refuses says of its service's server.
+const RECONNECTED: &str = "its server was connected again, and lists its tools anew";
 
 impl Described {
     /// `description` as generation `generation`, each method's `params`
@@ -1454,7 +1665,7 @@ fn answer(ask: u64, call: ServiceCallId, end: End) -> Value {
         (ServiceOutcome::Refused | ServiceOutcome::Returned, reason) => reason.map(name),
         _ => end.category.map(|category| category.as_str().to_string()),
     };
-    failed(
+    let mut line = failed(
         ask,
         Some(call),
         Failed {
@@ -1464,7 +1675,11 @@ fn answer(ask: u64, call: ServiceCallId, end: End) -> Value {
             message: end.message,
             path: end.path,
         },
-    )
+    );
+    // Where an MCP call ended, and what failed: `null` for any other service's.
+    line["error"]["state"] = json!(end.state.map(name));
+    line["error"]["failure"] = json!(end.failure.map(name));
+    line
 }
 
 /// What agent code reads of a call that returned no result, or of another
@@ -1530,7 +1745,10 @@ fn name(value: impl Serialize) -> String {
 /// service -- from an agent whose kernel the host did not open, or when the
 /// session serves nothing it could be of.
 pub(crate) fn unserved(line: &Value, opened: bool) -> Option<Value> {
-    if line["t"] != "service.call" && line["t"] != "mcp.relist" {
+    if !matches!(
+        line["t"].as_str(),
+        Some("service.call" | "mcp.relist" | "mcp.reconnect")
+    ) {
         return None;
     }
     let ask = line["id"].as_u64()?;

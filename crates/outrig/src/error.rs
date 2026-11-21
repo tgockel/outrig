@@ -413,6 +413,25 @@ pub enum McpFailureKind {
     Other,
 }
 
+/// Where in an MCP call's flow it ended: what it says of whether the server
+/// saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum McpDispatchState {
+    /// Nothing reached the transport: the call was refused or cancelled
+    /// before it was sent. No effect is possible.
+    NotDispatched,
+    /// The request was handed to the transport and no answer was read: the
+    /// write failed, the transport closed, the deadline passed, or the call
+    /// was told to stop. A failed write does not prove the server saw nothing,
+    /// and a cancel does not prove it stopped: its effects are open.
+    MayHaveDispatched,
+    /// The server answered: its effects are as its answer says, partial ones
+    /// included.
+    ResponseReceived,
+}
+
 /// A failure the MCP session machinery reported, as outrig's own type.
 ///
 /// The MCP SDK's error types are not on this crate's public surface. They are

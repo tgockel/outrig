@@ -937,6 +937,25 @@ impl Container {
         container
     }
 
+    /// A handle to an owned container whose first stop fails and whose next
+    /// proves it gone, for tests of a holder that tries again. The first stop
+    /// leaves its mark at `marker`, where nothing is yet.
+    #[cfg(test)]
+    pub(crate) fn stops_the_second_time(marker: &Path) -> Self {
+        let mut container = Self::unstoppable();
+        container.engine_override = vec![
+            ("podman rm", Cmd::new("/bin/true")),
+            (
+                "podman stop",
+                Cmd::new("/bin/sh")
+                    .arg("-c")
+                    .arg(r#"test -e "$0" || { : > "$0"; exit 1; }"#)
+                    .arg(marker),
+            ),
+        ];
+        container
+    }
+
     /// A handle whose stop is a no-op that cannot fail: a *borrowed*
     /// container, which outrig never stops because it never started it. The
     /// clean-unwind counterpart to [`unstoppable`](Self::unstoppable).

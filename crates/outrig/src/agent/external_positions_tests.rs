@@ -17,7 +17,7 @@ use super::children_tests::{
 };
 use super::external_request_tests::{ask, asks, once_then_silent, questions};
 use super::external_tests::{
-    Answer, Backend, constructed, from_launch, holder, holding, inbox, ready, running, until,
+    Answer, Backend, constructed, from_launch, holder, holding, inbox, ready, running,
 };
 use super::mock_http;
 use super::root_tests::agent_of;
@@ -27,6 +27,7 @@ use crate::harness::{
     Delivered, DeliveryId, Inbound, InboundItem, OutboundState, Position, SendAnswer, Settle,
     Verdict, Wake, WithdrawAnswer,
 };
+use crate::python::testing::until;
 use crate::python::testing::{Flag, within};
 
 /// `inbox`, pushed `items` from the start, each `m-N` from `alice` with the body `body-N` and

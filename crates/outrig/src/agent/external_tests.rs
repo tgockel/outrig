@@ -31,7 +31,7 @@ use crate::harness::{
     Facility, Inbound, ItemKind, Outbound, Position, Positions, Query, RootHandle, SendAnswer,
     SessionBuilder, SessionError, Settled, Verdict, Wake, WithdrawAnswer, Withdrawal,
 };
-use crate::python::testing::{Flag, py, within};
+use crate::python::testing::{Flag, py, until, within};
 
 /// The application's `app` package: `app.messages` holds the type a typed channel names, and
 /// `app.agents` the classes the tests construct.
@@ -422,17 +422,6 @@ pub(super) async fn constructed(tree: &Tree, spec: ConstructSpec) -> RootHandle 
     within(tree.session.construct(spec))
         .await
         .expect("constructed")
-}
-
-/// Wait until `done` holds -- `what` -- failing rather than hanging.
-pub(super) async fn until(what: &str, done: impl Fn() -> bool) {
-    let waited = tokio::time::timeout(Duration::from_secs(20), async {
-        while !done() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    assert!(waited.is_ok(), "{what} never came");
 }
 
 /// The opening of each round the agent whose class carries `marker` had past its orienting

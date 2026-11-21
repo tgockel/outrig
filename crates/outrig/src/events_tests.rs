@@ -15,8 +15,9 @@ use crate::harness::event::*;
 use crate::harness::{
     BindingStop, ChannelClose, ChannelOperation, ChannelRequestAtClose, ClosedBy, Direction,
     ExecutionOutcome, ExecutionStatus, HostedCall, McpDeclaredIn, McpOutcomeKind, McpPauseHow,
-    McpPlacementKind, McpRetryCause, McpServiceStop, McpStartupCause, McpStopHow, RequestOutcome,
-    SendAtClose, ServiceCall, ServiceErrorCategory, Stopped, UncertainAtClose, Verdict,
+    McpPlacementKind, McpRetryCause, McpServiceStop, McpStartupCause, McpStopHow, McpUncertainCall,
+    RequestOutcome, SendAtClose, ServiceCall, ServiceErrorCategory, Stopped, UncertainAtClose,
+    Verdict,
 };
 
 const SOURCE: &str = "/outrig/session/20260921T103000-a1b2";
@@ -302,6 +303,14 @@ fn each_event_has_exactly_its_data_fields() {
                     how: McpStopHow::Stopped,
                     proven: true,
                 }],
+                mcp_uncertain: vec![McpUncertainCall {
+                    call: ServiceCallId::new(5),
+                    service: text("gh"),
+                    tool: text("create-issue"),
+                    agent: text("primary"),
+                    failure: Some(McpFailureKind::Transport),
+                    reason: None,
+                }],
                 verdict: Verdict::StoppedWithUnknown,
             },
             "session.report",
@@ -315,6 +324,7 @@ fn each_event_has_exactly_its_data_fields() {
                 "requests",
                 "channels",
                 "mcp_services",
+                "mcp_uncertain",
                 "verdict",
             ],
         ),
@@ -608,6 +618,27 @@ fn each_event_has_exactly_its_data_fields() {
             },
             "mcp.service.list.changed",
             &["service"],
+        ),
+        (
+            Payload::McpServiceDisconnected {
+                service: text("fs"),
+                cause: McpRetryCause {
+                    kind: Some(McpFailureKind::Transport),
+                    message: text("Transport closed"),
+                },
+            },
+            "mcp.service.disconnected",
+            &["service", "cause"],
+        ),
+        (
+            Payload::McpServiceReconnected {
+                service: text("fs"),
+                attempts: 1,
+                listing: 2,
+                undecoded: Vec::new(),
+            },
+            "mcp.service.reconnected",
+            &["service", "attempts", "listing", "undecoded"],
         ),
         (
             Payload::BindingRefused {
@@ -1507,6 +1538,7 @@ fn each_event_has_exactly_its_data_fields() {
                     tool: text("read-file"),
                     listing: 2,
                     state: Some(McpDispatchState::ResponseReceived),
+                    failure: None,
                     is_error: Some(false),
                     blocks: Some([(text("text"), 1)].into()),
                     structured: Some(true),
@@ -1530,6 +1562,7 @@ fn each_event_has_exactly_its_data_fields() {
                 "tool",
                 "listing",
                 "state",
+                "failure",
                 "is_error",
                 "blocks",
                 "structured",
@@ -1685,6 +1718,14 @@ fn each_event_has_exactly_its_data_fields() {
                 "outcome": "ready",
                 "how": "stopped",
                 "proven": true,
+            }],
+            "mcp_uncertain": [{
+                "call": 5,
+                "service": "gh",
+                "tool": "create-issue",
+                "agent": "primary",
+                "failure": "transport",
+                "reason": null,
             }],
             "verdict": "stopped_with_unknown",
         })

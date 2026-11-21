@@ -46,6 +46,11 @@ pub struct ShutdownReport {
     /// Each MCP service the session declared, and how it was stopped: a
     /// container that would not stop makes the report not proven stopped.
     pub mcp_services: Vec<super::McpServiceStop>,
+    /// Each call of an MCP service's tool that ended may have dispatched at
+    /// any point in the session, in the order they ended: its server may have
+    /// done what it asked. One makes the verdict
+    /// [`Verdict::StoppedWithUnknown`].
+    pub mcp_uncertain: Vec<McpUncertainCall>,
     /// How the session's events reached its subscriptions and its log.
     pub events: EventDelivery,
 }
@@ -59,6 +64,7 @@ impl ShutdownReport {
             &self.hosted,
             &self.services,
             &self.channels,
+            &self.mcp_uncertain,
         )
     }
 }
@@ -69,6 +75,7 @@ pub(crate) fn verdict(
     hosted: &[HostedCall],
     services: &[ServiceCall],
     channels: &[ChannelClose],
+    mcp_uncertain: &[McpUncertainCall],
 ) -> Verdict {
     let unknown = executions
         .iter()
@@ -84,7 +91,8 @@ pub(crate) fn verdict(
                 .sends
                 .iter()
                 .any(|send| send.outcome == ItemOutcome::Uncertain)
-        });
+        })
+        || !mcp_uncertain.is_empty();
     match stopped {
         Stopped::NotProven { .. } => Verdict::NotProvenStopped,
         Stopped::Proven if unknown => Verdict::StoppedWithUnknown,
@@ -168,6 +176,27 @@ pub struct ServiceCall {
     /// `None`.
     pub category: Option<ServiceErrorCategory>,
     /// Why, for a `refused`, `cancelled` or `unknown` call; otherwise `None`.
+    pub reason: Option<ServiceReason>,
+}
+
+/// A call of an MCP service's tool that ended may have dispatched: its request
+/// was handed to the transport and no answer was read, so its server may have
+/// done what it asked. Nothing called it again. Its events say the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct McpUncertainCall {
+    /// The call, as its `service.call.received` numbered it.
+    pub call: ServiceCallId,
+    /// The MCP service whose tool it called.
+    pub service: String,
+    /// The tool, by its exact name.
+    pub tool: String,
+    /// The agent whose code made it, as the interpreter's protocol names it.
+    pub agent: String,
+    /// What failed: its transport, its deadline, a cancel; `None` for a call
+    /// abandoned without saying.
+    pub failure: Option<crate::error::McpFailureKind>,
+    /// Why it was told to stop, when it was.
     pub reason: Option<ServiceReason>,
 }
 
@@ -308,7 +337,8 @@ pub enum ExecutionStatus {
 pub enum Verdict {
     /// Everything stopped, and every outcome is known: the stop is clean.
     Clean,
-    /// Everything stopped, and some execution or hosted call was cut off.
+    /// Everything stopped, and some execution, hosted call or service call
+    /// was cut off, or some MCP call may have reached its server unanswered.
     /// Its outcome is unknown, never failed: its effect may stand.
     StoppedWithUnknown,
     /// Something could not be confirmed stopped. The stop is not clean, and

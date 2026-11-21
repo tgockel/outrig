@@ -101,8 +101,8 @@ pub use self::registry::{
 };
 pub use self::report::{
     BindingStop, ChannelClose, ChannelRequestAtClose, EventDelivery, ExecutionOutcome,
-    ExecutionStatus, HostedCall, LogLoss, RequestOutcome, SendAtClose, ServiceCall, ShutdownReport,
-    Stopped, UncertainAtClose, Verdict,
+    ExecutionStatus, HostedCall, LogLoss, McpUncertainCall, RequestOutcome, SendAtClose,
+    ServiceCall, ShutdownReport, Stopped, UncertainAtClose, Verdict,
 };
 pub use self::root::{
     Argument, ConstructSpec, Facility, Problem, RequestChannel, RequestHandle, RootError,
@@ -129,6 +129,8 @@ mod bindings_tests;
 #[path = "services_tests.rs"]
 pub(crate) mod services_tests;
 
+#[cfg(test)]
+mod mcp_dispatch_tests;
 #[cfg(test)]
 mod mcp_presenter_tests;
 #[cfg(test)]
