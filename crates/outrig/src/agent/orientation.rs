@@ -724,9 +724,12 @@ const MCP_RESULTS: &str = "A call of an MCP server's tool returns an `outrig.Mcp
                            `structured`, its structured data, and `text`, a view of the blocks \
                            that drops what is not text. Filter it in Python and print what you \
                            need. A result the server marks as an error raises \
-                           `outrig.ToolError`, carrying it. A call that fails may still have \
-                           reached the server, and OutRig never repeats one: before repeating a \
-                           call that changes something, check whether it happened.";
+                           `outrig.ToolError`, carrying it. A failed call raises an \
+                           `outrig.McpError` saying whether it reached the server: \
+                           `NotDispatched`, it did not; `MayHaveDispatched`, it may have -- a \
+                           timeout stops the wait, not the server; `ResponseReceived`, it \
+                           answered. OutRig never repeats a call: on `MayHaveDispatched`, check \
+                           whether a call that changes something happened before repeating it.";
 
 /// What a service is, as an agent holding one is told.
 const SERVICE_IS: &str = "an object whose methods are calls to the host, by value -- the \
@@ -1263,7 +1266,8 @@ mod tests {
             "- `tracker`: A server.",
             "returns an `outrig.McpResult`",
             "raises `outrig.ToolError`",
-            "OutRig never repeats one",
+            "OutRig never repeats a call",
+            "a timeout stops the wait, not the server",
         ] {
             assert!(both.contains(said), "{said}: {both}");
         }

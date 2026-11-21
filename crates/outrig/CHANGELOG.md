@@ -19,6 +19,33 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **An MCP call has three dispatch states.** Every MCP call that returns no result says where it
+  ended, decided by position, never guessed from what failed: `not_dispatched` (refused or
+  cancelled before it was sent), `may_have_dispatched` (handed to the transport, no answer read:
+  the transport failed, the deadline passed, the call was interrupted, stopped or cut off by the
+  close) or `response_received` (the server answered). `McpDispatchState` gains `NotDispatched`
+  and `MayHaveDispatched`, and `service.call.ended` carries `state` for every MCP ending and
+  `failure`, the `McpFailureKind`. In agent Python, `outrig.McpError` gains `failure` and a
+  class per state -- `NotDispatched` (with `UnknownTool`, `InvalidArguments`,
+  `ServiceUnavailable`, `AdmissionClosed`, `Paused`), `MayHaveDispatched` and `ResponseReceived`
+  (with `ProtocolError` and `ToolError`). A call past its deadline, interrupted, stopped or cut
+  off by the close sends its server `notifications/cancelled` and returns at once, `unknown`,
+  rather than after the service policy's grace. An error the server answers is `raised` with the
+  category its JSON-RPC code says: `invalid_arguments`, `not_found` or `failed`.
+- **A service may say it does not know.** `ServiceErrorCategory::Unknown`: a service returning
+  it ends its call `unknown`, never `raised`, as an abandoned call does.
+- **A failed MCP transport is connected again for later calls.** A transport failure marks the
+  service disconnected (`mcp.service.disconnected`); the next call, or `reconnect()` in agent
+  Python, places it again with the values resolved at the start, within the connect budget,
+  relists it (`mcp.service.reconnected`, then `service.described`), and only then makes the new
+  call. Nothing of the failed call is sent again. A reconnect that fails refuses its call with the
+  new `ServiceReason::Unavailable` and is tried again by the next, up to
+  `McpPolicy::reconnect_max` (3) a session; none is made once admission closes. A sidecar whose
+  container is gone is started again.
+- **The calls that may have reached a server are reported.** `McpServices::uncertain()` and
+  `ShutdownReport::mcp_uncertain` (`McpUncertainCall`: call, service, tool, agent, failure,
+  reason) list every MCP call that ended may have dispatched in the session, and one makes the
+  verdict `StoppedWithUnknown`. The Python `ShutdownReport` mirrors it.
 - **An MCP service's tools are Python objects, its results data.** A placed MCP server's object
   is an `outrig.McpService`: a method per tool by its exact name, `tool(name)` giving one with the
   descriptor its server listed, `tools` listing them, and a call returning an `outrig.McpResult`

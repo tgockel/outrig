@@ -722,7 +722,7 @@ async fn an_mcp_service_is_attributed_as_a_rust_one_is() {
     for said in [
         "- `fs`, an MCP server: ",
         "A call of an MCP server's tool returns an `outrig.McpResult`",
-        "OutRig never repeats one",
+        "OutRig never repeats a call",
     ] {
         assert!(primary.contains(said), "{said}: {primary}");
     }

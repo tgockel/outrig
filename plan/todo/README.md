@@ -106,7 +106,6 @@ phase.
 
 | Task      | What it settles                                     |
 | --------- | ----------------------------------------------------|
-| `0003-56` | An MCP call has three dispatch states               |
 | `0003-57` | An MCP service over HTTP                            |
 
 **Continuation**

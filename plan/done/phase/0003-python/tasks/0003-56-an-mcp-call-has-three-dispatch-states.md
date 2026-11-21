@@ -202,3 +202,108 @@ here.
 - `plan/phase/0003-python/lifecycle.md` -- "Closing a session", "The close table", "The report".
 - `plan/phase/0003-python/continuation.md` -- the disposition of open work (`0003-65`).
 - `crates/outrig/src/mcp.rs`, `error.rs`, `harness/session.rs`, `harness/report.rs`.
+
+## Decisions
+
+- **The user's calls (2026-11-21).**
+  - Forks 1 to 4 as recommended. A public `ServiceErrorCategory::Unknown` is recorded as the
+    outcome `unknown` for any service. A reconnect runs on the next call and on `reconnect()`,
+    never in the background. `ShutdownReport::mcp_uncertain` lists each call that ended may have
+    dispatched, and a non-empty list makes the verdict `stopped_with_unknown` -- unlike a
+    channel's `uncertain`, which leaves the verdict alone because its sender was told: a write a
+    server may have made stays uncertain through shutdown, whoever was told. `reconnect_max`
+    stays 3.
+  - `reconnect()` on a service whose transport is up does nothing and returns `None`. Forcing a
+    new transport would turn every call in flight into may have dispatched.
+  - A reconnect that fails refuses the call that asked for it, `unavailable`, known not
+    dispatched, and leaves the service disconnected. The next call or `reconnect()` tries again,
+    each try counted against `reconnect_max`. Once that is spent, the service is unavailable for
+    the session. Marking it unavailable at the first failure was the alternative.
+- **The bounded call is crate-private.** `McpClient::call_tool_within(name, arguments, deadline,
+  cancelled)` returns `McpCallFailure { state, source: McpSessionError, code }` on failure. The
+  state is decided by position:
+  - `send_request_with_option` failing, or the deadline or cancel firing during the send, is may
+    have dispatched, with no notice (no request id yet);
+  - a wait that fails, passes its deadline or is cancelled is may have dispatched;
+  - `McpError`, `UnexpectedResponse`, `InputRequiredRoundsExceeded` or a result of another type
+    is response received.
+
+  Any other rmcp variant, a new one included, is may have dispatched (`wait_state`, tested for
+  every variant 3.4.1 declares). On deadline or cancel the notice is sent and awaited (bounded
+  by `SHUTDOWN_GRACE`) before the call returns, so "the notice sent" is true when the report
+  says it; a dropped call still sends it from `CancelOnDrop`. `call_tool` keeps its signature,
+  errors and timeout message and calls the bounded form. No consumer needs the bounded form
+  public. `McpDispatchState` moved to `error.rs`, beside `McpFailureKind`, so the client does
+  not import the harness's events; `harness::event` re-exports it at the path it had.
+- **How an uncertain outcome crosses the trait.** Fork 1's public category, plus a crate-private
+  `McpEnd` on `ServiceError` for what only MCP says: `NotSent(reason)`, or `Sent { state,
+  failure }`. `End::failed` maps:
+  - `NotSent`: `cancelled` with the reason the table told the call, else `refused` for its
+    reason (`ServiceReason::Unavailable` is new; also `AdmissionClosed`, `Paused`, `Stopped`);
+  - the category `Unknown`, which a may-have-dispatched MCP call always carries: `unknown`, with
+    the told reason or none;
+  - everything else: `raised`.
+
+  `Table::end` fills an MCP call's `state` from its outcome where the service said none:
+  refused and cancelled are not dispatched, returned is response received, and unknown
+  (abandonment included) is may have dispatched. The answer line carries `state` and `failure`,
+  added in `answer()` rather than on the shared `Failed`, whose size clippy bounds.
+- **`Timeout` or `Canceled`** is read from which fired first in the bounded call: the deadline it
+  was given -- `cx.deadline()` -- or the token. A server's JSON-RPC error is `raised`:
+  `invalid_arguments` for -32602, `not_found` for -32601, `failed` otherwise, failure `protocol`.
+- **Uncertain calls are recorded where every call ends.** The service table's `end`, and the
+  report's seal of a dispatched MCP flight, push `McpUncertainCall { call, service, tool,
+  agent, failure, reason }`. `McpServices::uncertain()` reads that list, and the MCP table
+  keeps none of its own: a second record would have to be fed from the same funnel.
+- **Reconnect.**
+  - An entry's client became a `Link`: `Up`, `Down`, or `Closed` (stopped, closed, never
+    started). Unavailable is derived from `Down` and the spent count.
+  - A transport failure on the entry's current client (`Arc::ptr_eq`) sets `Down` and emits
+    `mcp.service.disconnected` once, however many calls the failure ends.
+  - The reconnect runs inside `McpService::call`, so a call whose service cannot be connected
+    again is dispatched to the service and `not_dispatched` to the server. The reference says to
+    read non-dispatch from `outcome` and `state`.
+  - It holds the entry's relisting lock, so a relist's and a reconnect's generations follow one
+    another, and the lock holds the count of reconnects tried. It runs as a control step under
+    the host's state lock: a quiesce waits for it, and it is refused while the host is paused
+    or stopped. Holding that lock serializes the reconnects of a shared sidecar's servers, a
+    cost kept so that no stop takes a container out from under a connect.
+  - It runs `establish`, the retry loop `start_one` now shares, over the entry's resolved
+    `Server`, within a fresh connect budget. Each try counts against `reconnect_max`, including
+    one cut off by its caller's cancel or by the close (`Services::closing()`).
+  - It relists through `Table::listed`, the tail it shares with a relist, whose announce emits
+    `mcp.service.reconnected` (with `undecoded`, as started and relisted have) before
+    `service.described`. It hears the new client's listing changes, and answers `reconnect()` as
+    a relist is answered.
+  - A failed reconnect emits nothing of its own: the refused call's `service.call.ended` carries
+    the cause.
+- **Placement by kind.**
+  - Exec in a sidecar: before a reconnect, never a start, `Placement::recover` asks podman
+    whether the held container still runs. One that is gone is stopped, proven gone and
+    detached, and the connect prepares a new one; one still running gets a new exec.
+  - Entrypoint: a new container, as every connect already makes.
+  - Command: a new exec in the primary.
+
+  A one-server sidecar -- `Host::alone` -- is restarted between failed attempts, as at start, but
+  not before the first, so an exec'd server whose transport alone failed is not taken down with
+  its container.
+- **The verdict.** `report::verdict` takes `mcp_uncertain`: a non-empty list is
+  `stopped_with_unknown`. Two `mcp_tests` that stop a call in flight now expect that verdict, and
+  the stop given up part-way waits on a slow container stop, since a stopped call now returns at
+  once.
+- **Python.** `outrig.McpError` gains `failure`. Under it are `NotDispatched` (`UnknownTool`,
+  `InvalidArguments`, `ServiceUnavailable`, `AdmissionClosed`, `Paused`), `MayHaveDispatched`
+  and `ResponseReceived` (`ProtocolError`, `ToolError`).
+
+  `_raised` picks the class:
+  - a refusal's class is chosen by its reason, so relist and reconnect refusals get one too;
+  - a server's error is a `ProtocolError`;
+  - otherwise the class follows the state.
+
+  A too-large result is `ResponseReceived`. `reconnect()` sends an `mcp.reconnect` line, routed
+  as `mcp.relist` is.
+- **The e2e is in the crate**, gated on `e2e`: no public API runs agent Python without a model.
+  It runs `mcp-fs` as a sidecar, `podman kill`s it, and checks the next call is may have
+  dispatched and the one after reconnects through a new container with the same tools. The
+  fixture has no slow tool, so the kill lands before the call, and the failed send is may have
+  dispatched by the same rule.

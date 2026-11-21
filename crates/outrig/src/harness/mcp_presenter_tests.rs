@@ -38,17 +38,17 @@ async fn toolboxed(
 }
 
 /// Calls of a few seconds, at most.
-fn calls() -> ServicePolicy {
+pub(super) fn calls() -> ServicePolicy {
     quick(Duration::from_secs(5))
 }
 
 /// A tool named `name`, taking what `schema` describes, as a server lists one.
-fn tool(name: &str, schema: Value) -> Value {
+pub(super) fn tool(name: &str, schema: Value) -> Value {
     json!({"name": name, "description": format!("The {name} tool."), "inputSchema": schema})
 }
 
 /// `{text: string}`, which the fake echoes.
-fn text() -> Value {
+pub(super) fn text() -> Value {
     json!({"type": "object", "properties": {"text": {"type": "string"}}})
 }
 
@@ -294,7 +294,7 @@ async fn a_large_result_is_filtered_in_python() {
              print(e.outcome, e.category, e.state, '1048576' in str(e), type(e).__name__)"
         )
         .await,
-        "returned result_too_large response_received True McpError\n"
+        "returned result_too_large response_received True ResponseReceived\n"
     );
     stop(session).await;
     let events = taken(&mut events);
@@ -555,7 +555,7 @@ help(fs)
         "{said}"
     );
     assert!(said.contains("ToolError: fs.fails (returned)"), "{said}");
-    assert!(said.contains("McpError: fs.missing (refused"), "{said}");
+    assert!(said.contains("UnknownTool: fs.missing (refused"), "{said}");
     assert!(!said.contains("sk-test"), "{said}");
     stop(session).await;
     let events = taken(&mut events);

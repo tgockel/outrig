@@ -276,6 +276,9 @@ pub enum Payload {
         channels: Vec<super::ChannelClose>,
         /// Each MCP service the session declared, and how it was stopped.
         mcp_services: Vec<super::McpServiceStop>,
+        /// Each call of an MCP service's tool that ended may have dispatched
+        /// during the session, in the order they ended.
+        mcp_uncertain: Vec<super::McpUncertainCall>,
         /// What the report adds up to.
         verdict: super::Verdict,
     },
@@ -1680,6 +1683,30 @@ pub enum Payload {
         /// The service.
         service: String,
     },
+    /// An MCP service's transport failed under a call: the next call, or a
+    /// reconnect agent code asks for, connects it again. The call keeps its
+    /// state, and nothing of it is sent again.
+    #[non_exhaustive]
+    McpServiceDisconnected {
+        /// The service.
+        service: String,
+        /// What failed.
+        cause: super::McpRetryCause,
+    },
+    /// An MCP service whose transport failed was connected again and its tools
+    /// listed. When the listing changed, its `service.described` follows.
+    #[non_exhaustive]
+    McpServiceReconnected {
+        /// The service.
+        service: String,
+        /// How many attempts it took.
+        attempts: u32,
+        /// The listing's generation now: the next one when anything changed,
+        /// else the one it had.
+        listing: u64,
+        /// The tools its server listed that did not decode, each left out.
+        undecoded: Vec<crate::McpUndecodedTool>,
+    },
 }
 
 impl Payload {
@@ -1776,6 +1803,8 @@ impl Payload {
             Payload::McpServiceStopped { .. } => "mcp.service.stopped",
             Payload::McpServiceRelisted { .. } => "mcp.service.relisted",
             Payload::McpServiceListChanged { .. } => "mcp.service.list.changed",
+            Payload::McpServiceDisconnected { .. } => "mcp.service.disconnected",
+            Payload::McpServiceReconnected { .. } => "mcp.service.reconnected",
             Payload::ChannelAttached { .. } => "channel.attached",
             Payload::ChannelConsumed { .. } => "channel.consumed",
             Payload::ChannelClosed { .. } => "channel.closed",
@@ -1815,7 +1844,9 @@ impl Payload {
             | Self::McpServiceResumed { .. }
             | Self::McpServiceStopped { .. }
             | Self::McpServiceRelisted { .. }
-            | Self::McpServiceListChanged { .. } => None,
+            | Self::McpServiceListChanged { .. }
+            | Self::McpServiceDisconnected { .. }
+            | Self::McpServiceReconnected { .. } => None,
             // An import is the agent's whose code made it, which may be none.
             Self::SkillImported { agent, .. } => agent.as_deref().map(Subject::agent),
             Self::HostedReceived { agent, .. }
@@ -2094,6 +2125,9 @@ pub enum ServiceReason {
     Paused,
     /// Its service was stopped.
     Stopped,
+    /// Its service could not be reached: an MCP service whose transport
+    /// failed, and whose reconnect failed or may not be made.
+    Unavailable,
 }
 
 /// What an MCP service's `service.call.received` adds: the tool, and the
@@ -2108,7 +2142,8 @@ pub struct McpCallReceived {
 }
 
 /// What an MCP service's `service.call.ended` adds: the tool, the listing,
-/// where in the call's flow it ended, and what the server's result held.
+/// where in the call's flow it ended, what failed, and what the server's
+/// result held.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct McpCallEnded {
@@ -2116,9 +2151,12 @@ pub struct McpCallEnded {
     pub tool: String,
     /// The listing the caller's method came from: the generation.
     pub listing: u64,
-    /// `response_received` when the server answered with a result, whether
-    /// or not its caller was given it; otherwise `None`.
+    /// Where in the call's flow it ended: what it says of whether the server
+    /// saw it. `None` only for a call whose service panicked.
     pub state: Option<McpDispatchState>,
+    /// What failed, for a call that ended may have dispatched or with an
+    /// error the server answered; otherwise `None`.
+    pub failure: Option<crate::error::McpFailureKind>,
     /// The server's own `isError`, for a result; otherwise `None`.
     pub is_error: Option<bool>,
     /// How many content blocks of each kind the result held, by the kind's
@@ -2128,15 +2166,7 @@ pub struct McpCallEnded {
     pub structured: Option<bool>,
 }
 
-/// Where in an MCP call's flow it ended: what it says of whether the server
-/// saw it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum McpDispatchState {
-    /// The server answered: its effects are as its answer says.
-    ResponseReceived,
-}
+pub use crate::error::McpDispatchState;
 
 /// The methods a service's new description added, removed and changed, each
 /// by exact name.

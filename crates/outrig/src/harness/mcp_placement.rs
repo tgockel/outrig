@@ -89,6 +89,13 @@ pub(crate) trait Placement: Send + Sync + 'static {
 
     /// Stop what the placement started, or say what was not proven stopped.
     fn stop(&self) -> BoxFuture<'_, std::result::Result<(), String>>;
+
+    /// Ready what the placement runs for a server whose transport failed to be
+    /// connected again, or say why it cannot be: before a reconnect, never a
+    /// start. Nothing, unless a placement can tell what it runs is gone.
+    fn recover(&self) -> BoxFuture<'_, std::result::Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// The primary container, where a `Command` server runs beside the
@@ -205,6 +212,15 @@ impl Sidecar {
         Ok(())
     }
 
+    /// What `failed`, the stops of its containers that failed, says.
+    fn said(&self, failed: &[OutrigError]) -> String {
+        failed
+            .iter()
+            .map(|e| format!("sidecar {:?}: {e}", self.name))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     /// Stop every container this placement holds -- `held`, and each an
     /// earlier stop could not -- each in place, so one stays held until its
     /// stop is proven: a stop that fails, or is dropped part-way, leaves it
@@ -318,19 +334,36 @@ impl Placement for Sidecar {
         })
     }
 
+    /// A container that is gone -- killed, its servers' transports with it --
+    /// is stopped as a held one is, which proves it gone and frees its name,
+    /// so the connect after starts a new one; a running one is left for the
+    /// connect to exec into.
+    fn recover(&self) -> BoxFuture<'_, std::result::Result<(), String>> {
+        Box::pin(async move {
+            let mut held = self.container.lock().await;
+            let Some(container) = held.as_ref() else {
+                return Ok(());
+            };
+            if Container::is_running(container.name())
+                .await
+                .unwrap_or(true)
+            {
+                return Ok(());
+            }
+            let mut abandoned = self.abandoned.lock().await;
+            self.stop_all(&mut held, &mut abandoned)
+                .await
+                .map_err(|failed| self.said(&failed))
+        })
+    }
+
     fn stop(&self) -> BoxFuture<'_, std::result::Result<(), String>> {
         Box::pin(async move {
             let mut held = self.container.lock().await;
             let mut abandoned = self.abandoned.lock().await;
             self.stop_all(&mut held, &mut abandoned)
                 .await
-                .map_err(|failed| {
-                    failed
-                        .iter()
-                        .map(|e| format!("sidecar {:?}: {e}", self.name))
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                })
+                .map_err(|failed| self.said(&failed))
         })
     }
 }
@@ -348,12 +381,13 @@ pub(crate) mod fake {
     use futures_util::future::BoxFuture;
     use rmcp::model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ClientNotification, ClientRequest,
-        ContentBlock, CustomResult, ErrorData, InitializeRequestParams, InitializeResult,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, ServerResult,
-        Tool,
+        ContentBlock, CustomResult, ErrorCode, ErrorData, InitializeRequestParams,
+        InitializeResult, ListToolsResult, PaginatedRequestParams, RequestId, ServerCapabilities,
+        ServerConfig, ServerResult, Tool,
     };
     use rmcp::service::{NotificationContext, RequestContext, RoleServer};
     use serde_json::Value;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
 
@@ -483,8 +517,14 @@ pub(crate) mod fake {
                     }
                     Behavior::Wedged => return std::future::pending().await,
                     Behavior::Toolbox(toolbox) => {
-                        return McpClient::handshake_in_memory(&server.name, Raw(toolbox), within)
-                            .await;
+                        let hang_up = toolbox.hang_up.clone();
+                        return McpClient::handshake_in_memory_until(
+                            &server.name,
+                            Raw(toolbox),
+                            within,
+                            hang_up,
+                        )
+                        .await;
                     }
                     Behavior::Unlisted => {
                         return McpClient::handshake_in_memory(&server.name, Unlisting, within)
@@ -612,10 +652,27 @@ pub(crate) mod fake {
         }
     }
 
+    /// What a call of one of a [`Toolbox`]'s tools does in place of
+    /// answering at once.
+    #[derive(Clone)]
+    pub(crate) enum Act {
+        /// Close its end of the transport on receipt, answering nothing: a
+        /// server whose process died with the request in hand.
+        HangUp,
+        /// Answer nothing until the client cancels the call.
+        Stall,
+        /// Answer after this long, cancelled or not.
+        After(Duration),
+        /// Answer with this JSON-RPC error code and message.
+        Fail(i32, &'static str),
+    }
+
     /// A server whose `tools/list` page and `tools/call` results are JSON a
     /// test sets, sent as they are -- what no typed server can send, such as a
     /// tool whose `inputSchema` is not an object. It records each call under
-    /// the name it was made by, and can tell its client its listing changed.
+    /// the name it was made by, and each cancel by the name of the call it
+    /// names; can tell its client its listing changed; and can make a tool
+    /// [`Act`] otherwise than answering.
     #[derive(Default)]
     pub(crate) struct Toolbox {
         /// The one page `tools/list` answers: `{"tools": [...]}`, and whatever
@@ -629,6 +686,15 @@ pub(crate) mod fake {
         peer: Mutex<Option<rmcp::Peer<RoleServer>>>,
         /// Whether the next `tools/list` is answered after announcing a change.
         announce: AtomicBool,
+        /// What a call of each tool does in place of answering at once.
+        acts: Mutex<HashMap<String, Act>>,
+        /// Each call's tool, by its request id, for the cancels that name it.
+        requests: Mutex<HashMap<RequestId, String>>,
+        /// Each `notifications/cancelled` the client sent, by the tool its
+        /// request called.
+        cancels: Mutex<Vec<String>>,
+        /// Cancelled to close its end of the transport.
+        pub(crate) hang_up: CancellationToken,
     }
 
     impl Toolbox {
@@ -655,6 +721,16 @@ pub(crate) mod fake {
                 .lock()
                 .unwrap()
                 .insert(tool.to_string(), result);
+        }
+
+        /// Make each call of `tool` do `act` in place of answering at once.
+        pub(crate) fn act(&self, tool: &str, act: Act) {
+            self.acts.lock().unwrap().insert(tool.to_string(), act);
+        }
+
+        /// The cancels the client sent, each by the tool its request called.
+        pub(crate) fn cancels(&self) -> Vec<String> {
+            self.cancels.lock().unwrap().clone()
         }
 
         /// The calls made, in order, each by the name it was made under.
@@ -728,6 +804,27 @@ pub(crate) mod fake {
                     let arguments = Value::Object(call.params.arguments.unwrap_or_default());
                     let text = arguments["text"].as_str().unwrap_or_default().to_string();
                     self.0.calls.lock().unwrap().push((name.clone(), arguments));
+                    self.0
+                        .requests
+                        .lock()
+                        .unwrap()
+                        .insert(context.id.clone(), name.clone());
+                    let act = self.0.acts.lock().unwrap().get(&name).cloned();
+                    match act {
+                        None => {}
+                        Some(Act::HangUp) => {
+                            self.0.hang_up.cancel();
+                            return std::future::pending().await;
+                        }
+                        Some(Act::Stall) => {
+                            context.ct.cancelled().await;
+                            return Err(ErrorData::internal_error("cancelled", None));
+                        }
+                        Some(Act::After(delay)) => tokio::time::sleep(delay).await,
+                        Some(Act::Fail(code, message)) => {
+                            return Err(ErrorData::new(ErrorCode(code), message, None));
+                        }
+                    }
                     let result = self.0.results.lock().unwrap().get(&name).cloned();
                     Ok(ServerResult::CustomResult(CustomResult(
                         result.unwrap_or_else(
@@ -744,6 +841,15 @@ pub(crate) mod fake {
             notification: ClientNotification,
             context: NotificationContext<RoleServer>,
         ) -> std::result::Result<(), ErrorData> {
+            if let ClientNotification::CancelledNotification(cancelled) = &notification {
+                let tool = cancelled
+                    .params
+                    .request_id
+                    .as_ref()
+                    .and_then(|id| self.0.requests.lock().unwrap().get(id).cloned())
+                    .unwrap_or_else(|| "an unknown request".to_string());
+                self.0.cancels.lock().unwrap().push(tool);
+            }
             rmcp::Service::handle_notification(&Plain, notification, context).await
         }
 

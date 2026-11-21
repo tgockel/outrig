@@ -111,11 +111,12 @@ repo or agent config can tighten it for a noisy project.
 `retry-budget-secs` is a default for every remote provider; a `[providers.<name>]` row that
 sets its own overrides it, which is usually the better place since rate limits are a property
 of the endpoint.
-`mcp-call-timeout-secs` is how long an MCP `tools/call` may run before outrig cancels it at the
-server and hands the model a timeout in place of a result -- 1 to 3600, default 600. It is the
+`mcp-call-timeout-secs` is how long an MCP `tools/call` may run before outrig stops waiting for
+it and hands the model a timeout in place of a result -- 1 to 3600, default 600. It is the
 default for every server in the session, sidecars and image-label servers included; a server's
 own [`call-timeout-secs`](#imagesnamemcp) overrides it, and in either file the repo value wins.
-The server is sent `notifications/cancelled`, which it may or may not act on.
+The server is sent `notifications/cancelled`, which is advisory: it may or may not act on it, so
+a timed-out call may still have done its work.
 `mcp-connect-budget-secs` is how long a session -- `outrig run-new`'s, or a host program's --
 gives each MCP server it places to start: every attempt, each bounded at two minutes, and every
 wait between them, together -- 1 to 3600, default 120. A failure that may pass is tried again
@@ -1497,8 +1498,9 @@ image, or declare any other MCP command that should run inside the container.
 
 - `call-timeout-secs` (integer, optional, default: the top-level
   [`mcp-call-timeout-secs`](#top-level), else `600`): how long one `tools/call` to this
-  server may run, 1 to 3600. Past it outrig sends the server `notifications/cancelled` and the
-  model gets a timeout error in place of a result. Any transport, any placement. For a server
+  server may run, 1 to 3600. Past it outrig sends the server `notifications/cancelled` -- which
+  asks it to stop and does not prove it did -- and the model gets a timeout error in place of a
+  result. Any transport, any placement. For a server
   whose tools run builds or test suites; `initialize` and `tools/list` are not affected -- they
   have a fixed 120-second bound each.
 

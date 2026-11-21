@@ -457,8 +457,8 @@ as a **service**: an object agent code reaches as `outrig.bindings[name]`, and a
 name where it is free, with a method per tool by the tool's exact name. Every call is checked
 against the tool's schema, held to a deadline, recorded as `service.call.*` events with
 `kind: "mcp"`, and listed in the shutdown report when the close ends it, as any service's call is.
-A call still running once its deadline and the grace after it are out ends `unknown`, its server
-sent `notifications/cancelled`: the server may have done the work.
+A call past its deadline, interrupted, or cut off by the close or a stop sends its server
+`notifications/cancelled` and ends at once, `unknown`: the server may have done the work.
 
 A server comes from one of three places: the configuration's `[images.<name>.mcp]` entries and the
 sidecar blocks they name, and the image's `org.outrig.mcp` label under `[repo] env-allow`, as
@@ -544,10 +544,48 @@ r.text             # the blocks as one string -- a lossy view
 
 Agent code filters a large result in Python and prints what it needs: what the model sees is
 what the code prints, never the result itself. A result the server marks as an error raises
-`outrig.ToolError`, carrying it, and a call that returns no result `outrig.McpError`, an
-`outrig.ServiceError`. A result larger than the session's bound -- 64 MiB of JSON, or the
-top-level `service-result-max-bytes` -- is not handed over: the call raises, and its event says it
-returned, since the server did the work. OutRig never calls a tool again.
+`outrig.ToolError`, carrying it. A result larger than the session's bound -- 64 MiB of JSON, or
+the top-level `service-result-max-bytes` -- is not handed over: the call raises, and its event
+says it returned, since the server did the work. OutRig never calls a tool again.
+
+**Did it happen?** A call that returns no result raises an `outrig.McpError`, an
+`outrig.ServiceError`, whose `state` is decided by where in the call it ended, never guessed from
+what failed:
+
+- `not_dispatched`, raised as `outrig.NotDispatched` -- nothing reached the server, so nothing
+  happened.
+- `may_have_dispatched`, raised as `outrig.MayHaveDispatched` -- the request was handed over and
+  no answer was read, so the server may have done it.
+- `response_received`, raised as `outrig.ResponseReceived` -- the server answered, and its answer
+  is what happened.
+
+A call refused before it was sent is `NotDispatched` -- `UnknownTool`, `InvalidArguments`,
+`ServiceUnavailable`, `AdmissionClosed` or `Paused`. One whose transport failed, whose deadline
+passed, or that was interrupted or cut off by the close is `MayHaveDispatched`, with `failure`
+saying which -- `transport`, `timeout`, `canceled` -- since a failed write does not prove the
+server saw nothing. An error the server answers is a `ProtocolError`, and a `ToolError` is a
+`ResponseReceived` too. `except outrig.MayHaveDispatched:` is the spelling that keeps a write
+from being repeated before checking whether it happened.
+
+**Deadlines and cancellation.** A call's deadline is the service's `call-timeout-secs` -- a
+builder's `with_call_timeout_secs`, a program's `call_timeout_secs` -- else the session's service
+policy's ten minutes, and `timeout=` on a call lowers it, never raises it. Past it, or when its
+caller is interrupted, the call ends at once and its server is sent `notifications/cancelled`,
+which asks it to stop and does not prove it did: a timeout stops the wait, not the server, and its
+late answer is discarded. A call made in an `asyncio.to_thread` worker is not reached by an
+interrupt, and ends at its deadline.
+
+**A server whose transport fails** is connected again for the calls after it, never for the call
+that failed, which stays `MayHaveDispatched` and is never sent again. The next call -- or
+`fs.reconnect()`, without a call -- places it again as it was placed at the start: a new exec in
+its sidecar, a new sidecar when its container is gone, a new entrypoint container, or a new exec
+in the session's container. Its `${VAR}` values are those resolved at the start, never resolved
+again; its tools are listed again, and a change is announced as a relist's is. It is tried within
+the connect budget, as a start is; one that fails refuses the call that asked for it,
+`ServiceUnavailable`, and the next call tries again, up to three reconnects a session (a Rust
+owner's `McpPolicy::with_reconnect_max`), after which the service is unavailable. No reconnect is
+made once the session is closing. The server the failed transport spoke to may still run until
+its container stops, and it is still listed among the writers.
 
 The tools are the server's listing as it started. `fs.relist()` asks the server again: a tool it
 added is a method from then on, one it removed is refused when called, and a method or tool
@@ -560,7 +598,12 @@ stopped, a paused one thawed first, one a stop left unproven stopped again -- a 
 started included, when its container ran; a command placement ends with the session's container,
 and is proven stopped only once that is -- one that did not start too, when an attempt ran it.
 The shutdown report's `mcp_services` lists each, with how it was stopped and whether that was
-proven.
+proven. A call in flight at the close drains to its deadline, and is then sent the cancel and
+ends `unknown`, may have dispatched; one waiting for its server to be connected again is refused.
+`mcp_uncertain` lists every call that ended may have dispatched in the session -- by call,
+service, tool and agent -- and one makes the report's verdict `stopped_with_unknown`: its server
+may have done what it asked. A Rust owner reads the same list at any time from
+`Session::mcp().uncertain()`.
 
 ## Dynamic addition
 
@@ -719,15 +762,20 @@ picked up promptly on the next session.
 ## What if a server crashes mid-session?
 
 A crashed MCP server is surfaced as a tool-call error to the LLM, which usually causes the model
-to stop calling that tool and tell you about the failure. outrig does not auto-restart MCP servers
-in v0 -- the server is gone for the rest of the session.
+to stop calling that tool and tell you about the failure. `outrig run` does not restart MCP
+servers -- the server is gone for the rest of the session.
+
+In a session (`run-new`, a host program, `SessionBuilder`), the call the crash ended raises
+`outrig.MayHaveDispatched`, its failure the transport, and the next call connects the server
+again, as [In a session](#in-a-session-mcp-services) says; nothing is sent again.
 
 A sidecar container that dies mid-session behaves the same way, uniformly and regardless of its
 `on-failure` setting: outrig logs the death to stderr, every tool the sidecar hosted returns
 errors, and nothing restarts. If the *primary* container dies out from under outrig (a manual
 `podman kill`, the OOM killer), outrig reaps every sidecar and ends the session with an error.
 
-> **TODO: Incomplete** -- auto-restart and per-server health-checking are deferred.
+> **TODO: Incomplete** -- for `outrig run`, auto-restart and per-server health-checking are
+> deferred.
 
 The server's stderr, captured to `<session_dir>/logs/<server>.stderr`, usually has the actual
 error. See [Sessions](https://tgockel.github.io/outrig/usage/sessions.html) for how to view it.
@@ -755,6 +803,10 @@ bounded wait rather than the session:
 A call outrig stops waiting for early is cancelled the same way: one in a turn interrupted with
 Ctrl-C, or one whose `outrig mcp` client sent its own cancel. Cancellation is advisory -- the MCP
 spec lets a server finish the work anyway -- so a tool with side effects may still complete them.
+
+In a session, a call past its deadline or interrupted raises `outrig.MayHaveDispatched`, its
+failure `timeout` or `canceled`, as soon as its server is sent the cancel; the server stays
+connected.
 
 Raise `call-timeout-secs` on a server whose tools legitimately run long, such as a build or a
 test suite, rather than the session-wide default; see

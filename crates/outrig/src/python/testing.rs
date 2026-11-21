@@ -36,6 +36,18 @@ pub(crate) async fn within<F: Future>(step: F) -> F::Output {
         .unwrap_or_else(|_| panic!("a step took longer than {TIMEOUT:?}"))
 }
 
+/// Wait until `done` holds -- `what` -- polling, and failing once [`TIMEOUT`]
+/// has passed rather than hanging.
+pub(crate) async fn until(what: &str, done: impl Fn() -> bool) {
+    let waited = tokio::time::timeout(TIMEOUT, async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "{what} never came");
+}
+
 /// Wait for the slot an execution nobody was waiting for held to come back,
 /// polling, since nothing on the host announces it.
 pub(crate) async fn slot_freed(interpreter: &Interpreter) {
