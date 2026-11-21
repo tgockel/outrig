@@ -228,3 +228,52 @@ async fn ignored_sessions_with_unwritten_or_unresolvable_aliases_reach_startup()
         );
     }
 }
+
+/// #996: a file-shaped registry entry ignored by `/roots/*` would still be
+/// hashed through an admitted alias to its parent. Refuse before writing it.
+#[tokio::test]
+async fn ignored_registry_entry_reached_through_parent_alias_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let agents = repo.join(".agents/outrig");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("config.toml"),
+        "default-image = \"tool\"\n[images.tool]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "/roots/*\n").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::os::unix::fs::symlink("roots", repo.join("alias")).unwrap();
+    let global = tmp.path().join("global.toml");
+    std::fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+    let external = tmp.path().join("external-session");
+    let root = repo.join("roots");
+    let (ok, stderr) = run_outrig(
+        &repo,
+        &[
+            "--global-config",
+            utf8(&global),
+            "--session-root",
+            utf8(&root),
+            "run",
+            "--session-dir",
+            utf8(&external),
+        ],
+    )
+    .await;
+    assert!(!ok, "{stderr}");
+    assert!(stderr.contains("is reached by symlink"), "{stderr}");
+    assert!(stderr.contains(utf8(&repo.join("alias"))), "{stderr}");
+    assert!(!stderr.contains("computing image tag"), "{stderr}");
+    assert!(!root.exists(), "probe left registry behind");
+    assert!(!external.exists(), "session record was created");
+}
