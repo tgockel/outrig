@@ -1840,6 +1840,110 @@ async fn refuse_session_dir_allows_a_gitignored_directory() {
         .expect("a gitignored directory is excluded from the context, not a conflict");
 }
 
+/// #999: excluding a session path can leave the tree with no admitted input.
+/// The first refusal must explain both steps of the remedy, before the user
+/// adds the ignore rule and hits the whole-tree fallback on retry.
+#[tokio::test]
+async fn session_path_ignore_remedy_mentions_non_ignored_input_before_retry() {
+    let ctx = make_ctx(&[]);
+    git_init(ctx.path());
+    let root = std::fs::canonicalize(ctx.path()).unwrap();
+    std::fs::write(root.join("Dockerfile"), "FROM alpine\n").unwrap();
+    // The only unignored paths are the future session directory and registry entry.
+    std::fs::write(
+        root.join(".gitignore"),
+        "*\n!sessions/\n!sessions/**\n!registry/\n!registry/**\n",
+    )
+    .unwrap();
+    let cfg = session_dir_test_cfg(&root);
+    let dir = root.join("sessions/auto123");
+    let entry = root.join("registry/auto123");
+    assert_not_ignored(&root, "sessions/auto123");
+    assert_not_ignored(&root, "registry/auto123");
+
+    let err = refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .expect_err("unignored session directory must be refused");
+    assert!(matches!(
+        err,
+        OutrigError::SessionDirInBuildContext {
+            whole_tree: false,
+            ..
+        }
+    ));
+    let message = err.to_string();
+    assert!(message.contains("add it to .gitignore"), "{message}");
+    assert!(message.contains("retain a non-ignored input"), "{message}");
+
+    let err = super::refuse_session_registry_entry_in_build_context(
+        "tool",
+        &cfg,
+        Path::new("/"),
+        &entry,
+        &entry,
+    )
+    .await
+    .expect_err("unignored registry entry must be refused");
+    assert!(matches!(
+        err,
+        OutrigError::SessionRegistryEntryInBuildContext {
+            whole_tree: false,
+            ..
+        }
+    ));
+    let message = err.to_string();
+    assert!(
+        message.contains("file-shaped entries in .gitignore"),
+        "{message}"
+    );
+    assert!(message.contains("retain a non-ignored input"), "{message}");
+
+    // Following only the ignore advice still fails, with the whole-tree reason.
+    std::fs::write(root.join(".gitignore"), "*\n").unwrap();
+    let err = refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .expect_err("all-ignored context hashes the whole tree");
+    assert!(matches!(
+        err,
+        OutrigError::SessionDirInBuildContext {
+            whole_tree: true,
+            ..
+        }
+    ));
+    let err = super::refuse_session_registry_entry_in_build_context(
+        "tool",
+        &cfg,
+        Path::new("/"),
+        &entry,
+        &entry,
+    )
+    .await
+    .expect_err("all-ignored context hashes the whole tree");
+    assert!(matches!(
+        err,
+        OutrigError::SessionRegistryEntryInBuildContext {
+            whole_tree: true,
+            ..
+        }
+    ));
+
+    // Following the complete advice allows both paths to be excluded.
+    std::fs::write(root.join(".gitignore"), "*\n!keep\n").unwrap();
+    std::fs::write(root.join("keep"), "context input").unwrap();
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+        .await
+        .expect("ignored session directory with a surviving input is safe");
+    super::refuse_session_registry_entry_in_build_context(
+        "tool",
+        &cfg,
+        Path::new("/"),
+        &entry,
+        &entry,
+    )
+    .await
+    .expect("ignored registry entry with a surviving input is safe");
+}
+
 /// #920: ignore matches do not exclude session writes when the hasher
 /// falls back to the whole tree. This applies at the context root and at
 /// nested repository boundaries, and to file-shaped registry entries too.

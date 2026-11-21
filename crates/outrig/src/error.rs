@@ -222,7 +222,8 @@ pub enum OutrigError {
         remedy = if *whole_tree {
             "retain a non-ignored input in the affected context tree so ignore rules apply"
         } else {
-            "add it to .gitignore"
+            "add it to .gitignore and retain a non-ignored input in the affected context tree \
+             so ignore rules apply"
         }
     )]
     #[non_exhaustive]
@@ -251,7 +252,8 @@ pub enum OutrigError {
             "retain a non-ignored input in the affected context tree so ignore rules apply"
         } else {
             "ignore its file-shaped entries in .gitignore (a directory-only rule does not \
-             exclude registry symlinks)"
+             exclude registry symlinks) and retain a non-ignored input in the affected context \
+             tree so ignore rules apply"
         }
     )]
     #[non_exhaustive]
