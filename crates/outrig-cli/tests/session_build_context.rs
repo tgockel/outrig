@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{GLOBAL_WITH_MODEL, run_outrig, utf8};
+use common::{GLOBAL_WITH_MODEL, run_outrig, run_outrig_with_env, utf8};
 
 #[tokio::test]
 async fn external_session_checks_the_registry_entry_before_creation() {
@@ -276,4 +276,331 @@ async fn ignored_registry_entry_reached_through_parent_alias_is_refused() {
     assert!(!stderr.contains("computing image tag"), "{stderr}");
     assert!(!root.exists(), "probe left registry behind");
     assert!(!external.exists(), "session record was created");
+}
+
+/// #1002: the first auto session creates a formerly absent, unignored root.
+/// It must be present before the tag is computed, not appear between keying
+/// and the pre-build rehash. The stub buildah refuses the build itself.
+#[tokio::test]
+async fn absent_unignored_session_root_reaches_build_on_cache_miss() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let agents = repo.join(".agents/outrig");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("config.toml"),
+        "default-image = \"tool\"\n[images.tool]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "/sessions/*\n").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let global = tmp.path().join("global.toml");
+    std::fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+    let root = repo.join("sessions");
+    assert!(!root.exists());
+    let (ok, stderr) = run_outrig(
+        &repo,
+        &[
+            "--global-config",
+            utf8(&global),
+            "--session-root",
+            utf8(&root),
+            "run",
+        ],
+    )
+    .await;
+    assert!(!ok, "stub buildah must stop this launch: {stderr}");
+    assert!(stderr.contains("ensuring image"), "{stderr}");
+    assert!(
+        stderr.contains("buildah"),
+        "must reach stub buildah: {stderr}"
+    );
+    assert!(!stderr.contains("BuildContextChanged"), "{stderr}");
+    assert!(root.is_dir());
+}
+
+/// Git can list from the context root while discovery from cache/ is blocked
+/// by GIT_CEILING_DIRECTORIES. The hasher must classify the ignored subdir
+/// from the same root and must not key its contents or mode.
+#[tokio::test]
+async fn ignored_subdirectory_stays_excluded_under_git_ceiling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let agents = repo.join(".agents/outrig");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("config.toml"),
+        "default-image = \"tool\"\n[images.tool]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "/cache/sub/\n").unwrap();
+    std::fs::create_dir(repo.join("cache")).unwrap();
+    std::fs::write(repo.join("cache/keep"), "keep").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args(["-C", utf8(&repo), "add", "cache/keep"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let global = tmp.path().join("global.toml");
+    std::fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+    let root = tmp.path().join("sessions");
+    let args = &[
+        "--global-config",
+        utf8(&global),
+        "--session-root",
+        utf8(&root),
+        "run",
+    ];
+    let env = [("GIT_CEILING_DIRECTORIES", repo.as_path())];
+    let run = || run_outrig_with_env(&repo, args, &env);
+    let (ok, before) = run().await;
+    assert!(!ok && before.contains("buildah"), "{before}");
+    std::fs::create_dir(repo.join("cache/sub")).unwrap();
+    std::fs::write(repo.join("cache/sub/file"), "data").unwrap();
+    let (ok, after) = run().await;
+    assert!(!ok && after.contains("buildah"), "{after}");
+    let tag = |text: &str| {
+        text.lines()
+            .find_map(|line| line.split("image tag computed: ").nth(1))
+            .expect("computed tag")
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(tag(&before), tag(&after));
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(repo.join("cache/sub"))
+            .unwrap()
+            .permissions(),
+    );
+    std::fs::set_permissions(
+        repo.join("cache/sub"),
+        std::os::unix::fs::PermissionsExt::from_mode(mode ^ 0o010),
+    )
+    .unwrap();
+    let (_, changed) = run().await;
+    assert_eq!(tag(&before), tag(&changed));
+}
+
+/// A warm or cold tag lookup uses one bulk ignore query per tree, not one
+/// subprocess per ignored directory left by earlier sessions.
+#[tokio::test]
+async fn ignore_query_count_does_not_grow_with_session_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let agents = repo.join(".agents/outrig");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("config.toml"),
+        "default-image = \"tool\"\n[images.tool]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "/sessions/*\n").unwrap();
+    std::fs::create_dir(repo.join("sessions")).unwrap();
+    std::fs::create_dir(repo.join("sessions/old-initial")).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let global = tmp.path().join("global.toml");
+    std::fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+    let root = tmp.path().join("external-sessions");
+    let trace = tmp.path().join("git-trace.json");
+    let args = &[
+        "--global-config",
+        utf8(&global),
+        "--session-root",
+        utf8(&root),
+        "run",
+    ];
+    let env = [("GIT_TRACE2_EVENT", trace.as_path())];
+    let run = || run_outrig_with_env(&repo, args, &env);
+    let count = || {
+        std::fs::read_to_string(&trace)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("\"argv\"") && line.contains("--stdin"))
+            .count()
+    };
+    let (_, before) = run().await;
+    assert!(before.contains("buildah"), "{before}");
+    let one = count();
+    assert!(one > 0);
+    for i in 0..40 {
+        std::fs::create_dir(repo.join(format!("sessions/old-{i}"))).unwrap();
+    }
+    let (_, after) = run().await;
+    assert!(after.contains("buildah"), "{after}");
+    assert_eq!(
+        count() - one,
+        one,
+        "ignored siblings must not add Git probes"
+    );
+}
+
+/// #1002: an ignored explicit session may have an absent unignored parent in
+/// the context. Create only that parent before keying, not the claimed leaf.
+#[tokio::test]
+async fn absent_explicit_session_parent_reaches_build_on_cache_miss() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let agents = repo.join(".agents/outrig");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("config.toml"),
+        "default-image = \"tool\"\n[images.tool]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "/sessions/*\n").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let global = tmp.path().join("global.toml");
+    std::fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+    let root = tmp.path().join("registry");
+    let explicit = repo.join("sessions/new");
+    assert!(!explicit.parent().unwrap().exists());
+    let (ok, stderr) = run_outrig(
+        &repo,
+        &[
+            "--global-config",
+            utf8(&global),
+            "--session-root",
+            utf8(&root),
+            "run",
+            "--session-dir",
+            utf8(&explicit),
+        ],
+    )
+    .await;
+    assert!(!ok && stderr.contains("buildah"), "{stderr}");
+    assert!(!stderr.contains("BuildContextChanged"), "{stderr}");
+    assert!(explicit.join("session.json").exists());
+}
+
+/// A registry spelling can traverse an initially absent unignored prefix
+/// before `..` resolves it inside the ignored explicit session directory.
+#[tokio::test]
+async fn lexical_registry_prefixes_exist_before_tag_computation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let agents = repo.join(".agents/outrig");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("config.toml"),
+        "default-image = \"tool\"\n[images.tool]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "/sessions/*\n/staging/*\n").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let global = tmp.path().join("global.toml");
+    std::fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+    let explicit = repo.join("sessions/new");
+    let root = repo.join("staging/transit/../../sessions/new/registry");
+    assert!(!repo.join("staging").exists());
+    assert!(!repo.join("sessions").exists());
+    let (ok, stderr) = run_outrig(
+        &repo,
+        &[
+            "--global-config",
+            utf8(&global),
+            "--session-root",
+            utf8(&root),
+            "run",
+            "--session-dir",
+            utf8(&explicit),
+        ],
+    )
+    .await;
+    assert!(!ok && stderr.contains("buildah"), "{stderr}");
+    assert!(!stderr.contains("BuildContextChanged"), "{stderr}");
+    assert!(repo.join("staging").is_dir());
+    assert!(explicit.join("session.json").exists());
+}
+
+/// Preparing a registry under an empty explicit directory would make the
+/// store reject that directory as nonempty before claiming it.
+#[tokio::test]
+async fn registry_under_explicit_directory_does_not_preempt_emptiness_check() {
+    for (existing, lexical) in [(false, false), (true, false), (false, true), (true, true)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let agents = repo.join(".agents/outrig");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("config.toml"),
+            "default-image = \"tool\"\n[images.tool]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n",
+        ).unwrap();
+        std::fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+        let global = tmp.path().join("global.toml");
+        std::fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+        let explicit = if lexical {
+            tmp.path().join("run/new")
+        } else {
+            tmp.path().join("run")
+        };
+        if existing {
+            std::fs::create_dir_all(&explicit).unwrap();
+        }
+        let root = if lexical {
+            explicit.join("inner/../../new/registry")
+        } else {
+            explicit.join("registry")
+        };
+        let (ok, stderr) = run_outrig(
+            &repo,
+            &[
+                "--global-config",
+                utf8(&global),
+                "--session-root",
+                utf8(&root),
+                "run",
+                "--session-dir",
+                utf8(&explicit),
+            ],
+        )
+        .await;
+        assert!(!ok && stderr.contains("buildah"), "{stderr}");
+        assert!(!stderr.contains("not empty"), "{stderr}");
+        assert!(explicit.join("session.json").exists());
+    }
 }

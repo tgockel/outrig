@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Session startup prepares absent, unignored session-root and explicit-session parent directories
+  before computing a build tag, without making an explicit directory nonempty by creating its
+  registry prematurely. Logical external prefixes traversed through `..` are also prepared
+  before keying without creating contents inside the explicit directory.
+  First launches no longer reject their own cache misses. (#1002)
+
 - Direct `outrig build`, including `--all`, now cancels on SIGINT, SIGTERM, and SIGHUP
   through the build cleanup path, allowing buildah to unwind and removing the temporary
   tag instead of exiting without running destructors. Runtime shutdown no longer waits

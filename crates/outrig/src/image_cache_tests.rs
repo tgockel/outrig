@@ -729,6 +729,540 @@ async fn an_ignored_directory_does_not_count() {
     );
 }
 
+/// Git's index can supply an ignore rule from a skip-worktree .gitignore
+/// absent on disk. The directory exclusion must match ls-files even though
+/// the worktree-only check-ignore probe cannot see that rule.
+#[tokio::test]
+async fn indexed_skip_worktree_ignore_excludes_directory_modes() {
+    let ctx = copy_all_ctx(&[
+        (".gitignore", "/build/\n/cache\\*/\n"),
+        ("cache-one", "tracked"),
+    ]);
+    git(
+        ctx.path(),
+        &["update-index", "--skip-worktree", ".gitignore"],
+    );
+    std::fs::remove_file(ctx.path().join(".gitignore")).unwrap();
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+
+    let sub = ctx.path().join("build/sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("generated"), "first").unwrap();
+    assert_eq!(before, key(&dockerfile, &args, ctx.path()).await);
+    chmod_directory(&sub);
+    std::fs::create_dir(sub.join("another")).unwrap();
+    assert_eq!(before, key(&dockerfile, &args, ctx.path()).await);
+
+    let literal = ctx.path().join("cache*");
+    std::fs::create_dir(&literal).unwrap();
+    std::fs::write(literal.join("output"), "generated").unwrap();
+    assert_eq!(before, key(&dockerfile, &args, ctx.path()).await);
+    chmod_directory(&literal);
+    assert_eq!(before, key(&dockerfile, &args, ctx.path()).await);
+}
+
+/// The source-discovery query runs under the same -C directory as the
+/// context listing, so a relative GIT_DIR remains anchored correctly.
+#[tokio::test]
+async fn relative_git_dir_does_not_break_ignore_source_discovery() {
+    const FIXTURE: &str = "OUTRIG_RELATIVE_GIT_DIR_FIXTURE";
+    if let Some(root) = std::env::var_os(FIXTURE) {
+        let ctx = Path::new(&root).join("ctx");
+        let before = key(&ctx.join("Dockerfile"), &BTreeMap::new(), &ctx).await;
+        chmod_directory(&ctx.join("build/sub"));
+        assert_eq!(
+            before,
+            key(&ctx.join("Dockerfile"), &BTreeMap::new(), &ctx).await
+        );
+        return;
+    }
+    for missing in [false, true] {
+        let repo = make_ctx(&[
+            ("ctx/.gitignore", "/build/\n"),
+            ("ctx/Dockerfile", "FROM scratch\n"),
+        ]);
+        git_init(repo.path());
+        if missing {
+            git(
+                repo.path(),
+                &["update-index", "--skip-worktree", "ctx/.gitignore"],
+            );
+            std::fs::remove_file(repo.path().join("ctx/.gitignore")).unwrap();
+        }
+        std::fs::create_dir_all(repo.path().join("ctx/build/sub")).unwrap();
+        std::fs::write(repo.path().join("ctx/build/sub/output"), "ignored").unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "image::image_cache_tests::relative_git_dir_does_not_break_ignore_source_discovery",
+            ])
+            .env(FIXTURE, repo.path())
+            .env("GIT_DIR", "../.git")
+            .env("GIT_WORK_TREE", repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "missing: {missing}, stdout: {}, stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Synthetic source-discovery pathspecs must ignore inherited pathspec modes.
+#[tokio::test]
+async fn inherited_pathspec_modes_do_not_hide_indexed_ignore_sources() {
+    const FIXTURE: &str = "OUTRIG_PATHSPEC_MODE_FIXTURE";
+    if let Some(root) = std::env::var_os(FIXTURE) {
+        let ctx = Path::new(&root).join("ctx");
+        let before = key(&ctx.join("Dockerfile"), &BTreeMap::new(), &ctx).await;
+        chmod_directory(&ctx.join("build/sub"));
+        assert_eq!(
+            before,
+            key(&ctx.join("Dockerfile"), &BTreeMap::new(), &ctx).await
+        );
+        return;
+    }
+    for mode in [
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+    ] {
+        let repo = make_ctx(&[
+            ("ctx/.gitignore", "/build/\n"),
+            ("ctx/Dockerfile", "FROM scratch\n"),
+        ]);
+        git_init(repo.path());
+        git(
+            repo.path(),
+            &["update-index", "--skip-worktree", "ctx/.gitignore"],
+        );
+        std::fs::remove_file(repo.path().join("ctx/.gitignore")).unwrap();
+        std::fs::create_dir_all(repo.path().join("ctx/build/sub")).unwrap();
+        std::fs::write(repo.path().join("ctx/build/sub/output"), "ignored").unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "image::image_cache_tests::inherited_pathspec_modes_do_not_hide_indexed_ignore_sources"])
+            .env(FIXTURE, repo.path())
+            .env(mode, "1")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}: stdout: {}, stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// A scratch index must not use the repository's split-index settings:
+/// expiry of its new shared base could remove the active index's base.
+#[tokio::test]
+async fn ignore_classification_does_not_expire_the_active_split_index() {
+    let ctx = copy_all_ctx(&[(".gitignore", "/build/\n")]);
+    git(ctx.path(), &["config", "core.splitIndex", "true"]);
+    git(
+        ctx.path(),
+        &["config", "splitIndex.sharedIndexExpire", "now"],
+    );
+    git(
+        ctx.path(),
+        &["update-index", "--skip-worktree", ".gitignore"],
+    );
+    git(ctx.path(), &["update-index", "--split-index"]);
+    std::fs::remove_file(ctx.path().join(".gitignore")).unwrap();
+    std::fs::create_dir(ctx.path().join("build")).unwrap();
+    let dockerfile = ctx.path().join("Dockerfile");
+    key(&dockerfile, &BTreeMap::new(), ctx.path()).await;
+    let listing = Command::new("git")
+        .current_dir(ctx.path())
+        .args(["ls-files", "--cached"])
+        .output()
+        .unwrap();
+    assert!(
+        listing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    assert!(String::from_utf8_lossy(&listing.stdout).contains("Dockerfile"));
+}
+
+/// A missing indexed ignore file can negate an info/exclude directory rule.
+/// Using the two sources together must retain the parent while still omitting
+/// its ignored children; unioning a no-index answer would drop the parent.
+#[tokio::test]
+async fn indexed_negation_keeps_parent_of_ignored_children() {
+    let ctx = copy_all_ctx(&[(".gitignore", "!/keep/\n/keep/*\n")]);
+    git(
+        ctx.path(),
+        &["update-index", "--skip-worktree", ".gitignore"],
+    );
+    std::fs::remove_file(ctx.path().join(".gitignore")).unwrap();
+    std::fs::write(ctx.path().join(".git/info/exclude"), "/keep/\n").unwrap();
+    let keep = ctx.path().join("keep");
+    std::fs::create_dir(&keep).unwrap();
+    let dockerfile = ctx.path().join("Dockerfile");
+    let before = key(&dockerfile, &BTreeMap::new(), ctx.path()).await;
+    std::fs::create_dir(keep.join("child")).unwrap();
+    assert_eq!(before, key(&dockerfile, &BTreeMap::new(), ctx.path()).await);
+    chmod_directory(&keep);
+    assert_ne!(before, key(&dockerfile, &BTreeMap::new(), ctx.path()).await);
+}
+
+/// Thousands of tracked paths must not be re-matched for every unignored
+/// parent that contains only ignored children. Ordinary on-disk rules need
+/// no temporary index at all, even when many parents remain after a walk.
+#[tokio::test]
+async fn many_unignored_parents_do_not_query_the_full_index_per_directory() {
+    use std::io::Write as _;
+    let ctx = copy_all_ctx(&[(".gitignore", "/parents/*/artifact/\n")]);
+    let oid = Command::new("git")
+        .current_dir(ctx.path())
+        .args(["hash-object", "-w", "Dockerfile"])
+        .output()
+        .unwrap();
+    assert!(oid.status.success());
+    let oid = String::from_utf8(oid.stdout).unwrap();
+    let oid = oid.trim();
+    let mut index = Command::new("git")
+        .current_dir(ctx.path())
+        .args(["update-index", "--index-info"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = index.stdin.take().unwrap();
+        for i in 0..2_000 {
+            writeln!(stdin, "100644 {oid} 0\ttracked/entry-{i:05}").unwrap();
+        }
+    }
+    assert!(index.wait().unwrap().success());
+    assert!(
+        super::missing_ignore_sources(ctx.path(), &[b"parents".to_vec()])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let parents = ctx.path().join("parents");
+    for i in 0..80 {
+        std::fs::create_dir_all(parents.join(format!("dir-{i}"))).unwrap();
+    }
+    let dockerfile = ctx.path().join("Dockerfile");
+    let before = key(&dockerfile, &BTreeMap::new(), ctx.path()).await;
+    for i in 0..80 {
+        std::fs::create_dir_all(parents.join(format!("dir-{i}/artifact"))).unwrap();
+    }
+    assert_eq!(before, key(&dockerfile, &BTreeMap::new(), ctx.path()).await);
+}
+
+/// Even the root ignore source in a sparse index matches a literal
+/// wildcard-looking directory as a tracked pathspec. Evaluate the exact
+/// directory against the complete rule set without any indexed-path gate.
+#[tokio::test]
+async fn missing_root_ignore_does_not_hide_literal_dot_directories() {
+    let ctx = copy_all_ctx(&[(".gitignore", "/.\\*/\n/.gitignore\\*/\n")]);
+    git(
+        ctx.path(),
+        &["update-index", "--skip-worktree", ".gitignore"],
+    );
+    std::fs::remove_file(ctx.path().join(".gitignore")).unwrap();
+    let dockerfile = ctx.path().join("Dockerfile");
+    let before = key(&dockerfile, &BTreeMap::new(), ctx.path()).await;
+    for name in [".*", ".gitignore*"] {
+        let literal = ctx.path().join(name);
+        std::fs::create_dir(&literal).unwrap();
+        std::fs::write(literal.join("output"), "generated").unwrap();
+        let sources = super::missing_ignore_sources(ctx.path(), &[name.as_bytes().to_vec()])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            super::check_literal_directory(ctx.path(), &sources, name.as_bytes())
+                .await
+                .unwrap(),
+            "{name}"
+        );
+        assert_eq!(before, key(&dockerfile, &BTreeMap::new(), ctx.path()).await);
+        chmod_directory(&literal);
+        assert_eq!(before, key(&dockerfile, &BTreeMap::new(), ctx.path()).await);
+    }
+}
+
+/// A directory-shaped .gitignore is not a readable rule source. A relative
+/// excludes file must still resolve in the original worktree when we query a
+/// literal glob-looking name from a disposable one.
+#[tokio::test]
+async fn literal_directory_uses_original_relative_excludes_with_nonregular_ignore_file() {
+    let ctx = copy_all_ctx(&[
+        ("foo/.gitignore", "other\n"),
+        ("relative.rules", "/star\\*/\n"),
+    ]);
+    git(
+        ctx.path(),
+        &["update-index", "--skip-worktree", "foo/.gitignore"],
+    );
+    std::fs::remove_file(ctx.path().join("foo/.gitignore")).unwrap();
+    std::fs::create_dir(ctx.path().join(".gitignore")).unwrap();
+    git(
+        ctx.path(),
+        &["config", "core.excludesFile", "relative.rules"],
+    );
+    let dockerfile = ctx.path().join("Dockerfile");
+    let before = key(&dockerfile, &BTreeMap::new(), ctx.path()).await;
+    let literal = ctx.path().join("star*");
+    std::fs::create_dir(&literal).unwrap();
+    std::fs::write(literal.join("output"), "generated").unwrap();
+    assert_eq!(before, key(&dockerfile, &BTreeMap::new(), ctx.path()).await);
+    chmod_directory(&literal);
+    assert_eq!(before, key(&dockerfile, &BTreeMap::new(), ctx.path()).await);
+}
+
+/// Git ignores a symlinked .gitignore rather than following its target; when
+/// the skip-worktree index holds the rules, the indexed blob still applies.
+#[tokio::test]
+async fn literal_directory_uses_indexed_rules_behind_symlinked_ignore_file() {
+    let ctx = copy_all_ctx(&[(".gitignore", "/star\\*/\n")]);
+    git(
+        ctx.path(),
+        &["update-index", "--skip-worktree", ".gitignore"],
+    );
+    std::fs::remove_file(ctx.path().join(".gitignore")).unwrap();
+    let pipe = ctx.path().join("pipe");
+    let status = Command::new("mkfifo").arg(&pipe).status().unwrap();
+    assert!(status.success());
+    std::os::unix::fs::symlink("pipe", ctx.path().join(".gitignore")).unwrap();
+    let dockerfile = ctx.path().join("Dockerfile");
+    let before = key(&dockerfile, &BTreeMap::new(), ctx.path()).await;
+    let literal = ctx.path().join("star*");
+    std::fs::create_dir(&literal).unwrap();
+    std::fs::write(literal.join("output"), "generated").unwrap();
+    assert_eq!(before, key(&dockerfile, &BTreeMap::new(), ctx.path()).await);
+}
+
+/// Ignore sources outside the context's candidate ancestors must not be
+/// statted. An inaccessible indexed sibling cannot affect an ignored build
+/// output directory inside a readable subcontext.
+#[tokio::test]
+async fn unrelated_inaccessible_skip_worktree_ignore_does_not_abort_subcontext_key() {
+    for blocked_is_file in [false, true] {
+        let repo = make_ctx(&[
+            ("ctx/Dockerfile", "FROM scratch\n"),
+            ("ctx/.gitignore", "/build/\n"),
+            ("blocked/.gitignore", "irrelevant\n"),
+        ]);
+        git_init(repo.path());
+        git(
+            repo.path(),
+            &["update-index", "--skip-worktree", "blocked/.gitignore"],
+        );
+        std::fs::remove_file(repo.path().join("blocked/.gitignore")).unwrap();
+        let blocked = repo.path().join("blocked");
+        if blocked_is_file {
+            std::fs::remove_dir(&blocked).unwrap();
+            std::fs::write(&blocked, "not a directory").unwrap();
+        } else {
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let context = repo.path().join("ctx");
+        let output = context.join("build/sub");
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join("generated"), "ignored").unwrap();
+        let dockerfile = context.join("Dockerfile");
+        let before = key(&dockerfile, &BTreeMap::new(), &context).await;
+        chmod_directory(&output);
+        assert_eq!(before, key(&dockerfile, &BTreeMap::new(), &context).await);
+        if !blocked_is_file {
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+}
+
+/// Git warns and ignores an unreadable ancestor .gitignore while still
+/// accepting a subdirectory context; our disposable copy must do the same.
+#[tokio::test]
+async fn unreadable_ancestor_ignore_does_not_abort_literal_directory_key() {
+    let ctx = make_ctx(&[
+        (".gitignore", "unused\n"),
+        ("ctx/Dockerfile", "FROM scratch\n"),
+        ("other/.gitignore", "other\n"),
+    ]);
+    git_init(ctx.path());
+    git(
+        ctx.path(),
+        &["update-index", "--skip-worktree", "other/.gitignore"],
+    );
+    std::fs::remove_file(ctx.path().join("other/.gitignore")).unwrap();
+    std::fs::write(ctx.path().join(".git/info/exclude"), "star\\*/\n").unwrap();
+    std::fs::set_permissions(
+        ctx.path().join(".gitignore"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let context = ctx.path().join("ctx");
+    let literal = context.join("star*");
+    std::fs::create_dir(&literal).unwrap();
+    std::fs::write(literal.join("output"), "generated").unwrap();
+    let dockerfile = context.join("Dockerfile");
+    let before = key(&dockerfile, &BTreeMap::new(), &context).await;
+    chmod_directory(&literal);
+    assert_eq!(before, key(&dockerfile, &BTreeMap::new(), &context).await);
+}
+
+/// The temporary worktree must use the same effective excludes source as
+/// the original Git listing, even when global config paths are relative or
+/// GIT_CONFIG redirects only `git config` to an unrelated alternate file.
+#[tokio::test]
+async fn literal_directory_preserves_global_and_alternate_config_routing() {
+    const FIXTURE: &str = "OUTRIG_LITERAL_CONFIG_FIXTURE";
+    if let Some(root) = std::env::var_os(FIXTURE) {
+        let ctx = Path::new(&root).join("ctx");
+        let before = key(&ctx.join("Dockerfile"), &BTreeMap::new(), &ctx).await;
+        chmod_directory(&ctx.join("star*"));
+        assert_eq!(
+            before,
+            key(&ctx.join("Dockerfile"), &BTreeMap::new(), &ctx).await
+        );
+        return;
+    }
+    for variable in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG"] {
+        let repo = make_ctx(&[
+            ("ctx/Dockerfile", "FROM scratch\n"),
+            ("other/.gitignore", "x\n"),
+        ]);
+        git_init(repo.path());
+        git(
+            repo.path(),
+            &["update-index", "--skip-worktree", "other/.gitignore"],
+        );
+        std::fs::remove_file(repo.path().join("other/.gitignore")).unwrap();
+        std::fs::write(repo.path().join("relative.rules"), "star\\*/\n").unwrap();
+        std::fs::write(
+            repo.path().join("cfg"),
+            "[core]\nexcludesFile = relative.rules\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("ctx/cfg"),
+            "[core]\nexcludesFile = absent.rules\n",
+        )
+        .unwrap();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "image::image_cache_tests::literal_directory_preserves_global_and_alternate_config_routing"])
+            .env(FIXTURE, repo.path());
+        if variable != "GIT_CONFIG" {
+            cmd.env(variable, "cfg");
+        } else {
+            git(
+                repo.path(),
+                &["config", "core.excludesFile", "relative.rules"],
+            );
+            std::fs::write(repo.path().join("alternate"), "").unwrap();
+            cmd.env("GIT_CONFIG", repo.path().join("alternate"));
+        }
+        let literal = repo.path().join("ctx/star*");
+        std::fs::create_dir(&literal).unwrap();
+        std::fs::write(literal.join("output"), "generated").unwrap();
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{variable}: stdout: {}, stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// The literal-name route must check the directory itself, not append a
+/// slash: a child-only rule would otherwise swallow a negated parent.
+#[tokio::test]
+async fn missing_ignore_negation_retains_literal_wildcard_parent() {
+    let ctx = copy_all_ctx(&[(".gitignore", "!/keep\\*/\n/keep\\*/*\n")]);
+    git(
+        ctx.path(),
+        &["update-index", "--skip-worktree", ".gitignore"],
+    );
+    std::fs::remove_file(ctx.path().join(".gitignore")).unwrap();
+    std::fs::write(ctx.path().join(".git/info/exclude"), "/keep\\*/\n").unwrap();
+    let parent = ctx.path().join("keep*");
+    std::fs::create_dir(&parent).unwrap();
+    let dockerfile = ctx.path().join("Dockerfile");
+    let before = key(&dockerfile, &BTreeMap::new(), ctx.path()).await;
+    std::fs::create_dir(parent.join("child")).unwrap();
+    assert_eq!(before, key(&dockerfile, &BTreeMap::new(), ctx.path()).await);
+    chmod_directory(&parent);
+    assert_ne!(before, key(&dockerfile, &BTreeMap::new(), ctx.path()).await);
+}
+
+/// A missing nested ignore source can itself match a literal directory's
+/// wildcard-looking pathspec. Its rules cannot affect a sibling directory.
+#[tokio::test]
+async fn missing_nested_ignore_does_not_hide_literal_sibling_directory() {
+    let ctx = copy_all_ctx(&[(".gitignore", "/foo\\*/\n"), ("foo/.gitignore", "out\n")]);
+    git(
+        ctx.path(),
+        &["update-index", "--skip-worktree", "foo/.gitignore"],
+    );
+    std::fs::remove_file(ctx.path().join("foo/.gitignore")).unwrap();
+    let dockerfile = ctx.path().join("Dockerfile");
+    let before = key(&dockerfile, &BTreeMap::new(), ctx.path()).await;
+    let literal = ctx.path().join("foo*");
+    std::fs::create_dir(&literal).unwrap();
+    std::fs::write(literal.join("output"), "generated").unwrap();
+    assert_eq!(before, key(&dockerfile, &BTreeMap::new(), ctx.path()).await);
+    chmod_directory(&literal);
+    assert_eq!(before, key(&dockerfile, &BTreeMap::new(), ctx.path()).await);
+}
+
+/// The index-backed fallback must not undo the no-index answer when a
+/// tracked filename matches a literal ignored directory name as a glob.
+#[tokio::test]
+async fn indexed_probe_does_not_hide_a_literal_ignored_directory() {
+    let ctx = copy_all_ctx(&[(".gitignore", "/cache\\*/\n"), ("cache-one", "tracked")]);
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+    let literal = ctx.path().join("cache*");
+    std::fs::create_dir(&literal).unwrap();
+    std::fs::write(literal.join("output"), "generated").unwrap();
+    assert_eq!(before, key(&dockerfile, &args, ctx.path()).await);
+    chmod_directory(&literal);
+    assert_eq!(before, key(&dockerfile, &args, ctx.path()).await);
+}
+
+/// #1002: git reports an unignored directory as ignored when all its
+/// children match a rule. The directory stays in the key; its children do not.
+#[tokio::test]
+async fn ignored_children_do_not_remove_their_unignored_parent_from_the_key() {
+    let ctx = copy_all_ctx(&[(".gitignore", "/sessions/*\n")]);
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let sessions = ctx.path().join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    assert_not_ignored(ctx.path(), "sessions");
+    let before = key(&dockerfile, &args, ctx.path()).await;
+    let cfg = build_cfg(ctx.path());
+    let tag = compute_tag_for("coding", &cfg, Path::new(""))
+        .await
+        .unwrap();
+
+    let child = sessions.join("auto123");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::write(child.join("session.json"), "one").unwrap();
+    assert_ignored(ctx.path(), "sessions/auto123");
+    assert_eq!(before, key(&dockerfile, &args, ctx.path()).await);
+    key_before_build("coding", &cfg, Path::new(""), &BTreeMap::new(), &tag)
+        .await
+        .expect("an ignored auto session must not invalidate the pre-build rehash");
+    std::fs::write(child.join("session.json"), "two").unwrap();
+    chmod_directory(&child);
+    assert_eq!(before, key(&dockerfile, &args, ctx.path()).await);
+
+    chmod_directory(&sessions);
+    assert_ne!(before, key(&dockerfile, &args, ctx.path()).await);
+}
+
 /// A nested repository is walked by its own pass, under its own rules; the
 /// outer one leaves it alone.
 #[tokio::test]

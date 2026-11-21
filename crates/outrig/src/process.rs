@@ -150,6 +150,8 @@ pub(crate) struct Cmd {
     shown: Vec<(usize, OsString)>,
     /// Added to the environment the child inherits.
     env: Vec<(OsString, OsString)>,
+    /// Removed from the child's inherited environment (also hidden in diagnostics).
+    env_remove: Vec<OsString>,
     /// Whether the child leads a process group of its own rather than
     /// joining outrig's. See [`Cmd::in_own_process_group`].
     own_process_group: bool,
@@ -162,6 +164,7 @@ impl Cmd {
             args: Vec::new(),
             shown: Vec::new(),
             env: Vec::new(),
+            env_remove: Vec::new(),
             own_process_group: false,
         }
     }
@@ -193,6 +196,13 @@ impl Cmd {
     pub(crate) fn env_hidden(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
         self.env
             .push((key.as_ref().to_os_string(), value.as_ref().to_os_string()));
+        self
+    }
+
+    /// Remove an inherited variable from the child without exposing its name
+    /// or value in command diagnostics.
+    pub(crate) fn env_remove_hidden(mut self, key: impl AsRef<OsStr>) -> Self {
+        self.env_remove.push(key.as_ref().to_os_string());
         self
     }
 
@@ -240,7 +250,7 @@ impl Cmd {
     /// Whether running or showing this command needs more than `program`
     /// and [`Cmd::exec_args`].
     pub(crate) fn carries_hidden(&self) -> bool {
-        !self.shown.is_empty() || !self.env.is_empty()
+        !self.shown.is_empty() || !self.env.is_empty() || !self.env_remove.is_empty()
     }
 
     /// Build a fresh `std::process::Command` from this argv, environment, and
@@ -250,6 +260,9 @@ impl Cmd {
 
         let mut c = std::process::Command::new(self.program);
         c.args(&self.args);
+        for key in &self.env_remove {
+            c.env_remove(key);
+        }
         c.envs(self.env.iter().map(|(k, v)| (k, v)));
         if self.own_process_group {
             c.process_group(0);

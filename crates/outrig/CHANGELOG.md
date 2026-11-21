@@ -14,6 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An unignored `sessions/` directory stays in the build cache key when its new, ignored
+  children make Git report the directory as excluded; auto sessions no longer trigger a
+  false `BuildContextChanged` before building. The ignored-directory check also honors absent
+  skip-worktree ignore rules without scanning the full index per directory or modifying the
+  active split index. Literal wildcard-looking directories use a disposable worktree so
+  indexed ignore-source paths cannot suppress Git's exact-path answer. Nonregular ignore
+  sources, unreadable ancestor rules, and relative excludes/config paths retain Git's original
+  behavior; inaccessible ignore files outside the context's candidate ancestors are not probed.
+  (#1002)
+
 - Streamed engine tracing runs on blocking workers, preserving output backpressure without
   blocking the async executor that must drive build cancellation. (#990)
 

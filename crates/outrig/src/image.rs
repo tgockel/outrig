@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Write as _};
 use std::io::ErrorKind;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -2362,18 +2362,19 @@ async fn hash_git_tree(
         &["--others", "--ignored", "--exclude-standard", "--directory"],
     )
     .await?;
+    // `ls-files --directory` can report a directory whose *children* are all
+    // ignored as `dir/`, even if `dir` itself is not ignored. Ask Git about
+    // the directories, not their contents, from the same worktree location
+    // used for the listing. A single NUL-delimited query also avoids a Git
+    // process per ignored session from earlier launches.
+    let mut skip = ignored_directories(&tree, &ignored).await?;
     // A nested repository is walked by its own call, under its own rules.
-    let skip: HashSet<Vec<u8>> = ignored
-        .iter()
-        .filter_map(|rel| rel.strip_suffix(b"/"))
-        .chain(
-            entries
-                .iter()
-                .filter(|(.., entry)| matches!(entry, ContextEntry::Dir))
-                .map(|(rel, ..)| rel.strip_suffix(b"/").unwrap_or(rel)),
-        )
-        .map(<[u8]>::to_vec)
-        .collect();
+    skip.extend(
+        entries
+            .iter()
+            .filter(|(.., entry)| matches!(entry, ContextEntry::Dir))
+            .map(|(rel, ..)| rel.strip_suffix(b"/").unwrap_or(rel).to_vec()),
+    );
     let (dirs, dir_stamps) = tokio::task::spawn_blocking(move || {
         let mut stamps = Stamps::default();
         context_dirs(&tree, &skip, &mut stamps).map(|dirs| (dirs, stamps))
@@ -2448,6 +2449,447 @@ async fn git_tree_listing(tree: &Path) -> Result<GitTreeListing> {
     })
     .await
     .expect("context listing task panicked")
+}
+
+/// Git's collapsed directory listing also includes unignored parents of
+/// ignored children. Ask about the directories themselves, using one bulk
+/// NUL-delimited query regardless of the number of old session directories.
+///
+/// Normally `--no-index` avoids the tracked-path glob gate: `./cache*` can
+/// name a *literal* directory while also matching a tracked `cache-one`.
+/// When an absent skip-worktree `.gitignore` supplies rules from the index,
+/// use a temporary index containing only those missing ignore sources. That
+/// supplies the complete rule precedence alongside on-disk ignore files and
+/// excludes unrelated tracked files from pathspec matching. An index scan to
+/// discover missing sources is paid once per tree, not once per directory.
+async fn ignored_directories(tree: &Path, listing: &[Vec<u8>]) -> Result<HashSet<Vec<u8>>> {
+    let candidates: Vec<Vec<u8>> = listing
+        .iter()
+        .filter_map(|rel| rel.strip_suffix(b"/"))
+        .map(<[u8]>::to_vec)
+        .collect();
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let Some(sources) = missing_ignore_sources(tree, &candidates).await? else {
+        return check_ignored_directories(tree, &candidates, None).await;
+    };
+    // A literal wildcard-looking name can match even the retained .gitignore
+    // entry as an indexed pathspec. Query those rare names from a disposable
+    // worktree with all their ancestor rules instead of using any index.
+    let (ordinary, unusual): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|rel| !rel.iter().any(|b| matches!(b, b'*' | b'?' | b'[')));
+    let mut ignored = if ordinary.is_empty() {
+        HashSet::new()
+    } else {
+        let sparse_index = make_sparse_ignore_index(tree, &sources).await?;
+        let index = sparse_index.path().join("index");
+        check_ignored_directories(tree, &ordinary, Some(&index)).await?
+    };
+    for rel in unusual {
+        if check_literal_directory(tree, &sources, &rel).await? {
+            ignored.insert(rel);
+        }
+    }
+    Ok(ignored)
+}
+
+/// Missing skip-worktree ignore sources, discovered with one scan of the
+/// repository index no matter how many directory candidates need checking.
+struct MissingIgnoreSources {
+    root: PathBuf,
+    git_dir: OsString,
+    /// (repository-relative path, index-info record, NUL-terminated path).
+    entries: Vec<(PathBuf, Vec<u8>, Vec<u8>)>,
+}
+
+async fn missing_ignore_sources(
+    tree: &Path,
+    candidates: &[Vec<u8>],
+) -> Result<Option<MissingIgnoreSources>> {
+    let root = process::run_capture(
+        Cmd::new("git")
+            .arg("-C")
+            .arg(tree)
+            .args(["rev-parse", "--show-toplevel"]),
+    )
+    .await?;
+    let root = PathBuf::from(OsString::from_vec(
+        root.stdout
+            .strip_suffix(b"\n")
+            .unwrap_or(&root.stdout)
+            .to_vec(),
+    ));
+    // Only ancestor ignore files can affect these exact directory paths.
+    // Filter the index listing *before* statting anything: an inaccessible
+    // skip-worktree source elsewhere in the repository is not a build input.
+    let root_canon = std::fs::canonicalize(&root).path_ctx("resolve", &root)?;
+    let tree_canon = std::fs::canonicalize(tree).path_ctx("resolve", tree)?;
+    let prefix = tree_canon.strip_prefix(&root_canon).map_err(|_| {
+        OutrigError::Configuration(format!(
+            "build context {} is outside its Git worktree {}",
+            tree.display(),
+            root.display()
+        ))
+    })?;
+    let candidate_paths: Vec<_> = candidates
+        .iter()
+        .map(|rel| prefix.join(OsStr::from_bytes(rel)))
+        .collect();
+    // Keep Git anchored at the same context as its original listing:
+    // GIT_DIR can be relative to that cwd. The top-anchored pathspec still
+    // discovers ignore sources above a subdirectory build context.
+    let rows = process::run_capture(
+        Cmd::new("git")
+            .env_hidden("GIT_LITERAL_PATHSPECS", "0")
+            .env_hidden("GIT_GLOB_PATHSPECS", "0")
+            .env_hidden("GIT_NOGLOB_PATHSPECS", "0")
+            .env_hidden("GIT_ICASE_PATHSPECS", "0")
+            .arg("-C")
+            .arg(tree)
+            .args([
+                "ls-files",
+                "--cached",
+                "--full-name",
+                "-t",
+                "--stage",
+                "-z",
+                "--",
+                ":(top,glob)**/.gitignore",
+            ]),
+    )
+    .await?;
+    let mut entries = Vec::new();
+    for row in rows.stdout.split(|b| *b == 0).filter(|row| !row.is_empty()) {
+        let Some(entry) = row.strip_prefix(b"S ") else {
+            continue;
+        };
+        let Some(tab) = entry.iter().position(|b| *b == b'\t') else {
+            continue;
+        };
+        let path = &entry[tab + 1..];
+        if !entry[..tab].ends_with(b" 0")
+            || path.rsplit(|b| *b == b'/').next() != Some(b".gitignore")
+        {
+            continue;
+        }
+        let source_rel = Path::new(OsStr::from_bytes(path));
+        if !source_rel.parent().is_some_and(|parent| {
+            candidate_paths
+                .iter()
+                .any(|candidate| candidate.starts_with(parent) && candidate != parent)
+        }) {
+            continue;
+        }
+        let source = root.join(OsStr::from_bytes(path));
+        match std::fs::symlink_metadata(&source) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                // Git does not follow ignore-file symlinks; a skip-worktree
+                // entry can still supply its indexed rules instead.
+            }
+            Ok(_) => continue,
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err).path_ctx("stat", &source),
+        }
+        let mut stage = entry.to_vec();
+        stage.push(0);
+        let mut name = path.to_vec();
+        name.push(0);
+        entries.push((PathBuf::from(OsStr::from_bytes(path)), stage, name));
+    }
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    // Index-info paths are repository-root relative. Pin the effective Git
+    // directory before switching cwd: an inherited relative GIT_DIR was
+    // resolved against `tree` by the listings above, not against `root`.
+    let git_dir = process::run_capture(
+        Cmd::new("git")
+            .arg("-C")
+            .arg(tree)
+            .args(["rev-parse", "--absolute-git-dir"]),
+    )
+    .await?;
+    let git_dir = OsString::from_vec(
+        git_dir
+            .stdout
+            .strip_suffix(b"\n")
+            .unwrap_or(&git_dir.stdout)
+            .to_vec(),
+    );
+    Ok(Some(MissingIgnoreSources {
+        root,
+        git_dir,
+        entries,
+    }))
+}
+
+/// Create an index containing only missing ignore files, not tracked build
+/// inputs. Scratch writers cannot use Git's split-index setting: its shared
+/// base expiry could otherwise delete the active repository index's base.
+async fn make_sparse_ignore_index(
+    tree: &Path,
+    sources: &MissingIgnoreSources,
+) -> Result<tempfile::TempDir> {
+    let mut stage = Vec::new();
+    let mut paths = Vec::new();
+    for (_, entry, name) in &sources.entries {
+        stage.extend_from_slice(entry);
+        paths.extend_from_slice(name);
+    }
+    let dir = tempfile::tempdir()?;
+    let index = dir.path().join("index");
+    let mut base = Cmd::new("git")
+        .arg("-C")
+        .arg(&sources.root)
+        .args(["-c", "core.splitIndex=false"])
+        .env_hidden("GIT_DIR", &sources.git_dir)
+        .env_hidden("GIT_WORK_TREE", &sources.root)
+        .env_hidden("GIT_INDEX_FILE", &index);
+    if let Some(common) = std::env::var_os("GIT_COMMON_DIR")
+        && Path::new(&common).is_relative()
+    {
+        base = base.env_hidden("GIT_COMMON_DIR", tree.join(common));
+    }
+    run_git_with_input(
+        base.clone().args(["update-index", "-z", "--index-info"]),
+        &stage,
+        &sources.root,
+    )
+    .await?;
+    run_git_with_input(
+        base.args(["update-index", "-z", "--skip-worktree", "--stdin"]),
+        &paths,
+        &sources.root,
+    )
+    .await?;
+    Ok(dir)
+}
+
+/// Run a Git command with a NUL-delimited input without blocking its output
+/// reader while writing. Nonzero statuses are errors, not ignore nonmatches.
+async fn run_git_with_input(cmd: Cmd, input: &[u8], tree: &Path) -> Result<std::process::Output> {
+    let mut child = process::spawn_stdio(cmd.clone()).await?;
+    let mut stdin = child.stdin.take().expect("piped git stdin");
+    let send = async move {
+        use tokio::io::AsyncWriteExt as _;
+        stdin.write_all(input).await
+    };
+    let (written, output) = tokio::join!(send, child.wait_with_output());
+    let output = output.path_ctx("wait", tree)?;
+    if !output.status.success() {
+        return Err(cmd.process_error(
+            output.status.code(),
+            process::tail_string(&output.stderr, 4096),
+        ));
+    }
+    written.path_ctx("write", tree)?;
+    Ok(output)
+}
+
+/// For a wildcard-looking *literal* name, even the ignore-only index can
+/// match its own `.gitignore` as a tracked glob path and suppress the answer.
+/// Reproduce the candidate's ancestor ignore files in a disposable worktree
+/// and ask Git with `--no-index`: the full rule precedence is retained, but
+/// there are no indexed paths to match the name. This rare route never writes
+/// the real worktree or its index.
+async fn check_literal_directory(
+    tree: &Path,
+    sources: &MissingIgnoreSources,
+    rel: &[u8],
+) -> Result<bool> {
+    let original_root = std::fs::canonicalize(&sources.root).path_ctx("resolve", &sources.root)?;
+    let original_tree = std::fs::canonicalize(tree).path_ctx("resolve", tree)?;
+    let target = original_tree.join(OsStr::from_bytes(rel));
+    let relative = target.strip_prefix(&original_root).map_err(|_| {
+        OutrigError::Configuration(format!(
+            "build context {} is outside its Git worktree {}",
+            tree.display(),
+            sources.root.display()
+        ))
+    })?;
+    let temp = tempfile::tempdir()?;
+    let parent = relative.parent().unwrap_or(Path::new(""));
+    for ancestor in parent.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        let dest = temp.path().join(ancestor);
+        std::fs::create_dir_all(&dest).path_ctx("create directory", &dest)?;
+        let source = original_root.join(ancestor).join(".gitignore");
+        let meta = match std::fs::symlink_metadata(&source) {
+            Ok(meta) => Some(meta),
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) => return Err(err).path_ctx("stat", &source),
+        };
+        let bytes = if meta.as_ref().is_some_and(|meta| meta.is_file()) {
+            match std::fs::read(&source) {
+                Ok(bytes) => Some(bytes),
+                // Git warns and proceeds without a rule when it cannot open
+                // an ancestor ignore file; it does not refuse the build key.
+                Err(err) if err.kind() == ErrorKind::PermissionDenied => None,
+                Err(err) => return Err(err).path_ctx("read", &source),
+            }
+        } else if meta.is_none()
+            || meta
+                .as_ref()
+                .is_some_and(|meta| meta.file_type().is_symlink())
+        {
+            let name = ancestor.join(".gitignore");
+            if let Some((_, stage, _)) = sources.entries.iter().find(|(path, ..)| path == &name) {
+                let oid = stage
+                    .split(|b| *b == b' ')
+                    .nth(1)
+                    .expect("index stage has object id");
+                Some(
+                    process::run_capture(
+                        Cmd::new("git")
+                            .arg("-C")
+                            .arg(tree)
+                            .args(["cat-file", "blob"])
+                            .arg(OsStr::from_bytes(oid)),
+                    )
+                    .await?
+                    .stdout,
+                )
+            } else {
+                None
+            }
+        } else {
+            // Git does not read a directory or another nonregular ignore
+            // source as a file. In particular, never follow a symlink to a
+            // FIFO (or try to read a directory).
+            None
+        };
+        if let Some(bytes) = bytes {
+            let file = dest.join(".gitignore");
+            std::fs::write(&file, bytes).path_ctx("write", &file)?;
+        }
+    }
+    // A relative core.excludesFile is resolved against the original worktree
+    // by Git. Preserve its effective path before pointing Git at `temp`.
+    let exclude_cmd = Cmd::new("git")
+        // GIT_CONFIG applies only to `git config`, not the ls-files and
+        // check-ignore invocations whose effective rules we are mirroring.
+        .env_remove_hidden("GIT_CONFIG")
+        .arg("-C")
+        .arg(tree)
+        .args(["config", "--path", "--get", "core.excludesFile"]);
+    let exclude = process::try_capture(exclude_cmd.clone()).await?;
+    let exclude_path = match exclude.status.code() {
+        Some(0) => {
+            let path = PathBuf::from(OsString::from_vec(
+                exclude
+                    .stdout
+                    .strip_suffix(b"\n")
+                    .unwrap_or(&exclude.stdout)
+                    .to_vec(),
+            ));
+            Some(if path.is_relative() {
+                sources.root.join(path)
+            } else {
+                path
+            })
+        }
+        Some(1) => None,
+        _ => {
+            return Err(exclude_cmd.process_error(
+                exclude.status.code(),
+                process::tail_string(&exclude.stderr, 4096),
+            ));
+        }
+    };
+    let mut cmd = Cmd::new("git")
+        .env_hidden("GIT_DIR", &sources.git_dir)
+        .env_hidden("GIT_WORK_TREE", temp.path())
+        .env_hidden("GIT_LITERAL_PATHSPECS", "0")
+        .env_hidden("GIT_GLOB_PATHSPECS", "0")
+        .env_hidden("GIT_NOGLOB_PATHSPECS", "0")
+        .env_hidden("GIT_ICASE_PATHSPECS", "0")
+        .arg("-C")
+        .arg(temp.path());
+    if let Some(common) = std::env::var_os("GIT_COMMON_DIR")
+        && Path::new(&common).is_relative()
+    {
+        cmd = cmd.env_hidden("GIT_COMMON_DIR", tree.join(common));
+    }
+    if let Some(path) = exclude_path {
+        let mut override_arg = OsString::from("core.excludesFile=");
+        override_arg.push(path);
+        cmd = cmd.arg("-c").arg(override_arg);
+    }
+    for variable in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"] {
+        if let Some(path) = std::env::var_os(variable)
+            && Path::new(&path).is_relative()
+        {
+            cmd = cmd.env_hidden(variable, sources.root.join(path));
+        }
+    }
+    cmd = cmd.args(["check-ignore", "--no-index", "-z", "--stdin"]);
+    // Directory-only rules need a directory-shaped candidate on disk.
+    let candidate = temp.path().join(relative);
+    std::fs::create_dir_all(&candidate).path_ctx("create directory", &candidate)?;
+    let path = relative.as_os_str().as_bytes().to_vec();
+    Ok(
+        query_ignored_paths(cmd, std::slice::from_ref(&path), temp.path())
+            .await?
+            .contains(&path),
+    )
+}
+
+async fn check_ignored_directories(
+    tree: &Path,
+    candidates: &[Vec<u8>],
+    index: Option<&Path>,
+) -> Result<HashSet<Vec<u8>>> {
+    let mut cmd = Cmd::new("git")
+        .env_hidden("GIT_LITERAL_PATHSPECS", "0")
+        .env_hidden("GIT_GLOB_PATHSPECS", "0")
+        .env_hidden("GIT_NOGLOB_PATHSPECS", "0")
+        .env_hidden("GIT_ICASE_PATHSPECS", "0")
+        .arg("-C")
+        .arg(tree)
+        .arg("check-ignore");
+    if let Some(index) = index {
+        cmd = cmd.env_hidden("GIT_INDEX_FILE", index);
+    } else {
+        cmd = cmd.arg("--no-index");
+    }
+    cmd = cmd.args(["-z", "--stdin"]);
+    query_ignored_paths(cmd, candidates, tree).await
+}
+
+/// Run `check-ignore` with literal directory spellings. Exit code 1 is an
+/// ordinary nonmatch; every other failure propagates.
+async fn query_ignored_paths(
+    cmd: Cmd,
+    candidates: &[Vec<u8>],
+    tree: &Path,
+) -> Result<HashSet<Vec<u8>>> {
+    let mut child = process::spawn_stdio(cmd.clone()).await?;
+    let mut stdin = child.stdin.take().expect("piped git stdin");
+    let input = async move {
+        use tokio::io::AsyncWriteExt as _;
+        for rel in candidates {
+            stdin.write_all(b"./").await?;
+            stdin.write_all(rel).await?;
+            stdin.write_all(b"\0").await?;
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    let (written, output) = tokio::join!(input, child.wait_with_output());
+    let output = output.path_ctx("wait", tree)?;
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        return Err(cmd.process_error(
+            output.status.code(),
+            process::tail_string(&output.stderr, 4096),
+        ));
+    }
+    written.path_ctx("write", tree)?;
+    Ok(output
+        .stdout
+        .split(|b| *b == 0)
+        .filter_map(|rel| rel.strip_prefix(b"./"))
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
 /// One entry of the context stream. Everything after the NUL-terminated path is

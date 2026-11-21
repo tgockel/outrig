@@ -634,6 +634,68 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
                     ))
                     .await?;
             }
+            // `store.create` makes the explicit directory and the registry
+            // root after keying. An ignored explicit child can have an absent,
+            // unignored parent: make that parent now, but leave the child for
+            // the store's emptiness and exclusive-claim checks.
+            if let Some(parent) = args
+                .explicit_session_dir
+                .and_then(Path::parent)
+                .filter(|p| !p.as_os_str().is_empty())
+            {
+                signals
+                    .race(async {
+                        tokio::fs::create_dir_all(parent)
+                            .await
+                            .path_ctx("create directory", parent)
+                    })
+                    .await?;
+            }
+            // The root (or an ancestor) can also be an unignored input. It
+            // must exist before keying, except when it lives *inside* an
+            // explicit directory: creating it there before the store checks
+            // that directory's emptiness would reject our own new registry.
+            // Such an explicit directory cannot be an admitted build input
+            // (the collision check above refuses it), so deferring its root
+            // until store.create cannot move the key. Still prepare lexical
+            // prefixes *outside* that directory: a spelling with `..` can
+            // traverse new, unignored directories before reaching the same
+            // logical registry, and the store will create those too.
+            let (root_logical, _) = session::canonicalize_prefix(&session_root)
+                .path_ctx("resolve", &session_root)?;
+            if args
+                .explicit_session_dir
+                .is_some_and(|_| root_logical.starts_with(&candidate_logical))
+            {
+                for prefix in session_root.ancestors().collect::<Vec<_>>().into_iter().rev() {
+                    if prefix.as_os_str().is_empty() {
+                        continue;
+                    }
+                    let (logical, _) = session::canonicalize_prefix(prefix)
+                        .path_ctx("resolve", prefix)?;
+                    if logical.starts_with(&candidate_logical) {
+                        continue;
+                    }
+                    // Do not traverse the original spelling here: an outside
+                    // logical prefix can still pass through the explicit
+                    // leaf and create contents before its emptiness check.
+                    signals
+                        .race(async {
+                            tokio::fs::create_dir_all(&logical)
+                                .await
+                                .path_ctx("create directory", &logical)
+                        })
+                        .await?;
+                }
+            } else {
+                signals
+                    .race(async {
+                        tokio::fs::create_dir_all(&session_root)
+                            .await
+                            .path_ctx("create directory", &session_root)
+                    })
+                    .await?;
+            }
         }
         // All session writes must be checked before even keying the build.
         let image_tag = signals
