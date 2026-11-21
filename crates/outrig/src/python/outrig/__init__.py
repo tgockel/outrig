@@ -31,7 +31,9 @@ the host by value; a call that returns no result raises `outrig.ServiceError`: s
 `help(outrig.Service)`. Each MCP server the session places is an `outrig.McpService`, a method per
 tool by the tool's exact name, whose calls return an `outrig.McpResult` -- content blocks in
 order, structured content -- and raise `outrig.ToolError` for a result the server marked an
-error: see `help(outrig.McpService)` and `help(outrig.McpResult)`.
+error, and an `outrig.McpError` saying whether a call that failed reached the server --
+`NotDispatched`, `MayHaveDispatched` or `ResponseReceived`: see `help(outrig.McpService)`,
+`help(outrig.McpResult)` and `help(outrig.McpError)`.
 
 `outrig.skills` reaches the session's skills, whose code imports as `outrig_skills.<name>`: see
 `help(outrig.skills)`.
@@ -64,6 +66,9 @@ from ._agents import (
     facility,
 )
 from ._mcp import (
+    AdmissionClosed,
+    InvalidArguments,
+    MayHaveDispatched,
     McpAudio,
     McpBlock,
     McpError,
@@ -76,13 +81,20 @@ from ._mcp import (
     McpService,
     McpText,
     McpTool,
+    NotDispatched,
+    Paused,
+    ProtocolError,
+    ResponseReceived,
+    ServiceUnavailable,
     ToolError,
+    UnknownTool,
 )
 from ._services import Service, ServiceError, ServiceMethod
 
 __all__ = [
     "schema",
     "skills",
+    "AdmissionClosed",
     "Agent",
     "AgentError",
     "AgentLimitReached",
@@ -93,6 +105,8 @@ __all__ = [
     "ChannelError",
     "CompletionRejected",
     "Facility",
+    "InvalidArguments",
+    "MayHaveDispatched",
     "McpAudio",
     "McpBlock",
     "McpError",
@@ -105,10 +119,14 @@ __all__ = [
     "McpService",
     "McpText",
     "McpTool",
+    "NotDispatched",
+    "Paused",
+    "ProtocolError",
     "Request",
     "RequestCancelled",
     "RequestEnded",
     "Resolution",
+    "ResponseReceived",
     "Section",
     "SendNotAccepted",
     "SendRefused",
@@ -116,9 +134,11 @@ __all__ = [
     "Service",
     "ServiceError",
     "ServiceMethod",
+    "ServiceUnavailable",
     "SessionClosing",
     "Status",
     "ToolError",
+    "UnknownTool",
     "UnreadableDelivery",
     "agent",
     "facility",

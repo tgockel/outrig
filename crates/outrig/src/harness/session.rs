@@ -813,6 +813,8 @@ impl Session {
         // sent are in: nothing hosted is published after.
         let hosted = bindings.report();
         let service_calls = services.report();
+        // After the report, which ends what was still in flight.
+        let mcp_uncertain = services.uncertain();
         let channel_close = channels.report();
         let stopped = match failed.is_empty() {
             true => Stopped::Proven,
@@ -845,12 +847,14 @@ impl Session {
             requests: requests.clone(),
             channels: channel_close.clone(),
             mcp_services: mcp_services.clone(),
+            mcp_uncertain: mcp_uncertain.clone(),
             verdict: report::verdict(
                 &stopped,
                 &executions,
                 &hosted,
                 &service_calls,
                 &channel_close,
+                &mcp_uncertain,
             ),
         });
         let log = events
@@ -870,6 +874,7 @@ impl Session {
             requests,
             channels: channel_close,
             mcp_services,
+            mcp_uncertain,
             events: EventDelivery {
                 last_sequence: tally.last,
                 missed: tally.missed,

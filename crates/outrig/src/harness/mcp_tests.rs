@@ -1169,9 +1169,24 @@ async fn a_stop_ends_calls_and_the_container() {
     };
     assert!(why.contains("the freezer is broken"), "{why}");
     let report = stop(session).await;
-    // The stop's unknown call ended before the close, so the report, which lists what the close
-    // ended, does not hold it: the events do.
-    assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
+    // The stop's unknown call ended before the close, so `services`, which lists what the close
+    // ended, does not hold it; `mcp_uncertain` does, its server having had it, and so the verdict
+    // is not clean.
+    assert!(report.services.is_empty(), "{report:?}");
+    let uncertain: Vec<_> = report
+        .mcp_uncertain
+        .iter()
+        .map(|call| (call.tool.as_str(), call.failure, call.reason))
+        .collect();
+    assert_eq!(
+        uncertain,
+        [(
+            "slow",
+            Some(McpFailureKind::Canceled),
+            Some(super::event::ServiceReason::Stopped)
+        )]
+    );
+    assert_eq!(report.verdict(), Verdict::StoppedWithUnknown, "{report:?}");
     let events = taken(&mut events);
     let cancels = of_kind(&events, "service.call.cancel.sent");
     assert_eq!(cancels[0]["reason"], "stopped");
@@ -1214,11 +1229,12 @@ async fn a_pause_given_up_on_is_resumed() {
     stop(session).await;
 }
 
-/// A stop the owner gives up on part-way runs to its end all the same: the service is stopped,
-/// and a resume says so rather than reopening it.
+/// A stop the owner gives up on part-way -- its container still stopping -- runs to its end all
+/// the same: the service is stopped, and a resume says so rather than reopening it.
 #[tokio::test]
 async fn a_stop_given_up_on_still_stops() {
     let fakes = Fakes::default();
+    fakes.of("mcp-side").slow_stop(Duration::from_millis(500));
     let (session, _events) = placed(
         &fakes,
         builder().mcp("side", McpServiceSpec::sidecar(sidecar(&[]))),
@@ -1232,7 +1248,7 @@ async fn a_stop_given_up_on_still_stops() {
         tokio::time::timeout(Duration::from_millis(100), stopping)
             .await
             .is_err(),
-        "given up on while its call is told to stop"
+        "given up on while its container stops"
     );
     within(slow.outcome()).await;
     let resumed = mcp.resume("side").await;
@@ -1244,7 +1260,8 @@ async fn a_stop_given_up_on_still_stops() {
     );
     assert_eq!(fakes.of("mcp-side").stops(), 1);
     let report = stop(session).await;
-    assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
+    // The call the stop cut off may have reached its server.
+    assert_eq!(report.verdict(), Verdict::StoppedWithUnknown, "{report:?}");
 }
 
 /// A pause given up on before the step it spawned has run still comes before a resume asked

@@ -16,7 +16,6 @@ use super::children_tests::{
 };
 use super::external_tests::{
     Answer, Backend, constructed, from_launch, holder, holding, inbox, openings, ready, running,
-    until,
 };
 use super::mock_http;
 use super::mock_http::{RecordedRequest, Responder, submit, text_reply};
@@ -27,6 +26,7 @@ use crate::harness::{
     Contract, DeliverError, Delivered, DeliveryId, Direction, Inbound, OutboundState, RosterState,
     Settle, SettleError, Settled, Settlement, Verdict, WithdrawAnswer, WithdrawEnd,
 };
+use crate::python::testing::until;
 use crate::python::testing::{Flag, py, within};
 
 /// `questions`: an inbound request channel, text both ways.

@@ -318,6 +318,21 @@ session.
 
 A call of one waiting on a cut's hold at the close is refused, admission closed, never dispatched.
 
+**MCP calls** (`0003-56`), as the **Service calls** rows, each with its `state`:
+
+- *Made after the close, or waiting on a cut's hold.* Outcome: `refused`, admission closed;
+  `not_dispatched`. Invoked: no. Effects: none.
+- *Waiting for its service to be connected again.* Outcome: no reconnect is made once admission
+  closes: `refused`, admission closed, `not_dispatched`; one the terminate reaches first is
+  `cancelled`, `closed`. Invoked: no. Effects: none.
+- *Running.* Outcome: it drains to its deadline; `returned` or `raised` if its server answers in
+  time, `response_received`. At terminating its server is sent `notifications/cancelled` and the
+  call ends at once, without the grace: `unknown`, reason `closed`, `may_have_dispatched`, failure
+  `canceled`, listed in `services` and in `mcp_uncertain`. Invoked: yes. Effects: open -- the
+  notice asks the server to stop and proves nothing, and nothing calls it again.
+- *Ended may have dispatched earlier in the session.* Outcome: as it ended; `mcp_uncertain` lists
+  it, and the verdict is `stopped_with_unknown`. Effects: open.
+
 **Root agents** (`0003-35`, `0003-46`)
 
 - *Constructing* (`0003-46`): the owner asked, and the root's kernel has not answered. Outcome: the

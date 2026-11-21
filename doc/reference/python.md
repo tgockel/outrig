@@ -45,7 +45,9 @@ the host by value; a call that returns no result raises `outrig.ServiceError`: s
 `help(outrig.Service)`. Each MCP server the session places is an `outrig.McpService`, a method per
 tool by the tool's exact name, whose calls return an `outrig.McpResult` -- content blocks in
 order, structured content -- and raise `outrig.ToolError` for a result the server marked an
-error: see `help(outrig.McpService)` and `help(outrig.McpResult)`.
+error, and an `outrig.McpError` saying whether a call that failed reached the server --
+`NotDispatched`, `MayHaveDispatched` or `ResponseReceived`: see `help(outrig.McpService)`,
+`help(outrig.McpResult)` and `help(outrig.McpError)`.
 
 `outrig.skills` reaches the session's skills, whose code imports as `outrig_skills.<name>`: see
 `help(outrig.skills)`.
@@ -571,6 +573,7 @@ class ShutdownReport:
     bindings: BindingStop | None
     events: EventDelivery
     mcp_services: tuple[McpServiceStop, ...] = ()
+    mcp_uncertain: tuple[McpUncertainCall, ...] = ()
 ```
 
 What a session's shutdown found: `session.shutdown_report` after the exit.
@@ -579,7 +582,8 @@ What a session's shutdown found: `session.shutdown_report` after the exit.
 
 - `"clean"`: everything the session started is stopped, and every outcome is known.
 - `"stopped_with_unknown"`: everything is stopped, and some execution, hosted call or service
-  call was cut off. Its outcome is unknown, never failed: its effect may stand.
+  call was cut off, or an MCP call may have reached its server unanswered. Its outcome is
+  unknown, never failed: its effect may stand.
 - `"not_proven_stopped"`: something could not be confirmed stopped, and may still be acting;
   the exit raised `ShutdownException`. Do not reuse what the session ran on.
 
@@ -587,7 +591,8 @@ What a session's shutdown found: `session.shutdown_report` after the exit.
 everything is proven stopped; `executions`, each execution running when admission closed;
 `hosted`, each hosted call whose outcome came after admission closed; `services`, each
 `ServiceCall` whose outcome came after it; `mcp_services`, each `McpServiceStop`, every MCP
-service and how it was stopped; `requests`, each
+service and how it was stopped; `mcp_uncertain`, each `McpUncertainCall`, every MCP call that
+may have reached its server unanswered during the session; `requests`, each
 `RequestOutcome`, a request made of a child agent that was open then; `bindings`, a
 `BindingStop`, how the process holding the bindings stopped, or `None` for a session with
 none; and `events`, an `EventDelivery`, how the session's events were delivered. It never
@@ -682,6 +687,26 @@ class McpServiceStop:
 One MCP service at a session's close: the `service`, its `placement`, how its start ended
 (`outcome`), `how` it was stopped -- `"stopped"`, its container stopped; `"with_primary"`, it
 ended with the session's container; or `"not_started"` -- and whether that is `proven`.
+
+### `McpUncertainCall`
+
+```python
+@dataclasses.dataclass(frozen=True)
+class McpUncertainCall:
+    call: int
+    service: str
+    tool: str
+    agent: str
+    failure: str | None
+    reason: str | None
+```
+
+A call of an MCP service's tool that ended may have dispatched at any point in a session:
+its request was handed to the server and no answer was read, so the server may have done what
+it asked. Its `call` id, the `service`, the `tool` by its exact name, the `agent` that made it,
+the `failure` that cut it off -- `"transport"`, `"timeout"`, `"canceled"`, `"other"` -- and the
+`reason` it was told to stop, such as `"deadline"` or `"closed"`; each `None` where there is
+none. Nothing called it again.
 
 ### `RequestOutcome`
 
@@ -1330,6 +1355,15 @@ describes; a program on the host has no use for them. What a program meets if it
 - `outrig.McpResourceLink` -- an `McpResult`'s resource link block, which only a kernel makes.
 - `outrig.McpOther` -- an `McpResult`'s block of a kind not modeled, which only a kernel makes.
 - `outrig.McpError` -- what a call of an MCP service's tool raises, which only a kernel makes.
+- `outrig.NotDispatched` -- an `McpError` of a call its server never got, which only a kernel makes.
+- `outrig.MayHaveDispatched` -- an `McpError` of a call its server may have done, only in a kernel.
+- `outrig.ResponseReceived` -- an `McpError` of a call its server answered, only in a kernel.
+- `outrig.UnknownTool` -- a `NotDispatched` for a tool not in the listing, only in a kernel.
+- `outrig.InvalidArguments` -- a `NotDispatched` for arguments the schema refused, only in a kernel.
+- `outrig.ServiceUnavailable` -- a `NotDispatched` for a server not connected, only in a kernel.
+- `outrig.AdmissionClosed` -- a `NotDispatched` for a call made as the session closed, in a kernel.
+- `outrig.Paused` -- a `NotDispatched` for a call of a paused MCP service, only in a kernel.
+- `outrig.ProtocolError` -- a `ResponseReceived` for an error its server answered, only in a kernel.
 - `outrig.ToolError` -- what a call raises for a result its MCP server marked an error, in a kernel.
 - `outrig.ChannelError` -- the base of what an external channel raises, which only a kernel holds.
 - `outrig.ChannelClosed` -- what an external channel raises once closed, which only a kernel holds.

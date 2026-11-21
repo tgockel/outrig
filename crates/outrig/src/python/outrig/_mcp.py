@@ -3,8 +3,9 @@ class generated from the server's tool listing, a method per tool by the tool's 
 
 The object is an `outrig.McpService`, an `outrig.Service` whose calls return an `outrig.McpResult`
 -- the server's content blocks in order, its structured content, its `_meta` and whether it marked
-the result an error -- rather than JSON data. A result the server marked as an error raises
-`outrig.ToolError`, and a call that returns no result `outrig.McpError`.
+the result an error -- rather than JSON data. A call that returns no result raises an
+`outrig.McpError` of the state it ended in: `NotDispatched`, `MayHaveDispatched` or
+`ResponseReceived`, a result the server marked as an error being an `outrig.ToolError`.
 """
 
 import base64
@@ -17,9 +18,11 @@ from . import _services
 from ._services import Service, ServiceError, _decoded, _failure, _line
 
 # The interpreter's, bound as it loads the package: `_relist(obj)` asks the host to list again the
-# tools of the MCP service `obj` stands for, from the calling kernel, and returns the host's answer,
-# a line with `ok` or with `error`. On the host it stays `None`.
+# tools of the MCP service `obj` stands for, from the calling kernel, and `_reconnect(obj)` to
+# connect it again; each returns the host's answer, a line with `ok` or with `error`. On the host
+# they stay `None`.
 _relist = None
+_reconnect = None
 
 # How many times the host said each service's server announced a changed listing, and how many of
 # those the latest relist covers, by service: a service is stale while the first is ahead. Counts,
@@ -40,17 +43,35 @@ def _list_changed(name, heard):
 
 
 class McpError(ServiceError):
-    """A call of an MCP service's tool, or a relist, that gave no result: an
-    `outrig.ServiceError` whose `tool` is the tool's exact name -- its `method` -- and whose `state`
-    says where in the call it ended, as far as OutRig knows: `"response_received"`, the server
-    answered, or `None`.
+    """A call of an MCP service's tool, or a relist or a reconnect, that gave no result: an
+    `outrig.ServiceError` whose `tool` is the tool's exact name -- its `method` -- with where in the
+    call it ended and what failed.
+
+    `state` is decided by where the call ended, never guessed from what failed:
+
+    - `"not_dispatched"` -- nothing reached the server: the session is closing, the tool is not in
+      the listing, the arguments do not match its schema, the service is paused or could not be
+      connected. Nothing can have happened. Raised as `outrig.NotDispatched`.
+    - `"may_have_dispatched"` -- the request was handed to the server and no answer was read: the
+      transport failed, the deadline passed, the call was interrupted or the session closed. The
+      server may have done it, all of it or part. A timeout stops the wait, not the server: it is
+      sent a cancel, which it may ignore. Raised as `outrig.MayHaveDispatched`.
+    - `"response_received"` -- the server answered: with an error, or with a result too large to
+      hand over. What it did is as its answer says. Raised as `outrig.ResponseReceived`.
+
+    `None` for a relist or a reconnect, which is no call. `failure` says what failed --
+    `"transport"`, `"protocol"`, `"timeout"`, `"canceled"`, `"other"` -- or is `None`.
+
+    OutRig never calls a tool again, whatever the state: `except outrig.MayHaveDispatched:` is
+    the spelling that keeps a write from being repeated before checking whether it happened.
     """
 
     __module__ = "outrig"
 
-    def __init__(self, message, *, state=None, **fields):
+    def __init__(self, message, *, state=None, failure=None, **fields):
         super().__init__(message, **fields)
         self.state = state
+        self.failure = failure
 
     @property
     def tool(self):
@@ -58,10 +79,72 @@ class McpError(ServiceError):
         return self.method
 
     def _fields(self):
-        return {**super()._fields(), "state": self.state}
+        return {**super()._fields(), "state": self.state, "failure": self.failure}
 
 
-class ToolError(McpError):
+class NotDispatched(McpError):
+    """Nothing reached the server, so nothing of the call can have happened. `reason` says why;
+    a subclass names the common ones."""
+
+    __module__ = "outrig"
+
+
+class MayHaveDispatched(McpError):
+    """The request was handed to the server and no answer was read, so the server may have done
+    what it asked: `failure` says what cut it off -- `"transport"`, `"timeout"`, `"canceled"` or
+    another. Check whether it happened before repeating a call that changes something."""
+
+    __module__ = "outrig"
+
+
+class ResponseReceived(McpError):
+    """The server answered, and its answer is what happened: an error it sent, effects and all,
+    or a result too large to hand over, the work done."""
+
+    __module__ = "outrig"
+
+
+class UnknownTool(NotDispatched):
+    """The service's listing has no tool of that name: it was never asked."""
+
+    __module__ = "outrig"
+
+
+class InvalidArguments(NotDispatched):
+    """The arguments do not match the tool's schema: `path` is the first JSON path that failed. It
+    was never asked."""
+
+    __module__ = "outrig"
+
+
+class ServiceUnavailable(NotDispatched):
+    """The service's transport failed, and connecting it again failed, or may not be made: it
+    was never asked. A later call or `reconnect()` tries again while the session allows it."""
+
+    __module__ = "outrig"
+
+
+class AdmissionClosed(NotDispatched):
+    """The session is closing to new work: it was never asked."""
+
+    __module__ = "outrig"
+
+
+class Paused(NotDispatched):
+    """The service is paused: it was never asked."""
+
+    __module__ = "outrig"
+
+
+class ProtocolError(ResponseReceived):
+    """The server answered with an error -- `category` is `invalid_arguments` for arguments it
+    refused, `not_found` for a tool it does not know, `failed` otherwise -- or with a message the
+    protocol does not allow there. What it did before answering stands."""
+
+    __module__ = "outrig"
+
+
+class ToolError(ResponseReceived):
     """A tool's result the server marked as an error: the tool ran and said it failed, which is a
     response, effects and all. `result` is the whole `outrig.McpResult` -- its `content` usually
     says what went wrong -- `outcome` is `returned`, and `state` is `"response_received"`.
@@ -76,6 +159,35 @@ class ToolError(McpError):
 
     def _fields(self):
         return {**super()._fields(), "result": self.result}
+
+
+# The class of a refusal, by its reason; another is `NotDispatched`.
+_REFUSED = {
+    "unknown_method": UnknownTool,
+    "invalid_arguments": InvalidArguments,
+    "unavailable": ServiceUnavailable,
+    "admission_closed": AdmissionClosed,
+    "paused": Paused,
+}
+_STATES = {
+    "not_dispatched": NotDispatched,
+    "may_have_dispatched": MayHaveDispatched,
+    "response_received": ResponseReceived,
+}
+
+
+def _raised(service, method, error):
+    """The `McpError` a call of `service`'s `method` -- or a relist or a reconnect, with no
+    `method` -- raises, from the `error` of the host's answer: of the class its state and outcome
+    say."""
+    outcome, state = error.get("outcome"), error.get("state")
+    if outcome == "refused":
+        cls = _REFUSED.get(error.get("reason"), NotDispatched)
+    elif state == "response_received" and outcome == "raised":
+        cls = ProtocolError
+    else:
+        cls = _STATES.get(state, McpError)
+    return _failure(cls, service, method, error, state=state, failure=error.get("failure"))
 
 
 class McpBlock:
@@ -357,14 +469,18 @@ class McpService(Service):
 
     A call returns an `outrig.McpResult`: the server's content blocks in order, its structured
     content, its `_meta`, and whether it marked the result an error -- in which case the call
-    raises `outrig.ToolError`, carrying it. A call that returns no result raises
-    `outrig.McpError`. OutRig never calls a tool again for you, whatever happened to the first
-    call.
+    raises `outrig.ToolError`, carrying it. A call that returns no result raises an
+    `outrig.McpError` of the state it ended in: `outrig.NotDispatched`, nothing reached the
+    server; `outrig.MayHaveDispatched`, it may have done the work, a timeout included -- a timeout
+    stops the wait, not the server; `outrig.ResponseReceived`, the server answered. OutRig never
+    calls a tool again for you, whatever happened to the first call.
 
     Every tool is reachable by its exact name: `call(name, arguments)` calls it, `tool(name)`
     gives it with its descriptor, and `tools` lists the descriptors as the server gave them.
     `relist()` asks the server for its tools again; `stale` says whether the server has said its
-    listing changed since, and `listing` which listing the methods come from.
+    listing changed since, and `listing` which listing the methods come from. When its transport
+    fails, the next call connects it again first -- and `reconnect()` does without a call -- with
+    nothing of an earlier call sent again.
     """
 
     __module__ = "outrig"
@@ -406,8 +522,10 @@ class McpService(Service):
                 "the content blocks in order, structured content, `_meta` and `is_error`. "
                 "`call(name, arguments)` calls any tool by its exact name, `tool(name)` gives one "
                 "with its descriptor, `tools` lists the descriptors, and `relist()` lists them "
-                "again. A result the server marks as an error raises outrig.ToolError, and a call "
-                "that returns no result raises outrig.McpError.")
+                "again. A result the server marks as an error raises outrig.ToolError; a call that "
+                "returns no result raises an outrig.McpError saying whether it reached the "
+                "server: NotDispatched, MayHaveDispatched or ResponseReceived. A server whose "
+                "transport failed is connected again by the next call, or by `reconnect()`.")
 
     @property
     def tools(self):
@@ -443,12 +561,29 @@ class McpService(Service):
         `outrig.McpTool` already held still calls the tool it named. Returns an
         `outrig.McpRelisted`: what was added, removed and changed, and what did not decode.
         Raises `outrig.McpError` when the tools could not be listed."""
-        name = type(self)._service
-        answer = _relist(self)
+        return self._relisted(self._asked(_relist))
+
+    def reconnect(self):
+        """Connect the service again, its transport having failed: placed as it was at the
+        session's start, with the values it had, then its tools listed again as `relist()` lists
+        them. Returns an `outrig.McpRelisted`, or `None` when the service is connected and nothing
+        was done. Nothing of an earlier call is sent again. Raises `outrig.ServiceUnavailable`
+        when it could not be connected, or may not be: the session bounds how many times."""
+        ok = self._asked(_reconnect)
+        return None if ok is None else self._relisted(ok)
+
+    def _asked(self, ask):
+        """What the host answered `ask(self)` -- a relist or a reconnect -- with: its `ok`, or the
+        `McpError` it raises."""
+        answer = ask(self)
         error = answer.get("error")
         if error is not None:
-            raise _failure(McpError, name, None, error)
-        ok = answer["ok"]
+            raise _raised(type(self)._service, None, error)
+        return answer["ok"]
+
+    def _relisted(self, ok):
+        """The `McpRelisted` the host's `ok` says."""
+        name = type(self)._service
         with _counted:
             _relisted[name] = max(_relisted.get(name, 0), ok.get("relisted", 0))
         undecoded = tuple((each.get("name"), each.get("reason")) for each in ok["undecoded"])
@@ -459,10 +594,7 @@ class McpService(Service):
         name = type(self)._service
         error = answer.get("error")
         if error is not None:
-            # A call that returned reached its server, which answered with a result too large to
-            # hand over; no other failure says yet where it ended.
-            state = "response_received" if error.get("outcome") == "returned" else None
-            raise _failure(McpError, name, method, error, state=state)
+            raise _raised(name, method, error)
         result = McpResult(_decoded(name, method, answer["ok"]))
         if result.is_error:
             text = result.text
@@ -475,7 +607,8 @@ class McpService(Service):
         return result
 
     def __dir__(self):
-        return sorted({*super().__dir__(), "tools", "tool", "listing", "stale", "relist"})
+        return sorted({*super().__dir__(), "tools", "tool", "listing", "stale", "relist",
+                       "reconnect"})
 
     def __repr__(self):
         cls = type(self)

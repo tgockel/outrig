@@ -296,6 +296,12 @@ three times for one call before the rejection ends it.
     -- `with_primary`, its transport closed, its server ending with the session's container, or
     `not_started`; and `proven`, whether that stop is. One not proven makes `stopped`
     `not_proven`.
+  - `mcp_uncertain`: each call of an MCP service's tool that ended `may_have_dispatched` at any
+    point in the session -- its request handed to the server and no answer read -- in the order
+    they ended, as `{call, service, tool, agent, failure, reason}`: `failure` as its
+    `service.call.ended` says, and `reason`, why it was told to stop, or `null`. One makes the
+    verdict `stopped_with_unknown`, whether or not its agent was told: its server may have done
+    what it asked.
   - `verdict`: `clean`, `stopped_with_unknown`, or `not_proven_stopped`.
 - `channel.attached` -- an external channel the session's owner declared was attached to the
   subject's kernel, which holds it from then on as `runtime.channels[channel]`: `channel`;
@@ -819,8 +825,10 @@ between a child's failed rounds is in that read and has no event of its own.
   called, published before it is. A call whose service is never called has none.
 - `service.call.cancel.sent` -- a dispatched call was told to stop, its cancellation token
   triggered: `call`, `service`, `agent`, and `reason`: `deadline`, its deadline passed;
-  `interrupted`, its caller was interrupted; or `closed`, the session's drain ended with it
-  running. The first of these holds. The call has its grace to end before it is abandoned.
+  `interrupted`, its caller was interrupted; `closed`, the session's drain ended with it
+  running; or `stopped`, its service was stopped. The first of these holds. The call has its
+  grace to end before it is abandoned; an MCP service's call sends its server
+  `notifications/cancelled` and ends at once.
 - `service.call.ended` -- how a call ended: `call`, `service`, `kind`, `method`, `agent`,
   `execid`; `outcome`; `category`, the service's own, for a `raised` call, else `null`; `reason`,
   for an outcome that has one, else `null`; `detail`, the first failing JSON path of arguments
@@ -828,31 +836,45 @@ between a child's failed rounds is in that read and has no event of its own.
   size of the result the service returned, as JSON, or `null`; `duration`, seconds from its
   receipt; and `body`, a preview of the result, or `null` unless the session's service policy
   records bodies. A call of an MCP service's tool adds `tool` and `listing`, as on
-  `service.call.received`; `state`, `response_received` when its server answered with a result,
-  handed over or not, else `null`; and, of that result, `is_error`, the server's own flag,
-  `blocks`, how many content blocks of each kind it held (`{"text": 2, "image": 1}`), and
-  `structured`, whether it held structured content, each `null` without one. `outcome` is:
+  `service.call.received`; `state`, where in the call it ended, which says whether its server
+  saw it -- `not_dispatched`, nothing reached the server (`refused` or `cancelled`);
+  `may_have_dispatched`, the request was handed to the transport and no answer was read
+  (`unknown`); `response_received`, the server answered (`returned`, or `raised` for an error it
+  answered) -- and `null` only for a call whose service panicked; `failure`, what failed, for a
+  call that may have dispatched or one the server answered with an error -- `transport`,
+  `protocol`, `timeout`, `canceled` or `other` -- else `null`; and, of a result, `is_error`, the
+  server's own flag, `blocks`, how many content blocks of each kind it held (`{"text": 2,
+  "image": 1}`), and `structured`, whether it held structured content, each `null` without one.
+  `outcome` is:
   - `returned` -- the service was called and returned its result. With the reason
     `result_too_large`, the result was larger as JSON than the policy lets one be, and its caller
     was not given it: `detail` says how large. What the call did is done.
   - `raised` -- the service was called and returned an error, whose `category` is
     `invalid_arguments`, `not_found`, `refused`, `unavailable`, `failed`, `cancelled` or `other`.
+    An MCP server's error is `invalid_arguments` for the protocol's invalid-params code,
+    `not_found` for method-not-found, and `failed` otherwise.
   - `refused` -- the service was never called: `admission_closed`, the session was closed to new
-    work; `unknown_method`, its description, as it stands, has no method of that name; or
-    `invalid_arguments`, the arguments did not match the method's schema.
-  - `cancelled` -- the service was never called: `interrupted` or `closed` reached the call
-    before its dispatch.
-  - `unknown` -- the service was called, told to stop, and still running when its grace ended, so
-    it was abandoned: `deadline`, `interrupted` or `closed`. What it did is open, and nothing
-    calls it again.
+    work; `unknown_method`, its description, as it stands, has no method of that name;
+    `invalid_arguments`, the arguments did not match the method's schema; `paused` or `stopped`,
+    its service is; or `unavailable`, an MCP service whose transport failed could not be
+    connected again, or may not be.
+  - `cancelled` -- the service was never called: `interrupted`, `closed`, `deadline` or
+    `stopped` reached the call before its dispatch, or before an MCP service it waited on to be
+    connected again was.
+  - `unknown` -- the service may have done the work: it said so -- the category `unknown`, or an
+    MCP call that may have dispatched -- or it was told to stop and still running when its grace
+    ended, and was abandoned. `reason`, when it was told to stop: `deadline`, `interrupted`,
+    `closed` or `stopped`. What it did is open, and nothing calls it again.
 
-  That a service was never called is read from `refused` or `cancelled` alone, as for a request
-  to a binding. The family follows the rule for a new one: the agent as subject, one id the host
-  mints, the interpreter's ids said to be its claims, previews of by-value data only, and no
-  "attempt". A call of an MCP service's tool is a call of this family, `kind` `mcp` and `method`
-  the tool's exact name; a call of a paused service is `refused`, `paused`, and one of a stopped
-  service `refused`, `stopped`; a call in flight when its service is stopped is told to stop,
-  `stopped`, and ends `unknown` with that reason.
+  That a service was never called is read from `outcome` -- `refused` or `cancelled` -- and, for
+  an MCP call, from `state`, never from a missing `service.call.dispatched` across a gap: an MCP
+  call is dispatched to its service before that service sends anything, so one refused because
+  its server could not be connected again has a `service.call.dispatched` and is
+  `not_dispatched` all the same. The family follows the rule for a new one: the agent as
+  subject, one id the host mints, the interpreter's ids said to be its claims, previews of
+  by-value data only, and no "attempt". A call of an MCP service's tool is a call of this
+  family, `kind` `mcp` and `method` the tool's exact name; a call in flight when its service is
+  stopped is told to stop, `stopped`, and ends `unknown` with that reason.
 - `mcp.service.started` -- an MCP server the session placed started, as the session started: its
   container placed, its `initialize` answered and its tools listed. `service`, the name agents
   reach it by; `server`, its own name in the configuration where that differs -- `my-fs`, bound
@@ -893,6 +915,16 @@ between a child's failed rounds is in that read and has no event of its own.
   `service.described` follows. A relist that failed has none.
 - `mcp.service.list.changed` -- a service's server said its tool listing changed: `service`.
   Nothing is relisted for it; agent code reads the service as stale until a relist.
+- `mcp.service.disconnected` -- a service's transport failed under a call: `service`, and
+  `cause`, `{kind, message}`, as a retry's. The call keeps its state, `may_have_dispatched`, and
+  nothing of it is sent again; the next call, or `reconnect()` in agent code, connects the
+  service again. The server the old transport spoke to may run on until its container stops.
+- `mcp.service.reconnected` -- a service whose transport failed was connected again, as it was
+  placed at the start and with the values resolved then, and its tools listed: `service`;
+  `attempts`, within the connect budget, each failed one an `mcp.service.retry`; `listing`, the
+  generation it is described at now; and `undecoded`, as `mcp.service.started` has it. When the
+  listing changed, its `service.described` follows. A reconnect that fails has none: the call
+  that asked for it is refused `unavailable`.
 
 **Totals.** What a session spent is the sum of its `model.attempt` usage, each `attempt_id`
 counted once, with a `model.usage.replaced` taking the place of its attempt's `null` and a

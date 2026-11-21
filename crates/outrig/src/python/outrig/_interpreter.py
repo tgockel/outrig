@@ -2496,7 +2496,8 @@ def _load_outrig(directory):
         "channel" if name in _CHANNELS else getattr(_SESSION.get(name), "kind", "binding")
     )
     outrig._services._call = _service_call
-    outrig._mcp._relist = _mcp_relist
+    outrig._mcp._relist = lambda obj: _mcp_ask(obj, "mcp.relist")
+    outrig._mcp._reconnect = lambda obj: _mcp_ask(obj, "mcp.reconnect")
     outrig.skills._install(
         _ask_host, _notify, _compiled_cause, lambda: next(_ids), _refuse_closing,
         lambda: _observing,
@@ -7866,19 +7867,20 @@ def _service_caller(obj):
     return name, kernel, execution
 
 
-def _mcp_relist(obj):
-    """Ask the host to list again the tools of the MCP service `obj` -- a kernel's object of it
-    -- stands for, from that kernel, and return its answer, a line with `ok` or with `error`. The
-    calling thread waits; an interrupt that reaches it stops the wait, and the host's answer, when
-    it comes, is dropped."""
+def _mcp_ask(obj, kind):
+    """Ask the host, in a line of `kind`, to list again the tools of the MCP service `obj` -- a
+    kernel's object of it -- stands for (`mcp.relist`), or to connect it again (`mcp.reconnect`),
+    from that kernel, and return its answer, a line with `ok` or with `error`. The calling thread
+    waits; an interrupt that reaches it stops the wait, and the host's answer, when it comes, is
+    dropped."""
     name, kernel, execution = _service_caller(obj)
     line = {
-        "t": "mcp.relist",
+        "t": kind,
         "agent": kernel.agent,
         "exec": None if execution is None else execution.id,
         "service": name,
     }
-    # Answered as a call is; bounded by the host, which lists within its own bound.
+    # Answered as a call is; bounded by the host, which lists and connects within its own bounds.
     answer = _ask_host(line, None)
     if answer.get("t") != "service":
         raise RuntimeError(answer["error"]["message"])

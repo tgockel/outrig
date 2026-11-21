@@ -1121,6 +1121,10 @@ pub fn outrig::container::install_panic_hook()
 pub fn outrig::container::sidecar_container_name(&str, &str) -> alloc::string::String
 pub fn outrig::container::with_panic_sweep<T>(impl core::ops::function::FnOnce() -> T) -> T
 pub mod outrig::error
+#[non_exhaustive] pub enum outrig::error::McpDispatchState
+pub outrig::error::McpDispatchState::MayHaveDispatched
+pub outrig::error::McpDispatchState::NotDispatched
+pub outrig::error::McpDispatchState::ResponseReceived
 #[non_exhaustive] pub enum outrig::error::McpFailureKind
 pub outrig::error::McpFailureKind::Canceled
 pub outrig::error::McpFailureKind::Other
@@ -1320,6 +1324,8 @@ pub outrig::harness::event::ItemOutcome::NotAccepted
 pub outrig::harness::event::ItemOutcome::Refused
 pub outrig::harness::event::ItemOutcome::Uncertain
 #[non_exhaustive] pub enum outrig::harness::event::McpDispatchState
+pub outrig::harness::event::McpDispatchState::MayHaveDispatched
+pub outrig::harness::event::McpDispatchState::NotDispatched
 pub outrig::harness::event::McpDispatchState::ResponseReceived
 #[non_exhaustive] pub enum outrig::harness::event::Operation
 pub outrig::harness::event::Operation::Buffiter
@@ -1606,6 +1612,9 @@ pub outrig::harness::event::Payload::InventoryObserved::execid: outrig::harness:
 pub outrig::harness::event::Payload::InventoryObserved::more: u64
 pub outrig::harness::event::Payload::InventoryObserved::names: alloc::vec::Vec<outrig::harness::event::Held>
 pub outrig::harness::event::Payload::InventoryObserved::total: u64
+#[non_exhaustive] pub outrig::harness::event::Payload::McpServiceDisconnected
+pub outrig::harness::event::Payload::McpServiceDisconnected::cause: outrig::harness::McpRetryCause
+pub outrig::harness::event::Payload::McpServiceDisconnected::service: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::McpServiceFailed
 pub outrig::harness::event::Payload::McpServiceFailed::attempts: u32
 pub outrig::harness::event::Payload::McpServiceFailed::cause: outrig::harness::McpStartupCause
@@ -1619,6 +1628,11 @@ pub outrig::harness::event::Payload::McpServicePaused::calls: alloc::vec::Vec<ou
 pub outrig::harness::event::Payload::McpServicePaused::how: outrig::harness::McpPauseHow
 pub outrig::harness::event::Payload::McpServicePaused::proven: bool
 pub outrig::harness::event::Payload::McpServicePaused::service: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::McpServiceReconnected
+pub outrig::harness::event::Payload::McpServiceReconnected::attempts: u32
+pub outrig::harness::event::Payload::McpServiceReconnected::listing: u64
+pub outrig::harness::event::Payload::McpServiceReconnected::service: alloc::string::String
+pub outrig::harness::event::Payload::McpServiceReconnected::undecoded: alloc::vec::Vec<outrig::McpUndecodedTool>
 #[non_exhaustive] pub outrig::harness::event::Payload::McpServiceRelisted
 pub outrig::harness::event::Payload::McpServiceRelisted::agent: alloc::string::String
 pub outrig::harness::event::Payload::McpServiceRelisted::listing: u64
@@ -1804,6 +1818,7 @@ pub outrig::harness::event::Payload::SessionReport::closed_by: outrig::harness::
 pub outrig::harness::event::Payload::SessionReport::executions: alloc::vec::Vec<outrig::harness::ExecutionOutcome>
 pub outrig::harness::event::Payload::SessionReport::hosted: alloc::vec::Vec<outrig::harness::HostedCall>
 pub outrig::harness::event::Payload::SessionReport::mcp_services: alloc::vec::Vec<outrig::harness::McpServiceStop>
+pub outrig::harness::event::Payload::SessionReport::mcp_uncertain: alloc::vec::Vec<outrig::harness::McpUncertainCall>
 pub outrig::harness::event::Payload::SessionReport::requests: alloc::vec::Vec<outrig::harness::RequestOutcome>
 pub outrig::harness::event::Payload::SessionReport::services: alloc::vec::Vec<outrig::harness::ServiceCall>
 pub outrig::harness::event::Payload::SessionReport::stopped: outrig::harness::Stopped
@@ -1910,6 +1925,7 @@ pub outrig::harness::event::ServiceReason::InvalidArguments
 pub outrig::harness::event::ServiceReason::Paused
 pub outrig::harness::event::ServiceReason::ResultTooLarge
 pub outrig::harness::event::ServiceReason::Stopped
+pub outrig::harness::event::ServiceReason::Unavailable
 pub outrig::harness::event::ServiceReason::UnknownMethod
 #[non_exhaustive] pub enum outrig::harness::event::SessionState
 pub outrig::harness::event::SessionState::Closing
@@ -2031,9 +2047,10 @@ pub outrig::harness::event::LeftOut::part: u64
 pub outrig::harness::event::LeftOut::turn: u64
 #[non_exhaustive] pub struct outrig::harness::event::McpCallEnded
 pub outrig::harness::event::McpCallEnded::blocks: core::option::Option<alloc::collections::btree::map::BTreeMap<alloc::string::String, u64>>
+pub outrig::harness::event::McpCallEnded::failure: core::option::Option<outrig::error::McpFailureKind>
 pub outrig::harness::event::McpCallEnded::is_error: core::option::Option<bool>
 pub outrig::harness::event::McpCallEnded::listing: u64
-pub outrig::harness::event::McpCallEnded::state: core::option::Option<outrig::harness::event::McpDispatchState>
+pub outrig::harness::event::McpCallEnded::state: core::option::Option<outrig::error::McpDispatchState>
 pub outrig::harness::event::McpCallEnded::structured: core::option::Option<bool>
 pub outrig::harness::event::McpCallEnded::tool: alloc::string::String
 #[non_exhaustive] pub struct outrig::harness::event::McpCallReceived
@@ -2380,6 +2397,7 @@ pub outrig::harness::ServiceErrorCategory::NotFound
 pub outrig::harness::ServiceErrorCategory::Other
 pub outrig::harness::ServiceErrorCategory::Refused
 pub outrig::harness::ServiceErrorCategory::Unavailable
+pub outrig::harness::ServiceErrorCategory::Unknown
 impl outrig::harness::ServiceErrorCategory
 pub fn outrig::harness::ServiceErrorCategory::as_str(self) -> &'static str
 #[non_exhaustive] pub enum outrig::harness::SessionEnd
@@ -2674,6 +2692,7 @@ impl outrig::harness::McpServices
 pub fn outrig::harness::McpServices::outcomes(&self) -> alloc::vec::Vec<(alloc::string::String, outrig::harness::McpServiceOutcome)>
 pub async fn outrig::harness::McpServices::quiesce(&self, &str, outrig::harness::Quiesce, core::time::Duration) -> outrig::harness::QuiesceOutcome
 pub async fn outrig::harness::McpServices::resume(&self, &str) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, alloc::string::String>
+pub fn outrig::harness::McpServices::uncertain(&self) -> alloc::vec::Vec<outrig::harness::McpUncertainCall>
 pub fn outrig::harness::McpServices::writers(&self) -> alloc::vec::Vec<outrig::harness::McpWriter>
 impl core::fmt::Debug for outrig::harness::McpServices
 pub fn outrig::harness::McpServices::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -2688,6 +2707,13 @@ pub outrig::harness::McpStartupCause::placement: outrig::harness::McpPlacementKi
 pub outrig::harness::McpStartupCause::server: core::option::Option<alloc::string::String>
 pub outrig::harness::McpStartupCause::service: alloc::string::String
 pub outrig::harness::McpStartupCause::stderr_tail: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub struct outrig::harness::McpUncertainCall
+pub outrig::harness::McpUncertainCall::agent: alloc::string::String
+pub outrig::harness::McpUncertainCall::call: outrig::harness::event::ServiceCallId
+pub outrig::harness::McpUncertainCall::failure: core::option::Option<outrig::error::McpFailureKind>
+pub outrig::harness::McpUncertainCall::reason: core::option::Option<outrig::harness::event::ServiceReason>
+pub outrig::harness::McpUncertainCall::service: alloc::string::String
+pub outrig::harness::McpUncertainCall::tool: alloc::string::String
 #[non_exhaustive] pub struct outrig::harness::McpWriter
 pub outrig::harness::McpWriter::placement: outrig::harness::McpPlacementKind
 pub outrig::harness::McpWriter::service: alloc::string::String
@@ -2926,6 +2952,7 @@ pub outrig::harness::ShutdownReport::events: outrig::harness::EventDelivery
 pub outrig::harness::ShutdownReport::executions: alloc::vec::Vec<outrig::harness::ExecutionOutcome>
 pub outrig::harness::ShutdownReport::hosted: alloc::vec::Vec<outrig::harness::HostedCall>
 pub outrig::harness::ShutdownReport::mcp_services: alloc::vec::Vec<outrig::harness::McpServiceStop>
+pub outrig::harness::ShutdownReport::mcp_uncertain: alloc::vec::Vec<outrig::harness::McpUncertainCall>
 pub outrig::harness::ShutdownReport::requests: alloc::vec::Vec<outrig::harness::RequestOutcome>
 pub outrig::harness::ShutdownReport::services: alloc::vec::Vec<outrig::harness::ServiceCall>
 pub outrig::harness::ShutdownReport::stopped: outrig::harness::Stopped
