@@ -1,10 +1,12 @@
 //! The rmcp the MCP client was reviewed against is the one the workspace
 //! locks.
 //!
-//! The two classifiers in `src/mcp.rs` -- `session_error_from_rmcp` over
-//! `ServiceError` and `init_error_class` over `ClientInitializeError` -- match
+//! The classifiers in `src/mcp.rs` -- `session_error_from_rmcp` over
+//! `ServiceError` and `init_error_class` over `ClientInitializeError` -- and
+//! `http_class` over `StreamableHttpError`, in `src/mcp/http.rs`, match
 //! `#[non_exhaustive]` enums, so a variant an upgrade adds lands in a wildcard
-//! without a compile error. The tolerant `tools/list` stands on the order of
+//! without a compile error. The HTTP one also reads a status from the text
+//! rmcp writes for a POST it could not use, `HTTP <status>: <body>`. The tolerant `tools/list` stands on the order of
 //! rmcp's untagged `ServerResult`: a page its typed decode refuses arrives as
 //! `CustomResult`, the last variant, unless an earlier one takes it first. This
 //! holds the lock to the release they were last read against, so the upgrade
@@ -41,8 +43,10 @@ fn the_locked_rmcp_is_the_reviewed_one() {
         "rmcp moved from the {REVIEWED_RMCP} the MCP client was reviewed against. Review, then \
          raise REVIEWED_RMCP: `session_error_from_rmcp` against `ServiceError` \
          (every_rmcp_service_error_is_classified) and `init_error_class` against \
-         `ClientInitializeError` (every_rmcp_init_error_is_classified) for variants the \
-         wildcards would file away; `ServerResult`'s variants before `CustomResult` against \
+         `ClientInitializeError` (every_rmcp_init_error_is_classified) and `http_class` \
+         against `StreamableHttpError` (every_rmcp_http_error_is_classified) for variants the \
+         wildcards would file away, and the `HTTP <status>` text `status_said` reads; the \
+         revision the HTTP client offers (mcp/http.rs) and its session recovery, kept off; `ServerResult`'s variants before `CustomResult` against \
          `list_every_page`'s seam (a_page_the_typed_decode_refuses_arrives_whole); \
          `SUPPORTED_PROTOCOL_VERSIONS` in mcp_proxy.rs against the revisions the release speaks; \
          and plan/next/rmcp-list-result-spec-gaps.md"

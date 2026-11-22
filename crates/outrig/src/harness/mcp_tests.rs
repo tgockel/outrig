@@ -719,6 +719,7 @@ fn a_configured_sidecar_never_takes_a_launched_ones_name() {
         |_| false,
         None,
         ["tools".to_string()].into(),
+        &[],
     );
     let why = plan.services[0]
         .misconfigured
@@ -1715,7 +1716,7 @@ async fn a_live_object_takes_no_mcp_services_name() {
 /// A declaration's header that names an identity header is refused, case aside.
 #[test]
 fn an_identity_header_is_not_a_declarations() {
-    let identity = vec![("X-Fence".to_string(), "t-1".to_string())];
+    let identity = vec!["X-Fence".to_string()];
     let named = super::mcp::names_identity_header(
         &["Authorization".to_string(), "x-fence".to_string()],
         &identity,

@@ -810,7 +810,8 @@ impl Config {
     }
 
     /// Every variable this config names through `${VAR}`: each provider's
-    /// `api-key`, and each image's `build-args` and MCP server `env`. These
+    /// `api-key`, and each image's `build-args` and MCP server `env` and
+    /// `headers`. These
     /// are OutRig's own secrets, so a binding that inherits the owner's
     /// environment inherits it without them.
     pub(crate) fn env_refs(&self) -> BTreeSet<String> {
@@ -825,6 +826,12 @@ impl Config {
                 .build_args
                 .values()
                 .chain(image.mcp.values().flat_map(|server| server.env().values()))
+                .chain(
+                    image
+                        .mcp
+                        .values()
+                        .flat_map(|server| server.headers().values()),
+                )
         });
         let refs = values.filter_map(|value| match value {
             EnvValue::EnvRef(var) => Some(var.clone()),
@@ -3124,6 +3131,12 @@ impl ImageConfig {
         self.source = Some(source);
     }
 
+    /// Whether a repository's configuration declared this entry, rather than
+    /// the global one or a caller: content the agent can write.
+    pub(crate) fn repo_declared(&self) -> bool {
+        self.repo_declared
+    }
+
     /// Directory that `dockerfile` and `context` resolve against. `repo_root`
     /// is the fallback for an entry with no recorded source, which keeps every
     /// hand-built [`ImageConfig`] resolving exactly as it did before.
@@ -3229,7 +3242,69 @@ pub enum McpServerSpec {
             skip_serializing_if = "Option::is_none"
         )]
         call_timeout_secs: Option<u64>,
+        /// A streamable-HTTP endpoint the host dials, in place of a server run
+        /// in a container: `run-new` and a host program's session start it,
+        /// and `outrig run` does not. Mutually exclusive with `command`,
+        /// `sidecar`, `image`, `args`, `view` and `env`. A repository's entry
+        /// starts only once the user approves it. Elided when unset, as the
+        /// keys below are, so every other entry serializes as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        /// What each request to `url` carries, a value a literal or a
+        /// `${VAR}` reference -- held to `[repo] env-allow` in a repository's
+        /// configuration, as `env` is.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, EnvValue>,
+        /// A PEM certificate authority `url`'s client trusts, relative to the
+        /// declaring config file's directory.
+        #[serde(
+            default,
+            rename = "trust-anchor",
+            skip_serializing_if = "Option::is_none"
+        )]
+        trust_anchor: Option<PathBuf>,
+        /// How `trust-anchor` is trusted: beside the system's roots, or in
+        /// their place.
+        #[serde(default, skip_serializing_if = "McpTrust::is_default")]
+        trust: McpTrust,
+        /// Whether a server at `url` that issues no session is taken: yes,
+        /// unless this says no.
+        #[serde(
+            default,
+            rename = "allow-stateless",
+            skip_serializing_if = "Option::is_none"
+        )]
+        allow_stateless: Option<bool>,
     },
+}
+
+/// How a URL MCP server's client trusts its trust anchor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum McpTrust {
+    /// Beside the system's roots: a private authority fronting one service
+    /// while the system's roots serve the rest.
+    #[default]
+    WithSystemRoots,
+    /// In their place: the server's certificate must chain to the anchor,
+    /// and to nothing else. Without an anchor it is misconfigured.
+    Only,
+}
+
+impl McpTrust {
+    /// Whether this is the default, which serialization elides.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The kebab-case name it is written as in TOML.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WithSystemRoots => "with-system-roots",
+            Self::Only => "only",
+        }
+    }
 }
 
 /// Dispatches on the value's own type -- an array is `Short`, a table `Full`
@@ -3255,6 +3330,13 @@ impl<'de> Deserialize<'de> for McpServerSpec {
             #[serde(default)]
             view: SidecarView,
             call_timeout_secs: Option<u64>,
+            url: Option<String>,
+            #[serde(default)]
+            headers: BTreeMap<String, EnvValue>,
+            trust_anchor: Option<PathBuf>,
+            #[serde(default)]
+            trust: McpTrust,
+            allow_stateless: Option<bool>,
         }
 
         struct SpecVisitor;
@@ -3286,6 +3368,11 @@ impl<'de> Deserialize<'de> for McpServerSpec {
                     args: t.args,
                     view: t.view,
                     call_timeout_secs: t.call_timeout_secs,
+                    url: t.url,
+                    headers: t.headers,
+                    trust_anchor: t.trust_anchor,
+                    trust: t.trust,
+                    allow_stateless: t.allow_stateless,
                 })
             }
         }
@@ -3318,6 +3405,24 @@ impl McpServerSpec {
     /// anonymous sidecar instead.
     pub fn entrypoint_in_sidecar(sidecar: impl Into<String>) -> Self {
         Self::full(None, None).with_sidecar(sidecar)
+    }
+
+    /// A streamable-HTTP server the host dials at `url`: see the `url` key.
+    pub fn at_url(url: impl Into<String>) -> Self {
+        Self::full(None, None).map_full(|spec| {
+            if let Self::Full { url: slot, .. } = spec {
+                *slot = Some(url.into());
+            }
+        })
+    }
+
+    /// What each request to a [`url`](Self::url) server carries.
+    pub fn with_headers(self, headers: BTreeMap<String, EnvValue>) -> Self {
+        self.map_full(|spec| {
+            if let Self::Full { headers: slot, .. } = spec {
+                *slot = headers;
+            }
+        })
     }
 
     /// Environment for the server process, resolved at spawn time.
@@ -3390,6 +3495,11 @@ impl McpServerSpec {
             args: Vec::new(),
             view: SidecarView::None,
             call_timeout_secs: None,
+            url: None,
+            headers: BTreeMap::new(),
+            trust_anchor: None,
+            trust: McpTrust::default(),
+            allow_stateless: None,
         }
     }
 
@@ -3481,6 +3591,70 @@ impl McpServerSpec {
                 call_timeout_secs, ..
             } => *call_timeout_secs,
         }
+    }
+
+    /// The streamable-HTTP endpoint the host dials, for a `url` entry.
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            Self::Short(_) => None,
+            Self::Full { url, .. } => url.as_deref(),
+        }
+    }
+
+    /// What each request to a `url` entry's server carries.
+    pub fn headers(&self) -> &BTreeMap<String, EnvValue> {
+        static EMPTY: BTreeMap<String, EnvValue> = BTreeMap::new();
+        match self {
+            Self::Short(_) => &EMPTY,
+            Self::Full { headers, .. } => headers,
+        }
+    }
+
+    /// The certificate authority a `url` entry's client trusts, as declared.
+    pub fn trust_anchor(&self) -> Option<&Path> {
+        match self {
+            Self::Short(_) => None,
+            Self::Full { trust_anchor, .. } => trust_anchor.as_deref(),
+        }
+    }
+
+    /// How a `url` entry's trust anchor is trusted.
+    pub fn trust(&self) -> McpTrust {
+        match self {
+            Self::Short(_) => McpTrust::default(),
+            Self::Full { trust, .. } => *trust,
+        }
+    }
+
+    /// Whether a `url` entry takes a server that issues no session, as
+    /// declared: `None` takes it.
+    pub fn allow_stateless(&self) -> Option<bool> {
+        match self {
+            Self::Short(_) => None,
+            Self::Full {
+                allow_stateless, ..
+            } => *allow_stateless,
+        }
+    }
+
+    /// Whether the entry is a streamable-HTTP endpoint the host dials, run in
+    /// no container: neither a command nor a placed entry.
+    pub fn is_url(&self) -> bool {
+        self.url().is_some()
+    }
+
+    /// The first key only a `url` entry takes that this entry sets, if it
+    /// sets one: the single list of them, which validation and the label
+    /// rules read.
+    pub(crate) fn url_key(&self) -> Option<&'static str> {
+        [
+            ("headers", !self.headers().is_empty()),
+            ("trust-anchor", self.trust_anchor().is_some()),
+            ("trust", !self.trust().is_default()),
+            ("allow-stateless", self.allow_stateless().is_some()),
+        ]
+        .into_iter()
+        .find_map(|(key, set)| set.then_some(key))
     }
 
     /// Whether the spec carries a command (`Short` always does).
@@ -3641,6 +3815,14 @@ mod tests {
             args: vec!["/workspace".to_string()],
             view: SidecarView::Primary,
             call_timeout_secs: Some(30),
+            url: Some("https://mcp.example.test/mcp".to_string()),
+            headers: BTreeMap::from([(
+                "X-Token".to_string(),
+                EnvValue::EnvRef("TOKEN".to_string()),
+            )]),
+            trust_anchor: Some(PathBuf::from("ca.pem")),
+            trust: McpTrust::Only,
+            allow_stateless: Some(false),
         };
 
         let json = serde_json::to_string(&spec).unwrap();

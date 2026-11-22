@@ -158,6 +158,7 @@ _HOST_ONLY = frozenset(
         "McpCommand",
         "McpSidecar",
         "McpPrimaryView",
+        "McpUrl",
         "McpPolicy",
         "Event",
         "Missed",

@@ -1016,6 +1016,17 @@ fn spec_to_toml_value(spec: &McpServerSpec) -> toml_edit::Value {
         toml_edit::Value::Array(items.into_iter().map(String::as_str).collect())
     }
 
+    /// `values` as an inline table, each value as declared: `${VAR}` stays a reference.
+    fn raw_table(
+        values: &std::collections::BTreeMap<String, outrig::config::EnvValue>,
+    ) -> toml_edit::Value {
+        let mut table = toml_edit::InlineTable::new();
+        for (key, value) in values {
+            table.insert(key, value.to_raw().into());
+        }
+        toml_edit::Value::InlineTable(table)
+    }
+
     // The table arm reads through the accessors rather than destructuring
     // `Full`, so it needs no dead catch-all and borrows instead of cloning.
     // Each key's elision still has to track the matching `skip_serializing_if`
@@ -1028,11 +1039,7 @@ fn spec_to_toml_value(spec: &McpServerSpec) -> toml_edit::Value {
                 table.insert("command", string_array(command));
             }
             if !spec.env().is_empty() {
-                let mut env_table = toml_edit::InlineTable::new();
-                for (key, value) in spec.env() {
-                    env_table.insert(key, value.to_raw().into());
-                }
-                table.insert("env", toml_edit::Value::InlineTable(env_table));
+                table.insert("env", raw_table(spec.env()));
             }
             if let Some(sidecar) = spec.sidecar() {
                 table.insert("sidecar", sidecar.into());
@@ -1051,6 +1058,21 @@ fn spec_to_toml_value(spec: &McpServerSpec) -> toml_edit::Value {
             if let Some(secs) = spec.call_timeout_secs() {
                 // In range by validation, so well inside an `i64`.
                 table.insert("call-timeout-secs", (secs as i64).into());
+            }
+            if let Some(url) = spec.url() {
+                table.insert("url", url.into());
+            }
+            if !spec.headers().is_empty() {
+                table.insert("headers", raw_table(spec.headers()));
+            }
+            if let Some(anchor) = spec.trust_anchor() {
+                table.insert("trust-anchor", anchor.to_string_lossy().as_ref().into());
+            }
+            if !spec.trust().is_default() {
+                table.insert("trust", spec.trust().as_str().into());
+            }
+            if let Some(allow) = spec.allow_stateless() {
+                table.insert("allow-stateless", allow.into());
             }
             toml_edit::Value::InlineTable(table)
         }

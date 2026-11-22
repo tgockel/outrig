@@ -526,6 +526,7 @@ fn each_event_has_exactly_its_data_fields() {
                 )],
                 attempts: 2,
                 duration: Duration::from_millis(900),
+                detail: None,
             },
             "mcp.service.started",
             &[
@@ -538,6 +539,7 @@ fn each_event_has_exactly_its_data_fields() {
                 "undecoded",
                 "attempts",
                 "duration",
+                "detail",
             ],
         ),
         (

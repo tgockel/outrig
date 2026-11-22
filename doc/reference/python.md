@@ -203,8 +203,9 @@ Making one checks its inputs and starts nothing:
   container after it take bounded times of their own.
 - `application`: an `Application`, the code this program's agent classes are in, which every
   kernel of the session imports from; or `None`.
-- `mcp`: the MCP servers it places and binds, each an `McpCommand`, an `McpSidecar` or an
-  `McpPrimaryView`; `mcp_policy`, an `McpPolicy`, how they start; and `mcp_identity`, a
+- `mcp`: the MCP servers it places and binds, each an `McpCommand`, an `McpSidecar`, an
+  `McpPrimaryView` or an `McpUrl`; `mcp_policy`, an `McpPolicy`, how they start; and
+  `mcp_identity`, a
   mapping of header names to values carried unread on every request to a URL server this
   program declares. Each starts with the session, beside its interpreter, and one that does
   not start does not fail entry: `session.mcp` says how each start ended.
@@ -417,10 +418,10 @@ after it, because they were not read in time: see `help(outrig.Session.events)`.
 ## MCP services
 
 A session places the MCP servers a program declares with `outrig.Session(mcp=[...])` -- an
-`outrig.McpCommand`, an `outrig.McpSidecar` or an `outrig.McpPrimaryView` each -- beside those the
-configuration declares, and starts them as an `outrig.McpPolicy` says. After entry, `session.mcp`
-maps each name to an `McpOutcome`, with an `McpCause` for one that did not start, met only as
-values. See [MCP Servers](../concepts/mcp-servers.md#in-a-session-mcp-services).
+`outrig.McpCommand`, an `outrig.McpSidecar`, an `outrig.McpPrimaryView` or an `outrig.McpUrl` each
+-- beside those the configuration declares, and starts them as an `outrig.McpPolicy` says. After
+entry, `session.mcp` maps each name to an `McpOutcome`, with an `McpCause` for one that did not
+start, met only as values. See [MCP Servers](../concepts/mcp-servers.md#in-a-session-mcp-services).
 
 ### `outrig.McpCommand`
 
@@ -490,6 +491,34 @@ An MCP server a session places as `image`'s entrypoint, handed `args`, in a cont
 sees the session container's whole filesystem, bound as `name`. As in an `McpCommand`, it may
 hold no credential; `env`, `call_timeout_secs` and `description` are as there.
 
+### `outrig.McpUrl`
+
+```python
+@dataclasses.dataclass(frozen=True)
+class McpUrl:
+    name: str
+    url: str
+    headers: Mapping = dataclasses.field(default_factory=dict)
+    trust_anchor: str | os.PathLike | bytes | None = None
+    trust: str = 'with-system-roots'
+    allow_stateless: bool = True
+    call_timeout_secs: int | None = None
+    description: str | None = None
+```
+
+An MCP server a session dials at `url`, over streamable HTTP from this host, bound as
+`name`: no container of the session's runs it, and it sees no file of the session's.
+
+`headers` sets what each request carries: each value a literal, or `"${VAR}"`, which the
+engine resolves; no value reaches this program or the agent. Each request also carries the
+session's `mcp_identity` headers, which `headers` may not name. `trust_anchor` is a
+certificate authority, PEM, its client trusts -- a path on this host, or the PEM as `bytes` --
+beside the system's roots, or, with `trust="only"`, in their place. `allow_stateless` takes a
+server that issues no session, as by default. A URL with a user name or password in it, a
+scheme other than `http` or `https`, or a header HTTP or the protocol sets itself -- in
+`headers` or `mcp_identity` -- does not start, and `session.mcp` says why.
+`call_timeout_secs` and `description` are as for `McpCommand`.
+
 ### `outrig.McpPolicy`
 
 ```python
@@ -523,9 +552,10 @@ class McpOutcome:
 How a declared MCP service's start ended: `session.mcp[name]` after entry. `outcome` is
 `"ready"` -- started and bound, with `tools` tools in its first listing, generation `listing`,
 after `attempts` attempts, and in `undecoded` each tool its server listed that did not decode,
-left out, as `(name, reason)` -- or `"unavailable"`, `"refused"`, `"misconfigured"` or
-`"unclassified"`, with the `McpCause` in `cause`. The session starts with the ready ones; what
-the others mean is this program's to decide.
+left out, as `(name, reason)` -- or `"unavailable"`, `"refused"`, `"misconfigured"`,
+`"unclassified"` or, for a repository's `url` entry nobody approved, `"unapproved"`, with the
+`McpCause` in `cause`. The session starts with the ready ones; what the others mean is this
+program's to decide.
 
 ### `McpCause`
 
@@ -546,9 +576,9 @@ class McpCause:
 
 Why an MCP service did not start, holding no value a `"${VAR}"` resolved to: the
 `service`, the `server`'s own name where it differs, its `placement` -- `"command"`,
-`"sidecar"` or `"primary_view"` -- who it was `declared_in`, the `command` run with its
-environment as declared, how its transport ended (`exit`), the end of what it wrote to stderr
-(`stderr_tail`), what went wrong (`message`), the `kind` of failure -- `"transport"`,
+`"sidecar"`, `"primary_view"` or `"url"` -- who it was `declared_in`, the `command` run with
+its environment as declared, how its transport ended (`exit`), the end of what it wrote to
+stderr (`stderr_tail`), what went wrong (`message`), the `kind` of failure -- `"transport"`,
 `"protocol"`, `"timeout"`, `"canceled"` or `"other"` -- and how many `attempts` were made; each
 `None` where there is none.
 
@@ -686,7 +716,8 @@ class McpServiceStop:
 
 One MCP service at a session's close: the `service`, its `placement`, how its start ended
 (`outcome`), `how` it was stopped -- `"stopped"`, its container stopped; `"with_primary"`, it
-ended with the session's container; or `"not_started"` -- and whether that is `proven`.
+ended with the session's container; `"disconnected"`, the HTTP session to a URL server ended,
+the server not the session's to stop; or `"not_started"` -- and whether that is `proven`.
 
 ### `McpUncertainCall`
 

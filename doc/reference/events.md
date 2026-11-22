@@ -293,7 +293,8 @@ three times for one call before the rejection ends it.
   - `mcp_services`: each MCP service the session declared, in the order declared, as `{service,
     placement, outcome, how, proven}`: `placement` and `outcome` as its `mcp.service.started` or
     `mcp.service.failed` say; `how`, `stopped` -- its transport closed and its container stopped
-    -- `with_primary`, its transport closed, its server ending with the session's container, or
+    -- `with_primary`, its transport closed, its server ending with the session's container,
+    `disconnected`, a URL server's HTTP session ended, the server not the session's to stop, or
     `not_started`; and `proven`, whether that stop is. One not proven makes `stopped`
     `not_proven`.
   - `mcp_uncertain`: each call of an MCP service's tool that ended `may_have_dispatched` at any
@@ -880,22 +881,27 @@ between a child's failed rounds is in that read and has no event of its own.
   container placed, its `initialize` answered and its tools listed. `service`, the name agents
   reach it by; `server`, its own name in the configuration where that differs -- `my-fs`, bound
   as `my_fs` -- else `null`; `placement`, `command` (exec'd in the session's container),
-  `sidecar` or `primary_view` (a sidecar that sees the session container's filesystem);
-  `declared_in`, `owner`, `config` or `image_label`; `tools`, how many its listing holds;
-  `listing`, 1; `undecoded`, each tool its server listed that did not decode -- one whose
-  `inputSchema` is not an object, say -- as `{name, reason}`, left out of the listing rather than
-  costing the server the rest; `attempts`; and `duration`, seconds its start took. Its
-  `service.bound` follows.
+  `sidecar`, `primary_view` (a sidecar that sees the session container's filesystem) or `url` (a
+  streamable-HTTP server the host dials); `declared_in`, `owner`, `config` or `image_label`;
+  `tools`, how many its listing holds; `listing`, 1; `undecoded`, each tool its server listed
+  that did not decode -- one whose `inputSchema` is not an object, say -- as `{name, reason}`,
+  left out of the listing rather than costing the server the rest; `attempts`; `duration`,
+  seconds its start took; and `detail`, what its owner should know of how it was reached -- that
+  a URL server's headers went to a host that is not loopback over plain `http`, in the clear --
+  else `null`. Its `service.bound` follows.
 - `mcp.service.retry` -- an attempt to start a server failed in a way that may pass -- its
-  transport failed, or its handshake did not answer within its bound -- and it is tried again:
+  transport failed, its handshake did not answer within its bound, or a URL server answered 408,
+  429 or a 5xx -- and it is tried again:
   `service`; `attempt`, the one that failed, from 1; `delay`, seconds until the next; and
   `cause`, `{kind, message}`: `kind`, `transport`, `protocol`, `timeout`, `canceled` or `other`,
   or `null`.
 - `mcp.service.failed` -- a server did not start, and the session starts without it: `service`;
   `outcome`: `unavailable`, a failure that may pass, every attempt the connect budget allowed;
-  `refused`, it answered `initialize` with an error; `misconfigured`, it cannot start as
-  declared -- a binary not there, a credential where agent code could read it, a `${VAR}` with no
-  value; or `unclassified`, any other failure, named so; `cause`, `{service, server, placement,
+  `refused`, it answered `initialize` with an error, or a URL server answered 401 or 403;
+  `misconfigured`, it cannot start as declared -- a binary not there, a credential where agent
+  code could read it, a `${VAR}` with no value, a URL server's certificate its client does not
+  trust; `unclassified`, any other failure, named so; or `unapproved`, a repository's URL entry
+  nobody approved, nothing connected; `cause`, `{service, server, placement,
   declared_in, command, exit, stderr_tail, message, kind, attempts}`, where `command` shows its
   environment as declared, each `${VAR}` as the reference, and `exit` and `stderr_tail` are how
   its transport ended and what it wrote, when one ran; `attempts`, 0 for a declaration that could
@@ -908,18 +914,21 @@ between a child's failed rounds is in that read and has no event of its own.
 - `mcp.service.resumed` -- a paused service was thawed, its held calls let go on: `service`,
   `proven`.
 - `mcp.service.stopped` -- a service's transport was closed and what it ran in stopped, by a
-  quiesce or the session's close: `service`; `how`, `stopped` or `with_primary`; and `proven`,
-  whether its container is proven stopped. A service that never started has none.
+  quiesce or the session's close: `service`; `how`, `stopped`, `with_primary` or
+  `disconnected`; and `proven`, whether its container is proven stopped -- always, for a URL
+  server, which runs in none of the session's. A service that never started has none.
 - `mcp.service.relisted` -- an agent listed a service's tools again: `service`; `agent`, whose
   code asked; `listing`, the generation it is described at now, the next one when anything
   changed; and `undecoded`, as `mcp.service.started` has it. When the listing changed, its
   `service.described` follows. A relist that failed has none.
 - `mcp.service.list.changed` -- a service's server said its tool listing changed: `service`.
   Nothing is relisted for it; agent code reads the service as stale until a relist.
-- `mcp.service.disconnected` -- a service's transport failed under a call: `service`, and
-  `cause`, `{kind, message}`, as a retry's. The call keeps its state, `may_have_dispatched`, and
-  nothing of it is sent again; the next call, or `reconnect()` in agent code, connects the
-  service again. The server the old transport spoke to may run on until its container stops.
+- `mcp.service.disconnected` -- a service's transport failed under a call, or a URL server's event
+  stream broke, or did not open, past resuming, so no change to its listing would be heard:
+  `service`, and `cause`, `{kind, message}`, as a retry's. The call keeps its state,
+  `may_have_dispatched`, and nothing of it is sent again; the next call, or `reconnect()` in agent
+  code, connects the service again. The server the old transport spoke to may run on until its
+  container stops.
 - `mcp.service.reconnected` -- a service whose transport failed was connected again, as it was
   placed at the start and with the values resolved then, and its tools listed: `service`;
   `attempts`, within the connect budget, each failed one an `mcp.service.retry`; `listing`, the

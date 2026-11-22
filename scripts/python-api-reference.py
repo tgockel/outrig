@@ -78,7 +78,8 @@ SECTIONS = [
     (
         "MCP services",
         "A session places the MCP servers a program declares with `outrig.Session(mcp=[...])` -- "
-        "an `outrig.McpCommand`, an `outrig.McpSidecar` or an `outrig.McpPrimaryView` each -- "
+        "an `outrig.McpCommand`, an `outrig.McpSidecar`, an `outrig.McpPrimaryView` or an "
+        "`outrig.McpUrl` each -- "
         "beside those the configuration declares, and starts them as an `outrig.McpPolicy` says. "
         "After entry, `session.mcp` maps each name to an `McpOutcome`, with an `McpCause` for one "
         "that did not start, met only as values. See "
@@ -88,6 +89,7 @@ SECTIONS = [
             "outrig.McpCommand",
             "outrig.McpSidecar",
             "outrig.McpPrimaryView",
+            "outrig.McpUrl",
             "outrig.McpPolicy",
             "McpOutcome",
             "McpCause",

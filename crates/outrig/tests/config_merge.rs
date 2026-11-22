@@ -8022,3 +8022,131 @@ srv = { command = ["srv"], env = { K = "${OPERATOR_SECRET}" } }
         assert!(!text.contains("repo"), "got: {text}");
     }
 }
+
+/// `[images.<n>.mcp]`'s `url` entry: a streamable-HTTP server the host dials, in no container.
+mod mcp_url {
+    use super::*;
+
+    fn dev(entry: &str) -> Config {
+        parse(&format!(
+            "[images.dev]\nimage-name = \"docker.io/library/debian\"\n\n\
+             [images.dev.mcp]\n{entry}\n"
+        ))
+    }
+
+    /// Every key a `url` entry takes parses, and the entry validates.
+    #[test]
+    fn a_url_entry_parses_with_its_keys() {
+        let cfg = dev(
+            r#"docs = { url = "https://docs.example.test/mcp", headers = { X-Token = "${TOKEN}", X-Team = "core" }, trust-anchor = "ca.pem", trust = "only", allow-stateless = false, call-timeout-secs = 30 }"#,
+        );
+        cfg.validate(None).expect("a url entry validates");
+        let spec = &cfg.images["dev"].mcp()["docs"];
+        assert!(spec.is_url() && !spec.is_placed() && !spec.has_command());
+        assert_eq!(spec.url(), Some("https://docs.example.test/mcp"));
+        assert_eq!(
+            spec.headers()["X-Token"],
+            EnvValue::EnvRef("TOKEN".to_string())
+        );
+        assert_eq!(spec.trust_anchor(), Some(Path::new("ca.pem")));
+        assert_eq!(spec.trust(), outrig::config::McpTrust::Only);
+        assert_eq!(
+            (spec.allow_stateless(), spec.call_timeout_secs()),
+            (Some(false), Some(30))
+        );
+    }
+
+    /// A `url` entry takes no key of a server run in a container, and an entry with no `url`
+    /// takes none of the keys only a `url` entry does.
+    #[test]
+    fn a_url_entry_takes_no_container_key() {
+        for (entry, key, without_url) in [
+            (
+                r#"docs = { url = "https://d.test/mcp", command = ["x"] }"#,
+                "command",
+                false,
+            ),
+            (
+                r#"docs = { url = "https://d.test/mcp", image = "i" }"#,
+                "image",
+                false,
+            ),
+            (
+                r#"docs = { url = "https://d.test/mcp", env = { A = "b" } }"#,
+                "env",
+                false,
+            ),
+            (
+                r#"docs = { command = ["x"], headers = { A = "b" } }"#,
+                "headers",
+                true,
+            ),
+            (
+                r#"docs = { command = ["x"], trust = "only" }"#,
+                "trust",
+                true,
+            ),
+        ] {
+            let err = expect_validation_err(&dev(entry), None);
+            assert!(
+                matches!(
+                    &err,
+                    ConfigValidationError::McpUrlConflict { key: k, without_url: w, .. }
+                        if *k == key && *w == without_url
+                ),
+                "{entry}: got {err:?}"
+            );
+            assert!(err.to_string().contains(&format!("`{key}`")), "{err}");
+        }
+    }
+
+    /// A `${VAR}` in a repository's `url` entry's headers is held to `[repo] env-allow`, as one in
+    /// `env` is: off the list it is refused at load, naming the header; listed, it loads.
+    #[test]
+    fn a_repo_header_reference_off_the_list_is_refused() {
+        let repo = |tmp: &Path| {
+            write_repo_cfg(
+                tmp,
+                "[images.dev]\nimage-name = \"docker.io/library/debian\"\n\n\
+                 [images.dev.mcp]\n\
+                 docs = { url = \"https://d.test/mcp\", headers = { X-Token = \"${DOCS_TOKEN}\" } }\n",
+            );
+        };
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), "");
+        repo(tmp.path());
+        let err = expect_load_validation_err(Config::load(tmp.path(), Some(&global)).unwrap_err());
+        assert!(
+            matches!(
+                &err,
+                ConfigValidationError::RepoMcpHeaderRef {
+                    server, header, var, declared_in: Some(file), ..
+                } if server == "docs" && header == "X-Token" && var == "DOCS_TOKEN"
+                    && file.ends_with(".agents/outrig/config.toml")
+            ),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("config.toml"), "{err}");
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), "[repo]\nenv-allow = [\"DOCS_TOKEN\"]\n");
+        repo(tmp.path());
+        Config::load(tmp.path(), Some(&global)).expect("a listed header reference loads");
+    }
+
+    /// A `url` entry is placed in no container: the plan holds it as dialed, it is not among the
+    /// servers the primary runs, and it shadows an image label's entry of its name.
+    #[test]
+    fn a_url_entry_is_planned_as_dialed() {
+        use outrig::container::sidecar::{Placement, merge_primary_labels, plan_from_config};
+
+        let cfg = dev(r#"docs = { url = "https://d.test/mcp" }"#);
+        let mut plan = plan_from_config(&cfg, &cfg.images["dev"]);
+        assert_eq!(plan.servers["docs"].placement, Placement::Url);
+        merge_primary_labels(
+            &mut plan,
+            [("docs".to_string(), McpServerSpec::exec(["label-docs"]))].into(),
+        );
+        assert_eq!(plan.servers["docs"].placement, Placement::Url);
+        assert!(plan.sidecars.is_empty());
+    }
+}

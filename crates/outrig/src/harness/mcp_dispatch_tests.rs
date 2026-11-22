@@ -30,7 +30,7 @@ use crate::python::testing::{Flag, until, within};
 
 /// `mcp(f, ...)` prints how a call of an MCP service's tool ended: `ok` and its text, or the
 /// class of the `outrig.McpError` it raised with its outcome, state, failure and reason.
-const MCP: &str = r#"
+pub(super) const MCP: &str = r#"
 import outrig
 def mcp(f, *a, **k):
     try:
@@ -78,7 +78,7 @@ async fn fs_session(attempts: Vec<Behavior>) -> (Session, Subscription, Fakes) {
     session_of(builder(), attempts, calls(), starts()).await
 }
 
-fn starts() -> McpPolicy {
+pub(super) fn starts() -> McpPolicy {
     policy(Duration::from_secs(5), Duration::from_secs(10))
 }
 

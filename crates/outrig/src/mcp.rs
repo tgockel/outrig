@@ -33,6 +33,7 @@ use rmcp::service::{
 };
 use serde_json::{Map, Value};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{EnvValue, McpServerSpec, ResolvedEnvValue, effective_mcp_call_timeout};
 use crate::container::{Container, ExecOptions, ExecTarget, embedded::McpDeclarationSource};
@@ -43,6 +44,10 @@ use crate::mcp_content::{
     McpTool, McpToolResult, McpUndecodedTool, result_from_rmcp, tool_from_rmcp,
 };
 use crate::process::{Cmd, Owned, StdioSpec, Transcript};
+
+mod http;
+
+pub(crate) use http::{HttpFailed, client as http_client, header as http_header, reserved_header};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
@@ -60,6 +65,9 @@ pub(crate) const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// on one page -- so one still paging here is minting cursors, not listing
 /// tools, and would otherwise grow the listing until [`STARTUP_TIMEOUT`].
 const TOOLS_LIST_PAGE_CEILING: usize = 1000;
+
+/// The stderr tail of a server OutRig runs no process of, a URL's.
+const NO_STDERR: &str = "(none: OutRig runs no process of this server)";
 
 /// The `reason` a stopped or dropped call's `notifications/cancelled` carries.
 const ABANDONED_REASON: &str = "outrig stopped waiting for this call";
@@ -390,7 +398,7 @@ impl McpClient {
     where
         S: rmcp::Service<rmcp::RoleServer>,
     {
-        let never = tokio_util::sync::CancellationToken::new();
+        let never = CancellationToken::new();
         Self::handshake_in_memory_until(name, server, initialize_within, never).await
     }
 
@@ -401,7 +409,7 @@ impl McpClient {
         name: &str,
         server: S,
         initialize_within: Duration,
-        hang_up: tokio_util::sync::CancellationToken,
+        hang_up: CancellationToken,
     ) -> Result<Self>
     where
         S: rmcp::Service<rmcp::RoleServer>,
@@ -489,7 +497,14 @@ impl McpClient {
     /// is not heard. Nothing relists on its own: the change is for whoever
     /// decides to.
     pub(crate) fn list_changes(&self) -> watch::Receiver<()> {
-        self.service.service().0.subscribe()
+        self.service.service().changes.subscribe()
+    }
+
+    /// Cancelled once its connection broke where no call was there to say so:
+    /// a URL server's stream it gave up resuming, after which no listing
+    /// change is heard. It is then to be connected again.
+    pub(crate) fn broken(&self) -> CancellationToken {
+        self.service.service().broken.clone()
     }
 
     /// Issue an MCP `tools/list`, following its pages until the server stops
@@ -541,15 +556,20 @@ impl McpClient {
         Err(self.list_failed(source).await)
     }
 
-    /// A listing that failed for `source`, with what the server wrote.
+    /// A listing that failed for `source`, with what the server wrote -- for
+    /// a server with no stderr file, a URL's, that it has none.
     async fn list_failed(&self, source: McpSessionError) -> OutrigError {
+        let stderr_tail = match self.stderr_path.as_os_str().is_empty() {
+            true => NO_STDERR.to_string(),
+            // Read once: the server may still be running, and the settle wait
+            // exists for a writer that has just exited.
+            false => read_stderr_tail_settling_for(&self.stderr_path, Duration::ZERO).await,
+        };
         OutrigError::McpToolsListFailed {
             name: self.name.clone(),
             source,
             stderr_path: self.stderr_path.clone(),
-            // Read once: the server may still be running, and the settle wait
-            // exists for a writer that has just exited.
-            stderr_tail: read_stderr_tail_settling_for(&self.stderr_path, Duration::ZERO).await,
+            stderr_tail,
         }
     }
 
@@ -579,10 +599,10 @@ impl McpClient {
                 .service
                 .send_request_with_option(request, PeerRequestOptions::no_options())
                 .await
-                .map_err(|source| session_error_from_rmcp(&source))?
+                .map_err(|source| listing_error(&source))?
                 .await_response()
                 .await
-                .map_err(|source| session_error_from_rmcp(&source))?;
+                .map_err(|source| listing_error(&source))?;
             let next = match answered {
                 ServerResult::ListToolsResult(listed) => {
                     let tools = listed.tools.into_iter().map(tool_from_rmcp);
@@ -940,15 +960,21 @@ impl Listing {
 }
 
 /// What a client hears from its server unasked: here only that its tool
-/// listing changed, for whoever watches [`McpClient::list_changes`]. Its
-/// `get_info` is the trait's own, as `()`'s is, so the handshake is the one a
-/// client with no handler makes.
+/// listing changed, for whoever watches [`McpClient::list_changes`]; and
+/// whether it can still hear it. Its `get_info` is the trait's own, as `()`'s
+/// is, so the handshake is the one a client with no handler makes.
 #[derive(Debug, Default)]
-pub(crate) struct Notices(watch::Sender<()>);
+pub(crate) struct Notices {
+    changes: watch::Sender<()>,
+    /// Cancelled once a stream the server speaks on broke past resuming, the
+    /// connection gone though its transport runs on: a URL's. A process's
+    /// pipes break with the transport, and this never is.
+    broken: CancellationToken,
+}
 
 impl rmcp::ClientHandler for Notices {
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        self.0.send_replace(());
+        self.changes.send_replace(());
     }
 }
 
@@ -1381,6 +1407,18 @@ fn session_error_from_rmcp(source: &rmcp::service::ServiceError) -> McpSessionEr
     McpSessionError::new(kind, source.to_string())
 }
 
+/// A `tools/list` that failed for `source`, as [`session_error_from_rmcp`]
+/// says, but for an HTTP failure under it: classified as one at `initialize`
+/// is, so that a server that refuses the listing is refused, not tried again.
+fn listing_error(source: &rmcp::service::ServiceError) -> McpSessionError {
+    let mut error = session_error_from_rmcp(source);
+    if let Some((kind, class)) = http::request_class(source) {
+        error.kind = kind;
+        error.class = Some(class);
+    }
+    error
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1470,7 +1508,7 @@ pub(crate) mod tests {
     /// write proves nothing -- and is the transport's failure.
     #[tokio::test]
     async fn a_call_on_a_closed_transport_may_have_dispatched() {
-        let hang_up = tokio_util::sync::CancellationToken::new();
+        let hang_up = CancellationToken::new();
         let (cancels, _heard) = tokio::sync::mpsc::unbounded_channel();
         let stalling = Stalling {
             calls: Default::default(),

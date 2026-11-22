@@ -161,7 +161,12 @@ Issues that bear on **host integrity** are in scope, for example:
   is one container, whose servers and their credentials share it. What a server returns, and what
   it writes to stderr, is its own text, which OutRig redacts nothing of. Pausing a sidecar freezes
   its container; a server in the session's container cannot be frozen apart from the interpreter,
-  and the control says so. See [Trust Model](doc/concepts/mcp-trust-model.md).
+  and the control says so. A URL server is dialed from the host, under the headers OutRig stamps
+  -- its resolved credential and, for one the owner declared, the owner's identity headers -- so
+  whatever the server lets that identity do, every agent can do; a configured one never carries
+  the owner's identity, and a repository's starts only once the operator approves it, since the
+  host's network reaches what the container's cannot. See
+  [Trust Model](doc/concepts/mcp-trust-model.md).
 - **Application code** (`SessionBuilder::application`, `outrig.Session(application=...)`, 0.3)
   runs in the container with the agent's authority, which is arbitrary execution there: it is the
   owner's code, trusted as the owner is. Its snapshot is mounted read-only so that the code the

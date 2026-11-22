@@ -6,20 +6,24 @@
 //! connects the server, and freezes, thaws and stops what it started. The MCP
 //! table ([`super::mcp`]) holds one per container and decides everything else
 //! -- which servers share one, what a failure means, when to try again -- so a
-//! test drives the table with a fake placement and no container.
+//! test drives the table with a fake placement and no container. A server a
+//! URL names runs in nothing of the session's: its placement, [`Http`], dials
+//! it, and has nothing to freeze or stop.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
+use http::{HeaderName, HeaderValue};
 use tokio::sync::Mutex;
 
-use crate::config::ResolvedEnvValue;
+use super::mcp::TrustAnchor;
+use crate::config::{McpTrust, ResolvedEnvValue};
 use crate::container::{Container, ExecTarget};
 use crate::error::{OutrigError, Result};
-use crate::mcp::McpClient;
+use crate::mcp::{HttpFailed, McpClient};
 use crate::outrig_::{SHUTDOWN_GRACE, SidecarHost, SidecarServerSpec, SidecarSpec};
 
 /// One server, as a placement starts it: its name, which names its stderr
@@ -65,6 +69,33 @@ pub(crate) enum Launch {
     /// The container's own `ENTRYPOINT`, handed these arguments: the server is
     /// the container.
     Entrypoint(Vec<String>),
+    /// Dialed at this URL, over streamable HTTP: its `env` is the headers
+    /// each request carries.
+    Url(Box<UrlLaunch>),
+}
+
+/// Where a URL server is, and what its client trusts there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UrlLaunch {
+    pub(crate) url: String,
+    pub(crate) trust_anchor: Option<TrustAnchor>,
+    pub(crate) trust: McpTrust,
+    pub(crate) allow_stateless: bool,
+}
+
+/// Why a placement did not connect a server: what starting or connecting it
+/// returned, or a streamable-HTTP connect, classified, which has no process
+/// to report on.
+#[derive(Debug)]
+pub(crate) enum Unconnected {
+    Outrig(OutrigError),
+    Http(HttpFailed),
+}
+
+impl From<OutrigError> for Unconnected {
+    fn from(e: OutrigError) -> Self {
+        Self::Outrig(e)
+    }
 }
 
 /// Where one or more of a session's servers run. Crate-private, which is
@@ -80,7 +111,7 @@ pub(crate) trait Placement: Send + Sync + 'static {
         &'a self,
         server: &'a Server,
         within: Duration,
-    ) -> BoxFuture<'a, Result<McpClient>>;
+    ) -> BoxFuture<'a, std::result::Result<McpClient, Unconnected>>;
 
     /// Freeze every process the placement runs, or say why not.
     fn freeze(&self) -> BoxFuture<'_, std::result::Result<(), String>>;
@@ -118,17 +149,18 @@ impl Placement for Primary {
         &'a self,
         server: &'a Server,
         within: Duration,
-    ) -> BoxFuture<'a, Result<McpClient>> {
+    ) -> BoxFuture<'a, std::result::Result<McpClient, Unconnected>> {
         Box::pin(async move {
             let Launch::Exec(command) = &server.launch else {
                 return Err(OutrigError::Configuration(format!(
-                    "mcp server {:?}: the primary runs no entrypoint server",
+                    "mcp server {:?}: the primary runs only a command",
                     server.name
-                )));
+                ))
+                .into());
             };
-            server
+            Ok(server
                 .connect_exec(&self.target, command, &self.log_dir, within)
-                .await
+                .await?)
         })
     }
 
@@ -274,7 +306,7 @@ impl Placement for Sidecar {
         &'a self,
         server: &'a Server,
         within: Duration,
-    ) -> BoxFuture<'a, Result<McpClient>> {
+    ) -> BoxFuture<'a, std::result::Result<McpClient, Unconnected>> {
         Box::pin(async move {
             let by = tokio::time::Instant::now() + within;
             let left = || by.saturating_duration_since(tokio::time::Instant::now());
@@ -296,9 +328,9 @@ impl Placement for Sidecar {
                         }
                         held.as_ref().expect("started above").exec_target()
                     };
-                    server
+                    Ok(server
                         .connect_exec(&target, command, &log_dir, left())
-                        .await
+                        .await?)
                 }
                 Launch::Entrypoint(args) => {
                     // Held from its creation, so a stop finds the container
@@ -318,8 +350,13 @@ impl Placement for Sidecar {
                     )
                     .await;
                     attachment.disarm();
-                    connected
+                    Ok(connected?)
                 }
+                Launch::Url(_) => Err(OutrigError::Configuration(format!(
+                    "mcp server {:?}: a sidecar runs no server a URL names",
+                    server.name
+                ))
+                .into()),
             }
         })
     }
@@ -376,6 +413,117 @@ impl Placement for Sidecar {
     }
 }
 
+/// A server a URL names, dialed over streamable HTTP: nothing of the
+/// session's runs it, so there is nothing to freeze, thaw or stop, and a
+/// quiesce holds its calls and nothing else. Each connect is a new HTTP
+/// session, through one client -- built at the first, with the declaration's
+/// trust anchor -- carrying the server's resolved headers and, for one the
+/// owner declared, the owner's identity headers.
+pub(crate) struct Http {
+    /// The owner's identity headers, never read, logged or shown: empty for
+    /// a server a configuration declared.
+    identity: Vec<(String, String)>,
+    client: tokio::sync::OnceCell<reqwest::Client>,
+}
+
+impl Http {
+    pub(crate) fn new(identity: Vec<(String, String)>) -> Self {
+        Self {
+            identity,
+            client: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// The client every connect of `url`'s server goes through, built once
+    /// with its trust anchor; or why it cannot be.
+    async fn client(&self, url: &UrlLaunch) -> std::result::Result<&reqwest::Client, String> {
+        self.client
+            .get_or_try_init(|| async {
+                let anchor = match &url.trust_anchor {
+                    None => None,
+                    Some(TrustAnchor::Pem(pem)) => Some(pem.clone()),
+                    Some(TrustAnchor::Path(path)) => {
+                        Some(tokio::fs::read(path).await.map_err(|e| {
+                            format!("its trust anchor {} could not be read: {e}", path.display())
+                        })?)
+                    }
+                };
+                let only = url.trust == McpTrust::Only;
+                // It reads and parses the system's roots: off the runtime's
+                // threads, so the other services' starts go on meanwhile.
+                tokio::task::spawn_blocking(move || {
+                    crate::mcp::http_client(anchor.as_deref(), only)
+                })
+                .await
+                .map_err(|e| format!("its HTTP client was not built: {e}"))?
+            })
+            .await
+    }
+
+    /// `server`'s resolved headers, then the identity headers, as each
+    /// request carries them.
+    fn headers(
+        &self,
+        server: &Server,
+    ) -> std::result::Result<HashMap<HeaderName, HeaderValue>, String> {
+        let declared = server
+            .env
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.value()));
+        let identity = self
+            .identity
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()));
+        declared
+            .chain(identity)
+            .map(|(name, value)| crate::mcp::http_header(name, value))
+            .collect()
+    }
+}
+
+impl Placement for Http {
+    fn connect<'a>(
+        &'a self,
+        server: &'a Server,
+        within: Duration,
+    ) -> BoxFuture<'a, std::result::Result<McpClient, Unconnected>> {
+        Box::pin(async move {
+            let misconfigured = |why: String| {
+                OutrigError::Configuration(format!("mcp server {:?}: {why}", server.name))
+            };
+            let Launch::Url(url) = &server.launch else {
+                return Err(misconfigured("it names no URL".to_string()).into());
+            };
+            let client = self.client(url).await.map_err(misconfigured)?.clone();
+            let headers = self.headers(server).map_err(misconfigured)?;
+            McpClient::connect_http(
+                &server.name,
+                client,
+                &url.url,
+                headers,
+                url.allow_stateless,
+                within,
+            )
+            .await
+            .map_err(Unconnected::Http)
+        })
+    }
+
+    fn freeze(&self) -> BoxFuture<'_, std::result::Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn thaw(&self) -> BoxFuture<'_, std::result::Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn stop(&self) -> BoxFuture<'_, std::result::Result<(), String>> {
+        // The server is not the session's to stop: closing its transport,
+        // which the table does first, ends the HTTP session.
+        Box::pin(async { Ok(()) })
+    }
+}
+
 /// A placement with no container behind it, whose servers are rmcp servers
 /// in memory, for the MCP table's tests.
 #[cfg(test)]
@@ -386,12 +534,13 @@ pub(crate) mod fake {
 
     use std::sync::Arc;
 
+    use futures_util::TryFutureExt;
     use futures_util::future::BoxFuture;
     use rmcp::model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ClientNotification, ClientRequest,
-        ContentBlock, CustomResult, ErrorCode, ErrorData, InitializeRequestParams,
-        InitializeResult, ListToolsResult, PaginatedRequestParams, RequestId, ServerCapabilities,
-        ServerConfig, ServerResult, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CancelledNotificationParam,
+        ClientNotification, ClientRequest, ContentBlock, CustomResult, ErrorCode, ErrorData,
+        InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
+        RequestId, ServerCapabilities, ServerConfig, ServerResult, Tool,
     };
     use rmcp::service::{NotificationContext, RequestContext, RoleServer};
     use serde_json::Value;
@@ -497,75 +646,11 @@ pub(crate) mod fake {
             &'a self,
             server: &'a Server,
             within: Duration,
-        ) -> BoxFuture<'a, Result<McpClient>> {
-            Box::pin(async move {
-                self.connects.fetch_add(1, Ordering::SeqCst);
-                self.envs.lock().unwrap().push((
-                    server.name.clone(),
-                    server
-                        .env
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.value().to_string()))
-                        .collect(),
-                ));
-                let next = self
-                    .scripts
-                    .lock()
-                    .unwrap()
-                    .get_mut(&server.name)
-                    .and_then(VecDeque::pop_front)
-                    .unwrap_or(Behavior::Serve(vec!["echo", "sleep", "slow"]));
-                let tools = match next {
-                    Behavior::Serve(tools) => tools,
-                    Behavior::Hang => {
-                        return McpClient::handshake_in_memory(&server.name, Hanging, within).await;
-                    }
-                    Behavior::Refuse => {
-                        return McpClient::handshake_in_memory(&server.name, Refusing, within)
-                            .await;
-                    }
-                    Behavior::RefuseAtBound => {
-                        tokio::time::sleep(within).await;
-                        return McpClient::handshake_in_memory(&server.name, Refusing, within)
-                            .await;
-                    }
-                    Behavior::Wedged => return std::future::pending().await,
-                    Behavior::Toolbox(toolbox) => {
-                        let hang_up = toolbox.hang_up.clone();
-                        return McpClient::handshake_in_memory_until(
-                            &server.name,
-                            Raw(toolbox),
-                            within,
-                            hang_up,
-                        )
-                        .await;
-                    }
-                    Behavior::Unlisted => {
-                        return McpClient::handshake_in_memory(&server.name, Unlisting, within)
-                            .await;
-                    }
-                    Behavior::Script(script) => {
-                        let log = tempfile::tempdir().expect("tempdir");
-                        let log_dir = log.path().to_path_buf();
-                        self.logs.lock().unwrap().push(log);
-                        return McpClient::connect_script(&server.name, script, &log_dir, within)
-                            .await;
-                    }
-                    Behavior::Exit(code, stderr) => {
-                        let command = match &server.launch {
-                            Launch::Exec(command) => command.clone(),
-                            Launch::Entrypoint(args) => args.clone(),
-                        };
-                        return Err(McpClient::exited_before_initialize(
-                            &server.name,
-                            &command,
-                            code,
-                            stderr,
-                        ));
-                    }
-                };
-                McpClient::handshake_in_memory(&server.name, Serving { tools }, within).await
-            })
+        ) -> BoxFuture<'a, std::result::Result<McpClient, Unconnected>> {
+            Box::pin(
+                self.connect_as_scripted(server, within)
+                    .map_err(Unconnected::from),
+            )
         }
 
         fn freeze(&self) -> BoxFuture<'_, std::result::Result<(), String>> {
@@ -606,6 +691,79 @@ pub(crate) mod fake {
                 tokio::time::sleep(takes).await;
                 Ok(())
             })
+        }
+    }
+
+    impl Fake {
+        /// What `server`'s next scripted attempt does.
+        async fn connect_as_scripted(
+            &self,
+            server: &Server,
+            within: Duration,
+        ) -> Result<McpClient> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            self.envs.lock().unwrap().push((
+                server.name.clone(),
+                server
+                    .env
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.value().to_string()))
+                    .collect(),
+            ));
+            let next = self
+                .scripts
+                .lock()
+                .unwrap()
+                .get_mut(&server.name)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or(Behavior::Serve(vec!["echo", "sleep", "slow"]));
+            let tools = match next {
+                Behavior::Serve(tools) => tools,
+                Behavior::Hang => {
+                    return McpClient::handshake_in_memory(&server.name, Hanging, within).await;
+                }
+                Behavior::Refuse => {
+                    return McpClient::handshake_in_memory(&server.name, Refusing, within).await;
+                }
+                Behavior::RefuseAtBound => {
+                    tokio::time::sleep(within).await;
+                    return McpClient::handshake_in_memory(&server.name, Refusing, within).await;
+                }
+                Behavior::Wedged => return std::future::pending().await,
+                Behavior::Toolbox(toolbox) => {
+                    let hang_up = toolbox.hang_up.clone();
+                    return McpClient::handshake_in_memory_until(
+                        &server.name,
+                        Raw(toolbox),
+                        within,
+                        hang_up,
+                    )
+                    .await;
+                }
+                Behavior::Unlisted => {
+                    return McpClient::handshake_in_memory(&server.name, Unlisting, within).await;
+                }
+                Behavior::Script(script) => {
+                    let log = tempfile::tempdir().expect("tempdir");
+                    let log_dir = log.path().to_path_buf();
+                    self.logs.lock().unwrap().push(log);
+                    return McpClient::connect_script(&server.name, script, &log_dir, within).await;
+                }
+                Behavior::Exit(code, stderr) => {
+                    let command = match &server.launch {
+                        Launch::Exec(command) => command.clone(),
+                        Launch::Entrypoint(args) => args.clone(),
+                        Launch::Url(_) => Vec::new(),
+                    };
+                    return Err(McpClient::exited_before_initialize(
+                        &server.name,
+                        &command,
+                        code,
+                        stderr,
+                    ));
+                }
+            };
+            McpClient::handshake_in_memory(&server.name, Serving { tools }, within).await
         }
     }
 
@@ -801,6 +959,67 @@ pub(crate) mod fake {
         }
     }
 
+    impl Toolbox {
+        /// The page `tools/list` answers, a change announced to the client first when asked
+        /// for.
+        async fn listed(&self, context: &RequestContext<RoleServer>) -> Value {
+            *self.peer.lock().unwrap() = Some(context.peer.clone());
+            if self.announce.swap(false, Ordering::SeqCst) {
+                context
+                    .peer
+                    .notify_tool_list_changed()
+                    .await
+                    .expect("notify the client");
+            }
+            self.page.lock().unwrap().clone()
+        }
+
+        /// What a call of `name` with `arguments` answers, once recorded and its tool's act
+        /// done.
+        async fn called(
+            &self,
+            name: String,
+            arguments: Value,
+            context: &RequestContext<RoleServer>,
+        ) -> std::result::Result<Value, ErrorData> {
+            *self.peer.lock().unwrap() = Some(context.peer.clone());
+            let text = arguments["text"].as_str().unwrap_or_default().to_string();
+            self.calls.lock().unwrap().push((name.clone(), arguments));
+            self.requests
+                .lock()
+                .unwrap()
+                .insert(context.id.clone(), name.clone());
+            let act = self.acts.lock().unwrap().get(&name).cloned();
+            match act {
+                None => {}
+                Some(Act::HangUp) => {
+                    self.hang_up.cancel();
+                    return std::future::pending().await;
+                }
+                Some(Act::Stall) => {
+                    context.ct.cancelled().await;
+                    return Err(ErrorData::internal_error("cancelled", None));
+                }
+                Some(Act::After(delay)) => tokio::time::sleep(delay).await,
+                Some(Act::Fail(code, message)) => {
+                    return Err(ErrorData::new(ErrorCode(code), message, None));
+                }
+            }
+            let result = self.results.lock().unwrap().get(&name).cloned();
+            Ok(result.unwrap_or_else(
+                || serde_json::json!({"content": [{"type": "text", "text": text}]}),
+            ))
+        }
+
+        /// Record a cancel the client sent of `request`, by the tool it called.
+        fn cancelled(&self, request: Option<&RequestId>) {
+            let tool = request
+                .and_then(|id| self.requests.lock().unwrap().get(id).cloned())
+                .unwrap_or_else(|| "an unknown request".to_string());
+            self.cancels.lock().unwrap().push(tool);
+        }
+    }
+
     impl rmcp::Service<RoleServer> for Raw {
         async fn handle_request(
             &self,
@@ -808,54 +1027,16 @@ pub(crate) mod fake {
             context: RequestContext<RoleServer>,
         ) -> std::result::Result<ServerResult, ErrorData> {
             *self.0.peer.lock().unwrap() = Some(context.peer.clone());
-            match request {
-                ClientRequest::ListToolsRequest(_) => {
-                    if self.0.announce.swap(false, Ordering::SeqCst) {
-                        context
-                            .peer
-                            .notify_tool_list_changed()
-                            .await
-                            .expect("notify the client");
-                    }
-                    Ok(ServerResult::CustomResult(CustomResult(
-                        self.0.page.lock().unwrap().clone(),
-                    )))
-                }
+            let answered = match request {
+                ClientRequest::ListToolsRequest(_) => self.0.listed(&context).await,
                 ClientRequest::CallToolRequest(call) => {
-                    let name = call.params.name.to_string();
                     let arguments = Value::Object(call.params.arguments.unwrap_or_default());
-                    let text = arguments["text"].as_str().unwrap_or_default().to_string();
-                    self.0.calls.lock().unwrap().push((name.clone(), arguments));
-                    self.0
-                        .requests
-                        .lock()
-                        .unwrap()
-                        .insert(context.id.clone(), name.clone());
-                    let act = self.0.acts.lock().unwrap().get(&name).cloned();
-                    match act {
-                        None => {}
-                        Some(Act::HangUp) => {
-                            self.0.hang_up.cancel();
-                            return std::future::pending().await;
-                        }
-                        Some(Act::Stall) => {
-                            context.ct.cancelled().await;
-                            return Err(ErrorData::internal_error("cancelled", None));
-                        }
-                        Some(Act::After(delay)) => tokio::time::sleep(delay).await,
-                        Some(Act::Fail(code, message)) => {
-                            return Err(ErrorData::new(ErrorCode(code), message, None));
-                        }
-                    }
-                    let result = self.0.results.lock().unwrap().get(&name).cloned();
-                    Ok(ServerResult::CustomResult(CustomResult(
-                        result.unwrap_or_else(
-                            || serde_json::json!({"content": [{"type": "text", "text": text}]}),
-                        ),
-                    )))
+                    let name = call.params.name.to_string();
+                    self.0.called(name, arguments, &context).await?
                 }
-                other => rmcp::Service::handle_request(&Plain, other, context).await,
-            }
+                other => return rmcp::Service::handle_request(&Plain, other, context).await,
+            };
+            Ok(ServerResult::CustomResult(CustomResult(answered)))
         }
 
         async fn handle_notification(
@@ -864,19 +1045,56 @@ pub(crate) mod fake {
             context: NotificationContext<RoleServer>,
         ) -> std::result::Result<(), ErrorData> {
             if let ClientNotification::CancelledNotification(cancelled) = &notification {
-                let tool = cancelled
-                    .params
-                    .request_id
-                    .as_ref()
-                    .and_then(|id| self.0.requests.lock().unwrap().get(id).cloned())
-                    .unwrap_or_else(|| "an unknown request".to_string());
-                self.0.cancels.lock().unwrap().push(tool);
+                self.0.cancelled(cancelled.params.request_id.as_ref());
             }
             rmcp::Service::handle_notification(&Plain, notification, context).await
         }
 
         fn get_info(&self) -> ServerConfig {
             rmcp::Service::get_info(&Plain)
+        }
+    }
+
+    /// A [`Toolbox`] as a typed rmcp server answers it -- what rmcp's streamable-HTTP server
+    /// takes -- its pages and results decoded: what the raw form sends as it is, this one
+    /// cannot.
+    pub(crate) struct Served(pub(crate) Arc<Toolbox>);
+
+    impl rmcp::ServerHandler for Served {
+        fn get_info(&self) -> ServerConfig {
+            rmcp::ServerHandler::get_info(&Plain)
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            context: RequestContext<RoleServer>,
+        ) -> std::result::Result<ListToolsResult, ErrorData> {
+            let page = self.0.listed(&context).await;
+            serde_json::from_value(page).map_err(|e| ErrorData::internal_error(e.to_string(), None))
+        }
+
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> std::result::Result<CallToolResponse, ErrorData> {
+            let arguments = Value::Object(request.arguments.unwrap_or_default());
+            let answered = self
+                .0
+                .called(request.name.to_string(), arguments, &context)
+                .await?;
+            let result: CallToolResult = serde_json::from_value(answered)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            Ok(result.into())
+        }
+
+        async fn on_cancelled(
+            &self,
+            notification: CancelledNotificationParam,
+            _context: NotificationContext<RoleServer>,
+        ) {
+            self.0.cancelled(notification.request_id.as_ref());
         }
     }
 

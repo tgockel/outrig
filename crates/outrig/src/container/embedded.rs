@@ -122,7 +122,7 @@ pub enum EmbeddedImageConfigError {
     EmptyMcpCommand { server: String },
 
     #[error(
-        "mcp server {server:?} carries a placement key (sidecar/image); image labels \
+        "mcp server {server:?} carries a placement key (sidecar/image/url); image labels \
          declare servers for the image that carries them -- placement is repo-config-only"
     )]
     PlacementInLabel { server: String },
@@ -181,7 +181,7 @@ pub enum StandaloneImageTomlError {
     EmptyMcpCommand { server: String },
 
     #[error(
-        "mcp server {server:?} carries a placement key (sidecar/image); image labels \
+        "mcp server {server:?} carries a placement key (sidecar/image/url); image labels \
          declare servers for the image that carries them -- placement is repo-config-only"
     )]
     PlacementInLabel { server: String },
@@ -259,17 +259,24 @@ pub(crate) fn merged_mcp_config_to_labels(
 }
 
 /// The subset of a config MCP table that belongs to the image itself: entries
-/// without a `sidecar`/`image` placement key. Used when serializing config
-/// into an image's own `org.outrig.mcp` label (and its cache key), where
-/// placement keys are rejected on read.
+/// without a `sidecar`/`image` placement key or a `url`. Used when serializing
+/// config into an image's own `org.outrig.mcp` label (and its cache key),
+/// where placement keys are rejected on read.
 pub(crate) fn primary_scoped_mcp(
     config: &BTreeMap<String, McpServerSpec>,
 ) -> BTreeMap<String, McpServerSpec> {
     config
         .iter()
-        .filter(|(_, spec)| !spec.is_placed())
+        .filter(|(_, spec)| !placed_elsewhere(spec))
         .map(|(name, spec)| (name.clone(), spec.clone()))
         .collect()
+}
+
+/// Whether `spec` runs anywhere but the image a label declares it in: a
+/// container it names, or a URL the host dials -- a key only a `url` entry
+/// takes counting as one.
+fn placed_elsewhere(spec: &McpServerSpec) -> bool {
+    spec.is_placed() || spec.is_url() || spec.url_key().is_some()
 }
 
 /// Serialize a validated standalone config into the OCI label map buildah
@@ -522,7 +529,7 @@ fn parse_mcp_table(
                 server: server.clone(),
             });
         }
-        if spec.is_placed() {
+        if placed_elsewhere(spec) {
             return Err(EmbeddedImageConfigError::PlacementInLabel {
                 server: server.clone(),
             });
@@ -644,7 +651,7 @@ impl TryFrom<StandaloneImageTomlRaw> for StandaloneImageToml {
                     server: server.clone(),
                 });
             }
-            if spec.is_placed() {
+            if placed_elsewhere(spec) {
                 return Err(StandaloneImageTomlError::PlacementInLabel {
                     server: server.clone(),
                 });
@@ -715,18 +722,11 @@ mod tests {
     }
 
     fn full(cmd: &[&str], env: &[(&str, EnvValue)]) -> McpServerSpec {
-        McpServerSpec::Full {
-            command: Some(cmd.iter().map(|s| s.to_string()).collect()),
-            env: env
-                .iter()
+        McpServerSpec::exec(cmd.iter().copied()).with_env(
+            env.iter()
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
-            view: crate::config::SidecarView::None,
-            sidecar: None,
-            image: None,
-            args: Vec::new(),
-            call_timeout_secs: None,
-        }
+        )
     }
 
     fn standalone(
@@ -1017,6 +1017,37 @@ mod tests {
             err,
             EmbeddedImageConfigError::PlacementInLabel { ref server } if server == "fs"
         ));
+    }
+
+    /// A label carries no `url` entry, nor a key only one takes: the image a label belongs to
+    /// runs its servers, and a URL is dialed from the host.
+    #[test]
+    fn parse_mcp_table_rejects_url_entries() {
+        for label in [
+            r#"{"docs": {"url": "https://d.test/mcp"}}"#,
+            r#"{"docs": {"command": ["bin"], "headers": {"X-Token": "t"}}}"#,
+        ] {
+            let err = parse_mcp_table(label).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    EmbeddedImageConfigError::PlacementInLabel { ref server } if server == "docs"
+                ),
+                "{label}: {err:?}"
+            );
+        }
+        let config = BTreeMap::from([
+            (
+                "docs".to_string(),
+                McpServerSpec::at_url("https://d.test/mcp"),
+            ),
+            ("fs".to_string(), McpServerSpec::exec(["mcp-fs"])),
+        ]);
+        assert_eq!(
+            primary_scoped_mcp(&config).keys().collect::<Vec<_>>(),
+            ["fs"],
+            "a url entry is not stamped into the image's label"
+        );
     }
 
     /// `args` is the argv of a sidecar's ENTRYPOINT, and a label cannot

@@ -44,7 +44,11 @@ use crate::tool_name;
 /// them, leaving clients unable to fetch the tool list at all.
 ///
 /// Adding an entry here asserts that both [`ProxyServer`] and the `outrig mcp self`
-/// server meet that revision's requirements. Review it on every rmcp upgrade.
+/// server meet that revision's requirements. Review it on every rmcp upgrade -- and
+/// with it the client's side: a URL service's client (`mcp/http.rs`) offers rmcp's
+/// `ProtocolVersion::LATEST` in a plain `initialize` and takes the revision the server
+/// answers, as the stdio client does, so an upgrade that moves `LATEST` moves what
+/// OutRig asks every URL server for.
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
     ProtocolVersion::V_2024_11_05,
     ProtocolVersion::V_2025_03_26,

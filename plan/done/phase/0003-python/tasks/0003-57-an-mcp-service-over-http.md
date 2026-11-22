@@ -191,3 +191,166 @@ same way (`rcgen` is the obvious candidate), each with its test-suite evidence i
 - `plan/next/loopback-mocks-follow-system-proxy.md` -- the proxy finding fork 5 cites.
 - `crates/outrig/Cargo.toml`; `crates/outrig/src/mcp.rs`; rmcp 3.4.1's
   `src/transport/streamable_http_client.rs` in the cargo registry.
+
+## Decisions
+
+- **The user's calls (2026-11-21).**
+  - Fork 3: plain `http` to a host that is not loopback starts, and `mcp.service.started`
+    gains `detail` -- `null` otherwise -- saying the headers went in the clear. No MCP event had a
+    `detail`, so this is the one field the task's "nothing new is added" admits.
+  - Fork 4: the config `url` form lands here, with its approval and `unapproved`.
+  - `outrig run` and `outrig mcp` skip a `url` entry, printing one warning naming each, after
+    every label has merged, so it still shadows a label entry of its name.
+  - Forks 1, 2 and 5 as recommended: the anchor beside the system roots, `trust = "only"` in their
+    place; `allow_stateless` true; the system proxy honored, `#[cfg(test)] .no_proxy()` as the model
+    loop's client does.
+- **"Unverified", confirmed against rmcp 3.4.1.**
+  - `StreamableHttpClientTransport::with_client` takes a `reqwest::Client` built with a custom
+    root (`a_trust_anchor_decides_what_is_trusted`). reqwest 0.13's `tls_certs_merge` gives the
+    platform verifier extra roots; `tls_certs_only` a webpki store of the anchor alone.
+  - `custom_headers` ride every request: `initialize`, its notice, `tools/list`, `tools/call`, the
+    standing GET, the cancel notice (`headers_reach_every_request_and_show_nowhere`) and the
+    `DELETE` at the close (`a_url_service_is_no_writer`). rmcp reserves `accept`,
+    `mcp-session-id` and `last-event-id`, not `authorization`; its `auth_header` prefixes
+    `Bearer ` and would duplicate a custom `Authorization`, so it stays unset and every header
+    travels as declared.
+  - Which errors carry a status: on a POST, 401 or 403 with `WWW-Authenticate` is `AuthRequired`
+    / `InsufficientScope`, 404 with a session `SessionExpired`, any other non-2xx
+    `UnexpectedServerResponse("HTTP <status>: <body>")` -- the status in text only, which
+    `status_said` reads -- and a JSON-RPC error body `JsonRpcError`; GET and `DELETE` give
+    `Client(reqwest::Error)` with `.status()`. Connect, TLS and timeout failures are `Client(e)`.
+    It reaches `serve_client`'s caller as `ClientInitializeError::TransportError`, recovered by
+    `downcast_ref::<StreamableHttpError<reqwest::Error>>()`. `Client` names reqwest's error as no
+    source, so the message renders reqwest's chain itself.
+  - That JSON-RPC branch drops the status: a gateway's 503 or 429 at `initialize` whose body is a
+    JSON-RPC error reached the classifier as the server's answer, `refused`, never retried
+    (review). No reqwest hook sees a response's status before rmcp reads it -- its retry
+    classifier sees no request headers to tell requests apart -- so the client rmcp drives is a
+    `Dialer` of OutRig's: rmcp's own reqwest client for every request but `initialize`, whose POST
+    it sends itself, as rmcp does, reading any non-2xx answer as its status and a 2xx one as rmcp
+    reads it (`sse-stream`, already rmcp's, parses the stream). Only `initialize`: elsewhere a
+    JSON-RPC error with a non-2xx status is the server's answer to that request, and a call's
+    dispatch state rests on it.
+  - Reading that answer's body first let a 401 or 403 whose body never ended become the attempt's
+    timeout, retried, then `unavailable` (review). The `Dialer` now reads a challenge as rmcp does,
+    before the body -- `AuthRequired` or `InsufficientScope` -- and waits for any other non-2xx
+    body at most a second, or half the attempt's time left, keeping what arrived: the status is
+    what the answer means, and the body only says more. rmcp's own reading of a non-2xx POST
+    waits for the body unbounded; that stays, the request no longer being `initialize`.
+- **Protocol revision.** `serve_client` sends a plain `initialize` offering 2025-11-25
+  (`ProtocolVersion::LATEST`) and takes whatever revision the server answers, unchecked, as the
+  stdio client does; the transport then sends `MCP-Protocol-Version` with it. Against rmcp's own
+  server this is its legacy session mode: a session id is issued, and `notifications/cancelled`
+  is POSTed (discover mode would keep a cancel local). `mcp_proxy.rs`'s review note and
+  `REVIEWED_RMCP`'s message name both.
+- **Session recovery is off** (`reinit_on_expired_session = false`). rmcp's would re-send only a
+  POST answered 404, which a compliant server never processed, but it re-initializes behind the
+  session: no relist, no `mcp.service.reconnected`, no recheck of the call against the new
+  listing. Off, a dead session is a transport failure and `0003-56`'s reconnect makes the new HTTP
+  session. A call that meets the 404 reads as may have dispatched, the conservative reading:
+  `plan/next/a-404-call-was-not-processed.md`.
+- **Bounds.**
+  - SSE resumes: three -- at once, then after half a second, then after a second, or after the
+    server's own `retry:` hint where that is longer (rmcp's server says three seconds). rmcp
+    resumes forever by default, which holds a call whose server died until its deadline; bounded,
+    the call ends `TransportClosed` -- transport, may have dispatched, the service down. The same
+    policy bounds the standing GET stream, which rmcp, once it gives up, only logs: the session
+    stayed up and deaf, its listing changes unheard and the service never stale (review). rmcp
+    takes one policy for both kinds of stream and tells it nothing of which, so the policy,
+    `Resumes`, cancels a token when it gives up on either, and the table's listener marks the
+    service disconnected -- `mcp.service.disconnected`, no call failing -- so the next call
+    reconnects: a new session and standing stream, its tools listed again. A call's own stream
+    that gives up disconnects it anyway, so the two say the same; the standing stream is not
+    resumed apart from calls, which would need the unbounded resumes the bound exists to end.
+  - The policy never saw a standing stream that failed to open: rmcp asks for it once and wraps
+    it for resuming only once it opens, logging a failed opening as it logs a given-up resume
+    (review). So the `Dialer` answers a failed opening -- anything but 405, rmcp's "no stream to
+    give", which still leaves the session without one -- with a stream that ends at once, and
+    rmcp resumes that as a stream that ended, by `Resumes`: three tries, then the disconnect. The
+    opening is the connection's first `GET` with no event id; a response stream resumes only
+    after an event id. A retry loop of OutRig's own would have repeated the schedule and its
+    give-up; an immediate disconnect would have made one 503 a reconnect.
+  - Connect timeout 10 s, for the resumes nothing else waits on; no request timeout, which would
+    cut the event streams -- an attempt's bound and a call's deadline bound the rest.
+  - Largest server-sent event: 4 GiB, `service-result-max-bytes`'s ceiling. rmcp's 16 MiB would
+    end a call the table's 64 MiB bound takes as a transport failure.
+  - Cancel notice POST: rmcp's 5 s; the call waits on it no longer than `SHUTDOWN_GRACE`. The
+    `DELETE` gets what `McpClient::shutdown`'s grace leaves, as best it can.
+  - No redirect followed, so headers reach no other address; no idle connection kept, as rmcp's
+    own client keeps none.
+- **The placement.** A crate-private `Http` in `mcp_placement.rs`, one host per URL service keyed
+  `<url:NAME>` -- no sidecar name can be -- which `McpServices::start` builds itself, so the
+  session's `place` closures and test placers stay as they were. It holds the identity pairs (an
+  owner's service only) and the client, built at the first connect and reused by reconnects; a
+  trust anchor that cannot be read or parsed is `misconfigured`. `freeze`, `thaw` and `stop` do
+  nothing, so a pause holds the service's calls and waits for those running, and the close ends
+  the HTTP session. Header values are marked sensitive. `McpStopHow::Disconnected` is new --
+  neither `stopped` nor `with_primary` is true of a server the session does not run -- and its
+  row is proven, since nothing of the session's ran there. `writes` is `Nothing`.
+- **A classified failure crosses `Placement::connect`** as a crate-private
+  `Unconnected { Outrig, Http }`, rather than a process faked into the public
+  `McpStartupFailure`; its HTTP side has no `exit` or `stderr_tail`, and a listing failure with no
+  stderr file has no tail either.
+- **Classification** (`mcp/http.rs`, `http_class`): `AuthRequired`, `InsufficientScope`, 401 and
+  403 refused; rustls's `InvalidCertificate` among the error's causes -- an `io::Error` looked
+  inside, since its `source` skips what it wraps -- a 404 at `initialize`, a reserved header and a
+  missing session where one is required misconfigured; a connect, request or body failure, a
+  timeout, 408, 429 and 5xx, a broken stream and an expired session transient; the rest
+  unclassified. `rustls` is a direct dependency for that downcast alone, at the version reqwest
+  already locks. A listing that fails after `initialize` under an HTTP failure is classified the
+  same way (review): `McpSessionError` carries the class, crate-private as
+  `McpStartupFailure`'s, and `Failed::of` reads it before the kind, so a 401 or 403 at
+  `tools/list` is `refused` after one attempt and an expired session's 404 stays transient.
+- **Checked before any request**, at plan or resolve time and never quoting the URL or a value:
+  a URL that does not parse, userinfo, a scheme other than http or https, `trust = only` with no
+  anchor, a header name that is not one, one named twice in two cases, one HTTP or the transport
+  sets itself (`accept`, `connection`, `content-length`, `content-type`, `host`,
+  `last-event-id`, `mcp-method`, `mcp-name`, `mcp-protocol-version`, `mcp-session-id`,
+  `transfer-encoding`, and any `mcp-param-*`), one naming an identity header -- for any
+  declaration, an owner's or a configuration's -- and a value, literal or resolved, that is not a
+  header value. Under protocol 2026-07-28 rmcp sets `Mcp-Method` and `Mcp-Name` on each request
+  and `Mcp-Param-*` from a tool's annotated arguments, replacing a custom header so named, so an
+  identity header so named would change between requests (review): the owner's identity names
+  are checked as a declaration's headers are, and an owner's server is `misconfigured` while one
+  is such a name; a configured server, which never carries the identity, is not. A `${VAR}` in a URL's headers is allowed: the host
+  sends it, and no container sees it.
+- **Config.** `McpServerSpec::Full` gains `url`, `headers`, `trust-anchor`, `trust` and
+  `allow-stateless`, each elided unset, so no image's label or cache key changes. `trust` is
+  `McpTrust`, `"with-system-roots"` or `"only"`, a string enum with a named default, in `config`
+  and re-exported at the root as `SidecarView` is. A url entry takes no container key, and an
+  entry without `url` none of its keys (`McpUrlConflict`). A url entry is
+  `container::sidecar::Placement::Url`, which puts it in `placed_elsewhere` and out of the launch
+  spec's map with no change there, and lets it shadow a label entry. A repo config's header
+  reference is held to `env-allow` (`RepoMcpHeaderRef`, whose `declared_in` is boxed: a second
+  variant as large as `RepoMcpEnvRef` cost `ConfigValidationError` its niche and every `Result`
+  carrying it 8 bytes, which clippy's `result_large_err` refuses). A label refuses `url` and its
+  keys as `PlacementInLabel`. `trust-anchor` resolves against the declaring file's directory.
+- **Approval.** `ApprovalRequest` is a struct, so it gains a field, `subject: ApprovalSubject`
+  (`Binding` or `McpUrl { url, headers }`), not a variant. The shown `declaration` is the entry's
+  table with its headers by name. The remembered digest -- prefix `outrig mcp url approval 1`,
+  never a binding's -- is over the repository root, the table and the entry as declared, each
+  header's value or reference included, so an edit asks again while no value is shown or written
+  to the store. Approvals share the bindings' store. A repo entry is unapproved until asked, so a
+  path that forgot to ask starts nothing; `start` and `start_on_host` ask before the launch,
+  through `spawn_blocking`, as bindings are asked. `TerminalApprover` words its prompt by subject.
+- **Python.** `outrig.McpUrl`; a path anchor is made absolute in the program, and bytes are sent as
+  `{"pem": ...}`.
+- **Test crates, after a survey.** A server's TLS is `axum::serve` over a small
+  `axum::serve::Listener` doing the rustls accept, in place of `axum-server`, which nothing locks,
+  or hyper-util by hand. `tokio-rustls` 0.26.4, the rustls project's, is already compiled in
+  through reqwest's hyper-rustls; its crate ships its suite (`tests/test.rs`, `badssl.rs`,
+  `early-data.rs`). `rcgen` 0.14.10, the rustls project's certificate minter, ships 37 unit tests
+  and checks what it mints against openssl in its dev-dependencies; it runs on `ring`, already in
+  the graph for the build script, because its `aws_lc_rs` feature raised the lock's aws-lc-rs
+  1.17 to 1.19 under every TLS user.
+- **A configured entry is its spec.** `ConfiguredUrl` holds the entry as declared -- what is
+  dialed, and what its approval shows and digests, so the two cannot differ -- with its trust
+  anchor resolved against its file, its table, and why it may not start yet: a repository's
+  entry starts out not asked. A binding's approval digest is the one recorded before, byte for
+  byte (`a_bindings_digest_is_the_one_recorded_before`).
+- **The loopback server** runs on a runtime of its own, so stopping it cuts every connection
+  unanswered, as a server that dies does; `fake::Served` is the toolbox as a typed rmcp handler,
+  which rmcp's HTTP server takes and the raw form is not. A front records each request and can
+  answer a status in the server's place, or cut a call's connection once the server has it. It
+  says a 50 ms `retry:` hint, so the reconnect test waits on the client's resumes, not on rmcp's
+  three-second default.

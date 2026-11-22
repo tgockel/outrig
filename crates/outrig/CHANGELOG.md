@@ -19,6 +19,30 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **An MCP service may be a server at a URL.** `McpServiceSpec::url`, `outrig.McpUrl` and a
+  configuration's `url` entry declare a streamable-HTTP server the host dials, in no container of
+  the session's. Each request carries the declaration's `headers` -- each `${VAR}` resolved once,
+  through the session's secrets, and shown nowhere -- and, for one the owner declared, the owner's
+  identity headers (`mcp_identity`); a configured one never carries them. Its client trusts the
+  system's roots and a `TrustAnchor` beside them, or with `McpTrust::Only` in their place, and
+  follows no redirect. HTTP failures are classified: 401 and 403, at `initialize` or the listing,
+  `refused`; a certificate the client does not trust and a 404 at `initialize` `misconfigured`; a
+  failed connection, 408, 429 and 5xx retried, whatever the body. A reconnect is a new HTTP session,
+  and an event stream broken, or not opened, past resuming disconnects the service for the next call
+  to reconnect; the close ends it, `McpStopHow::Disconnected`. A URL service is no writer, and a
+  pause holds its calls with nothing to freeze. A URL carrying a user name or password, another
+  scheme, or a header -- declared, or one of the owner's identity headers -- naming an identity
+  header or one HTTP or the MCP transport sets itself, `Mcp-Param-*` included, is `misconfigured`;
+  plain `http` to a host that is not loopback starts, and `mcp.service.started` gains `detail` to
+  say so. `McpPlacementKind::Url`.
+- **A repository's `url` entry needs approval.** It starts only once the `Approver` approves that
+  exact entry in that repository -- shown with its URL and its headers by name, never a value,
+  and remembered as a binding's approval is -- and is `McpServiceOutcome::Unapproved` otherwise.
+  `ApprovalRequest` gains `subject`, an `ApprovalSubject`: `Binding` or `McpUrl`. In the
+  configuration, `[images.<name>.mcp]` entries gain `url`, `headers`, `trust-anchor`, `trust` and
+  `allow-stateless`; a `${VAR}` in a repo config's `headers` is held to `[repo] env-allow`, an
+  `org.outrig.mcp` label refuses them, and `container::sidecar::Placement` gains `Url`. `outrig
+  run` and `outrig mcp` start no `url` entry, and say which they leave out.
 - **An MCP call has three dispatch states.** Every MCP call that returns no result says where it
   ended, decided by position, never guessed from what failed: `not_dispatched` (refused or
   cancelled before it was sent), `may_have_dispatched` (handed to the transport, no answer read:

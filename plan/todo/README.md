@@ -102,12 +102,6 @@ was built from the phase's exit criteria instead and silently omitted discovery,
 observability -- the exit criteria describe the first milestone, the deliverables describe the
 phase.
 
-**MCP services**
-
-| Task      | What it settles                                     |
-| --------- | ----------------------------------------------------|
-| `0003-57` | An MCP service over HTTP                            |
-
 **Continuation**
 
 | Task      | What it settles                                     |

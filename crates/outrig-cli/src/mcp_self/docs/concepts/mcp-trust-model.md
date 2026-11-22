@@ -128,13 +128,17 @@ have the next session load the result. That is why what reaches the host's secre
 global-only: a provider carrying an `api-key` -- a reference to a variable in the operator's
 environment, paired with the `base-url` it is sent to -- is refused in a repo config, as the
 `[network]` policy keys are. A repo config may still name global providers from its models. A
-repo config file may reference a host variable, in `build-args` or an MCP server's `env`, only
-if the global config lists it in [`[repo]` `env-allow`](../reference/config.md#repo): the value
-goes to code the repo controls, so a variable on that list is the repo's to route. A binding a
-repo config declares starts only once the operator approves that exact declaration, because its
-factory is code the host runs. For the same reason, a session whose workspace would contain the
-global config is refused, whether a repo config declared that workspace or outrig picked it; the
-global config's own `[workspace]` and `--volume` are the operator's choice.
+repo config file may reference a host variable, in `build-args` or an MCP server's `env` or
+`headers`, only if the global config lists it in
+[`[repo]` `env-allow`](../reference/config.md#repo): the value goes to code the repo controls,
+so a variable on that list is the repo's to route. A
+binding a repo config declares starts only once the operator approves that exact declaration,
+because its factory is code the host runs. For the same reason, a session whose workspace would
+contain the global config is refused, whether a repo config declared that workspace or outrig
+picked it; the global config's own `[workspace]` and `--volume` are the operator's choice. A repo
+config's MCP `url` entry starts only once the operator approves it, too: the host dials it from
+its own network, so unapproved it would reach loopback and host-only services the container
+cannot, at an address the agent may have written.
 
 A repo can also reach the host through an image. An `org.outrig.mcp` label is not a config file,
 but a reference in a server's `env` there is read from the host the same way, so the label is held
@@ -153,6 +157,19 @@ A live object a host program injects acts with that program's authority in the s
 agents of a session share one interpreter and every binding, so the grant is the session's, not
 one agent's. [Hosted Objects](https://tgockel.github.io/outrig/concepts/hosted-objects.html) says
 what a binding grants and what crosses it.
+
+## Across the boundary: URL servers
+
+An MCP server a session dials at a URL runs in nothing of the session's: the host sends each
+request, from its own network, under the headers OutRig stamps -- the declaration's, each
+`${VAR}` resolved once and shown nowhere, and, for a server the session's owner declared, the
+owner's identity headers, unread and unchanged. So every tool the server offers that identity is
+the session's, callable by every agent, each call published. A server a configuration declares
+never carries the owner's identity, approved or not: its URL is a destination the repository's
+author chose. A server that can enforce a fence does so with the token the owner hands it; one
+that cannot is promised no stop, and a call in flight when the session closes may finish after
+it, reported `unknown`. The server sees no file of the session's, and a pause of it freezes
+nothing: it holds its calls.
 
 ## Practical posture
 

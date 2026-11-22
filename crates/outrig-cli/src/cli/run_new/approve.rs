@@ -1,14 +1,16 @@
-//! The terminal's answer to whether a binding a repository declared may start.
+//! The terminal's answer to whether a binding, or a `url` MCP entry, a repository declared may
+//! start.
 //!
-//! A binding's factory runs on this host, as the user, before the agent has done anything, and a
-//! repository's config is content a cloned project brings and the agent can write. So `run-new`
-//! shows the operator each such declaration whole, once, and starts it only on a yes; the library
-//! remembers the yes, and asks again after any edit. With no terminal to ask on -- a script, CI --
-//! the binding does not start, and the session runs without it.
+//! A binding's factory runs on this host, as the user, before the agent has done anything; a
+//! `url` MCP entry is dialed from this host, which reaches what the session's container cannot;
+//! and a repository's config is content a cloned project brings and the agent can write. So
+//! `run-new` shows the operator each such declaration, once, and starts it only on a yes; the
+//! library remembers the yes, and asks again after any edit. With no terminal to ask on -- a
+//! script, CI -- it does not start, and the session runs without it.
 
 use std::io::{BufRead, IsTerminal, Write};
 
-use outrig::harness::{Approval, ApprovalRequest, Approver};
+use outrig::harness::{Approval, ApprovalRequest, ApprovalSubject, Approver};
 
 /// Asks on the terminal: the declaration on stderr, the answer from stdin.
 pub(super) struct TerminalApprover;
@@ -36,12 +38,27 @@ fn ask(
         .declared_in
         .as_ref()
         .map_or_else(|| "the repository's config".to_string(), |f| f.display().to_string());
+    // The declaration opens with the table that declares it.
+    let table = request.declaration.lines().next().unwrap_or_default();
+    let (what, grants) = match &request.subject {
+        ApprovalSubject::McpUrl { .. } => (
+            "MCP server",
+            "an MCP server this host dials, from this host's own network -- which reaches what \
+             the session's container cannot -- and every agent of the session can call each \
+             tool it offers",
+        ),
+        _ => (
+            "binding",
+            "a binding. Its factory runs on this host, as you, with your credentials, before the \
+             agent starts, and the agent can use what it builds",
+        ),
+    };
     if !interactive {
         let _ = writeln!(
             output,
-            "[outrig] the binding `{name}`, declared in {file}, is not approved and there is no \
+            "[outrig] the {what} `{name}`, declared in {file}, is not approved and there is no \
              terminal to ask on, so it does not start; to approve it, run `outrig run-new` at a \
-             terminal in {}, or move [bindings.{name}] to the global config",
+             terminal in {}, or move {table} to the global config",
             request.repo_root.display()
         );
         return Approval::CannotAsk;
@@ -53,8 +70,7 @@ fn ask(
         .collect();
     let _ = write!(
         output,
-        "[outrig] {file} declares a binding. Its factory runs on this host, as you, with your \
-         credentials, before the agent starts, and the agent can use what it builds:\n\n\
+        "[outrig] {file} declares {grants}:\n\n\
          {declaration}\n\
          [outrig] start `{name}`, and remember the answer for this declaration in {}? [y/N] ",
         request.repo_root.display()
@@ -70,7 +86,7 @@ fn ask(
     }
     let _ = writeln!(
         output,
-        "[outrig] the binding `{name}` does not start; the next session asks again"
+        "[outrig] the {what} `{name}` does not start; the next session asks again"
     );
     Approval::Refuse
 }
@@ -114,6 +130,31 @@ mod tests {
             assert_eq!(answer, Approval::Refuse, "{typed:?}");
             assert!(shown.contains("`repo` does not start"), "{shown}");
         }
+    }
+
+    #[test]
+    fn a_url_entry_is_asked_about_as_a_server_the_host_dials() {
+        let asked = ApprovalRequest::new(
+            "docs",
+            None,
+            "/home/a/p",
+            "[images.coding.mcp.docs]\nurl = \"https://docs.test/mcp\"\nheaders = [\"X-Token\"]\n",
+        )
+        .about(ApprovalSubject::mcp_url(
+            "https://docs.test/mcp",
+            ["X-Token".to_string()],
+        ));
+        let mut output = Vec::new();
+        let answer = ask(&asked, true, &mut Cursor::new("y\n"), &mut output);
+        let shown = String::from_utf8(output).expect("utf-8");
+        assert_eq!(answer, Approval::Approve);
+        assert!(shown.contains("an MCP server this host dials"), "{shown}");
+        assert!(shown.contains("    url = \"https://docs.test/mcp\""), "{shown}");
+        let mut output = Vec::new();
+        ask(&asked, false, &mut Cursor::new(""), &mut output);
+        let shown = String::from_utf8(output).expect("utf-8");
+        assert!(shown.contains("the MCP server `docs`"), "{shown}");
+        assert!(shown.contains("move [images.coding.mcp.docs] to the global"), "{shown}");
     }
 
     #[test]

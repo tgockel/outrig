@@ -24,15 +24,17 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::event::{McpDispatchState, Payload, ServiceCallId, ServiceKind, ServiceReason};
-use super::mcp_placement::{Launch, Placement, SHARES_THE_PRIMARY, Server};
+use super::mcp_placement::{
+    Http, Launch, Placement, SHARES_THE_PRIMARY, Server, Unconnected, UrlLaunch,
+};
 use super::report::McpUncertainCall;
 use super::services::{
     CallContext, Failed as Refusal, Hold, McpEnd, MethodDescription, Service, ServiceDescription,
     ServiceError, ServiceErrorCategory, ServiceFuture, Services, failed,
 };
 use crate::config::{
-    ApiKeyError, EnvValue, McpServerSpec, MountAccess, ResolvedEnvValue, Secrets, SidecarView,
-    SidecarWorkspaceAccess,
+    ApiKeyError, EnvValue, McpServerSpec, McpTrust, MountAccess, ResolvedEnvValue, Secrets,
+    SidecarView, SidecarWorkspaceAccess,
 };
 use crate::container::embedded::McpDeclarationSource;
 use crate::error::{McpFailureKind, McpSessionError, OutrigError};
@@ -98,6 +100,31 @@ impl McpServiceSpec {
         })
     }
 
+    /// A server dialed at `url` over streamable HTTP, from the host: no
+    /// container of the session's runs it, and it sees no file of the
+    /// session's. Each request carries its [headers](Self::with_header) and,
+    /// for a service the owner declares, the session's
+    /// [identity headers](super::SessionBuilder::mcp_identity). Its client
+    /// trusts the system's roots, and a [trust anchor](Self::with_trust_anchor)
+    /// when it is given one; it takes a server that issues no session.
+    ///
+    /// A URL carrying a user name or password, a scheme other than `http` or
+    /// `https`, or a header naming an identity header or one HTTP or the
+    /// protocol sets itself -- `Mcp-Param-*` among them -- is
+    /// [`McpServiceOutcome::Misconfigured`], as is every server the owner
+    /// declares while an identity header is one the protocol sets. Plain
+    /// `http` to a host that is not loopback starts, and its
+    /// `mcp.service.started` says the headers went in the clear.
+    pub fn url(url: impl Into<String>) -> Self {
+        Self::placed(McpPlacement::Url {
+            url: url.into(),
+            headers: BTreeMap::new(),
+            trust_anchor: None,
+            trust: McpTrust::default(),
+            allow_stateless: true,
+        })
+    }
+
     fn placed(placement: McpPlacement) -> Self {
         Self {
             placement,
@@ -124,6 +151,53 @@ impl McpServiceSpec {
                     *server = server.clone().with_env(env);
                 }
             }
+            McpPlacement::Url { .. } => {}
+        }
+        self
+    }
+
+    /// The spec, with each request of a URL server carrying `name` set to
+    /// `value`: a literal, or a `${VAR}` reference the session's
+    /// [`Secrets`](super::Secrets) resolve once, at start. Nothing for
+    /// another placement, whose server takes [`env`](Self::with_env).
+    #[must_use]
+    pub fn with_header(mut self, name: impl Into<String>, value: EnvValue) -> Self {
+        if let McpPlacement::Url { headers, .. } = &mut self.placement {
+            headers.insert(name.into(), value);
+        }
+        self
+    }
+
+    /// The spec, with a URL server's client trusting `anchor`, as
+    /// [`with_trust`](Self::with_trust) says. Nothing for another placement.
+    #[must_use]
+    pub fn with_trust_anchor(mut self, anchor: TrustAnchor) -> Self {
+        if let McpPlacement::Url { trust_anchor, .. } = &mut self.placement {
+            *trust_anchor = Some(anchor);
+        }
+        self
+    }
+
+    /// The spec, with a URL server's trust anchor trusted as `how` says.
+    /// Nothing for another placement.
+    #[must_use]
+    pub fn with_trust(mut self, how: McpTrust) -> Self {
+        if let McpPlacement::Url { trust, .. } = &mut self.placement {
+            *trust = how;
+        }
+        self
+    }
+
+    /// The spec, with a URL server that issues no session taken when
+    /// `allow`, as it is by default, or refused as misconfigured. Nothing for
+    /// another placement.
+    #[must_use]
+    pub fn with_allow_stateless(mut self, allow: bool) -> Self {
+        if let McpPlacement::Url {
+            allow_stateless, ..
+        } = &mut self.placement
+        {
+            *allow_stateless = allow;
         }
         self
     }
@@ -178,6 +252,31 @@ pub enum McpPlacement {
         /// Its environment.
         env: BTreeMap<String, EnvValue>,
     },
+    /// Dialed over streamable HTTP: see [`McpServiceSpec::url`].
+    #[non_exhaustive]
+    Url {
+        /// Where.
+        url: String,
+        /// What each request carries.
+        headers: BTreeMap<String, EnvValue>,
+        /// A certificate authority its client trusts.
+        trust_anchor: Option<TrustAnchor>,
+        /// How it trusts `trust_anchor`.
+        trust: McpTrust,
+        /// Whether a server that issues no session is taken.
+        allow_stateless: bool,
+    },
+}
+
+/// A certificate authority a URL server's client trusts: PEM, one certificate
+/// or several.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TrustAnchor {
+    /// A file on the host, read when the server is first connected.
+    Path(PathBuf),
+    /// The PEM itself.
+    Pem(Vec<u8>),
 }
 
 /// How a session starts its MCP services. The deadline, result bound and
@@ -247,6 +346,8 @@ pub enum McpPlacementKind {
     Sidecar,
     /// In a sidecar that sees the primary's filesystem.
     PrimaryView,
+    /// Dialed at a URL, from the host.
+    Url,
 }
 
 /// Who declared an MCP service.
@@ -277,6 +378,8 @@ pub enum McpOutcomeKind {
     Misconfigured,
     /// See [`McpServiceOutcome::Unclassified`].
     Unclassified,
+    /// See [`McpServiceOutcome::Unapproved`].
+    Unapproved,
 }
 
 impl McpOutcomeKind {
@@ -288,6 +391,7 @@ impl McpOutcomeKind {
             Self::Refused => "refused",
             Self::Misconfigured => "misconfigured",
             Self::Unclassified => "unclassified",
+            Self::Unapproved => "unapproved",
         }
     }
 }
@@ -353,6 +457,9 @@ pub enum McpServiceOutcome {
     Misconfigured(McpStartupCause),
     /// Failed in a way OutRig does not classify: named so, not guessed at.
     Unclassified(McpStartupCause),
+    /// A repository's URL entry the user did not approve: nothing was
+    /// connected.
+    Unapproved(McpStartupCause),
 }
 
 impl McpServiceOutcome {
@@ -364,6 +471,7 @@ impl McpServiceOutcome {
             Self::Refused(_) => McpOutcomeKind::Refused,
             Self::Misconfigured(_) => McpOutcomeKind::Misconfigured,
             Self::Unclassified(_) => McpOutcomeKind::Unclassified,
+            Self::Unapproved(_) => McpOutcomeKind::Unapproved,
         }
     }
 
@@ -374,7 +482,8 @@ impl McpServiceOutcome {
             Self::Unavailable(cause)
             | Self::Refused(cause)
             | Self::Misconfigured(cause)
-            | Self::Unclassified(cause) => Some(cause),
+            | Self::Unclassified(cause)
+            | Self::Unapproved(cause) => Some(cause),
         }
     }
 }
@@ -496,6 +605,9 @@ pub enum McpStopHow {
     Stopped,
     /// Its transport was closed; it ends with the primary container.
     WithPrimary,
+    /// Its HTTP session was ended; the server, which the session does not
+    /// run, runs on.
+    Disconnected,
     /// It never started, so there was nothing to stop.
     NotStarted,
 }
@@ -559,12 +671,16 @@ pub(crate) struct Planned {
     /// container name.
     pub(crate) host: String,
     pub(crate) launch: Launch,
+    /// Its environment; for a URL server, the headers each request carries.
     pub(crate) env: BTreeMap<String, EnvValue>,
     pub(crate) call_deadline: Option<Duration>,
     pub(crate) description: Option<String>,
     pub(crate) writes: McpWrites,
     /// Why it cannot start, found before anything did.
     pub(crate) misconfigured: Option<String>,
+    /// Why a repository's URL entry may not start, when the user did not
+    /// approve it: nothing of it is connected.
+    pub(crate) unapproved: Option<String>,
 }
 
 impl Planned {
@@ -591,6 +707,7 @@ impl Planned {
             description: None,
             writes,
             misconfigured: None,
+            unapproved: None,
         }
     }
 
@@ -638,6 +755,9 @@ pub(crate) struct Plan {
     /// The sidecars the launch starts, whose names no block of the
     /// configuration's can take.
     launched: BTreeSet<String>,
+    /// The names of the owner's identity headers, which no declaration's
+    /// headers may name.
+    identity: Vec<String>,
 }
 
 impl Plan {
@@ -647,7 +767,8 @@ impl Plan {
     /// checked. A configured server whose name `taken` says is taken, or that
     /// cannot be bound, is misconfigured; an owner's name was checked before.
     /// `workspace` is the host directory a sidecar's workspace access mounts,
-    /// and `launched` names the sidecars the launch starts.
+    /// `launched` names the sidecars the launch starts, and `identity` holds
+    /// the owner's identity headers, whose names no declaration may set.
     pub(crate) fn new(
         owner: &[(String, McpServiceSpec)],
         configured: Option<&ConfiguredMcp>,
@@ -655,9 +776,11 @@ impl Plan {
         taken: impl Fn(&str) -> bool,
         workspace: Option<PathBuf>,
         launched: BTreeSet<String>,
+        identity: &[(String, String)],
     ) -> Self {
         let mut plan = Self {
             launched,
+            identity: identity.iter().map(|(name, _)| name.clone()).collect(),
             ..Self::default()
         };
         plan.hosts.insert(PRIMARY.to_string(), HostPlan::Primary);
@@ -723,6 +846,26 @@ impl Plan {
                 sidecar.servers.retain(|_, hosted| !hosted.is_entrypoint());
                 self.sidecar(sidecar);
                 one
+            }
+            McpPlacement::Url {
+                url,
+                headers,
+                trust_anchor,
+                trust,
+                allow_stateless,
+            } => {
+                let launch = UrlLaunch {
+                    url: url.clone(),
+                    trust_anchor: trust_anchor.clone(),
+                    trust: *trust,
+                    allow_stateless: *allow_stateless,
+                };
+                owner(
+                    McpPlacementKind::Url,
+                    "",
+                    (Launch::Url(Box::new(launch)), headers.clone()),
+                    McpWrites::Nothing,
+                )
             }
         };
         one.description = spec.description.clone();
@@ -830,6 +973,26 @@ impl Plan {
                 self.sidecar(spec);
             }
         }
+        for (server, entry) in &configured.urls {
+            let spec = &entry.spec;
+            let launch = UrlLaunch {
+                url: spec.url().unwrap_or_default().to_string(),
+                trust_anchor: entry.trust_anchor.clone().map(TrustAnchor::Path),
+                trust: spec.trust(),
+                allow_stateless: spec.allow_stateless().unwrap_or(true),
+            };
+            let mut one = Planned::new(
+                server,
+                McpDeclaredIn::Config,
+                McpPlacementKind::Url,
+                "",
+                (Launch::Url(Box::new(launch)), spec.headers().clone()),
+                McpWrites::Nothing,
+            );
+            one.call_deadline = deadline(spec.call_timeout_secs());
+            one.unapproved = entry.unapproved.clone();
+            self.configured_name(one, server, taken);
+        }
         for (server, sidecar) in &configured.manual {
             let mut one = Planned::new(
                 server,
@@ -893,13 +1056,103 @@ impl Plan {
             .or_insert_with(|| HostPlan::Sidecar(Box::new(spec)));
     }
 
-    /// `one`, checked against what holds no credential, and added.
+    /// `one`, checked, and added: a server in a container against what holds
+    /// no credential; a URL server as its declaration says, in a host of its
+    /// own keyed by the name it is bound as, which no sidecar's name can be.
     fn push(&mut self, mut one: Planned) {
-        if one.misconfigured.is_none() {
-            one.misconfigured = env_misconfigured(&one);
+        let checked = match &one.launch {
+            Launch::Url(launch) => self.url_misconfigured(launch, &one.env, one.declared_in),
+            Launch::Exec(_) | Launch::Entrypoint(_) => env_misconfigured(&one),
+        };
+        one.misconfigured = one.misconfigured.or(checked);
+        if let Launch::Url(_) = one.launch {
+            one.host = format!("<url:{}>", one.name);
         }
         self.services.push(one);
     }
+
+    /// Why the URL server `launch` names, with `headers`, cannot start as
+    /// `declared_in` declared it, if it cannot: found before any request. The
+    /// URL is never quoted -- one with a password in it would put the
+    /// password in the message -- and no header's value is; a value is
+    /// checked once it has one, as it is resolved. An owner's server carries
+    /// the owner's identity headers too, whose names are checked as its own.
+    fn url_misconfigured(
+        &self,
+        launch: &UrlLaunch,
+        headers: &BTreeMap<String, EnvValue>,
+        declared_in: McpDeclaredIn,
+    ) -> Option<String> {
+        let url = match reqwest::Url::parse(&launch.url) {
+            Ok(url) => url,
+            Err(e) => return Some(format!("its url is not a URL: {e}")),
+        };
+        if !url.username().is_empty() || url.password().is_some() {
+            return Some(
+                "its url carries a user name or password; a credential goes in its headers, \
+                 which no one is shown"
+                    .to_string(),
+            );
+        }
+        if !matches!(url.scheme(), "http" | "https") {
+            return Some(format!(
+                "its url's scheme is {:?}, and a URL server is dialed over http or https",
+                url.scheme()
+            ));
+        }
+        if launch.trust == McpTrust::Only && launch.trust_anchor.is_none() {
+            return Some("it trusts only its trust anchor, and names none".to_string());
+        }
+        let mut seen = BTreeSet::new();
+        for name in headers.keys() {
+            if let Some(why) = unsettable(name) {
+                return Some(format!("its header {why}"));
+            }
+            if !seen.insert(name.to_ascii_lowercase()) {
+                return Some(format!("it sets the header {name} twice, in two cases"));
+            }
+        }
+        if let Some(header) = names_identity_header(headers.keys(), &self.identity) {
+            return Some(format!(
+                "its header {header} is one of the owner's identity headers, which only the \
+                 owner sets, on the URL services it declares"
+            ));
+        }
+        if declared_in != McpDeclaredIn::Owner {
+            return None;
+        }
+        self.identity
+            .iter()
+            .find_map(|name| unsettable(name))
+            .map(|why| format!("the owner's identity header {why}"))
+    }
+}
+
+/// Why no request may carry a header named `name`, which it then names, if
+/// none may: one that is no header name, or one HTTP or the MCP transport
+/// sets itself, which would replace it between one request and the next.
+fn unsettable(name: &str) -> Option<String> {
+    if http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+        return Some(format!("{name:?} is not a header name"));
+    }
+    crate::mcp::reserved_header(name)
+        .then(|| format!("{name} is one HTTP or the MCP transport sets itself"))
+}
+
+/// What the owner of a URL server reached at `url` should know of how it was
+/// reached: that its headers went to a host that is not loopback over plain
+/// `http`, readable by anything on the way.
+pub(super) fn in_the_clear(url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(url).ok()?;
+    let host = url.host_str()?;
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    (url.scheme() == "http" && !loopback)
+        .then(|| format!("its headers went to {host} over plain http, unencrypted"))
 }
 
 /// Why a server placed as `one` is with `one.env` cannot start, if it
@@ -918,7 +1171,7 @@ fn env_misconfigured(one: &Planned) -> Option<String> {
     let place = match one.placement {
         McpPlacementKind::Command => Some("the primary container, beside the interpreter"),
         McpPlacementKind::PrimaryView => Some("a sidecar that joins the primary's namespaces"),
-        McpPlacementKind::Sidecar => None,
+        McpPlacementKind::Sidecar | McpPlacementKind::Url => None,
     };
     if let (false, Some(place)) = (references.is_empty(), place) {
         return Some(format!(
@@ -1055,10 +1308,6 @@ struct Table {
     /// The interpreter's writer, once the services are bound: what relists
     /// are answered on and listing changes told on.
     to_interpreter: OnceLock<ToInterpreter>,
-    /// Held for the URL services an owner declares, and never read, logged
-    /// or shown.
-    #[expect(dead_code, reason = "the URL placement (`0003-57`) stamps them")]
-    identity: Vec<(String, String)>,
 }
 
 /// One container, and what it runs.
@@ -1251,13 +1500,25 @@ impl McpServices {
             events,
         } = start;
         let secrets = Once::new(&*secrets);
-        let launches: Vec<Result<Server, String>> = plan
+        // Nothing of an entry the user did not approve is resolved or placed.
+        let launches: Vec<Result<Server, Unplaced>> = plan
             .services
             .iter()
-            .map(|planned| match &planned.misconfigured {
-                Some(why) => Err(why.clone()),
-                None => resolve(planned, &secrets),
-            })
+            .map(
+                |planned| match (&planned.unapproved, &planned.misconfigured) {
+                    (Some(why), _) => Err((
+                        McpOutcomeKind::Unapproved,
+                        format!(
+                            "it is a repository's URL entry, and {why}, so nothing was connected; \
+                         approve it in a session started at a terminal, or move it to the \
+                         global config"
+                        ),
+                    )),
+                    (None, Some(why)) => Err((McpOutcomeKind::Misconfigured, why.clone())),
+                    (None, None) => resolve(planned, &secrets)
+                        .map_err(|why| (McpOutcomeKind::Misconfigured, why)),
+                },
+            )
             .collect();
         // How many servers each container runs, of those that can be launched.
         let launched = |key: &str| {
@@ -1267,24 +1528,44 @@ impl McpServices {
                 .filter(|(planned, launch)| launch.is_ok() && planned.host == key)
                 .count()
         };
-        let hosts: BTreeMap<String, Host> = plan
+        let host = |placement, stops, alone| Host {
+            placement,
+            stops,
+            alone,
+            state: Arc::new(tokio::sync::Mutex::new(HostState::Running)),
+        };
+        let mut hosts: BTreeMap<String, Host> = plan
             .hosts
             .iter()
             .filter(|(key, _)| launched(key) > 0)
-            .map(|(key, host)| {
-                let stops = match host {
+            .map(|(key, planned)| {
+                let stops = match planned {
                     HostPlan::Primary => McpStopHow::WithPrimary,
                     HostPlan::Sidecar(_) => McpStopHow::Stopped,
                 };
-                let host = Host {
-                    placement: place(host),
-                    stops,
-                    alone: stops == McpStopHow::Stopped && launched(key) == 1,
-                    state: Arc::new(tokio::sync::Mutex::new(HostState::Running)),
-                };
-                (key.clone(), host)
+                let alone = stops == McpStopHow::Stopped && launched(key) == 1;
+                (key.clone(), host(place(planned), stops, alone))
             })
             .collect();
+        // A URL server runs in nothing of the session's: it is dialed, by a
+        // placement of the table's own, which only an owner's carries the
+        // owner's identity in.
+        let dialed = plan
+            .services
+            .iter()
+            .zip(&launches)
+            .filter(|(planned, launch)| {
+                planned.placement == McpPlacementKind::Url && launch.is_ok()
+            });
+        for (planned, _) in dialed {
+            let identity = match planned.declared_in {
+                McpDeclaredIn::Owner => identity.clone(),
+                McpDeclaredIn::Config | McpDeclaredIn::ImageLabel => Vec::new(),
+            };
+            let dialer: Arc<dyn Placement> = Arc::new(Http::new(identity));
+            let dialed = host(dialer, McpStopHow::Disconnected, false);
+            hosts.insert(planned.host.clone(), dialed);
+        }
         let started = join_all(
             plan.services
                 .iter()
@@ -1353,7 +1634,6 @@ impl McpServices {
             hosts,
             services: OnceLock::new(),
             to_interpreter: OnceLock::new(),
-            identity,
         }))
     }
 
@@ -1716,16 +1996,38 @@ impl Table {
     /// the interpreter is told the count, which makes the service stale until
     /// a relist that began after it. Nothing is relisted for it. A change
     /// said after its first listing was asked for and before now is heard
-    /// first.
+    /// first. A client that can no longer hear one -- a URL server's stream
+    /// that broke past resuming -- is disconnected, so that the next call
+    /// connects it again, its tools listed again.
     fn listen(self: &Arc<Self>, entry: &Arc<Entry>) {
         let Some(mut changes) = entry.changes.lock().expect("entry lock").take() else {
             return;
         };
+        // The client the changes are of: published just now, and none since.
+        let Some(client) = entry.client() else {
+            return;
+        };
+        let broken = client.broken();
+        let client = Arc::downgrade(&client);
         let table = Arc::downgrade(self);
         let entry = Arc::clone(entry);
         tokio::spawn(async move {
-            // Ends once the client's connection does, its sender with it.
-            while changes.changed().await.is_ok() {
+            loop {
+                tokio::select! {
+                    // Ends once the client's connection does, its sender with it.
+                    changed = changes.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    () = broken.cancelled() => {
+                        if let (Some(table), Some(client)) = (table.upgrade(), client.upgrade()) {
+                            let cause = McpSessionError::new(McpFailureKind::Transport, DEAF);
+                            table.went_down(&entry, &client, &cause);
+                        }
+                        return;
+                    }
+                }
                 let heard = entry.heard.fetch_add(1, Ordering::SeqCst) + 1;
                 let Some(table) = table.upgrade() else {
                     return;
@@ -2133,23 +2435,29 @@ impl Table {
 async fn start_one(
     events: &Events,
     planned: &Planned,
-    launch: &Result<Server, String>,
+    launch: &Result<Server, Unplaced>,
     host: Option<&Host>,
     policy: &McpPolicy,
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> Started {
     let (Ok(server), Some(host)) = (launch, host) else {
-        let why = launch.as_ref().err().cloned().unwrap_or_default();
+        let (kind, why) = match launch {
+            Err((kind, why)) => (*kind, why.clone()),
+            Ok(_) => (McpOutcomeKind::Misconfigured, String::new()),
+        };
         let cause = planned.cause(why);
         events.emit(Payload::McpServiceFailed {
             service: planned.name.clone(),
-            outcome: McpOutcomeKind::Misconfigured,
+            outcome: kind,
             cause: cause.clone(),
             attempts: 0,
             duration: Duration::ZERO,
         });
-        return Started::failed(McpServiceOutcome::Misconfigured(cause));
+        return Started::failed(match kind {
+            McpOutcomeKind::Unapproved => McpServiceOutcome::Unapproved(cause),
+            _ => McpServiceOutcome::Misconfigured(cause),
+        });
     };
     let since = Instant::now();
     let (attempts, established) =
@@ -2178,6 +2486,10 @@ async fn start_one(
                 undecoded,
                 attempts,
                 duration: since.elapsed(),
+                detail: match &planned.launch {
+                    Launch::Url(launch) => in_the_clear(&launch.url),
+                    _ => None,
+                },
             });
             return started;
         }
@@ -2205,6 +2517,10 @@ async fn start_one(
     });
     Started::failed(outcome)
 }
+
+/// Why a service is not placed: the outcome it starts as -- misconfigured or
+/// unapproved -- and why.
+type Unplaced = (McpOutcomeKind, String);
 
 /// What a server that connected came to: its client, what it says of its
 /// listing's changes from before its first listing was asked for, and that
@@ -2238,7 +2554,10 @@ async fn establish(
         let mut unlisted = None;
         let attempt = async {
             let within = policy.attempt.min(left.saturating_sub(REPORT_MARGIN));
-            let client = placement.connect(server, within).await?;
+            let client = placement
+                .connect(server, within)
+                .await
+                .map_err(|e| Failed::unconnected(&e))?;
             let changes = client.list_changes();
             let left = deadline.saturating_duration_since(Instant::now());
             match client
@@ -2247,9 +2566,10 @@ async fn establish(
             {
                 Ok(listing) => Ok((client, changes, listing)),
                 Err(e) => {
-                    unlisted = Some(Failed::of(&e));
+                    let failed = Failed::of(&e);
+                    unlisted = Some(failed.clone());
                     let _ = client.shutdown().await;
-                    Err(e)
+                    Err(failed)
                 }
             }
         };
@@ -2263,7 +2583,7 @@ async fn establish(
         };
         let failed = match attempted {
             Ok(Ok(established)) => return (attempts, Ok(established)),
-            Ok(Err(e)) => Failed::of(&e),
+            Ok(Err(failed)) => failed,
             Err(_) => unlisted.unwrap_or_else(|| Failed::timed_out(left)),
         };
         if failed.class != StartupClass::Transient {
@@ -2336,6 +2656,7 @@ async fn shut_down(entry: &Entry) {
 }
 
 /// One failed attempt, classified.
+#[derive(Clone)]
 struct Failed {
     class: StartupClass,
     kind: Option<McpFailureKind>,
@@ -2364,17 +2685,19 @@ impl Failed {
             },
             OutrigError::McpToolsListFailed {
                 source,
+                stderr_path,
                 stderr_tail,
                 ..
             } => Self {
-                class: match source.kind {
+                class: source.class.unwrap_or(match source.kind {
                     McpFailureKind::Transport | McpFailureKind::Timeout => StartupClass::Transient,
                     _ => StartupClass::Unclassified,
-                },
+                }),
                 kind: Some(source.kind),
                 message: format!("tools/list failed: {}", source.message),
                 exit: None,
-                stderr_tail: Some(stderr_tail.clone()),
+                // A server with no stderr of its own -- a URL's -- has no tail.
+                stderr_tail: (!stderr_path.as_os_str().is_empty()).then(|| stderr_tail.clone()),
             },
             OutrigError::McpEnvResolveFailed { .. }
             | OutrigError::Configuration(_)
@@ -2383,6 +2706,21 @@ impl Failed {
                 plain(StartupClass::Misconfigured, error.to_string())
             }
             _ => plain(StartupClass::Unclassified, error.to_string()),
+        }
+    }
+
+    /// What a placement that did not connect a server said: its error, or a
+    /// streamable-HTTP connect, classified, with no exit or stderr to tell.
+    fn unconnected(error: &Unconnected) -> Self {
+        match error {
+            Unconnected::Outrig(error) => Self::of(error),
+            Unconnected::Http(failed) => Self {
+                class: failed.class,
+                kind: Some(failed.source.kind),
+                message: failed.source.message.clone(),
+                exit: None,
+                stderr_tail: None,
+            },
         }
     }
 
@@ -2413,10 +2751,16 @@ impl Failed {
 /// How `planned` starts, its environment resolved through `secrets`; or why
 /// a value has none.
 fn resolve(planned: &Planned, secrets: &Once<'_>) -> Result<Server, String> {
+    let headers = matches!(planned.launch, Launch::Url(_));
+    let what = if headers { "header" } else { "env" };
     let mut env = BTreeMap::new();
     for (key, value) in &planned.env {
         let resolved = ResolvedEnvValue::resolve_with(value.clone(), secrets)
-            .map_err(|e| format!("its env {key} = {}: {e}", value.to_raw()))?;
+            .map_err(|e| format!("its {what} {key} = {}: {e}", value.to_raw()))?;
+        // A header's value is checked once it has one, and never shown.
+        if headers {
+            crate::mcp::http_header(key, resolved.value())?;
+        }
         env.insert(key.clone(), resolved);
     }
     Ok(Server {
@@ -2646,6 +2990,11 @@ fn category(kind: McpFailureKind) -> ServiceErrorCategory {
 /// Why a call or a relist reached no server: its client is gone.
 const NOT_CONNECTED: &str = "the server is not connected";
 
+/// Why a service was disconnected with no call there to fail: its server can
+/// no longer tell it of a change to its listing.
+const DEAF: &str = "a stream its server speaks on broke, or did not open, and was not resumed, so \
+                    a change to its listing would not be heard";
+
 /// The refusal of an ask of `service`, which the session has not started.
 fn no_service(service: &str) -> Refusal {
     Refusal::refused(
@@ -2654,22 +3003,18 @@ fn no_service(service: &str) -> Refusal {
     )
 }
 
-/// Whether a declaration's `headers` name one of the owner's identity
-/// headers, which no declaration may: they are the owner's to stamp, on the
-/// URL services the owner declares (`0003-57`). Header names compare without
+/// Which of a declaration's `headers` names one of the owner's `identity`
+/// headers, if one does, which no declaration may: they are the owner's to
+/// stamp, on the URL services the owner declares. Header names compare without
 /// regard to case.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the URL placement (`0003-57`) has headers")
-)]
 pub(crate) fn names_identity_header<'a>(
     headers: impl IntoIterator<Item = &'a String>,
-    identity: &[(String, String)],
+    identity: &[String],
 ) -> Option<String> {
     headers.into_iter().find_map(|header| {
         identity
             .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case(header))
+            .any(|name| name.eq_ignore_ascii_case(header))
             .then(|| header.clone())
     })
 }

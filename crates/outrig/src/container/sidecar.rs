@@ -34,6 +34,9 @@ use crate::error::{OutrigError, Result};
 pub enum Placement {
     Primary,
     Sidecar(String),
+    /// None: a `url` entry, dialed from the host by a session. `outrig run`
+    /// starts no such server.
+    Url,
 }
 
 impl Placement {
@@ -42,15 +45,16 @@ impl Placement {
         match self {
             Self::Primary => "primary".to_string(),
             Self::Sidecar(name) => format!("sidecar {name:?}"),
+            Self::Url => "url".to_string(),
         }
     }
 
-    /// The sidecar this placement names, or `None` for the primary. Lives
-    /// here so callers ask one question instead of matching an enum that is
-    /// `#[non_exhaustive]` to them.
+    /// The sidecar this placement names, or `None` for the primary or a URL.
+    /// Lives here so callers ask one question instead of matching an enum
+    /// that is `#[non_exhaustive]` to them.
     pub fn sidecar_name(&self) -> Option<&str> {
         match self {
-            Self::Primary => None,
+            Self::Primary | Self::Url => None,
             Self::Sidecar(name) => Some(name),
         }
     }
@@ -413,7 +417,9 @@ pub fn plan_from_config(cfg: &Config, image_cfg: &ImageConfig) -> SessionMcpPlan
     }
 
     for (name, spec) in image_cfg.mcp() {
-        let placement = if let Some(sc) = spec.sidecar() {
+        let placement = if spec.is_url() {
+            Placement::Url
+        } else if let Some(sc) = spec.sidecar() {
             Placement::Sidecar(sc.to_string())
         } else if let Some(image) = spec.image() {
             plan.sidecars.insert(
@@ -483,17 +489,18 @@ pub fn merge_sidecar_labels(
             PlacedServer {
                 // Rewrite so serialization (e.g. `show-merged`) shows the
                 // placement the label materialized into.
-                spec: McpServerSpec::Full {
-                    command: Some(command),
-                    env,
-                    sidecar: Some(sidecar.to_string()),
-                    image: None,
-                    // Labels are exec-stdio-only (`parse_mcp_table` rejects
-                    // `args` alongside the placement keys), so there is never
-                    // anything to carry across.
-                    args: Vec::new(),
-                    view: crate::config::SidecarView::None,
-                    call_timeout_secs: spec.call_timeout_secs(),
+                //
+                // Labels are exec-stdio-only (`parse_mcp_table` rejects `args`,
+                // `url` and the placement keys), so there is nothing else to
+                // carry across.
+                spec: {
+                    let placed = McpServerSpec::exec(command)
+                        .with_env(env)
+                        .with_sidecar(sidecar);
+                    match spec.call_timeout_secs() {
+                        Some(secs) => placed.with_call_timeout_secs(secs),
+                        None => placed,
+                    }
                 },
                 source: McpDeclarationSource::ImageLabel,
                 placement: Placement::Sidecar(sidecar.to_string()),

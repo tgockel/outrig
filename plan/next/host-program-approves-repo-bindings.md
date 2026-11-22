@@ -9,6 +9,9 @@ operator approved in an interactive `run-new` starts in a host program's session
 well. That session installs no approver, though, so a declaration not yet approved -- a new one,
 or one edited since -- is refused, and the program has no way to approve it.
 
+A repository's `url` MCP entry (`0003-57`) is asked about through the same `Approver` and store,
+and has the same gap: in a host program's session, one not yet approved is `unapproved`.
+
 ## Shape
 
 - An approver the program may install on `outrig.Session`, an `async def` receiving the

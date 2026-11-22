@@ -1034,11 +1034,16 @@ async fn setup_sidecars(
         to_start.push((name, tag, sc));
     }
 
-    // Every label has merged, so the plan is complete. Checked here rather
-    // than after `setup` returns so a refusal -- an undeclared name, a label
-    // reference no list allows -- takes `setup`'s abort path, which stops the
-    // containers and finalizes the session record, and before Phase C starts a
-    // sidecar on the strength of a label that is about to be refused.
+    // Every label has merged, so a `url` entry has shadowed any label entry of
+    // its name, and can be left out: the host dials one, which only `run-new`
+    // and a host program's session do.
+    skip_url_servers(&mut plan);
+
+    // The plan is complete. Checked here rather than after `setup` returns so
+    // a refusal -- an undeclared name, a label reference no list allows --
+    // takes `setup`'s abort path, which stops the containers and finalizes the
+    // session record, and before Phase C starts a sidecar on the strength of a
+    // label that is about to be refused.
     check_env_servers(args.cli_env, &plan, args.image_cfg_name)?;
     check_label_env_refs(&plan, args.image_cfg_name, args.cfg.repo.env_allow())?;
     let server_count = plan.servers.len();
@@ -1155,6 +1160,28 @@ fn check_env_servers(
         }
     }
     Ok(())
+}
+
+/// Leave `plan`'s `url` entries out, saying once which: this path runs every
+/// server in a container, and a `url` entry runs in none -- `run-new` and a
+/// host program's session dial it from the host.
+fn skip_url_servers(plan: &mut SessionMcpPlan) {
+    let dialed: Vec<&str> = plan
+        .servers
+        .iter()
+        .filter(|(_, placed)| placed.placement == Placement::Url)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if dialed.is_empty() {
+        return;
+    }
+    eprintln!(
+        "[outrig] warning: not starting MCP server(s) {}: a `url` entry is started by \
+         `outrig run-new` and a host program's session, not here",
+        dialed.join(", ")
+    );
+    plan.servers
+        .retain(|_, placed| placed.placement != Placement::Url);
 }
 
 /// Hold every server an image's label declared to `env_allow`, the global

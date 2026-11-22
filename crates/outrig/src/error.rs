@@ -453,6 +453,10 @@ pub struct McpSessionError {
     /// The SDK's rendering of what went wrong. Diagnostic text for a human to
     /// read -- branch on `kind` rather than parsing this.
     pub message: String,
+    /// What it means for a start trying again, where the transport said more
+    /// than its kind does: an HTTP status, a certificate. The session's MCP
+    /// table reads it.
+    pub(crate) class: Option<crate::mcp::StartupClass>,
 }
 
 impl McpSessionError {
@@ -466,6 +470,7 @@ impl McpSessionError {
         Self {
             kind,
             message: message.into(),
+            class: None,
         }
     }
 }

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`run-new` dials a configuration's `url` MCP entries.** An `[images.<name>.mcp]` entry with a
+  `url` -- and `headers`, `trust-anchor`, `trust`, `allow-stateless` -- is a streamable-HTTP
+  server the host dials; see the library's changelog. One a repository's config declares is shown
+  at the terminal, its URL and its headers by name, and starts only on a yes, remembered as a
+  binding's approval is. `outrig run` and `outrig mcp` start no `url` entry: they print one
+  warning naming those they leave out.
+
 - **`run-new`'s agent gets an MCP tool's result as data.** A call returns the server's content
   blocks in order and its structured content, for the agent's Python to filter, and raises for
   a result the server marks as an error: see the library's changelog. A server listing a tool

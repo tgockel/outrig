@@ -3125,3 +3125,115 @@ async fn a_program_declares_mcp_servers_and_reads_their_outcomes() {
     );
     assert!(ran.stdout.contains("mcp.service.started"), "{}", ran.stdout);
 }
+
+/// A program declares a URL server as `outrig.McpUrl`, whose fields reach the engine: a header
+/// naming the program's identity header, and `trust="only"` with no anchor, are misconfigured; one
+/// with its anchor as PEM bytes and a resolved header is tried at its URL until the budget. Fields
+/// of the wrong type or value are refused as the class is made.
+#[tokio::test]
+async fn a_program_declares_a_url_server() {
+    let key = rcgen::KeyPair::generate().expect("a key");
+    let pem = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+        .expect("params")
+        .self_signed(&key)
+        .expect("a certificate")
+        .pem();
+    let bed = Bed::new();
+    bed.write(
+        "mcp.py",
+        &r#"
+        import asyncio, json, outrig
+
+        PEM = PEM_TEXT.encode()
+        URL = "http://127.0.0.1:9/mcp"
+
+        def refused(make):
+            try:
+                make()
+            except (TypeError, ValueError) as e:
+                return type(e).__name__
+
+        print(json.dumps([
+            refused(lambda: outrig.McpUrl("x", URL, trust="maybe")),
+            refused(lambda: outrig.McpUrl("x", URL, trust_anchor=5)),
+            refused(lambda: outrig.McpUrl("x", 5)),
+            refused(lambda: outrig.McpUrl("x", URL, allow_stateless="no")),
+        ]), flush=True)
+
+        async def main():
+            session = outrig.Session(
+                mcp=[
+                    outrig.McpUrl("fenced", URL, headers={"x-fence": "mine"}),
+                    outrig.McpUrl("pinned", URL, trust="only"),
+                    outrig.McpUrl(
+                        "anchored",
+                        URL,
+                        headers={"X-Token": "${OUTRIG_TEST_MCP_PROGRAM_TOKEN}"},
+                        trust_anchor=PEM,
+                        trust="only",
+                        allow_stateless=False,
+                    ),
+                ],
+                mcp_policy=outrig.McpPolicy(connect_budget_secs=1),
+                mcp_identity={"X-Fence": "fence-1"},
+            )
+            async with session:
+                print(json.dumps({
+                    name: [o.outcome, o.cause.placement, o.cause.message]
+                    for name, o in session.mcp.items()
+                }), flush=True)
+
+        asyncio.run(main())
+        "#
+        // One line, so the source keeps its indentation for the dedent.
+        .replace("PEM_TEXT", &format!("{pem:?}")),
+    );
+    let mut sessions = bed.sessions();
+    sessions.secrets = Some(Arc::new(|var: &str| {
+        (var == "OUTRIG_TEST_MCP_PROGRAM_TOKEN").then(|| "sk-program-7a1e".to_string())
+    }));
+    let program = bed
+        .start("mcp.py", bed.config("", false), sessions, |p| p)
+        .await;
+    let ran = bed.finish(program).await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    let lines = ran.json();
+    assert_eq!(
+        lines[0],
+        serde_json::json!(["ValueError", "TypeError", "TypeError", "TypeError"])
+    );
+    let outcome = |name: &str| (lines[1][name][0].clone(), lines[1][name][1].clone());
+    let message = |name: &str| lines[1][name][2].as_str().unwrap_or_default().to_string();
+    assert_eq!(
+        outcome("fenced"),
+        (serde_json::json!("misconfigured"), serde_json::json!("url"))
+    );
+    assert!(
+        message("fenced").contains("identity headers"),
+        "{}",
+        message("fenced")
+    );
+    assert_eq!(
+        outcome("pinned"),
+        (serde_json::json!("misconfigured"), serde_json::json!("url"))
+    );
+    assert!(
+        message("pinned").contains("names none"),
+        "{}",
+        message("pinned")
+    );
+    assert_eq!(
+        outcome("anchored"),
+        (serde_json::json!("unavailable"), serde_json::json!("url"))
+    );
+    assert!(
+        message("anchored").contains("Connection refused"),
+        "{}",
+        message("anchored")
+    );
+    assert!(
+        !ran.stdout.contains("sk-program") && !ran.stderr.contains("sk-program"),
+        "a value reached the program: {}",
+        ran.stdout
+    );
+}

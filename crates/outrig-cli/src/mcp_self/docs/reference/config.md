@@ -1233,7 +1233,8 @@ shows it whole and asks once; the approval is remembered under
 `$XDG_STATE_HOME/outrig/approved-bindings/` (or `~/.local/state/outrig/approved-bindings/`),
 by a digest of the declaration and the repository's root, so any edit asks again. With no
 terminal to ask on, the binding does not start, and the session runs without it. A binding in
-the global config needs no approval.
+the global config needs no approval. A repo config's MCP [`url` entry](#imagesnamemcp) is asked
+about and remembered the same way.
 
 **Same paths.** When a session has a binding, the workspace and every
 [`[[workspace.mounts]]`](#workspace) entry appear in the container at their host paths, so a
@@ -1430,7 +1431,8 @@ SELinux, read-only roots, mount policy, or network egress filtering.
 ### `[images.<name>.mcp]`
 
 Map of MCP server entries, **keyed on server name**. Each entry is one of two shapes, told
-apart by type -- an array is the short form, a table the full form:
+apart by type -- an array is the short form, a table the full form. A full-form entry with a
+`url` is a server the host dials rather than one run in a container:
 
 ```toml
 [images.coding.mcp]
@@ -1450,6 +1452,10 @@ grep = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
 # FETCH_TOKEN has to be listed in the global config's [repo] env-allow.
 fetch = { image = "ghcr.io/example/mcp-fetch:2", env = { TOKEN = "${FETCH_TOKEN}" } }
 serve = { image = "docker.io/mcp/filesystem:latest", args = ["/workspace"] }
+
+# url -- a streamable-HTTP server the host dials. `run-new` and a host program's session start
+# it, once you approve it when a repo config declares it; `outrig run` does not.
+docs = { url = "https://docs.example.com/mcp", headers = { X-Token = "${DOCS_TOKEN}" } }
 ```
 
 `shell-mcp-command` is a placeholder. Replace it with the shell MCP server you install in the
@@ -1496,6 +1502,31 @@ image, or declare any other MCP command that should run inside the container.
   The `args` written here and the elements the sidecar image declares end up meaning different
   paths -- see [Concepts -> MCP Servers](../concepts/mcp-servers.md#primary-filesystem-view).
 
+- `url` (string, optional): a streamable-HTTP endpoint, `http` or `https`, which the host dials
+  -- from its own network, in no container of the session's -- in place of a server run in a
+  container. It takes `headers`, `trust-anchor`, `trust`, `allow-stateless` and
+  `call-timeout-secs`, and no `command`, `env`, `sidecar`, `image`, `args` or `view`; those four
+  keys are refused on an entry without it. A URL with a user name or password in it is refused
+  when the session starts, as is a scheme other than `http` or `https`: a credential goes in
+  `headers`. Plain `http` to a host that is not loopback starts, and says so in its
+  `mcp.service.started` event. A `url` entry in a repo config starts only once you approve that
+  exact entry in that repository, as a repository's [binding](#bindingsname) does -- shown with
+  its headers by name, never a value -- and one nobody approved is
+  `unapproved`; the global config's needs none. `outrig run` and `outrig mcp` start no `url` entry
+  and say which they leave out. See
+  [Concepts -> MCP Servers](../concepts/mcp-servers.md#in-a-session-mcp-services).
+- `headers` (table str->str, optional, default: `{}`): what each request to `url` carries, each
+  value a literal or a `${VAR}` [reference](#mcp-env-value-syntax), resolved once when the session
+  starts and shown nowhere. In a repo config a reference may name only a variable the global
+  config lists in [`[repo]`](#repo) `env-allow`, as in `env`. A header HTTP or the protocol sets
+  itself -- `Accept`, `Content-Type`, `Host`, `Mcp-Session-Id`, `Mcp-Protocol-Version` and the
+  like -- or one the session's owner stamps as an identity header is refused.
+- `trust-anchor` (path, optional): a PEM certificate authority, one certificate or several, that
+  `url`'s client trusts, relative to the config file's directory.
+- `trust` (string, optional, default: `"with-system-roots"`): `"with-system-roots"` trusts
+  `trust-anchor` beside the system's roots; `"only"` trusts it in their place, and needs one.
+- `allow-stateless` (boolean, optional, default: `true`): whether a server that issues no
+  session is taken.
 - `call-timeout-secs` (integer, optional, default: the top-level
   [`mcp-call-timeout-secs`](#top-level), else `600`): how long one `tools/call` to this
   server may run, 1 to 3600. Past it outrig sends the server `notifications/cancelled` -- which
@@ -1524,8 +1555,9 @@ Notes:
   subsection below. A reference in a repo config file is refused at load, and one in an image
   label when the session starts, unless the global config's [`[repo]`](#repo) `env-allow` lists
   the variable.
-- Images can provide the same table via their `org.outrig.mcp` OCI label (placement keys are
-  repo-config-only and rejected in labels; `call-timeout-secs` is allowed). Repo config entries
+- Images can provide the same table via their `org.outrig.mcp` OCI label (placement keys and
+  `url` and its keys are repo-config-only and rejected in labels; `call-timeout-secs` is
+  allowed). Repo config entries
   override image entries by server name, wholesale -- a label's `call-timeout-secs` does not
   survive a config entry of the same name that omits it; see
   [Concepts -> MCP Servers](../concepts/mcp-servers.md#embedding-mcp-config-in-the-image).

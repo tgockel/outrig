@@ -58,8 +58,8 @@ mod supervise;
 mod tool_name;
 
 pub use config::{
-    CapabilityProfile, MountAccess, NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy,
-    NetworkPolicyBuilder, SidecarView, SidecarWorkspaceAccess,
+    CapabilityProfile, McpTrust, MountAccess, NetworkAction, NetworkEntry, NetworkMode,
+    NetworkPolicy, NetworkPolicyBuilder, SidecarView, SidecarWorkspaceAccess,
 };
 // Doubled at the root the way `config`'s types are, because it is the one
 // `container` type a root-level *signature* names -- `Outrig::exec_stdio` and

@@ -993,6 +993,8 @@ pub(crate) struct ConfiguredMcp {
     pub(crate) sidecars: Vec<ConfiguredSidecar>,
     /// Each server placed in a `start = "manual"` sidecar, and that sidecar.
     pub(crate) manual: BTreeMap<String, String>,
+    /// Each `url` entry: dialed from the host, in no container.
+    pub(crate) urls: BTreeMap<String, ConfiguredUrl>,
     /// Where each server sidecar labels added was declared: its sidecar's
     /// image, not the configuration.
     pub(crate) from_labels: BTreeSet<String>,
@@ -1004,6 +1006,29 @@ pub(crate) struct ConfiguredMcp {
     /// The top-level `mcp-call-timeout-secs`.
     pub(crate) call_timeout_secs: Option<u64>,
 }
+
+/// One `url` entry of a configuration, lowered: its trust anchor resolved
+/// against the file that declared it.
+#[derive(Debug, Clone)]
+pub(crate) struct ConfiguredUrl {
+    /// The entry as declared: what is dialed, and what its approval shows and
+    /// digests.
+    pub(crate) spec: McpServerSpec,
+    /// Its `trust-anchor`, resolved against the file that declared it.
+    pub(crate) trust_anchor: Option<PathBuf>,
+    /// The table that declares it: `images.<image>.mcp.<server>`.
+    pub(crate) table: String,
+    /// The config file that declared it, when that is recorded.
+    pub(crate) declared_in: Option<PathBuf>,
+    /// Why it may not start, when it may not: a repository's entry until the
+    /// session's start has the user's approval of it -- [`NOT_ASKED`] until
+    /// it is asked. A global one may.
+    pub(crate) unapproved: Option<String>,
+}
+
+/// Why a repository's `url` entry may not start before the session's start
+/// has asked about it.
+pub(crate) const NOT_ASKED: &str = "the session did not ask about it";
 
 /// One sidecar a configuration's servers run in.
 #[derive(Debug, Clone)]
@@ -1082,6 +1107,25 @@ impl ConfiguredMcp {
                     .then(|| (server.clone(), sc.to_string()))
             })
             .collect();
+        let base = block.base_dir(repo_root);
+        let urls = plan
+            .servers
+            .iter()
+            .filter(|(_, placed)| placed.placement == Placement::Url)
+            .map(|(name, placed)| {
+                let spec = &placed.spec;
+                let entry = ConfiguredUrl {
+                    trust_anchor: spec
+                        .trust_anchor()
+                        .map(|path| crate::config::resolve_against(base, path)),
+                    spec: spec.clone(),
+                    table: format!("images.{image_name}.mcp.{name}"),
+                    declared_in: block.declared_in(),
+                    unapproved: block.repo_declared().then(|| NOT_ASKED.to_string()),
+                };
+                (name.clone(), entry)
+            })
+            .collect();
         let (primary, specs) = plan_to_launch_parts(&plan, repo_root);
         let sidecars = specs
             .into_iter()
@@ -1099,6 +1143,7 @@ impl ConfiguredMcp {
             primary,
             sidecars,
             manual,
+            urls,
             from_labels,
             names,
             env_allow: config.repo.env_allow().to_vec(),

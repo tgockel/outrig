@@ -548,6 +548,25 @@ pub enum ConfigValidationError {
         declared_in: Option<PathBuf>,
     },
 
+    // `declared_in` is boxed, unlike its siblings': a second variant as large
+    // as `RepoMcpEnvRef` would cost this enum its niche, growing every
+    // `Result` that carries it.
+    #[error(
+        "repo config may not reference ${{{var}}} in image {image:?} mcp server {server:?} \
+         header {header:?}{}: list {var:?} in [repo] env-allow in global config to allow it",
+        declared_in_clause(&declared_in.as_deref().map(Path::to_path_buf))
+    )]
+    #[non_exhaustive]
+    RepoMcpHeaderRef {
+        image: String,
+        server: String,
+        header: String,
+        var: String,
+        /// The repo config file that declared the image, or `None` when
+        /// unrecorded.
+        declared_in: Option<Box<Path>>,
+    },
+
     // As with the two above, the key comes from a config file and prints with
     // `{:?}`: it is exactly the keys that are not variable names that land
     // here, and one could otherwise carry a control character to the terminal.
@@ -618,6 +637,24 @@ pub enum ConfigValidationError {
          they are mutually exclusive"
     )]
     McpPlacementConflict { image: String, server: String },
+
+    /// A `url` entry beside a key of a server run in a container, or a key
+    /// only a `url` entry takes on one that names none.
+    #[error(
+        "image {image:?} mcp server {server:?} sets `{key}`{}; a `url` entry is dialed from \
+         the host and runs in no container, so it takes `url`, `headers`, `trust-anchor`, \
+         `trust`, `allow-stateless` and `call-timeout-secs` only",
+        if *without_url { " and no `url`" } else { " beside `url`" }
+    )]
+    #[non_exhaustive]
+    McpUrlConflict {
+        image: String,
+        server: String,
+        key: &'static str,
+        /// Whether `key` is one only a `url` entry takes, on an entry with no
+        /// `url`.
+        without_url: bool,
+    },
 
     #[error(
         "image {image:?} mcp server {server:?} has sidecar={sidecar:?} which does not \
@@ -1278,6 +1315,17 @@ fn validate_repo_env_refs(
                 });
             }
         }
+        for (header, value) in spec.headers() {
+            if let Some(var) = unlisted(value) {
+                return Err(ConfigValidationError::RepoMcpHeaderRef {
+                    image: image_name.to_string(),
+                    server: server.clone(),
+                    header: header.clone(),
+                    var,
+                    declared_in: image.declared_in().map(PathBuf::into_boxed_path),
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -1651,6 +1699,7 @@ fn validate_mcp_placement(
     server_name: &str,
     spec: &McpServerSpec,
 ) -> Result<(), ConfigValidationError> {
+    validate_mcp_url_keys(image_name, server_name, spec)?;
     if spec.sidecar().is_some() && spec.image().is_some() {
         return Err(ConfigValidationError::McpPlacementConflict {
             image: image_name.to_string(),
@@ -1712,6 +1761,39 @@ fn validate_mcp_placement(
         });
     }
     Ok(())
+}
+
+/// A `url` entry takes no key of a server run in a container, and an entry
+/// with no `url` takes none of the keys only a `url` entry does.
+fn validate_mcp_url_keys(
+    image_name: &str,
+    server_name: &str,
+    spec: &McpServerSpec,
+) -> Result<(), ConfigValidationError> {
+    let url = spec.is_url();
+    let container_keys = [
+        ("command", spec.has_command()),
+        ("sidecar", spec.sidecar().is_some()),
+        ("image", spec.image().is_some()),
+        ("args", !spec.args().is_empty()),
+        ("view", spec.view() != super::SidecarView::None),
+        ("env", !spec.env().is_empty()),
+    ];
+    let conflict = match url {
+        true => container_keys
+            .into_iter()
+            .find_map(|(key, set)| set.then_some(key)),
+        false => spec.url_key(),
+    };
+    match conflict {
+        Some(key) => Err(ConfigValidationError::McpUrlConflict {
+            image: image_name.to_string(),
+            server: server_name.to_string(),
+            key,
+            without_url: !url,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// The `[images.<name>.mcp]` entries hosted by `sidecar_name`, in name order.
@@ -2713,8 +2795,9 @@ pub(crate) fn mcp_command_is_empty(spec: &McpServerSpec) -> bool {
         } => cmd.is_empty(),
         // The no-command form is entrypoint-stdio when the entry names a
         // container -- inline `image` or a named `sidecar` -- whose ENTRYPOINT
-        // is then the server. Naming neither leaves nothing to run.
-        McpServerSpec::Full { command: None, .. } => !spec.is_placed(),
+        // is then the server, or a URL the host dials. Naming none leaves
+        // nothing to run.
+        McpServerSpec::Full { command: None, .. } => !spec.is_placed() && !spec.is_url(),
     }
 }
 

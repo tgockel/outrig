@@ -644,7 +644,8 @@ class EventDelivery:
 class McpServiceStop:
     """One MCP service at a session's close: the `service`, its `placement`, how its start ended
     (`outcome`), `how` it was stopped -- `"stopped"`, its container stopped; `"with_primary"`, it
-    ended with the session's container; or `"not_started"` -- and whether that is `proven`."""
+    ended with the session's container; `"disconnected"`, the HTTP session to a URL server ended,
+    the server not the session's to stop; or `"not_started"` -- and whether that is `proven`."""
 
     service: str
     placement: str
@@ -836,13 +837,18 @@ async def _settled(reply):
 
 
 def _mcp_common(declaration):
-    """Check what every MCP declaration has -- its `name`, `image` where it has one, `env`,
-    `call_timeout_secs` and `description` -- and make its `env` a plain dict."""
-    for field in ("name", "image"):
+    """Check what every MCP declaration has -- its `name`, `image` or `url` where it has one,
+    `env` or `headers`, `call_timeout_secs` and `description` -- and make its `env` or `headers` a
+    plain dict."""
+    for field in ("name", "image", "url"):
         value = getattr(declaration, field, "")
         if not isinstance(value, str):
             raise TypeError(f"{field} takes a string, not {value!r}")
-    object.__setattr__(declaration, "env", _string_map("env", declaration.env))
+    for field in ("env", "headers"):
+        if hasattr(declaration, field):
+            object.__setattr__(
+                declaration, field, _string_map(field, getattr(declaration, field))
+            )
     timeout = declaration.call_timeout_secs
     if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, int)):
         raise TypeError(
@@ -937,6 +943,60 @@ class McpPrimaryView:
 
 
 @dataclasses.dataclass(frozen=True)
+class McpUrl:
+    """An MCP server a session dials at `url`, over streamable HTTP from this host, bound as
+    `name`: no container of the session's runs it, and it sees no file of the session's.
+
+    `headers` sets what each request carries: each value a literal, or `"${VAR}"`, which the
+    engine resolves; no value reaches this program or the agent. Each request also carries the
+    session's `mcp_identity` headers, which `headers` may not name. `trust_anchor` is a
+    certificate authority, PEM, its client trusts -- a path on this host, or the PEM as `bytes` --
+    beside the system's roots, or, with `trust="only"`, in their place. `allow_stateless` takes a
+    server that issues no session, as by default. A URL with a user name or password in it, a
+    scheme other than `http` or `https`, or a header HTTP or the protocol sets itself -- in
+    `headers` or `mcp_identity` -- does not start, and `session.mcp` says why.
+    `call_timeout_secs` and `description` are as for `McpCommand`.
+    """
+
+    name: str
+    url: str
+    headers: Mapping = dataclasses.field(default_factory=dict)
+    trust_anchor: str | os.PathLike | bytes | None = None
+    trust: str = "with-system-roots"
+    allow_stateless: bool = True
+    call_timeout_secs: int | None = None
+    description: str | None = None
+
+    _placement = "url"
+
+    def __post_init__(self):
+        anchor = self.trust_anchor
+        if anchor is not None and not isinstance(anchor, bytes):
+            if not isinstance(anchor, (str, os.PathLike)):
+                raise TypeError(
+                    f"trust_anchor takes None, a path or the PEM as bytes, not {anchor!r}"
+                )
+            object.__setattr__(self, "trust_anchor", str(pathlib.Path(anchor).absolute()))
+        if self.trust not in ("with-system-roots", "only"):
+            raise ValueError(f"trust is 'with-system-roots' or 'only', not {self.trust!r}")
+        if not isinstance(self.allow_stateless, bool):
+            raise TypeError(f"allow_stateless takes a bool, not {self.allow_stateless!r}")
+        _mcp_common(self)
+
+
+def _mcp_declared(declaration):
+    """What the engine is sent of an MCP declaration: its fields, and its placement -- a trust
+    anchor tagged as a path or as the PEM."""
+    declared = {"placement": declaration._placement, **dataclasses.asdict(declaration)}
+    anchor = declared.get("trust_anchor")
+    if isinstance(anchor, bytes):
+        declared["trust_anchor"] = {"pem": anchor.decode("ascii")}
+    elif anchor is not None:
+        declared["trust_anchor"] = {"path": anchor}
+    return declared
+
+
+@dataclasses.dataclass(frozen=True)
 class McpPolicy:
     """How a session's MCP servers start: `connect_budget_secs`, how long each has to start --
     every attempt and every wait between them -- before it is `"unavailable"`, from 1 to 3600
@@ -976,9 +1036,9 @@ _MCP_CONNECT_BUDGET_MAX = 3600
 class McpCause:
     """Why an MCP service did not start, holding no value a `"${VAR}"` resolved to: the
     `service`, the `server`'s own name where it differs, its `placement` -- `"command"`,
-    `"sidecar"` or `"primary_view"` -- who it was `declared_in`, the `command` run with its
-    environment as declared, how its transport ended (`exit`), the end of what it wrote to stderr
-    (`stderr_tail`), what went wrong (`message`), the `kind` of failure -- `"transport"`,
+    `"sidecar"`, `"primary_view"` or `"url"` -- who it was `declared_in`, the `command` run with
+    its environment as declared, how its transport ended (`exit`), the end of what it wrote to
+    stderr (`stderr_tail`), what went wrong (`message`), the `kind` of failure -- `"transport"`,
     `"protocol"`, `"timeout"`, `"canceled"` or `"other"` -- and how many `attempts` were made; each
     `None` where there is none."""
 
@@ -999,9 +1059,10 @@ class McpOutcome:
     """How a declared MCP service's start ended: `session.mcp[name]` after entry. `outcome` is
     `"ready"` -- started and bound, with `tools` tools in its first listing, generation `listing`,
     after `attempts` attempts, and in `undecoded` each tool its server listed that did not decode,
-    left out, as `(name, reason)` -- or `"unavailable"`, `"refused"`, `"misconfigured"` or
-    `"unclassified"`, with the `McpCause` in `cause`. The session starts with the ready ones; what
-    the others mean is this program's to decide."""
+    left out, as `(name, reason)` -- or `"unavailable"`, `"refused"`, `"misconfigured"`,
+    `"unclassified"` or, for a repository's `url` entry nobody approved, `"unapproved"`, with the
+    `McpCause` in `cause`. The session starts with the ready ones; what the others mean is this
+    program's to decide."""
 
     service: str
     outcome: str
@@ -1046,8 +1107,9 @@ class Session:
       container after it take bounded times of their own.
     - `application`: an `Application`, the code this program's agent classes are in, which every
       kernel of the session imports from; or `None`.
-    - `mcp`: the MCP servers it places and binds, each an `McpCommand`, an `McpSidecar` or an
-      `McpPrimaryView`; `mcp_policy`, an `McpPolicy`, how they start; and `mcp_identity`, a
+    - `mcp`: the MCP servers it places and binds, each an `McpCommand`, an `McpSidecar`, an
+      `McpPrimaryView` or an `McpUrl`; `mcp_policy`, an `McpPolicy`, how they start; and
+      `mcp_identity`, a
       mapping of header names to values carried unread on every request to a URL server this
       program declares. Each starts with the session, beside its interpreter, and one that does
       not start does not fail entry: `session.mcp` says how each start ended.
@@ -1115,19 +1177,16 @@ class Session:
         if application is not None and not isinstance(application, Application):
             raise TypeError(f"application takes an outrig.Application or None, not {application!r}")
         self._application = None if application is None else dataclasses.asdict(application)
-        declarations = (McpCommand, McpSidecar, McpPrimaryView)
+        declarations = (McpCommand, McpSidecar, McpPrimaryView, McpUrl)
         # Read once: an iterator gives its declarations only once.
         mcp = list(mcp)
         for declaration in mcp:
             if not isinstance(declaration, declarations):
                 raise TypeError(
-                    "mcp takes McpCommand, McpSidecar and McpPrimaryView entries, not "
+                    "mcp takes McpCommand, McpSidecar, McpPrimaryView and McpUrl entries, not "
                     f"{declaration!r}"
                 )
-        self._mcp = [
-            {"placement": declaration._placement, **dataclasses.asdict(declaration)}
-            for declaration in mcp
-        ]
+        self._mcp = [_mcp_declared(declaration) for declaration in mcp]
         # The MCP services declared here, which no live object may be named as.
         self._mcp_names = frozenset(declaration.name for declaration in mcp)
         if mcp_policy is not None and not isinstance(mcp_policy, McpPolicy):

@@ -83,12 +83,17 @@ miniz_oxide        = { version = "0.9.1",   default-features = false }
 nix                = { version = "0.31.3",  default-features = false }
 rand               = { version = "0.10.2",  default-features = false }
 ratatui            = { version = "0.30.2",  default-features = false }
+# Mints the certificate authorities the MCP URL placement's TLS tests trust and refuse.
+rcgen              = { version = "0.14.10", default-features = false }
 regex              = { version = "1.12.4",  default-features = false }
 reqwest            = { version = "0.13.4",  default-features = false }
 # The `rig` facade over rig-core, rig-agent and rig-reqwest: `agent` is the runner and its
 # hooks, `reqwest` the HTTP transport. Neither crate uses `derive`.
 rig                = { version = "0.45.0",  default-features = false, features = ["agent", "reqwest", "rustls"] }
 rmcp               = { version = "3.4.1",   default-features = false }
+# Read, not configured: a URL MCP service's failed TLS handshake is told apart by rustls's own
+# certificate error, found among reqwest's sources. reqwest builds the TLS stack.
+rustls             = { version = "0.23.43", default-features = false }
 rustyline          = { version = "18.0.1",  default-features = false }
 ruzstd             = { version = "0.9.0",   default-features = false }
 saphyr-parser      = { version = "0.2.2",   default-features = false }
@@ -96,10 +101,15 @@ schemars           = { version = "1.2.2",   default-features = false }
 serde              = { version = "1.0.229", default-features = false }
 serde_json         = { version = "1.0.151", default-features = false }
 sha2               = { version = "0.11.0",  default-features = false }
+# Reads the answer to a URL MCP service's `initialize` as rmcp reads one, the POST being
+# OutRig's own so its status is kept. rmcp depends on it already.
+sse-stream         = { version = "0.2.5",   default-features = false }
 tar                = { version = "0.4.46",  default-features = false }
 tempfile           = { version = "3.27.0",  default-features = false }
 thiserror          = { version = "2.0.19",  default-features = false }
 tokio              = { version = "1.53.1",  default-features = false }
+# The MCP URL placement's TLS tests serve over it.
+tokio-rustls       = { version = "0.26.4",  default-features = false }
 toml               = { version = "1.1.4",   default-features = false }
 toml_edit          = { version = "0.25.13", default-features = false }
 tracing            = { version = "0.1.44",  default-features = false }

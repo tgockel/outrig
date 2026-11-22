@@ -184,6 +184,11 @@ pub outrig::config::ConfigValidationError::McpUnknownSidecar
 pub outrig::config::ConfigValidationError::McpUnknownSidecar::image: alloc::string::String
 pub outrig::config::ConfigValidationError::McpUnknownSidecar::server: alloc::string::String
 pub outrig::config::ConfigValidationError::McpUnknownSidecar::sidecar: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::McpUrlConflict
+pub outrig::config::ConfigValidationError::McpUrlConflict::image: alloc::string::String
+pub outrig::config::ConfigValidationError::McpUrlConflict::key: &'static str
+pub outrig::config::ConfigValidationError::McpUrlConflict::server: alloc::string::String
+pub outrig::config::ConfigValidationError::McpUrlConflict::without_url: bool
 pub outrig::config::ConfigValidationError::McpViewNotInlineEntrypoint
 pub outrig::config::ConfigValidationError::McpViewNotInlineEntrypoint::image: alloc::string::String
 pub outrig::config::ConfigValidationError::McpViewNotInlineEntrypoint::server: alloc::string::String
@@ -217,6 +222,12 @@ pub outrig::config::ConfigValidationError::RepoMcpEnvRef::image: alloc::string::
 pub outrig::config::ConfigValidationError::RepoMcpEnvRef::key: alloc::string::String
 pub outrig::config::ConfigValidationError::RepoMcpEnvRef::server: alloc::string::String
 pub outrig::config::ConfigValidationError::RepoMcpEnvRef::var: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::RepoMcpHeaderRef
+pub outrig::config::ConfigValidationError::RepoMcpHeaderRef::declared_in: core::option::Option<alloc::boxed::Box<std::path::Path>>
+pub outrig::config::ConfigValidationError::RepoMcpHeaderRef::header: alloc::string::String
+pub outrig::config::ConfigValidationError::RepoMcpHeaderRef::image: alloc::string::String
+pub outrig::config::ConfigValidationError::RepoMcpHeaderRef::server: alloc::string::String
+pub outrig::config::ConfigValidationError::RepoMcpHeaderRef::var: alloc::string::String
 pub outrig::config::ConfigValidationError::RepoNetworkPolicy
 pub outrig::config::ConfigValidationError::RepoNetworkPolicy::key: &'static str
 #[non_exhaustive] pub outrig::config::ConfigValidationError::RepoProviderApiKey
@@ -455,16 +466,23 @@ pub fn outrig::config::LlmProvider::responses(impl core::convert::Into<alloc::st
 pub fn outrig::config::LlmProvider::style(&self) -> &'static str
 #[non_exhaustive] pub enum outrig::config::McpServerSpec
 #[non_exhaustive] pub outrig::config::McpServerSpec::Full
+pub outrig::config::McpServerSpec::Full::allow_stateless: core::option::Option<bool>
 pub outrig::config::McpServerSpec::Full::args: alloc::vec::Vec<alloc::string::String>
 pub outrig::config::McpServerSpec::Full::call_timeout_secs: core::option::Option<u64>
 pub outrig::config::McpServerSpec::Full::command: core::option::Option<alloc::vec::Vec<alloc::string::String>>
 pub outrig::config::McpServerSpec::Full::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
+pub outrig::config::McpServerSpec::Full::headers: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
 pub outrig::config::McpServerSpec::Full::image: core::option::Option<alloc::string::String>
 pub outrig::config::McpServerSpec::Full::sidecar: core::option::Option<alloc::string::String>
+pub outrig::config::McpServerSpec::Full::trust: outrig::config::McpTrust
+pub outrig::config::McpServerSpec::Full::trust_anchor: core::option::Option<std::path::PathBuf>
+pub outrig::config::McpServerSpec::Full::url: core::option::Option<alloc::string::String>
 pub outrig::config::McpServerSpec::Full::view: outrig::config::SidecarView
 pub outrig::config::McpServerSpec::Short(alloc::vec::Vec<alloc::string::String>)
 impl outrig::config::McpServerSpec
+pub fn outrig::config::McpServerSpec::allow_stateless(&self) -> core::option::Option<bool>
 pub fn outrig::config::McpServerSpec::args(&self) -> &[alloc::string::String]
+pub fn outrig::config::McpServerSpec::at_url(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::config::McpServerSpec::call_timeout_secs(&self) -> core::option::Option<u64>
 pub fn outrig::config::McpServerSpec::command(&self) -> core::option::Option<&[alloc::string::String]>
 pub fn outrig::config::McpServerSpec::entrypoint(impl core::convert::Into<alloc::string::String>) -> Self
@@ -472,19 +490,31 @@ pub fn outrig::config::McpServerSpec::entrypoint_in_sidecar(impl core::convert::
 pub fn outrig::config::McpServerSpec::env(&self) -> &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
 pub fn outrig::config::McpServerSpec::exec(impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
 pub fn outrig::config::McpServerSpec::has_command(&self) -> bool
+pub fn outrig::config::McpServerSpec::headers(&self) -> &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
 pub fn outrig::config::McpServerSpec::image(&self) -> core::option::Option<&str>
 pub fn outrig::config::McpServerSpec::is_entrypoint_stdio(&self) -> bool
 pub fn outrig::config::McpServerSpec::is_placed(&self) -> bool
+pub fn outrig::config::McpServerSpec::is_url(&self) -> bool
 pub fn outrig::config::McpServerSpec::normalize(&self) -> (alloc::vec::Vec<alloc::string::String>, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>)
 pub fn outrig::config::McpServerSpec::sidecar(&self) -> core::option::Option<&str>
+pub fn outrig::config::McpServerSpec::trust(&self) -> outrig::config::McpTrust
+pub fn outrig::config::McpServerSpec::trust_anchor(&self) -> core::option::Option<&std::path::Path>
+pub fn outrig::config::McpServerSpec::url(&self) -> core::option::Option<&str>
 pub fn outrig::config::McpServerSpec::view(&self) -> outrig::config::SidecarView
 pub fn outrig::config::McpServerSpec::with_args(self, impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
 pub fn outrig::config::McpServerSpec::with_call_timeout_secs(self, u64) -> Self
 pub fn outrig::config::McpServerSpec::with_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> Self
+pub fn outrig::config::McpServerSpec::with_headers(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> Self
 pub fn outrig::config::McpServerSpec::with_sidecar(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::config::McpServerSpec::with_view(self, outrig::config::SidecarView) -> Self
 impl<'de> serde_core::de::Deserialize<'de> for outrig::config::McpServerSpec
 pub fn outrig::config::McpServerSpec::deserialize<D>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error> where D: serde_core::de::Deserializer<'de>
+#[non_exhaustive] pub enum outrig::config::McpTrust
+pub outrig::config::McpTrust::Only
+pub outrig::config::McpTrust::WithSystemRoots
+impl outrig::config::McpTrust
+pub fn outrig::config::McpTrust::as_str(self) -> &'static str
+pub fn outrig::config::McpTrust::is_default(&self) -> bool
 #[non_exhaustive] pub enum outrig::config::ModelSourceRef<'a>
 #[non_exhaustive] pub outrig::config::ModelSourceRef::Alias
 pub outrig::config::ModelSourceRef::Alias::targets: &'a [alloc::string::String]
@@ -972,6 +1002,7 @@ pub mod outrig::container::sidecar
 #[non_exhaustive] pub enum outrig::container::sidecar::Placement
 pub outrig::container::sidecar::Placement::Primary
 pub outrig::container::sidecar::Placement::Sidecar(alloc::string::String)
+pub outrig::container::sidecar::Placement::Url
 impl outrig::container::sidecar::Placement
 pub fn outrig::container::sidecar::Placement::description(&self) -> alloc::string::String
 pub fn outrig::container::sidecar::Placement::sidecar_name(&self) -> core::option::Option<&str>
@@ -1649,6 +1680,7 @@ pub outrig::harness::event::Payload::McpServiceRetry::service: alloc::string::St
 #[non_exhaustive] pub outrig::harness::event::Payload::McpServiceStarted
 pub outrig::harness::event::Payload::McpServiceStarted::attempts: u32
 pub outrig::harness::event::Payload::McpServiceStarted::declared_in: outrig::harness::McpDeclaredIn
+pub outrig::harness::event::Payload::McpServiceStarted::detail: core::option::Option<alloc::string::String>
 pub outrig::harness::event::Payload::McpServiceStarted::duration: core::time::Duration
 pub outrig::harness::event::Payload::McpServiceStarted::listing: u64
 pub outrig::harness::event::Payload::McpServiceStarted::placement: outrig::harness::McpPlacementKind
@@ -2175,6 +2207,13 @@ pub fn outrig::harness::AgentState::at_rest(&self) -> bool
 pub outrig::harness::Approval::Approve
 pub outrig::harness::Approval::CannotAsk
 pub outrig::harness::Approval::Refuse
+#[non_exhaustive] pub enum outrig::harness::ApprovalSubject
+pub outrig::harness::ApprovalSubject::Binding
+#[non_exhaustive] pub outrig::harness::ApprovalSubject::McpUrl
+pub outrig::harness::ApprovalSubject::McpUrl::headers: alloc::vec::Vec<alloc::string::String>
+pub outrig::harness::ApprovalSubject::McpUrl::url: alloc::string::String
+impl outrig::harness::ApprovalSubject
+pub fn outrig::harness::ApprovalSubject::mcp_url(impl core::convert::Into<alloc::string::String>, impl core::iter::traits::collect::IntoIterator<Item = alloc::string::String>) -> Self
 #[non_exhaustive] pub enum outrig::harness::Argument
 pub outrig::harness::Argument::Data
 pub outrig::harness::Argument::Data::class: core::option::Option<alloc::string::String>
@@ -2268,6 +2307,7 @@ pub outrig::harness::McpDeclaredIn::Owner
 pub outrig::harness::McpOutcomeKind::Misconfigured
 pub outrig::harness::McpOutcomeKind::Ready
 pub outrig::harness::McpOutcomeKind::Refused
+pub outrig::harness::McpOutcomeKind::Unapproved
 pub outrig::harness::McpOutcomeKind::Unavailable
 pub outrig::harness::McpOutcomeKind::Unclassified
 impl outrig::harness::McpOutcomeKind
@@ -2284,10 +2324,17 @@ pub outrig::harness::McpPlacement::PrimaryView::args: alloc::vec::Vec<alloc::str
 pub outrig::harness::McpPlacement::PrimaryView::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
 pub outrig::harness::McpPlacement::PrimaryView::image: alloc::string::String
 pub outrig::harness::McpPlacement::Sidecar(outrig::SidecarSpec)
+#[non_exhaustive] pub outrig::harness::McpPlacement::Url
+pub outrig::harness::McpPlacement::Url::allow_stateless: bool
+pub outrig::harness::McpPlacement::Url::headers: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
+pub outrig::harness::McpPlacement::Url::trust: outrig::config::McpTrust
+pub outrig::harness::McpPlacement::Url::trust_anchor: core::option::Option<outrig::harness::TrustAnchor>
+pub outrig::harness::McpPlacement::Url::url: alloc::string::String
 #[non_exhaustive] pub enum outrig::harness::McpPlacementKind
 pub outrig::harness::McpPlacementKind::Command
 pub outrig::harness::McpPlacementKind::PrimaryView
 pub outrig::harness::McpPlacementKind::Sidecar
+pub outrig::harness::McpPlacementKind::Url
 #[non_exhaustive] pub enum outrig::harness::McpServiceOutcome
 pub outrig::harness::McpServiceOutcome::Misconfigured(outrig::harness::McpStartupCause)
 #[non_exhaustive] pub outrig::harness::McpServiceOutcome::Ready
@@ -2296,12 +2343,14 @@ pub outrig::harness::McpServiceOutcome::Ready::listing: u64
 pub outrig::harness::McpServiceOutcome::Ready::tools: usize
 pub outrig::harness::McpServiceOutcome::Ready::undecoded: alloc::vec::Vec<outrig::McpUndecodedTool>
 pub outrig::harness::McpServiceOutcome::Refused(outrig::harness::McpStartupCause)
+pub outrig::harness::McpServiceOutcome::Unapproved(outrig::harness::McpStartupCause)
 pub outrig::harness::McpServiceOutcome::Unavailable(outrig::harness::McpStartupCause)
 pub outrig::harness::McpServiceOutcome::Unclassified(outrig::harness::McpStartupCause)
 impl outrig::harness::McpServiceOutcome
 pub fn outrig::harness::McpServiceOutcome::cause(&self) -> core::option::Option<&outrig::harness::McpStartupCause>
 pub fn outrig::harness::McpServiceOutcome::kind(&self) -> outrig::harness::McpOutcomeKind
 #[non_exhaustive] pub enum outrig::harness::McpStopHow
+pub outrig::harness::McpStopHow::Disconnected
 pub outrig::harness::McpStopHow::NotStarted
 pub outrig::harness::McpStopHow::Stopped
 pub outrig::harness::McpStopHow::WithPrimary
@@ -2447,6 +2496,9 @@ pub outrig::harness::Tasks::CouldNotTell
 #[non_exhaustive] pub outrig::harness::Tasks::Listed
 pub outrig::harness::Tasks::Listed::more: usize
 pub outrig::harness::Tasks::Listed::names: alloc::vec::Vec<alloc::string::String>
+#[non_exhaustive] pub enum outrig::harness::TrustAnchor
+pub outrig::harness::TrustAnchor::Path(std::path::PathBuf)
+pub outrig::harness::TrustAnchor::Pem(alloc::vec::Vec<u8>)
 #[non_exhaustive] pub enum outrig::harness::Verdict
 pub outrig::harness::Verdict::Clean
 pub outrig::harness::Verdict::NotProvenStopped
@@ -2492,7 +2544,9 @@ pub outrig::harness::ApprovalRequest::declaration: alloc::string::String
 pub outrig::harness::ApprovalRequest::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::harness::ApprovalRequest::name: alloc::string::String
 pub outrig::harness::ApprovalRequest::repo_root: std::path::PathBuf
+pub outrig::harness::ApprovalRequest::subject: outrig::harness::ApprovalSubject
 impl outrig::harness::ApprovalRequest
+pub fn outrig::harness::ApprovalRequest::about(self, outrig::harness::ApprovalSubject) -> Self
 pub fn outrig::harness::ApprovalRequest::new(impl core::convert::Into<alloc::string::String>, core::option::Option<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<alloc::string::String>) -> Self
 pub struct outrig::harness::BindingSpec
 impl outrig::harness::BindingSpec
@@ -2677,10 +2731,15 @@ impl outrig::harness::McpServiceSpec
 pub fn outrig::harness::McpServiceSpec::command(impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
 pub fn outrig::harness::McpServiceSpec::primary_view(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::harness::McpServiceSpec::sidecar(outrig::SidecarSpec) -> Self
+pub fn outrig::harness::McpServiceSpec::url(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::harness::McpServiceSpec::with_allow_stateless(self, bool) -> Self
 pub fn outrig::harness::McpServiceSpec::with_args(self, impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
 pub fn outrig::harness::McpServiceSpec::with_call_timeout_secs(self, u64) -> Self
 pub fn outrig::harness::McpServiceSpec::with_description(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::harness::McpServiceSpec::with_env(self, impl core::convert::Into<alloc::string::String>, outrig::config::EnvValue) -> Self
+pub fn outrig::harness::McpServiceSpec::with_header(self, impl core::convert::Into<alloc::string::String>, outrig::config::EnvValue) -> Self
+pub fn outrig::harness::McpServiceSpec::with_trust(self, outrig::config::McpTrust) -> Self
+pub fn outrig::harness::McpServiceSpec::with_trust_anchor(self, outrig::harness::TrustAnchor) -> Self
 #[non_exhaustive] pub struct outrig::harness::McpServiceStop
 pub outrig::harness::McpServiceStop::how: outrig::harness::McpStopHow
 pub outrig::harness::McpServiceStop::outcome: outrig::harness::McpOutcomeKind
@@ -3146,6 +3205,12 @@ pub fn outrig::McpResourceContents::text(impl core::convert::Into<alloc::string:
 pub enum outrig::McpRole
 pub outrig::McpRole::Assistant
 pub outrig::McpRole::User
+#[non_exhaustive] pub enum outrig::McpTrust
+pub outrig::McpTrust::Only
+pub outrig::McpTrust::WithSystemRoots
+impl outrig::config::McpTrust
+pub fn outrig::config::McpTrust::as_str(self) -> &'static str
+pub fn outrig::config::McpTrust::is_default(&self) -> bool
 #[non_exhaustive] pub enum outrig::MountAccess
 pub outrig::MountAccess::ReadOnly
 pub outrig::MountAccess::ReadWrite

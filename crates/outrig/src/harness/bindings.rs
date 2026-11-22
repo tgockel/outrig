@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::approval::{self, Approval, Approver, Store};
+use super::approval::{self, Approver, Store};
 use super::event::Payload;
 use super::report::{BindingStop, HostedCall};
 use crate::config::{Binding, Config};
@@ -150,35 +150,13 @@ pub(crate) async fn approve(declared: Vec<Declared>, setup: &Setup<'_>) -> Vec<D
             kept.push(binding);
             continue;
         }
-        let request = approval::request(&binding.name, &binding.spec.binding, setup.repo_root);
-        if store.is_some_and(|store| store.approved(&request)) {
-            kept.push(binding);
-            continue;
-        }
-        let reason = match &setup.approver {
-            None => "the session has no approver to ask about its declaration",
-            Some(approver) => {
-                let (approver, asked) = (Arc::clone(approver), request.clone());
-                let answer = tokio::task::spawn_blocking(move || approver.approve(&asked))
-                    .await
-                    .unwrap_or(Approval::CannotAsk);
-                match answer {
-                    Approval::Approve => {
-                        if let Some(Err(e)) = store.map(|store| store.record(&request)) {
-                            tracing::warn!(
-                                target: "outrig::harness",
-                                "the approval of the binding `{}` could not be remembered, so \
-                                 the next session asks again: {e}",
-                                binding.name
-                            );
-                        }
-                        kept.push(binding);
-                        continue;
-                    }
-                    Approval::Refuse => "the operator did not approve its declaration",
-                    _ => "nobody could be asked to approve its declaration",
-                }
+        let asked = approval::request(&binding.name, &binding.spec.binding, setup.repo_root);
+        let reason = match approval::ask(&asked, store, setup.approver.as_ref()).await {
+            Ok(()) => {
+                kept.push(binding);
+                continue;
             }
+            Err(reason) => reason,
         };
         let reason = format!(
             "{reason}; approve it in a session started at a terminal, or move \
@@ -188,7 +166,7 @@ pub(crate) async fn approve(declared: Vec<Declared>, setup: &Setup<'_>) -> Vec<D
         tracing::warn!(target: "outrig::harness", "the binding `{}` does not start: {reason}", binding.name);
         setup.events.emit(Payload::BindingRefused {
             binding: binding.name.clone(),
-            declared_in: request.declared_in,
+            declared_in: asked.request.declared_in,
             reason,
         });
     }

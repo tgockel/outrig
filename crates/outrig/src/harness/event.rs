@@ -1598,6 +1598,10 @@ pub enum Payload {
         /// How long it took to start, every attempt included.
         #[serde(serialize_with = "seconds")]
         duration: Duration,
+        /// What its owner should know of how it was started: that a URL
+        /// server's headers went to a host that is not loopback over plain
+        /// `http`, in the clear. `None` otherwise.
+        detail: Option<String>,
     },
     /// An attempt to start an MCP service failed in a way that may pass, and
     /// it is tried again after `delay`.

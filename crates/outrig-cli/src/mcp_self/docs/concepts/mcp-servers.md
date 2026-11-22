@@ -464,7 +464,7 @@ A server comes from one of three places: the configuration's `[images.<name>.mcp
 sidecar blocks they name, and the image's `org.outrig.mcp` label under `[repo] env-allow`, as
 above; a host program's `outrig.Session(mcp=[...])`; or `SessionBuilder::mcp`. A configured
 server is bound under its own name, or with `-` read as `_` when that is free -- `my-fs` as
-`my_fs` -- and its events keep its own name as `server`. Each runs in one of three placements:
+`my_fs` -- and its events keep its own name as `server`. Each runs in one of four placements:
 
 - **command** -- exec'd in the session's container, beside the interpreter, as the session's
   user, as a primary-placed entry is.
@@ -475,11 +475,48 @@ server is bound under its own name, or with `-` read as `_` when that is free --
   are `misconfigured`.
 - **primary view** -- an entrypoint sidecar with `view = "primary"`, seeing the session container's
   whole filesystem; see [Primary filesystem view](#primary-filesystem-view).
+- **url** -- a streamable-HTTP server the host dials, in no container of the session's: it sees no
+  file of the session's, and is not the session's to stop.
+
+**A URL server** is declared with a `url` and the `headers` each request carries --
+`McpServiceSpec::url(..).with_header(..)`, `outrig.McpUrl(name, url, headers=...)`, or a
+configuration's `url` entry:
+
+```toml
+[images.coding.mcp]
+docs = { url = "https://docs.example.com/mcp", headers = { X-Token = "${DOCS_TOKEN}" } }
+```
+
+Each request carries those headers -- `initialize`, every call and listing, the server's standing
+event stream, a cancel notice and the request that ends the session -- each `${VAR}` resolved once,
+at start, and shown nowhere: not in an event, an outcome, the report, the service's description,
+its `repr` or `help()`, or an exception. One the owner declares -- on the builder or
+`outrig.Session` -- also carries the owner's identity headers (`SessionBuilder::mcp_identity`,
+`outrig.Session(mcp_identity=...)`), unread and unchanged; a configured one never does, approved or
+not. Its client trusts the system's roots, and a trust anchor -- a PEM certificate authority, by
+path or as bytes -- beside them, or with `trust = "only"` in their place; it follows no redirect,
+honors the system proxy, and takes a server that issues no session unless told
+`allow-stateless = false`. A URL with a user name or password in it, a scheme other than `http` or
+`https`, `trust = "only"` with no anchor, or a header that names an identity header or one HTTP or
+the protocol sets itself -- `Accept`, `Content-Type`, `Mcp-Session-Id`, `Mcp-Method`, `Mcp-Name`,
+any `Mcp-Param-*` and the like -- is `misconfigured` before any request, as is every server the
+owner declares while one of the owner's identity headers is such a header. Plain `http` to a host
+that is not loopback starts, and its `mcp.service.started` says in `detail` that the headers went
+in the clear.
+
+**A repository's URL entry needs your approval.** The host dials a URL server from its own
+network, so a repository's entry would reach loopback and host-only services the session's
+container cannot. It starts only once you approve that exact entry in that repository, as a
+repository's [binding](../reference/config.md#bindingsname) does: `run-new` shows its URL and
+its headers by name, never a value, and asks once, and any edit asks again. One nobody approved
+connects to nothing and is `unapproved`. An entry in the global config asks nothing. `outrig run`
+and `outrig mcp` start no URL server: they say which they leave out.
 
 **A server that holds a credential is never placed beside the interpreter.** A `${VAR}` in a
 command's or a primary view's `env` would be readable from agent Python wherever `/proc` allows,
-so such a server does not start; a credentialed server is a sidecar. A `${VAR}` under a key podman
-reads itself (see [MCP `env` value syntax](../reference/config.md#mcp-env-value-syntax)) does not
+so such a server does not start; a credentialed server is a sidecar, or a URL whose headers the
+host sends. A `${VAR}` under a key podman reads itself (see
+[MCP `env` value syntax](../reference/config.md#mcp-env-value-syntax)) does not
 start either, since its value would reach podman's command line. Each `${VAR}` is resolved once,
 by the session's secret resolver -- the process environment for `run-new` -- and a value reaches
 podman by name, never on a command line.
@@ -498,12 +535,17 @@ launched and did not start, since what it ran may still run in the session's con
 with an outcome:
 
 - `ready` -- started and bound.
-- `unavailable` -- it failed in a way that may pass, every attempt the budget allowed.
-- `refused` -- it answered `initialize` with an error.
+- `unavailable` -- it failed in a way that may pass, every attempt the budget allowed: a URL server
+  whose connection failed, or that answered `initialize` 408, 429 or a 5xx, whatever its body,
+  included.
+- `refused` -- it answered `initialize` with an error, or a URL server answered `initialize` or its
+  listing 401 or 403.
 - `misconfigured` -- it cannot start as declared: its command exited 126 or 127, it holds a
   credential beside the interpreter, a `${VAR}` has no value, a configured sidecar's image could
-  not be built, pulled or found.
+  not be built, pulled or found, a URL server's certificate is not one its client trusts, or its
+  URL answered 404.
 - `unclassified` -- any other failure, another exit status included, named so rather than guessed.
+- `unapproved` -- a repository's URL entry nobody approved: nothing was connected.
 
 A server that does not start does not stop the session: it starts with the servers that are
 ready. `run-new` prints one line per server; a host program reads `session.mcp`; a Rust program
@@ -516,15 +558,17 @@ failure. A sidecar's `on-failure` is not consulted, and a `start = "manual"` sid
 `misconfigured`: a session starts every server it places.
 
 **Quiescing.** `Session::mcp()` also says which servers can write what -- a command and a primary
-view the session container's filesystem, a sidecar the workspace when it mounts it `rw` and its
-`rw` mounts -- and can pause or stop one: a pause holds its new calls, waits for those running, and
-freezes its container with `podman pause`; a stop tells each call in flight to stop, closes the
-transport and stops the container, which stays under the session's network policy until its stop
-is proven. A pause or a stop runs to its end even when its caller stops waiting, and a resume
-asked after it waits for it and undoes what it did; one whose caller stopped waiting before it
-began does nothing. A command placement cannot be frozen apart from the interpreter, and
-a stopped server is not paused; each says so. A container a configuration's block shares is
-paused or stopped for all of its servers at once.
+view the session container's filesystem, a sidecar the workspace when it mounts it `rw` and its `rw`
+mounts, a URL server nothing the session mounts -- and can pause or stop one: a pause holds its new
+calls, waits for those running, and freezes its container with `podman pause`; a stop tells each
+call in flight to stop, closes the transport and stops the container, which stays under the
+session's network policy until its stop is proven. A pause or a stop runs to its end even when its
+caller stops waiting, and a resume asked after it waits for it and undoes what it did; one whose
+caller stopped waiting before it began does nothing. A URL server has no container: a pause holds
+its calls and waits for those running, with nothing to freeze, and a stop ends its HTTP session. A
+command placement cannot be frozen apart from the interpreter, and a stopped server is not paused;
+each says so. A container a configuration's block shares is paused or stopped for all of its servers
+at once.
 
 **In agent Python.** The service is an `outrig.McpService`: each tool is a method, by its exact
 name where that is an identifier -- `-` read as `_`, and a trailing `_` for a keyword -- and
@@ -577,18 +621,20 @@ interrupt, and ends at its deadline.
 
 **A server whose transport fails** is connected again for the calls after it, never for the call
 that failed, which stays `MayHaveDispatched` and is never sent again. The next call -- or
-`fs.reconnect()`, without a call -- places it again as it was placed at the start: a new exec in
-its sidecar, a new sidecar when its container is gone, a new entrypoint container, or a new exec
-in the session's container. Its `${VAR}` values are those resolved at the start, never resolved
-again; its tools are listed again, as a relist lists them, and a change is announced as a
-relist's is. The call that connected it is checked again against that listing before it is sent:
-a tool no longer listed is `UnknownTool`, and arguments its new schema refuses are
-`InvalidArguments`, each never sent. The whole reconnect is tried within the connect budget, as a
-start is; one that fails refuses the call that asked for it, `ServiceUnavailable`, and the next
-call tries again, up to three reconnects a session (a Rust owner's
-`McpPolicy::with_reconnect_max`), after which the service is unavailable. No reconnect is made
-once the session is closing. The server the failed transport spoke to may still run until
-its container stops, and it is still listed among the writers.
+`fs.reconnect()`, without a call -- places it again as it was placed at the start: a new exec in its
+sidecar, a new sidecar when its container is gone, a new entrypoint container, a new exec in the
+session's container, or a new HTTP session with a URL server. Its `${VAR}` values are those resolved
+at the start, never resolved again; its tools are listed again, as a relist lists them, and a change
+is announced as a relist's is. The call that connected it is checked again against that listing
+before it is sent: a tool no longer listed is `UnknownTool`, and arguments its new schema refuses
+are `InvalidArguments`, each never sent. The whole reconnect is tried within the connect budget, as
+a start is; one that fails refuses the call that asked for it, `ServiceUnavailable`, and the next
+call tries again, up to three reconnects a session (a Rust owner's `McpPolicy::with_reconnect_max`),
+after which the service is unavailable. No reconnect is made once the session is closing. The server
+the failed transport spoke to may still run until its container stops, and it is still listed among
+the writers. A URL server's event stream that breaks, or does not open, and is not resumed within
+about two seconds -- three tries -- disconnects the service with no call failing, since no change to
+its listing would be heard; the next call connects it again.
 
 The tools are the server's listing as it started. `fs.relist()` asks the server again: a tool it
 added is a method from then on, one it removed is refused when called, and a method or tool
@@ -599,7 +645,8 @@ listing changed marks the service `stale`, and nothing is relisted until agent c
 **The close.** At the session's close each server's transport is closed and its container
 stopped, a paused one thawed first, one a stop left unproven stopped again -- a server that never
 started included, when its container ran; a command placement ends with the session's container,
-and is proven stopped only once that is -- one that did not start too, when an attempt ran it.
+and is proven stopped only once that is -- one that did not start too, when an attempt ran it; a
+URL server's HTTP session is ended, `disconnected`, the server left running.
 The shutdown report's `mcp_services` lists each, with how it was stopped and whether that was
 proven. A call in flight at the close drains to its deadline, and is then sent the cancel and
 ends `unknown`, may have dispatched; one waiting for its server to be connected again is refused.

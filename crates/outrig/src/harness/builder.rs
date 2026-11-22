@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use super::application::{self, ApplicationSpec, Prepared};
-use super::approval::Approver;
+use super::approval::{self, Approver};
 use super::bindings::{self, BindingSpec, Bindings, Declared, Places, Setup};
 use super::channels::{self, ChannelBackend, ChannelDefinition, Channels};
 use super::event::{DEFAULT_CAPACITY, Subscription};
@@ -371,7 +371,10 @@ impl SessionBuilder {
     /// Carry `headers`, unread and unchanged, on every request to every URL
     /// MCP service the owner declares -- one of them may be a fence token --
     /// and on none a configuration declares. A server in a container receives
-    /// identity only through the environment its declaration gives it.
+    /// identity only through the environment its declaration gives it. A
+    /// header HTTP or the MCP transport sets itself -- `Mcp-Name`, any
+    /// `Mcp-Param-*` -- would not travel unchanged, and leaves each of the
+    /// owner's URL services misconfigured.
     pub fn mcp_identity<K, V>(mut self, headers: impl IntoIterator<Item = (K, V)>) -> Self
     where
         K: Into<String>,
@@ -763,8 +766,13 @@ impl SessionBuilder {
         )
         .await;
         // The launch leaves the configuration's servers out; the MCP table
-        // starts them, once the primary they may run in is up.
-        let configured = spec.configured_mcp.take();
+        // starts them, once the primary they may run in is up. A
+        // repository's URL entries are put to the approver first, as its
+        // bindings are.
+        let mut configured = spec.configured_mcp.take();
+        self.approve_mcp_urls(configured.as_mut(), &repo_root)
+            .await
+            .map_err(start_error)?;
         let mcp = McpInputs {
             launched: spec
                 .sidecars
@@ -921,6 +929,38 @@ impl SessionBuilder {
             &catalog,
         )
         .await
+    }
+
+    /// Ask about each `url` MCP entry of `configured` a repository declared,
+    /// as a repository's binding is asked about: one approved before in
+    /// `repo_root`, or now, may start; another stays unapproved, saying why.
+    async fn approve_mcp_urls(
+        &mut self,
+        configured: Option<&mut crate::outrig_::ConfiguredMcp>,
+        repo_root: &Path,
+    ) -> Result<(), OutrigError> {
+        let Some(configured) = configured else {
+            return Ok(());
+        };
+        if !configured
+            .urls
+            .values()
+            .any(|entry| entry.unapproved.is_some())
+        {
+            return Ok(());
+        }
+        let store = self.places()?.store;
+        for (name, entry) in &mut configured.urls {
+            if entry.unapproved.is_none() {
+                continue;
+            }
+            let asked = approval::mcp_url_request(name, entry, repo_root);
+            entry.unapproved = approval::ask(&asked, store.as_ref(), self.approver.as_ref())
+                .await
+                .err()
+                .map(str::to_string);
+        }
+        Ok(())
     }
 
     /// `declared`, less the repository's bindings not approved, installed and
@@ -1102,10 +1142,13 @@ impl SessionBuilder {
         )
         .await;
         let cwd = self.workdir.clone().unwrap_or_else(|| repo_root.clone());
-        let (configured, labels) = match self.mcp_configured.take() {
+        let (mut configured, labels) = match self.mcp_configured.take() {
             Some((configured, labels)) => (Some(configured), labels),
             None => (None, ConfiguredLabels::default()),
         };
+        self.approve_mcp_urls(configured.as_mut(), &repo_root)
+            .await
+            .map_err(start_error)?;
         let mcp = self.mcp_inputs(
             declared
                 .iter()
@@ -1227,6 +1270,7 @@ impl McpInputs {
             |name| self.taken.iter().any(|taken| taken == name),
             workspace,
             self.launched,
+            &self.start.identity,
         );
         McpServices::start(self.start, plan, place, by, cancel).await
     }

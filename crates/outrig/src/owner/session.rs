@@ -35,8 +35,8 @@ use super::connection::Out;
 use super::{LeftOpen, SessionEnd};
 use crate::agent::children::Children;
 use crate::config::{
-    Config, EnvValue, EventsMode, MCP_CALL_TIMEOUT_SECS_CEILING, MountAccess, MountConfig,
-    SidecarWorkspaceAccess, Workspace, validate_session_paths,
+    Config, EnvValue, EventsMode, MCP_CALL_TIMEOUT_SECS_CEILING, McpTrust, MountAccess,
+    MountConfig, SidecarWorkspaceAccess, Workspace, validate_session_paths,
 };
 use crate::events::Record;
 use crate::harness::bindings::Brief;
@@ -44,7 +44,7 @@ use crate::harness::event::{Received, Subscription};
 use crate::harness::mcp::check_connect_budget;
 use crate::harness::{
     ApplicationSpec, Closer, ContainerSpec, DEFAULT_DRAIN, McpPlacement, McpPolicy, McpServiceSpec,
-    Session, SessionBuilder, ShutdownReport, Stopped, container_spec,
+    Session, SessionBuilder, ShutdownReport, Stopped, TrustAnchor, container_spec,
 };
 use crate::image;
 use crate::supervise::{Owed, Tracked};
@@ -131,6 +131,33 @@ pub(crate) enum McpRequest {
         call_timeout_secs: Option<u64>,
         description: Option<String>,
     },
+    /// Dialed at `url`, over streamable HTTP.
+    Url {
+        name: String,
+        url: String,
+        #[serde(default)]
+        headers: BTreeMap<String, EnvValue>,
+        trust_anchor: Option<TrustAnchorRequest>,
+        #[serde(default)]
+        trust: McpTrust,
+        #[serde(default = "taken")]
+        allow_stateless: bool,
+        call_timeout_secs: Option<u64>,
+        description: Option<String>,
+    },
+}
+
+/// A URL server's trust anchor, as a program sends it: a path on the host, or the PEM.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum TrustAnchorRequest {
+    Path(PathBuf),
+    Pem(String),
+}
+
+/// What an unset `allow_stateless` is: a server that issues no session is taken.
+fn taken() -> bool {
+    true
 }
 
 impl McpRequest {
@@ -194,6 +221,30 @@ impl McpRequest {
             } => (
                 name,
                 McpPlacement::PrimaryView { image, args, env },
+                call_timeout_secs,
+                description,
+            ),
+            Self::Url {
+                name,
+                url,
+                headers,
+                trust_anchor,
+                trust,
+                allow_stateless,
+                call_timeout_secs,
+                description,
+            } => (
+                name,
+                McpPlacement::Url {
+                    url,
+                    headers,
+                    trust_anchor: trust_anchor.map(|anchor| match anchor {
+                        TrustAnchorRequest::Path(path) => TrustAnchor::Path(path),
+                        TrustAnchorRequest::Pem(pem) => TrustAnchor::Pem(pem.into_bytes()),
+                    }),
+                    trust,
+                    allow_stateless,
+                },
                 call_timeout_secs,
                 description,
             ),

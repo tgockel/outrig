@@ -1048,6 +1048,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
                 "undecoded": [{"name": "bad", "reason": "invalid type: sequence, expected a map"}],
                 "attempts": 2,
                 "duration": 1.5,
+                "detail": None,
             },
             None,
         ),

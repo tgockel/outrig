@@ -79,7 +79,7 @@ pub(crate) mod stop;
 use std::time::Duration;
 
 pub use self::application::{ApplicationIdentity, ApplicationSpec};
-pub use self::approval::{Approval, ApprovalRequest, Approver};
+pub use self::approval::{Approval, ApprovalRequest, ApprovalSubject, Approver};
 pub use self::bindings::BindingSpec;
 pub(crate) use self::builder::chosen_repo_root;
 pub use self::builder::{ContainerSpec, Progress, SessionBuilder, Step, container_spec};
@@ -93,7 +93,7 @@ pub use self::error::{Closed, ClosedBy, Failure, SessionError};
 pub use self::mcp::{
     McpDeclaredIn, McpOutcomeKind, McpPauseHow, McpPlacement, McpPlacementKind, McpPolicy,
     McpRetryCause, McpServiceOutcome, McpServiceSpec, McpServiceStop, McpServices, McpStartupCause,
-    McpStopHow, McpWriter, McpWrites, Quiesce, QuiesceOutcome,
+    McpStopHow, McpWriter, McpWrites, Quiesce, QuiesceOutcome, TrustAnchor,
 };
 pub use self::registry::{
     ChannelSnapshot, InboundItem, OutboundState, OutstandingRequest, Positions, ReceivedRequest,
@@ -131,6 +131,8 @@ pub(crate) mod services_tests;
 
 #[cfg(test)]
 mod mcp_dispatch_tests;
+#[cfg(test)]
+mod mcp_http_tests;
 #[cfg(test)]
 mod mcp_presenter_tests;
 #[cfg(test)]
