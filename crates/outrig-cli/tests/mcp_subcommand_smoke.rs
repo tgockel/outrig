@@ -493,17 +493,10 @@ async fn mcp_subcommand_serves_namespaced_tools_and_exits_clean() {
         .nth(1)
         .expect("container name after `started:`")
         .trim();
-    let ps = Command::new("podman")
-        .args(["ps", "-a", "--filter"])
-        .arg(format!("name={our_container}"))
-        .args(["--format", "{{.Names}}"])
-        .output()
-        .await
-        .expect("podman ps");
-    let leftovers = String::from_utf8_lossy(&ps.stdout);
+    let leftovers = podman_names(&format!("name={our_container}")).await;
     assert!(
-        leftovers.trim().is_empty(),
-        "this run's container `{our_container}` is still alive: {leftovers}"
+        leftovers.is_empty(),
+        "this run's container `{our_container}` is still alive: {leftovers:?}"
     );
 }
 
@@ -672,17 +665,10 @@ async fn mcp_listen_http_serves_multiple_independent_sessions() {
         .nth(1)
         .expect("container name after `started:`")
         .trim();
-    let ps = Command::new("podman")
-        .args(["ps", "-a", "--filter"])
-        .arg(format!("name={our_container}"))
-        .args(["--format", "{{.Names}}"])
-        .output()
-        .await
-        .expect("podman ps");
-    let leftovers = String::from_utf8_lossy(&ps.stdout);
+    let leftovers = podman_names(&format!("name={our_container}")).await;
     assert!(
-        leftovers.trim().is_empty(),
-        "this run's container `{our_container}` is still alive: {leftovers}"
+        leftovers.is_empty(),
+        "this run's container `{our_container}` is still alive: {leftovers:?}"
     );
 }
 
@@ -1127,17 +1113,10 @@ async fn mcp_env_for_undeclared_server_finalizes_session_and_stops_container() {
     assert_eq!(session.exit_code, Some(1), "{session:?}");
     assert!(session.ended_at.is_some(), "{session:?}");
 
-    let ps = Command::new("podman")
-        .args(["ps", "-a", "--filter"])
-        .arg(format!("name={}", session.container_name))
-        .args(["--format", "{{.Names}}"])
-        .output()
-        .await
-        .expect("podman ps");
-    let leftovers = String::from_utf8_lossy(&ps.stdout);
+    let leftovers = podman_names(&format!("name={}", session.container_name)).await;
     assert!(
-        leftovers.trim().is_empty(),
-        "container `{}` is still alive: {leftovers}",
+        leftovers.is_empty(),
+        "container `{}` is still alive: {leftovers:?}",
         session.container_name
     );
 }

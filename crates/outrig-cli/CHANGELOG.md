@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Remaining direct cleanup queries in the `run` and `mcp` smoke tests now use the checked
+  Podman helper, so failed queries cannot pass as successful container cleanup. (#1008)
+
 - Session startup prepares absent, unignored session-root and explicit-session parent directories
   before computing a build tag, without making an explicit directory nonempty by creating its
   registry prematurely. Logical external prefixes traversed through `..` are also prepared

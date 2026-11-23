@@ -312,17 +312,10 @@ async fn run_drives_one_tool_call_and_prints_reply() {
         .nth(1)
         .expect("container name after `started:`")
         .trim();
-    let ps = Command::new("podman")
-        .args(["ps", "-a", "--filter"])
-        .arg(format!("name={our_container}"))
-        .args(["--format", "{{.Names}}"])
-        .output()
-        .await
-        .expect("podman ps");
-    let leftovers = String::from_utf8_lossy(&ps.stdout);
+    let leftovers = podman_names(&format!("name={our_container}")).await;
     assert!(
-        leftovers.trim().is_empty(),
-        "this run's container `{our_container}` is still alive: {leftovers}"
+        leftovers.is_empty(),
+        "this run's container `{our_container}` is still alive: {leftovers:?}"
     );
 }
 
@@ -758,17 +751,10 @@ async fn verbose_run_writes_container_log_and_enables_trace() {
         .nth(1)
         .expect("container name after `started:`")
         .trim();
-    let ps = Command::new("podman")
-        .args(["ps", "-a", "--filter"])
-        .arg(format!("name={our_container}"))
-        .args(["--format", "{{.Names}}"])
-        .output()
-        .await
-        .expect("podman ps");
-    let leftovers = String::from_utf8_lossy(&ps.stdout);
+    let leftovers = podman_names(&format!("name={our_container}")).await;
     assert!(
-        leftovers.trim().is_empty(),
-        "this run's container `{our_container}` is still alive: {leftovers}"
+        leftovers.is_empty(),
+        "this run's container `{our_container}` is still alive: {leftovers:?}"
     );
 }
 
