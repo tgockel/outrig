@@ -979,7 +979,7 @@ async fn missing_root_ignore_does_not_hide_literal_dot_directories() {
             .unwrap()
             .unwrap();
         assert!(
-            super::check_literal_directory(ctx.path(), &sources, name.as_bytes())
+            super::check_literal_path(ctx.path(), &sources, name.as_bytes(), true)
                 .await
                 .unwrap(),
             "{name}"
@@ -2988,8 +2988,7 @@ async fn refuse_session_dir_is_not_confused_by_a_tracked_file_matching_its_glob(
 /// checked directly, without a `git` to run against.
 #[test]
 fn check_ignore_cmd_pins_off_all_four_pathspec_magic_modes() {
-    let cmd = check_ignore_cmd(Path::new("/some/context/sessions"))
-        .expect("a path with a parent and a basename always has a command");
+    let cmd = check_ignore_cmd(Path::new("/some/context"), Path::new("sessions"));
     assert_eq!(
         cmd.hidden_env(),
         [
@@ -3029,7 +3028,7 @@ async fn check_ignore_cmd_still_answers_under_an_inherited_pathspec_mode() {
     let ctx_canon = std::fs::canonicalize(ctx.path()).expect("canonicalize ctx");
     std::fs::create_dir(ctx_canon.join("sessions")).unwrap();
 
-    let cmd = check_ignore_cmd(&ctx_canon.join("sessions")).expect("has a parent and a name");
+    let cmd = check_ignore_cmd(&ctx_canon, Path::new("sessions"));
 
     for inherited in [
         "GIT_LITERAL_PATHSPECS",
@@ -3461,4 +3460,668 @@ async fn session_symlink_probe_keeps_errors_for_admitted_paths() {
     CacheKey::compute(&root.join("Dockerfile"), &BTreeMap::new(), &root)
         .await
         .expect_err("the hasher also fails on the admitted path");
+}
+
+/// #1026: admission must see the same index-backed rules as the hasher,
+/// without letting tracked glob matches answer for a literal session path.
+#[tokio::test]
+async fn session_admission_honors_missing_skip_worktree_rules() {
+    for prefix in ["", "ctx/", "nested/"] {
+        for name in [
+            "sessions",
+            "cache*",
+            "[.]gitignore",
+            ":sessions",
+            "-sessions",
+        ] {
+            let rule = format!("/{}/\n", name.replace('*', "\\*").replace('[', "\\["));
+            let ignore = format!("{prefix}.gitignore");
+            let dockerfile = format!("{prefix}Dockerfile");
+            let ctx = make_ctx(&[
+                ("Dockerfile", "FROM alpine\n"),
+                (&dockerfile, "FROM alpine\n"),
+                (&ignore, &rule),
+                (&format!("{prefix}cache-one"), "tracked glob collision"),
+            ]);
+            git_init(ctx.path());
+            let root = std::fs::canonicalize(ctx.path()).unwrap();
+            let tree = root.join(prefix);
+            if prefix == "nested/" {
+                git(&root, &["rm", "-q", "-r", "--cached", "nested"]);
+                git_init(&tree);
+            }
+            git(&tree, &["update-index", "--skip-worktree", ".gitignore"]);
+            std::fs::remove_file(tree.join(".gitignore")).unwrap();
+            let index = tree.join(".git/index");
+            let index = if index.exists() {
+                index
+            } else {
+                root.join(".git/index")
+            };
+            let index_before = std::fs::read(&index).unwrap();
+            // Exercise a subdirectory context as well as a nested repository.
+            let context = if prefix == "ctx/" {
+                tree.clone()
+            } else {
+                root.clone()
+            };
+            let dir = tree.join(name);
+            let before = key(&root.join("Dockerfile"), &BTreeMap::new(), &context).await;
+            refuse_session_dir_in_build_context(
+                "tool",
+                &session_dir_test_cfg(&context),
+                Path::new("/"),
+                &dir,
+                &dir,
+            )
+            .await
+            .expect("index-backed directory rule must admit the session");
+            assert!(!dir.exists(), "admission must remove its probe directory");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("session.json"), "session writes").unwrap();
+            assert_eq!(
+                before,
+                key(&root.join("Dockerfile"), &BTreeMap::new(), &context).await,
+                "prefix {prefix:?}, name {name:?}"
+            );
+            assert_eq!(index_before, std::fs::read(&index).unwrap());
+            assert!(!tree.join(".gitignore").exists());
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_admission_index_rules_preserve_file_shape_and_negation() {
+    for (rule, allowed) in [
+        ("/roots/\n", true),
+        ("/roots/*\n", true),
+        ("/roots/*/\n", false),
+    ] {
+        let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n"), (".gitignore", rule)]);
+        git_init(ctx.path());
+        let root = std::fs::canonicalize(ctx.path()).unwrap();
+        git(&root, &["update-index", "--skip-worktree", ".gitignore"]);
+        std::fs::remove_file(root.join(".gitignore")).unwrap();
+        let entry = root.join("roots/auto123");
+        let result = super::refuse_session_registry_entry_in_build_context(
+            "tool",
+            &session_dir_test_cfg(&root),
+            Path::new("/"),
+            &entry,
+            &entry,
+        )
+        .await;
+        assert_eq!(result.is_ok(), allowed, "{rule:?}: {result:?}");
+        assert!(!root.join("roots").exists());
+    }
+    // A deeper negation wins whether it or its ancestor comes from the index.
+    for missing in [".gitignore", "roots/.gitignore"] {
+        let ctx = make_ctx(&[
+            ("Dockerfile", "FROM alpine\n"),
+            (".gitignore", "/roots/*\n"),
+            ("roots/.gitignore", "!sessions/\n"),
+        ]);
+        git_init(ctx.path());
+        let root = std::fs::canonicalize(ctx.path()).unwrap();
+        git(&root, &["add", "-f", "roots/.gitignore"]);
+        git(&root, &["update-index", "--skip-worktree", missing]);
+        std::fs::remove_file(root.join(missing)).unwrap();
+        let dir = root.join("roots/sessions");
+        let result = refuse_session_dir_in_build_context(
+            "tool",
+            &session_dir_test_cfg(&root),
+            Path::new("/"),
+            &dir,
+            &dir,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(OutrigError::SessionDirInBuildContext { .. })
+        ));
+        assert!(!dir.exists());
+    }
+}
+
+/// Ignore rules never exclude tracked outputs, even while they are deleted.
+#[tokio::test]
+async fn session_admission_refuses_deleted_tracked_outputs() {
+    for indexed_ignore in [false, true] {
+        for (output, existing, refused) in [
+            ("session.json", false, true),
+            ("outrig-enter", false, true),
+            ("logs/container.log", false, true),
+            ("logs/subagent-parent/subagent-child.log", false, true),
+            ("unrelated", false, true),
+            ("unrelated", true, false),
+            ("session.json/child", true, true),
+            ("outrig-enter/child", true, true),
+            ("logs/container.log/child", true, true),
+            ("logs/subagent-parent/subagent-child.log/child", true, true),
+        ] {
+            let tracked = format!("sessions/new/{output}");
+            let ctx = make_ctx(&[
+                ("Dockerfile", "FROM alpine\n"),
+                (".gitignore", "/sessions/\n"),
+                (&tracked, "old output"),
+            ]);
+            git_init(ctx.path());
+            let root = std::fs::canonicalize(ctx.path()).unwrap();
+            git(&root, &["add", "-f", &tracked]);
+            std::fs::remove_dir_all(root.join("sessions")).unwrap();
+            if indexed_ignore {
+                git(&root, &["update-index", "--skip-worktree", ".gitignore"]);
+                std::fs::remove_file(root.join(".gitignore")).unwrap();
+            }
+            let dir = root.join("sessions/new");
+            if existing {
+                std::fs::create_dir_all(&dir).unwrap();
+            }
+            let result = refuse_session_dir_in_build_context(
+                "tool",
+                &session_dir_test_cfg(&root),
+                Path::new("/"),
+                &dir,
+                &dir,
+            )
+            .await;
+            assert_eq!(
+                result.is_err(),
+                refused,
+                "{indexed_ignore}, {output}, existing={existing}: {result:?}"
+            );
+            if let Err(err) = result {
+                assert!(matches!(err, OutrigError::SessionDirInBuildContext { .. }));
+            }
+            assert_eq!(dir.exists(), existing);
+            if existing {
+                assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+            } else {
+                assert!(!root.join("sessions").exists());
+            }
+            if !refused {
+                let args = BTreeMap::new();
+                let before = key(&root.join("Dockerfile"), &args, &root).await;
+                std::fs::write(dir.join("session.json"), "new record").unwrap();
+                std::fs::create_dir(dir.join("logs")).unwrap();
+                std::fs::write(dir.join("logs/container.log"), "new log").unwrap();
+                assert_eq!(before, key(&root.join("Dockerfile"), &args, &root).await);
+            }
+        }
+    }
+}
+
+/// An outer index must not veto a path owned by a nested repository.
+#[tokio::test]
+async fn tracked_ancestor_checks_stop_at_the_owning_repository() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        ("nested/Dockerfile", "FROM alpine\n"),
+        ("nested/.gitignore", "/sessions/\n"),
+        ("nested/sessions", "tracked only by the outer repository"),
+    ]);
+    git_init(ctx.path());
+    let root = std::fs::canonicalize(ctx.path()).unwrap();
+    let nested = root.join("nested");
+    std::fs::remove_file(nested.join("sessions")).unwrap();
+    git_init(&nested);
+    git(&nested, &["update-index", "--skip-worktree", ".gitignore"]);
+    std::fs::remove_file(nested.join(".gitignore")).unwrap();
+    let target = nested.join("sessions/new");
+    let cfg = session_dir_test_cfg(&nested);
+    refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &target, &target)
+        .await
+        .unwrap();
+    super::refuse_session_registry_entry_in_build_context(
+        "tool",
+        &cfg,
+        Path::new("/"),
+        &target,
+        &target,
+    )
+    .await
+    .unwrap();
+    assert!(!nested.join("sessions").exists());
+    let args = BTreeMap::new();
+    let before = key(&nested.join("Dockerfile"), &args, &nested).await;
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("session.json"), "new record").unwrap();
+    assert_eq!(
+        before,
+        key(&nested.join("Dockerfile"), &args, &nested).await
+    );
+}
+
+/// Cached ancestors above the configured context are never visited by its
+/// hasher. On-disk ancestor rules admit safe writes, but absent indexed
+/// ancestor rules above the context do not exclude its future file inputs.
+#[tokio::test]
+async fn tracked_ancestors_above_subcontext_do_not_veto_session_paths() {
+    for cached in ["holder", "holder/ctx"] {
+        for indexed_ignore in [false, true] {
+            for directory in [true, false] {
+                let ctx = make_ctx(&[
+                    (".gitignore", "/holder/ctx/sessions/\n"),
+                    (
+                        cached,
+                        "deleted tracked ancestor outside the context listing",
+                    ),
+                ]);
+                git_init(ctx.path());
+                let root = std::fs::canonicalize(ctx.path()).unwrap();
+                std::fs::remove_file(root.join(cached)).unwrap();
+                let context = root.join("holder/ctx");
+                std::fs::create_dir_all(&context).unwrap();
+                std::fs::write(context.join("Dockerfile"), "FROM alpine\n").unwrap();
+                if indexed_ignore {
+                    git(&root, &["update-index", "--skip-worktree", ".gitignore"]);
+                    std::fs::remove_file(root.join(".gitignore")).unwrap();
+                }
+                let target = context.join("sessions/new");
+                let cfg = session_dir_test_cfg(&context);
+                let args = BTreeMap::new();
+                let before = key(&context.join("Dockerfile"), &args, &context).await;
+                let result = if directory {
+                    refuse_session_dir_in_build_context(
+                        "tool",
+                        &cfg,
+                        Path::new("/"),
+                        &target,
+                        &target,
+                    )
+                    .await
+                } else {
+                    super::refuse_session_registry_entry_in_build_context(
+                        "tool",
+                        &cfg,
+                        Path::new("/"),
+                        &target,
+                        &target,
+                    )
+                    .await
+                };
+                assert_eq!(
+                    result.is_ok(),
+                    !indexed_ignore,
+                    "{cached}, directory={directory}: {result:?}"
+                );
+                assert!(!context.join("sessions").exists());
+                if directory {
+                    std::fs::create_dir_all(&target).unwrap();
+                    std::fs::write(target.join("session.json"), "new record").unwrap();
+                } else {
+                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    std::os::unix::fs::symlink(root.join("external-session"), &target).unwrap();
+                }
+                assert_eq!(
+                    before == key(&context.join("Dockerfile"), &args, &context).await,
+                    !indexed_ignore,
+                    "{cached}, directory={directory}, indexed={indexed_ignore}"
+                );
+            }
+        }
+    }
+}
+
+/// Relative Git routing is evaluated at each hasher tree, not the session
+/// path's parent. Isolate environment overrides in a subprocess.
+#[tokio::test]
+async fn cached_session_conflicts_use_the_hashers_relative_git_view() {
+    const FIXTURE: &str = "OUTRIG_SESSION_ROUTING_FIXTURE";
+    const SHAPE: &str = "OUTRIG_SESSION_ROUTING_SHAPE";
+    if let Some(root) = std::env::var_os(FIXTURE) {
+        let root = std::fs::canonicalize(root).unwrap();
+        let directory = std::env::var(SHAPE).unwrap() == "directory";
+        let target = root.join("sessions/new");
+        let cfg = session_dir_test_cfg(&root);
+        let args = BTreeMap::new();
+        let before = key(&root.join("Dockerfile"), &args, &root).await;
+        let result = if directory {
+            refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &target, &target)
+                .await
+        } else {
+            super::refuse_session_registry_entry_in_build_context(
+                "tool",
+                &cfg,
+                Path::new("/"),
+                &target,
+                &target,
+            )
+            .await
+        };
+        if std::env::var_os("OUTRIG_REJECT_PARENT_ONLY_IGNORE").is_some() {
+            assert!(
+                result.is_err(),
+                "a parent-only routing match is not a hasher exclusion"
+            );
+            assert!(!target.exists());
+            return;
+        }
+        result.unwrap();
+        assert!(!target.exists());
+        if directory {
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("session.json"), "new record").unwrap();
+        } else {
+            std::os::unix::fs::symlink(root.join("external-session"), &target).unwrap();
+        }
+        assert_eq!(before, key(&root.join("Dockerfile"), &args, &root).await);
+        return;
+    }
+    for directory in [true, false] {
+        for (relative_index, relative_git_dir) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let ctx = make_ctx(&[
+                ("Dockerfile", "FROM alpine\n"),
+                (".gitignore", "/sessions/\n"),
+                (
+                    "sessions/.gitignore",
+                    if directory { "/new/\n" } else { "/new\n" },
+                ),
+                ("new", "unrelated tracked file"),
+            ]);
+            git_init(ctx.path());
+            std::fs::remove_file(ctx.path().join("new")).unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact", "image::image_cache_tests::cached_session_conflicts_use_the_hashers_relative_git_view",
+            ]).env(FIXTURE, ctx.path())
+                .env(SHAPE, if directory { "directory" } else { "registry" })
+                .env("GIT_WORK_TREE", ".");
+            if relative_index {
+                command.env("GIT_INDEX_FILE", ".git/index");
+            }
+            if relative_git_dir {
+                command.env("GIT_DIR", ".git");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "directory={directory}, relative_index={relative_index}, relative_git_dir={relative_git_dir}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    for directory in [true, false] {
+        let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n"), (".gitignore", "")]);
+        git_init(ctx.path());
+        std::fs::create_dir(ctx.path().join("sessions")).unwrap();
+        std::fs::write(
+            ctx.path().join(".git/info/exclude"),
+            if directory { "/new/\n" } else { "/new\n" },
+        )
+        .unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "image::image_cache_tests::cached_session_conflicts_use_the_hashers_relative_git_view"])
+            .env(FIXTURE, ctx.path())
+            .env(SHAPE, if directory { "directory" } else { "registry" })
+            .env("GIT_WORK_TREE", ".")
+            .env("OUTRIG_REJECT_PARENT_ONLY_IGNORE", "1")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "directory={directory}:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[tokio::test]
+async fn probe_time_whole_tree_veto_survives_cleanup() {
+    const FIXTURE: &str = "OUTRIG_PROBE_STATE_FIXTURE";
+    if let Some(root) = std::env::var_os(FIXTURE) {
+        let root = std::fs::canonicalize(root).unwrap();
+        let directory = std::env::var("OUTRIG_PROBE_DIRECTORY").unwrap() == "1";
+        let keep_input = std::env::var("OUTRIG_PROBE_KEEP_INPUT").unwrap() == "1";
+        let allowed = std::env::var("OUTRIG_PROBE_ALLOWED").unwrap() == "1";
+        let target = root.join("sessions/new");
+        let cfg = session_dir_test_cfg(&root);
+        let args = BTreeMap::new();
+        let before = key(&root.join("Dockerfile"), &args, &root).await;
+        let index_before = std::fs::read(root.join(".git/index")).unwrap();
+        let result = if directory {
+            refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &target, &target)
+                .await
+        } else {
+            super::refuse_session_registry_entry_in_build_context(
+                "tool",
+                &cfg,
+                Path::new("/"),
+                &target,
+                &target,
+            )
+            .await
+        };
+        assert_eq!(result.is_ok(), allowed, "{result:?}");
+        if let Err(err) = result
+            && !keep_input
+        {
+            assert!(
+                matches!(
+                    err,
+                    OutrigError::SessionDirInBuildContext {
+                        whole_tree: true,
+                        ..
+                    } | OutrigError::SessionRegistryEntryInBuildContext {
+                        whole_tree: true,
+                        ..
+                    }
+                ),
+                "{err}"
+            );
+        }
+        assert!(!target.exists());
+        assert_eq!(root.join("sessions").exists(), keep_input);
+        assert_eq!(before, key(&root.join("Dockerfile"), &args, &root).await);
+        assert_eq!(
+            index_before,
+            std::fs::read(root.join(".git/index")).unwrap()
+        );
+        if allowed {
+            if directory {
+                std::fs::create_dir(&target).unwrap();
+                std::fs::write(target.join("session.json"), "new record").unwrap();
+            } else {
+                std::os::unix::fs::symlink(root.join("external-session"), &target).unwrap();
+            }
+            assert_eq!(before, key(&root.join("Dockerfile"), &args, &root).await);
+        }
+        return;
+    }
+    for directory in [true, false] {
+        for (keep_input, allowed) in [(false, false), (true, false), (true, true)] {
+            let ctx = make_ctx(&[
+                ("Dockerfile", "FROM alpine\n"),
+                (
+                    ".gitignore",
+                    if allowed {
+                        "/sessions/\n"
+                    } else if directory {
+                        "/new/\n"
+                    } else {
+                        "/new\n"
+                    },
+                ),
+                ("sessions", "deleted tracked ancestor"),
+            ]);
+            git_init(ctx.path());
+            if allowed {
+                git(ctx.path(), &["rm", "-q", "--cached", "sessions"]);
+            }
+            git(
+                ctx.path(),
+                &["update-index", "--skip-worktree", ".gitignore"],
+            );
+            std::fs::remove_file(ctx.path().join(".gitignore")).unwrap();
+            std::fs::remove_file(ctx.path().join("sessions")).unwrap();
+            if keep_input {
+                std::fs::create_dir(ctx.path().join("sessions")).unwrap();
+                std::fs::write(ctx.path().join("sessions/Dockerfile"), "FROM alpine\n").unwrap();
+            }
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "image::image_cache_tests::probe_time_whole_tree_veto_survives_cleanup",
+                ])
+                .env(FIXTURE, ctx.path())
+                .env("OUTRIG_PROBE_DIRECTORY", if directory { "1" } else { "0" })
+                .env(
+                    "OUTRIG_PROBE_KEEP_INPUT",
+                    if keep_input { "1" } else { "0" },
+                )
+                .env("OUTRIG_PROBE_ALLOWED", if allowed { "1" } else { "0" })
+                .env("GIT_WORK_TREE", ".")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "directory={directory}, keep_input={keep_input}, allowed={allowed}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn real_repository_ancestors_delegate_session_paths_to_their_repository() {
+    for gitlink in [true, false] {
+        for directory in [true, false] {
+            let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+            if !gitlink {
+                std::fs::write(ctx.path().join("nested"), "old cached file").unwrap();
+            }
+            git_init(ctx.path());
+            if !gitlink {
+                std::fs::remove_file(ctx.path().join("nested")).unwrap();
+            }
+            let root = std::fs::canonicalize(ctx.path()).unwrap();
+            let nested = root.join("nested");
+            std::fs::create_dir(&nested).unwrap();
+            std::fs::write(nested.join("Dockerfile"), "FROM alpine\n").unwrap();
+            std::fs::write(nested.join(".gitignore"), "/sessions/\n").unwrap();
+            git_init(&nested);
+            if gitlink {
+                git(&root, &["add", "nested"]);
+            }
+            let target = nested.join("sessions/new");
+            let cfg = session_dir_test_cfg(&root);
+            let args = BTreeMap::new();
+            let before = key(&root.join("Dockerfile"), &args, &root).await;
+            if directory {
+                refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &target, &target)
+                    .await
+                    .unwrap();
+                std::fs::create_dir_all(&target).unwrap();
+                std::fs::write(target.join("session.json"), "new record").unwrap();
+            } else {
+                super::refuse_session_registry_entry_in_build_context(
+                    "tool",
+                    &cfg,
+                    Path::new("/"),
+                    &target,
+                    &target,
+                )
+                .await
+                .unwrap();
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(root.join("external-session"), &target).unwrap();
+            }
+            assert_eq!(before, key(&root.join("Dockerfile"), &args, &root).await);
+        }
+    }
+}
+
+#[tokio::test]
+async fn overlapping_unmerged_index_routes_all_check_session_exclusion() {
+    use std::io::Write as _;
+    for directory in [true, false] {
+        for ignored_by_inner in [false, true] {
+            let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+            git_init(ctx.path());
+            let root = std::fs::canonicalize(ctx.path()).unwrap();
+            let a = root.join("a");
+            std::fs::create_dir(&a).unwrap();
+            std::fs::write(a.join("Dockerfile"), "FROM alpine\n").unwrap();
+            std::fs::write(a.join(".gitignore"), "/b/\n").unwrap();
+            git_init(&a);
+            let b = a.join("b");
+            std::fs::create_dir(&b).unwrap();
+            std::fs::write(b.join("Dockerfile"), "FROM alpine\n").unwrap();
+            std::fs::write(
+                b.join(".gitignore"),
+                if ignored_by_inner { "/sessions/\n" } else { "" },
+            )
+            .unwrap();
+            git_init(&b);
+            let blob = Command::new("git")
+                .current_dir(&root)
+                .args(["rev-parse", ":Dockerfile"])
+                .output()
+                .unwrap();
+            let commit = Command::new("git")
+                .current_dir(&b)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            assert!(blob.status.success() && commit.status.success());
+            let blob = String::from_utf8(blob.stdout).unwrap();
+            let commit = String::from_utf8(commit.stdout).unwrap();
+            let mut index = Command::new("git")
+                .current_dir(&root)
+                .args(["update-index", "--index-info"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            {
+                let mut stdin = index.stdin.take().unwrap();
+                writeln!(stdin, "100644 {} 2\ta", blob.trim()).unwrap();
+                writeln!(stdin, "160000 {} 3\ta/b", commit.trim()).unwrap();
+            }
+            assert!(index.wait().unwrap().success());
+            let index_before = std::fs::read(root.join(".git/index")).unwrap();
+            let target = b.join("sessions/new");
+            let cfg = session_dir_test_cfg(&root);
+            let args = BTreeMap::new();
+            let before = key(&root.join("Dockerfile"), &args, &root).await;
+            let result = if directory {
+                refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &target, &target)
+                    .await
+            } else {
+                super::refuse_session_registry_entry_in_build_context(
+                    "tool",
+                    &cfg,
+                    Path::new("/"),
+                    &target,
+                    &target,
+                )
+                .await
+            };
+            assert_eq!(
+                result.is_ok(),
+                ignored_by_inner,
+                "directory={directory}: {result:?}"
+            );
+            assert!(!b.join("sessions").exists());
+            assert_eq!(
+                index_before,
+                std::fs::read(root.join(".git/index")).unwrap()
+            );
+            if directory {
+                std::fs::create_dir_all(&target).unwrap();
+                std::fs::write(target.join("session.json"), "new record").unwrap();
+            } else {
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(root.join("external-session"), &target).unwrap();
+            }
+            assert_eq!(
+                before == key(&root.join("Dockerfile"), &args, &root).await,
+                ignored_by_inner
+            );
+        }
+    }
 }

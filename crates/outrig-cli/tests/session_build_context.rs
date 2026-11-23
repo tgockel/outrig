@@ -616,3 +616,439 @@ async fn registry_under_explicit_directory_does_not_preempt_emptiness_check() {
         assert!(explicit.join("session.json").exists());
     }
 }
+
+/// #1026 review: deleted index entries can expose directory creation or
+/// become unresolvable beneath file-shaped outputs after publication.
+#[tokio::test]
+async fn deleted_tracked_entries_are_refused_before_session_publication() {
+    for indexed_ignore in [true, false] {
+        for (output, existing) in [
+            ("unrelated", false),
+            ("session.json/child", true),
+            ("session.json", true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path().join("repo");
+            let agents = repo.join(".agents/outrig");
+            std::fs::create_dir_all(&agents).unwrap();
+            std::fs::write(
+            agents.join("config.toml"),
+            "default-image = \"tool\"\n[images.tool]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n",
+        ).unwrap();
+            std::fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+            std::fs::write(repo.join(".gitignore"), "/sessions/\n").unwrap();
+            let explicit = repo.join("sessions");
+            let tracked = format!("sessions/{output}");
+            let tracked_path = repo.join(&tracked);
+            std::fs::create_dir_all(tracked_path.parent().unwrap()).unwrap();
+            std::fs::write(&tracked_path, "old tracked content").unwrap();
+            for args in [
+                vec!["init", "-q"],
+                vec!["add", "-f", ".gitignore", &tracked],
+            ] {
+                assert!(
+                    std::process::Command::new("git")
+                        .current_dir(&repo)
+                        .args(args)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            std::fs::remove_dir_all(&explicit).unwrap();
+            if existing {
+                std::fs::create_dir(&explicit).unwrap();
+            }
+            if indexed_ignore {
+                assert!(
+                    std::process::Command::new("git")
+                        .current_dir(&repo)
+                        .args(["update-index", "--skip-worktree", ".gitignore"])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                std::fs::remove_file(repo.join(".gitignore")).unwrap();
+            }
+            let global = tmp.path().join("global.toml");
+            std::fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+            let registry = tmp.path().join("registry");
+            let (ok, stderr) = run_outrig(
+                &repo,
+                &[
+                    "--global-config",
+                    utf8(&global),
+                    "--session-root",
+                    utf8(&registry),
+                    "run",
+                    "--session-dir",
+                    utf8(&explicit),
+                ],
+            )
+            .await;
+            assert!(!ok, "{stderr}");
+            assert!(stderr.contains("inside the build context"), "{stderr}");
+            assert!(!stderr.contains("computing image tag"), "{stderr}");
+            assert!(
+                !explicit.join("session.json").exists(),
+                "record was published"
+            );
+            assert!(!registry.exists(), "registry was published");
+            assert_eq!(explicit.exists(), existing);
+            if existing {
+                assert_eq!(std::fs::read_dir(&explicit).unwrap().count(), 0);
+            }
+        }
+    }
+}
+
+/// The cached ancestor may be a deleted file even though its replacement
+/// directory exists temporarily during the admission probe.
+#[tokio::test]
+async fn deleted_tracked_ancestors_are_refused_before_session_publication() {
+    for indexed_ignore in [true, false] {
+        for registry_entry in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path().join("repo");
+            let agents = repo.join(".agents/outrig");
+            std::fs::create_dir_all(&agents).unwrap();
+            let config = "default-image = \"tool\"\n[images.tool]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n";
+            std::fs::write(agents.join("config.toml"), config).unwrap();
+            std::fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+            std::fs::write(repo.join(".gitignore"), "/sessions/\n").unwrap();
+            std::fs::write(repo.join("sessions"), "tracked ancestor").unwrap();
+            for args in [
+                vec!["init", "-q"],
+                vec!["add", "-f", ".gitignore", "sessions"],
+            ] {
+                assert!(
+                    std::process::Command::new("git")
+                        .current_dir(&repo)
+                        .args(args)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            std::fs::remove_file(repo.join("sessions")).unwrap();
+            if indexed_ignore {
+                assert!(
+                    std::process::Command::new("git")
+                        .current_dir(&repo)
+                        .args(["update-index", "--skip-worktree", ".gitignore"])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                std::fs::remove_file(repo.join(".gitignore")).unwrap();
+            }
+            let index_before = std::fs::read(repo.join(".git/index")).unwrap();
+            let global = tmp.path().join("global.toml");
+            std::fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+            let explicit = if registry_entry {
+                tmp.path().join("external-session")
+            } else {
+                repo.join("sessions/new")
+            };
+            let registry = if registry_entry {
+                repo.join("sessions")
+            } else {
+                tmp.path().join("registry")
+            };
+            let (ok, stderr) = run_outrig(
+                &repo,
+                &[
+                    "--global-config",
+                    utf8(&global),
+                    "--session-root",
+                    utf8(&registry),
+                    "run",
+                    "--session-dir",
+                    utf8(&explicit),
+                ],
+            )
+            .await;
+            assert!(!ok, "{stderr}");
+            assert!(stderr.contains("inside the build context"), "{stderr}");
+            assert_eq!(
+                stderr.contains("session registry entry"),
+                registry_entry,
+                "{stderr}"
+            );
+            assert!(!stderr.contains("computing image tag"), "{stderr}");
+            assert!(
+                !repo.join("sessions").exists(),
+                "probe left its parent behind"
+            );
+            assert!(!explicit.exists(), "session was published");
+            assert!(!registry.exists(), "registry was published");
+            assert_eq!(
+                index_before,
+                std::fs::read(repo.join(".git/index")).unwrap()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tracked_ancestors_above_subcontext_allow_session_publication() {
+    for cached in ["holder", "holder/ctx"] {
+        for indexed_ignore in [false, true] {
+            for registry_entry in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let repo = tmp.path().join("repo");
+                let agents = repo.join(".agents/outrig");
+                std::fs::create_dir_all(&agents).unwrap();
+                let config = "default-image = \"tool\"\n[images.tool]\ndockerfile = \"holder/ctx/Dockerfile\"\ncontext = \"holder/ctx\"\n";
+                std::fs::write(agents.join("config.toml"), config).unwrap();
+                std::fs::write(repo.join(".gitignore"), "/holder/ctx/sessions/\n").unwrap();
+                let cached_path = repo.join(cached);
+                std::fs::create_dir_all(cached_path.parent().unwrap()).unwrap();
+                std::fs::write(&cached_path, "tracked ancestor").unwrap();
+                for args in [vec!["init", "-q"], vec!["add", "-f", ".gitignore", cached]] {
+                    assert!(
+                        std::process::Command::new("git")
+                            .current_dir(&repo)
+                            .args(args)
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                }
+                std::fs::remove_file(&cached_path).unwrap();
+                let context = repo.join("holder/ctx");
+                std::fs::create_dir_all(&context).unwrap();
+                std::fs::write(context.join("Dockerfile"), "FROM scratch\n").unwrap();
+                if indexed_ignore {
+                    assert!(
+                        std::process::Command::new("git")
+                            .current_dir(&repo)
+                            .args(["update-index", "--skip-worktree", ".gitignore"])
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                    std::fs::remove_file(repo.join(".gitignore")).unwrap();
+                }
+                let global = tmp.path().join("global.toml");
+                std::fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+                let explicit = if registry_entry {
+                    tmp.path().join("external-session")
+                } else {
+                    context.join("sessions/new")
+                };
+                let registry = if registry_entry {
+                    context.join("sessions")
+                } else {
+                    tmp.path().join("registry")
+                };
+                let (ok, stderr) = run_outrig(
+                    &repo,
+                    &[
+                        "--global-config",
+                        utf8(&global),
+                        "--session-root",
+                        utf8(&registry),
+                        "run",
+                        "--session-dir",
+                        utf8(&explicit),
+                    ],
+                )
+                .await;
+                if indexed_ignore {
+                    assert!(
+                        !ok && stderr.contains("inside the build context"),
+                        "{stderr}"
+                    );
+                    assert!(!stderr.contains("computing image tag"), "{stderr}");
+                    assert!(!explicit.exists());
+                    assert!(!registry.exists());
+                    continue;
+                }
+                assert!(!ok && stderr.contains("buildah"), "{stderr}");
+                assert!(!stderr.contains("inside the build context"), "{stderr}");
+                assert!(
+                    !stderr.contains("changed while it was building"),
+                    "{stderr}"
+                );
+                assert!(explicit.join("session.json").exists());
+                let entries = std::fs::read_dir(&registry)
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(entries.len(), 1);
+                assert!(entries[0].path().is_symlink());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn probe_time_whole_tree_fallback_refuses_before_publication() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let agents = repo.join(".agents/outrig");
+    std::fs::create_dir_all(&agents).unwrap();
+    let config =
+        "default-image = \"tool\"\n[images.tool]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n";
+    std::fs::write(agents.join("config.toml"), config).unwrap();
+    std::fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "/new/\n").unwrap();
+    std::fs::write(repo.join("sessions"), "tracked ancestor").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "Dockerfile", ".gitignore", "sessions"],
+        vec!["update-index", "--skip-worktree", ".gitignore"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::remove_file(repo.join("sessions")).unwrap();
+    std::fs::remove_file(repo.join(".gitignore")).unwrap();
+    let global = tmp.path().join("global.toml");
+    std::fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+    let explicit = repo.join("sessions/new");
+    let registry = tmp.path().join("registry");
+    let (ok, stderr) = run_outrig_with_env(
+        &repo,
+        &[
+            "--global-config",
+            utf8(&global),
+            "--session-root",
+            utf8(&registry),
+            "run",
+            "--session-dir",
+            utf8(&explicit),
+        ],
+        &[("GIT_WORK_TREE", std::path::Path::new("."))],
+    )
+    .await;
+    assert!(
+        !ok && stderr.contains("inside the build context"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("tree is hashed whole"), "{stderr}");
+    assert!(!stderr.contains("computing image tag"), "{stderr}");
+    assert!(
+        !repo.join("sessions").exists(),
+        "probe directories left behind"
+    );
+    assert!(!registry.exists(), "registry was published");
+}
+
+#[tokio::test]
+async fn overlapping_index_routes_refuse_before_session_publication() {
+    use std::io::Write as _;
+    fn git(repo: &std::path::Path, args: &[&str]) -> Vec<u8> {
+        let output = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+    for registry_entry in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let agents = repo.join(".agents/outrig");
+        std::fs::create_dir_all(&agents).unwrap();
+        let config = "default-image = \"tool\"\n[images.tool]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n";
+        std::fs::write(agents.join("config.toml"), config).unwrap();
+        std::fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["add", "Dockerfile"]);
+        let a = repo.join("a");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::write(a.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(a.join(".gitignore"), "/b/\n").unwrap();
+        git(&a, &["init", "-q"]);
+        git(&a, &["add", "Dockerfile", ".gitignore"]);
+        let b = a.join("b");
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(b.join("Dockerfile"), "FROM scratch\n").unwrap();
+        git(&b, &["init", "-q"]);
+        git(&b, &["add", "Dockerfile"]);
+        git(
+            &b,
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
+        let blob = String::from_utf8(git(&repo, &["rev-parse", ":Dockerfile"])).unwrap();
+        let commit = String::from_utf8(git(&b, &["rev-parse", "HEAD"])).unwrap();
+        let mut index = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["update-index", "--index-info"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut stdin = index.stdin.take().unwrap();
+            writeln!(stdin, "100644 {} 2\ta", blob.trim()).unwrap();
+            writeln!(stdin, "160000 {} 3\ta/b", commit.trim()).unwrap();
+        }
+        assert!(index.wait().unwrap().success());
+        let index_before = std::fs::read(repo.join(".git/index")).unwrap();
+        let global = tmp.path().join("global.toml");
+        std::fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+        let explicit = if registry_entry {
+            tmp.path().join("external-session")
+        } else {
+            b.join("sessions/new")
+        };
+        let registry = if registry_entry {
+            b.join("sessions")
+        } else {
+            tmp.path().join("registry")
+        };
+        let (ok, stderr) = run_outrig(
+            &repo,
+            &[
+                "--global-config",
+                utf8(&global),
+                "--session-root",
+                utf8(&registry),
+                "run",
+                "--session-dir",
+                utf8(&explicit),
+            ],
+        )
+        .await;
+        assert!(
+            !ok && stderr.contains("inside the build context"),
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.contains("session registry entry"),
+            registry_entry,
+            "{stderr}"
+        );
+        assert!(!stderr.contains("computing image tag"), "{stderr}");
+        assert!(!b.join("sessions").exists());
+        assert!(!explicit.exists());
+        assert!(!registry.exists());
+        assert_eq!(
+            index_before,
+            std::fs::read(repo.join(".git/index")).unwrap()
+        );
+    }
+}

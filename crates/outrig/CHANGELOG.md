@@ -14,6 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Session paths excluded by missing skip-worktree `.gitignore` files are admitted inside
+  build contexts, matching the context hasher while preserving literal-path handling and
+  file-shaped registry-entry checks. Tracked entries that expose directory creation or
+  session-output shape changes, including deleted tracked ancestors, are refused before metadata
+  publication. Ancestors above a subdirectory context do not veto safe session writes. Both
+  on-disk and indexed ignore rules retain their owning repository's boundaries; indexed exemptions
+  use only ignore sources loaded by the context's Git file listing. Admission's cached, ignore,
+  and source probes use the entered hasher trees' effective Git routing, including relative
+  worktree, Git-directory, and index paths. Cached ancestor checks retain outer-tree inputs while
+  gitlinks and real embedded repositories delegate safely. Whole-tree vetoes observed while temporary probe
+  directories exist remain binding after cleanup. Overlapping directory routes from unmerged
+  indexes must each exclude session writes; unchecked gitlinks do not grant exemptions. (#1026)
+
 - Session-path build-context refusals outside Git now offer only relocation, rather than
   ineffective `.gitignore` advice. Git contexts retain their ignore remedies. (#1022)
 

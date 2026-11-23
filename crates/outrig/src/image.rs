@@ -631,7 +631,8 @@ fn context_changed(image: &str, tag: &ImageTag) -> OutrigError {
 /// directory under it, as `hash_git_tree` honors. A non-git context has no
 /// ignore mechanism at all, so there every directory inside it conflicts.
 /// An ignored path also conflicts when the hasher falls back to the whole
-/// tree because every file is ignored, at any repository boundary (#920), or
+/// tree because every file is ignored, at any repository boundary (#920),
+/// tracked entries expose directory creation or session-output shape changes, or
 /// an admitted symlink reaches it through a whole-referent walk (#921).
 pub async fn refuse_session_dir_in_build_context(
     image: &str,
@@ -689,14 +690,18 @@ async fn refuse_session_path_in_build_context(
     }
     // The context root itself: nothing excludes a context from its own
     // build, so there is no rule to even ask about.
-    let ignored = if session_path_logical == context_canon {
-        false
+    let probe = if session_path_logical == context_canon {
+        SessionPathIgnore::default()
     } else if directory {
-        directory_is_ignored(session_path_logical).await?
+        directory_is_ignored(&context_canon, session_path_logical).await?
     } else {
-        registry_entry_is_ignored(session_path_logical).await?
+        registry_entry_is_ignored(&context_canon, session_path_logical).await?
     };
-    if ignored && context_honors_ignore_at(&context_canon, session_path_logical).await? {
+    let ignored = probe.ignored;
+    if ignored
+        && probe.honors_ignore
+        && context_honors_ignore_at(&context_canon, session_path_logical).await?
+    {
         if let Some(link) =
             session_path_via_symlink(&context_canon, session_path_logical, directory).await?
         {
@@ -733,27 +738,68 @@ async fn refuse_session_path_in_build_context(
 /// the way to `path` uses ignore rules. An all-ignored tree (including a nested
 /// repository) or a plain-tree submodule is hashed whole instead (#920).
 async fn context_honors_ignore_at(context: &Path, path: &Path) -> Result<bool> {
+    Ok(context_git_trees_at(context, path)
+        .await?
+        .is_some_and(|views| views.honors_ignore))
+}
+
+/// Every containing Git view the hasher independently visits, including
+/// overlapping directory entries from an unmerged index. Leaves need their
+/// own ignore answer; a sibling route's ignore rule cannot exempt them.
+struct ContextGitTrees {
+    entered: Vec<PathBuf>,
+    leaves: Vec<PathBuf>,
+    honors_ignore: bool,
+}
+
+async fn context_git_trees_at(context: &Path, path: &Path) -> Result<Option<ContextGitTrees>> {
     if !is_git_context(context).await? {
-        return Ok(false);
+        return Ok(None);
     }
-    let mut tree = context.to_path_buf();
-    loop {
+    let mut views = ContextGitTrees {
+        entered: Vec::new(),
+        leaves: Vec::new(),
+        honors_ignore: true,
+    };
+    let mut pending = vec![context.to_path_buf()];
+    let mut seen = HashSet::new();
+    while let Some(tree) = pending.pop() {
+        if !seen.insert(tree.clone()) {
+            continue;
+        }
+        views.entered.push(tree.clone());
         let listing = git_tree_listing(&tree).await?;
         if listing.whole_tree {
-            return Ok(false);
+            views.honors_ignore = false;
+            views.leaves.push(tree);
+            continue;
         }
-        let nested = listing.entries.into_iter().find_map(|(rel, meta)| {
-            let candidate = tree.join(OsStr::from_bytes(&rel));
-            (meta.is_dir() && path.starts_with(&candidate)).then_some(candidate)
-        });
-        let Some(nested) = nested else {
-            return Ok(true);
-        };
-        if !is_worktree_root(&nested).await? {
-            return Ok(false);
+        let containing: Vec<_> = listing
+            .entries
+            .into_iter()
+            .filter_map(|(rel, meta)| {
+                let candidate = tree.join(OsStr::from_bytes(&rel));
+                (meta.is_dir() && path.starts_with(&candidate)).then_some(candidate)
+            })
+            .collect();
+        if containing.is_empty() {
+            views.leaves.push(tree);
+            continue;
         }
-        tree = nested;
+        let mut plain_tree = false;
+        for nested in containing {
+            if is_worktree_root(&nested).await? {
+                pending.push(nested);
+            } else {
+                plain_tree = true;
+            }
+        }
+        if plain_tree {
+            views.honors_ignore = false;
+            views.leaves.push(tree);
+        }
     }
+    Ok(Some(views))
 }
 
 /// Find an admitted link whose referent walk can include session writes.
@@ -864,6 +910,15 @@ fn session_path_is_written(session: &Path, referent: &Path, directory: bool) -> 
     })
 }
 
+/// Keep the ignore answer separate from whether the probe-time hasher tree
+/// honors it. Removing temporary directories can change that tree selection;
+/// a later post-cleanup check must never erase a veto observed by the probe.
+#[derive(Default)]
+struct SessionPathIgnore {
+    ignored: bool,
+    honors_ignore: bool,
+}
+
 /// Whether `dir` -- a path inside a build context, possibly not created yet
 /// -- is excluded by a `.gitignore`, `core.excludesFile`, or
 /// `.git/info/exclude` rule, in whichever repository actually owns it: the
@@ -875,14 +930,13 @@ fn session_path_is_written(session: &Path, referent: &Path, directory: bool) -> 
 ///
 /// `git check-ignore` needs `dir` to exist to answer a directory-only rule
 /// (`/sessions/`) correctly -- asked about a path that is not there yet, it
-/// cannot tell that path would have been a directory -- and needs to be run
-/// from inside whichever repository actually owns `dir` for a nested one
-/// under the build context to be asked about its own rules rather than the
-/// outer repository's, which refuses a path across that boundary. So `dir`
-/// (and any missing parent) is created first, asked about by
+/// cannot tell that path would have been a directory. Run the probe from
+/// the containing hasher tree, including nested repositories, so relative
+/// Git routing and rule lookup agree with hashing. `dir` (and any missing
+/// parent) is created first, asked about by
 /// [`check_ignore_at`], and removed back down to whatever already existed,
 /// win or lose: this is a read of the context, not a write to it.
-async fn directory_is_ignored(dir: &Path) -> Result<bool> {
+async fn directory_is_ignored(context: &Path, dir: &Path) -> Result<SessionPathIgnore> {
     let boundary = deepest_existing_ancestor(dir);
     // Holds the directories this creates for the rest of the function, and
     // removes them on the way out whichever way that happens -- including a
@@ -898,14 +952,14 @@ async fn directory_is_ignored(dir: &Path) -> Result<bool> {
     } else {
         None
     };
-    check_ignore_at(dir).await
+    check_ignore_at(context, dir, true, _guard.is_some()).await
 }
 
 // Only the parent needs to exist: creating the leaf as a directory would
 // wrongly let a directory-only ignore rule hide the future registry symlink.
-async fn registry_entry_is_ignored(entry: &Path) -> Result<bool> {
+async fn registry_entry_is_ignored(context: &Path, entry: &Path) -> Result<SessionPathIgnore> {
     let Some(parent) = entry.parent() else {
-        return Ok(false);
+        return Ok(SessionPathIgnore::default());
     };
     let boundary = deepest_existing_ancestor(parent);
     let _guard = if boundary != parent {
@@ -917,7 +971,7 @@ async fn registry_entry_is_ignored(entry: &Path) -> Result<bool> {
     } else {
         None
     };
-    check_ignore_at(entry).await
+    check_ignore_at(context, entry, false, false).await
 }
 
 /// `dir` itself, or the nearest ancestor already on disk. Always returns
@@ -963,45 +1017,110 @@ impl Drop for CreatedDirGuard {
     }
 }
 
-/// `git check-ignore --quiet --no-index -- ./<name>` for `dir`'s own
-/// basename, run with `dir`'s *parent* as the working directory. Four things
-/// ride on asking it exactly that way:
+/// Query a literal tree-relative session path from the containing hasher
+/// tree. Never ask about `.` from inside the candidate: a children-only
+/// wildcard rule can match that spelling. Keep discovery, ignore sources,
+/// and cached paths in the same effective worktree/index view as hashing,
+/// including inherited relative Git routing variables and nested trees.
 ///
-/// - Asked about `.` from inside `dir` itself, `check-ignore` answers against
-///   the literal string `.` rather than `dir`'s repository-relative path, and
-///   a pattern ending in a wildcard (`/sessions/*`) matches that literal --
-///   wrongly reporting `dir` itself excluded by a rule that excludes only its
-///   children. Asking the parent about the plain basename does not have this
-///   failure mode.
-/// - Run from `dir`'s parent, git's own repository discovery still resolves
-///   to whichever repository actually owns `dir` -- a nested one under the
-///   build context included, the same boundary [`hash_git_tree`] honors --
-///   because `dir` and its parent are (barring the parent being a repository
-///   root itself, which a session directory never is) inside the same one.
-///   Asking the *build context's* root about a path across that boundary is
-///   refused by git itself, which is why this cannot run from there instead.
-/// - `--` alone does not make `name` literal: a pathspec beginning with `:`
-///   is "magic" syntax (`:(glob)...`, `:!...`) rather than a path, which `--`
-///   stops git from reading as an *option* but not from reading as *pathspec
-///   magic*. Prefixing it with `./` forces the plain-path reading either way.
-/// - `--no-index` keeps the question off the index entirely: without it, a
-///   basename whose glob pathspec happens to match some unrelated *tracked*
-///   file resolves against that file instead of the untracked directory this
-///   is actually asking about, and a tracked file is answered "not excluded"
-///   unconditionally (tracked content is never subject to exclude rules).
-/// - The four `GIT_*_PATHSPECS` environment variables, inherited from
-///   whatever started outrig, each select a pathspec-magic mode
-///   `check-ignore` does not support at all -- it fails outright (exit 128)
-///   if any is on, this call's own `./` included. Pinned off here so this
-///   probe's own answer does not depend on what the caller's shell exported.
+/// `--no-index` avoids tracked glob matches suppressing a literal answer.
+/// Missing indexed rules are supplied through a disposable worktree with no
+/// tracked-path gate. The four ambient pathspec modes are pinned off, and
+/// `./` prevents leading-colon magic even after `--`.
 ///
-/// The parent must exist. A directory-shaped leaf must also exist so a
-/// directory-only rule (`/sessions/`) can match it; a future file or symlink
-/// leaf need not. See [`directory_is_ignored`] and [`registry_entry_is_ignored`].
-async fn check_ignore_at(dir: &Path) -> Result<bool> {
-    let Some(cmd) = check_ignore_cmd(dir) else {
-        return Ok(false);
+/// A directory-shaped leaf must exist so directory-only rules can match;
+/// future file/symlink leaves remain absent. `created_directory` records
+/// whether the probe created the leaf, for index-safety checks.
+async fn check_ignore_at(
+    context: &Path,
+    dir: &Path,
+    directory: bool,
+    created_directory: bool,
+) -> Result<SessionPathIgnore> {
+    let Some(views) = context_git_trees_at(context, dir).await? else {
+        return Ok(SessionPathIgnore::default());
     };
+    // An entered tree root is itself a visible build input, not an ignored
+    // descendant. This also avoids querying "." under relative routing.
+    if views.entered.iter().any(|tree| tree == dir) {
+        return Ok(SessionPathIgnore::default());
+    }
+    // A parent listing can retain cached ancestors even when a deeper
+    // tree uses a different effective Git worktree. Check every entered
+    // view, not just the final one. Whole-tree probes are already vetoed;
+    // keep their ignore match only to explain the refusal accurately.
+    if views.honors_ignore {
+        // Git's untracked listing treats real embedded repositories as
+        // opaque, even if the outer cached entry used to be a regular file.
+        // A root fabricated solely by GIT_WORK_TREE=. has no such marker:
+        // its parent view can still enumerate future session outputs.
+        let mut delegated = HashSet::new();
+        for nested in views.entered.iter().skip(1) {
+            let marker = process::try_capture(
+                Cmd::new("git")
+                    .arg("-C")
+                    .arg(context)
+                    .args(["rev-parse", "--resolve-git-dir"])
+                    .arg(nested.join(".git")),
+            )
+            .await?;
+            if marker.status.success() {
+                delegated.insert(nested.clone());
+            }
+        }
+        for cached_tree in &views.entered {
+            if session_path_has_tracked_conflict(
+                context,
+                cached_tree,
+                dir,
+                directory,
+                created_directory,
+                &delegated,
+                &views.entered,
+            )
+            .await?
+            {
+                return Ok(SessionPathIgnore::default());
+            }
+        }
+    }
+    for tree in &views.leaves {
+        if !session_path_is_ignored_in_tree(context, tree, dir, directory).await? {
+            return Ok(SessionPathIgnore::default());
+        }
+    }
+    Ok(SessionPathIgnore {
+        ignored: true,
+        honors_ignore: views.honors_ignore,
+    })
+}
+
+/// Ask each terminal route in its own effective worktree/index view.
+async fn session_path_is_ignored_in_tree(
+    context: &Path,
+    tree: &Path,
+    dir: &Path,
+    directory: bool,
+) -> Result<bool> {
+    let relative = dir.strip_prefix(tree).expect("containing hasher tree");
+    if let Some(mut sources) =
+        missing_ignore_sources(tree, &[relative.as_os_str().as_bytes().to_vec()]).await?
+    {
+        // ls-files loads on-disk ancestor rules above a subdirectory
+        // context, but not absent indexed ancestor ignore files. Do not
+        // synthesize rules that its file listing never applies.
+        let root = std::fs::canonicalize(&sources.root).path_ctx("resolve", &sources.root)?;
+        sources
+            .entries
+            .retain(|(rel, ..)| root.join(rel).starts_with(context));
+        if !sources.entries.is_empty() {
+            let ignored =
+                check_literal_path(tree, &sources, relative.as_os_str().as_bytes(), directory)
+                    .await?;
+            return Ok(ignored);
+        }
+    }
+    let cmd = check_ignore_cmd(tree, relative);
     let output = process::try_capture(cmd).await?;
     match output.status.code() {
         // 0: matched, excluded. 1: no rule matched it. Anything else -- no
@@ -1016,33 +1135,118 @@ async fn check_ignore_at(dir: &Path) -> Result<bool> {
     }
 }
 
-/// The command [`check_ignore_at`] runs, split out so its shape -- argv and
-/// the pathspec-magic overrides -- is checkable without a `git` to run it
-/// against. `None` for a `dir` with no parent or no basename (`/`, or an
-/// empty path), which [`check_ignore_at`] reads as "not excluded" the same
-/// as any other answer this cannot get.
-fn check_ignore_cmd(dir: &Path) -> Option<Cmd> {
-    let parent = dir.parent()?;
-    let name = dir.file_name()?;
-    let mut literal_name = OsString::from("./");
-    literal_name.push(name);
-    Some(
+/// Check the index separately from symlink-referent reachability. A missing
+/// session directory with any tracked descendant joins the hashed directory
+/// set when created, even if the tracked leaf stays deleted. Deleted tracked
+/// ancestors below the configured context become whole-tree inputs when
+/// recreated as directories. Cached entries at or above its root are never
+/// visited by the context listing. An existing
+/// directory can retain unrelated deleted entries, but tracked entries at or
+/// beneath file-shaped outputs can change content or fail stat with ENOTDIR.
+/// Session startup owns session.json, outrig-enter, and the entire logs tree;
+/// keep these names in sync with the CLI session store.
+/// The parent exists while check_ignore_at's caller holds its probe guard.
+async fn session_path_has_tracked_conflict(
+    context: &Path,
+    tree: &Path,
+    path: &Path,
+    directory: bool,
+    created_directory: bool,
+    delegated: &HashSet<PathBuf>,
+    checked: &[PathBuf],
+) -> Result<bool> {
+    // Keep both discovery and listing at the containing hasher tree so all
+    // inherited Git routing variables select the same worktree and index.
+    let root = process::run_capture(
         Cmd::new("git")
-            // `check-ignore` supports none of the four pathspec-magic modes
-            // these select and fails outright (exit 128) if the environment
-            // it inherits has turned one on, which this read's own `./`
-            // prefix as much as a caller's pathspec could -- so every one is
-            // pinned off for this call alone, regardless of what outrig's own
-            // process was started with.
+            .arg("-C")
+            .arg(tree)
+            .args(["rev-parse", "--show-toplevel"]),
+    )
+    .await?;
+    let root = PathBuf::from(OsString::from_vec(
+        root.stdout
+            .strip_suffix(b"\n")
+            .unwrap_or(&root.stdout)
+            .to_vec(),
+    ));
+    let root = std::fs::canonicalize(&root).path_ctx("resolve", &root)?;
+    let relative = path.strip_prefix(&root).map_err(|_| {
+        OutrigError::Configuration(format!(
+            "session path {} is outside its Git worktree {}",
+            path.display(),
+            root.display()
+        ))
+    })?;
+    // Selecting the topmost component includes both deleted indexed
+    // ancestors and the candidate subtree. Filter siblings out below.
+    // --full-name makes every result relative to this repository, never an
+    // enclosing repository that might also have tracked this nested tree.
+    let mut pathspec = OsString::from(":(top,literal)");
+    pathspec.push(
+        relative
+            .components()
+            .next()
+            .expect("nonempty session path")
+            .as_os_str(),
+    );
+    let output = process::run_capture(
+        Cmd::new("git")
             .env_hidden("GIT_LITERAL_PATHSPECS", "0")
             .env_hidden("GIT_GLOB_PATHSPECS", "0")
             .env_hidden("GIT_NOGLOB_PATHSPECS", "0")
             .env_hidden("GIT_ICASE_PATHSPECS", "0")
             .arg("-C")
-            .arg(parent)
-            .args(["check-ignore", "--quiet", "--no-index", "--"])
-            .arg(literal_name),
+            .arg(tree)
+            .args(["ls-files", "--cached", "--stage", "--full-name", "-z", "--"])
+            .arg(pathspec),
     )
+    .await?;
+    let owned = ["session.json", "outrig-enter", "logs"].map(|name| relative.join(name));
+    Ok(output
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|rel| !rel.is_empty())
+        .any(|row| {
+            let Some(tab) = row.iter().position(|byte| *byte == b'\t') else {
+                return false;
+            };
+            let tracked = Path::new(OsStr::from_bytes(&row[tab + 1..]));
+            // A tracked ancestor is walked whole after it becomes a
+            // directory, exposing even otherwise ignored session writes,
+            // but only when the configured context's listing can visit it.
+            let tracked_path = root.join(tracked);
+            (relative.starts_with(tracked)
+                && tracked_path != context
+                && tracked_path.starts_with(context)
+                // Gitlinks and real embedded repositories delegate. A
+                // synthetic worktree root alone does not hide the parent's
+                // untracked inputs.
+                && !(row.starts_with(b"160000 ")
+                    && tracked != relative
+                    && checked.contains(&tracked_path))
+                && !delegated.contains(&tracked_path))
+                || (tracked.starts_with(relative)
+                    && (!directory
+                        || created_directory
+                        || owned.iter().any(|output| tracked.starts_with(output))))
+        }))
+}
+
+/// The literal-path command used by [`check_ignore_at`], split out so its
+/// argv and pathspec-mode overrides can be checked independently of Git.
+fn check_ignore_cmd(tree: &Path, relative: &Path) -> Cmd {
+    let mut literal_name = OsString::from("./");
+    literal_name.push(relative.as_os_str());
+    Cmd::new("git")
+        .env_hidden("GIT_LITERAL_PATHSPECS", "0")
+        .env_hidden("GIT_GLOB_PATHSPECS", "0")
+        .env_hidden("GIT_NOGLOB_PATHSPECS", "0")
+        .env_hidden("GIT_ICASE_PATHSPECS", "0")
+        .arg("-C")
+        .arg(tree)
+        .args(["check-ignore", "--quiet", "--no-index", "--"])
+        .arg(literal_name)
 }
 
 /// Returns `true` iff `tag` already exists in buildah's local image store.
@@ -2491,7 +2695,7 @@ async fn ignored_directories(tree: &Path, listing: &[Vec<u8>]) -> Result<HashSet
         check_ignored_directories(tree, &ordinary, Some(&index)).await?
     };
     for rel in unusual {
-        if check_literal_directory(tree, &sources, &rel).await? {
+        if check_literal_path(tree, &sources, &rel, true).await? {
             ignored.insert(rel);
         }
     }
@@ -2696,11 +2900,13 @@ async fn run_git_with_input(cmd: Cmd, input: &[u8], tree: &Path) -> Result<std::
 /// Reproduce the candidate's ancestor ignore files in a disposable worktree
 /// and ask Git with `--no-index`: the full rule precedence is retained, but
 /// there are no indexed paths to match the name. This rare route never writes
-/// the real worktree or its index.
-async fn check_literal_directory(
+/// the real worktree or its index. Session admission also uses this for its
+/// single candidate, which can be directory-shaped or a future file/symlink.
+async fn check_literal_path(
     tree: &Path,
     sources: &MissingIgnoreSources,
     rel: &[u8],
+    directory: bool,
 ) -> Result<bool> {
     let original_root = std::fs::canonicalize(&sources.root).path_ctx("resolve", &sources.root)?;
     let original_tree = std::fs::canonicalize(tree).path_ctx("resolve", tree)?;
@@ -2827,9 +3033,12 @@ async fn check_literal_directory(
         }
     }
     cmd = cmd.args(["check-ignore", "--no-index", "-z", "--stdin"]);
-    // Directory-only rules need a directory-shaped candidate on disk.
-    let candidate = temp.path().join(relative);
-    std::fs::create_dir_all(&candidate).path_ctx("create directory", &candidate)?;
+    // Directory-only rules need a directory-shaped candidate on disk. For
+    // a future registry symlink, leave the leaf absent (file-shaped).
+    if directory {
+        let candidate = temp.path().join(relative);
+        std::fs::create_dir_all(&candidate).path_ctx("create directory", &candidate)?;
+    }
     let path = relative.as_os_str().as_bytes().to_vec();
     Ok(
         query_ignored_paths(cmd, std::slice::from_ref(&path), temp.path())
