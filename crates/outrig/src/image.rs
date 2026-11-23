@@ -709,11 +709,13 @@ async fn refuse_session_path_in_build_context(
         }
         return Ok(());
     }
+    let git_context = is_git_context(&context_canon).await?;
     Err(if directory {
         OutrigError::SessionDirInBuildContext {
             image: image.to_string(),
             dir: session_path.to_path_buf(),
             context,
+            git_context,
             whole_tree: ignored,
         }
     } else {
@@ -721,6 +723,7 @@ async fn refuse_session_path_in_build_context(
             image: image.to_string(),
             entry: session_path.to_path_buf(),
             context,
+            git_context,
             whole_tree: ignored,
         }
     })

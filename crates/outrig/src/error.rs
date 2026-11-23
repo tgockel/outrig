@@ -211,7 +211,7 @@ pub enum OutrigError {
     #[error(
         "session directory {} is inside the build context {} for image-config {image:?}, and \
          {reason}\n\
-         help: pass --session-dir or --session-root outside the build context, or {remedy}",
+         help: pass --session-dir or --session-root outside the build context{remedy}",
         dir.display(),
         context.display(),
         reason = if *whole_tree {
@@ -219,10 +219,12 @@ pub enum OutrigError {
         } else {
             "nothing excludes it there"
         },
-        remedy = if *whole_tree {
-            "retain a non-ignored input in the affected context tree so ignore rules apply"
+        remedy = if !*git_context {
+            ""
+        } else if *whole_tree {
+            ", or retain a non-ignored input in the affected context tree so ignore rules apply"
         } else {
-            "add it to .gitignore and retain a non-ignored input in the affected context tree \
+            ", or add it to .gitignore and retain a non-ignored input in the affected context tree \
              so ignore rules apply"
         }
     )]
@@ -231,6 +233,8 @@ pub enum OutrigError {
         image: String,
         dir: PathBuf,
         context: PathBuf,
+        /// The build context has an owning Git repository, so ignore rules can apply.
+        git_context: bool,
         /// An ignore match was overridden by whole-tree hashing.
         whole_tree: bool,
     },
@@ -240,7 +244,7 @@ pub enum OutrigError {
     #[error(
         "session registry entry {} is inside the build context {} for image-config {image:?}, \
          and {reason}\n\
-         help: pass --session-root outside the build context, or {remedy}",
+         help: pass --session-root outside the build context{remedy}",
         entry.display(),
         context.display(),
         reason = if *whole_tree {
@@ -248,10 +252,12 @@ pub enum OutrigError {
         } else {
             "nothing excludes it there"
         },
-        remedy = if *whole_tree {
-            "retain a non-ignored input in the affected context tree so ignore rules apply"
+        remedy = if !*git_context {
+            ""
+        } else if *whole_tree {
+            ", or retain a non-ignored input in the affected context tree so ignore rules apply"
         } else {
-            "ignore its file-shaped entries in .gitignore (a directory-only rule does not \
+            ", or ignore its file-shaped entries in .gitignore (a directory-only rule does not \
              exclude registry symlinks) and retain a non-ignored input in the affected context \
              tree so ignore rules apply"
         }
@@ -261,6 +267,8 @@ pub enum OutrigError {
         image: String,
         entry: PathBuf,
         context: PathBuf,
+        /// The build context has an owning Git repository, so ignore rules can apply.
+        git_context: bool,
         /// An ignore match was overridden by whole-tree hashing.
         whole_tree: bool,
     },

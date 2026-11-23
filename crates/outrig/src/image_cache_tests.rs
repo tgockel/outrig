@@ -2434,11 +2434,83 @@ async fn refuse_session_dir_refuses_inside_a_non_git_context() {
     assert!(
         matches!(
             &err,
-            OutrigError::SessionDirInBuildContext { image, dir: d, context, whole_tree: false }
+            OutrigError::SessionDirInBuildContext { image, dir: d, context, git_context: false, whole_tree: false }
                 if image == "tool" && d == &dir && context == &ctx_canon
         ),
         "got {err}"
     );
+}
+
+/// #1022: ignore files have no effect outside Git. Both refusals must offer
+/// relocation alone, even after the user adds the previously suggested rule.
+#[tokio::test]
+async fn session_path_non_git_remedy_only_offers_relocation() {
+    for ignore in [None, Some("/sessions/\n/registry/\n")] {
+        let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+        if let Some(ignore) = ignore {
+            std::fs::write(ctx.path().join(".gitignore"), ignore).unwrap();
+        }
+        let root = std::fs::canonicalize(ctx.path()).unwrap();
+        let cfg = session_dir_test_cfg(&root);
+        let dir = root.join("sessions/auto123");
+        let entry = root.join("registry/auto123");
+        let errors = [
+            refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+                .await
+                .expect_err("non-Git session directory must be refused"),
+            super::refuse_session_registry_entry_in_build_context(
+                "tool",
+                &cfg,
+                Path::new("/"),
+                &entry,
+                &entry,
+            )
+            .await
+            .expect_err("non-Git registry entry must be refused"),
+        ];
+        for (err, relocation) in errors
+            .into_iter()
+            .zip(["--session-dir or --session-root", "--session-root"])
+        {
+            let message = err.to_string();
+            assert_eq!(
+                message.split_once("help: ").unwrap().1,
+                format!("pass {relocation} outside the build context"),
+                "{message}",
+            );
+        }
+    }
+}
+
+/// A build context inherits Git ownership from an ancestor, and still offers
+/// the ignore remedy even without a `.git` entry at the context root (#1022).
+#[tokio::test]
+async fn session_path_nested_git_context_retains_ignore_remedy() {
+    let repo = make_ctx(&[("context/Dockerfile", "FROM alpine\n")]);
+    git_init(repo.path());
+    let root = std::fs::canonicalize(repo.path().join("context")).unwrap();
+    let cfg = session_dir_test_cfg(&root);
+    let dir = root.join("sessions/auto123");
+    let entry = root.join("registry/auto123");
+    let errors = [
+        refuse_session_dir_in_build_context("tool", &cfg, Path::new("/"), &dir, &dir)
+            .await
+            .expect_err("unignored session directory must be refused"),
+        super::refuse_session_registry_entry_in_build_context(
+            "tool",
+            &cfg,
+            Path::new("/"),
+            &entry,
+            &entry,
+        )
+        .await
+        .expect_err("unignored registry entry must be refused"),
+    ];
+    for err in errors {
+        let message = err.to_string();
+        assert!(message.contains(".gitignore"), "{message}");
+        assert!(message.contains("retain a non-ignored input"), "{message}");
+    }
 }
 
 /// #909: an explicit `--session-dir` landing exactly on the context root is

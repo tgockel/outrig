@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Session-path build-context refusals outside Git now offer only relocation, rather than
+  ineffective `.gitignore` advice. Git contexts retain their ignore remedies. (#1022)
+
 - Directory swaps on the path of a copied symlink are now detected even under ignored
   directories or `.git`, preventing a restored context from caching the replacement image
   under the original key. Adding or removing an entry directly in a traversed directory

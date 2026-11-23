@@ -73,10 +73,22 @@ async fn external_session_checks_the_registry_entry_before_creation() {
         if collision {
             assert!(stderr.contains("session registry entry"), "{stderr}");
             assert!(stderr.contains("pass --session-root outside"), "{stderr}");
-            assert!(
-                stderr.contains("file-shaped entries in .gitignore"),
-                "{stderr}"
-            );
+            if git {
+                assert!(
+                    stderr.contains("file-shaped entries in .gitignore"),
+                    "{stderr}"
+                );
+                assert!(stderr.contains("retain a non-ignored input"), "{stderr}");
+            } else {
+                assert!(
+                    stderr.lines().any(|line| {
+                        line.trim() == "help: pass --session-root outside the build context"
+                    }),
+                    "{stderr}"
+                );
+                assert!(!stderr.contains(".gitignore"), "{stderr}");
+                assert!(!stderr.contains("retain a non-ignored input"), "{stderr}");
+            }
             assert!(!stderr.contains("--session-dir"), "{stderr}");
             assert!(stderr.contains(&format!("{}/", root.display())), "{stderr}");
             assert!(!stderr.contains("computing image tag"), "{stderr}");
