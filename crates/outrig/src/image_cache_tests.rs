@@ -2156,6 +2156,108 @@ async fn a_link_re_pointed_and_put_back_under_an_ignored_directory_is_refused() 
     );
 }
 
+/// A rename of an ancestor leaves the referent's bytes and metadata alone.
+/// Even ancestors skipped by the git walk must witness a swap across `COPY`.
+#[tokio::test]
+async fn a_directory_swapped_and_put_back_on_a_link_path_is_refused() {
+    for (referent, swapped) in [
+        ("hidden/current/f", "hidden/current"),
+        ("hidden/a/b/f", "hidden/a"),
+        ("hidden/a/b/f", "hidden/a/b"),
+        (".git/probe/f", ".git/probe"),
+    ] {
+        let ctx = make_ctx(&[
+            ("Dockerfile", "FROM alpine\nCOPY cfg /cfg\n"),
+            (".gitignore", "/hidden/\n"),
+        ]);
+        git_init(ctx.path());
+        let payload = ctx.path().join(referent);
+        std::fs::create_dir_all(payload.parent().unwrap()).expect("mkdir referent parent");
+        std::fs::write(&payload, "original\n").expect("write original");
+        std::os::unix::fs::symlink(referent, ctx.path().join("cfg")).expect("link cfg");
+        let cfg = build_cfg(ctx.path());
+        let no_args = BTreeMap::new();
+        let tag = compute_tag_for("coding", &cfg, Path::new(""))
+            .await
+            .expect("compute_tag_for");
+        let before = key_before_build("coding", &cfg, Path::new(""), &no_args, &tag)
+            .await
+            .expect("key_before_build");
+
+        std::thread::sleep(TIMESTAMP_TICK);
+        let current = ctx.path().join(swapped);
+        let aside = current.with_file_name("aside");
+        std::fs::rename(&current, &aside).expect("move original aside");
+        std::fs::create_dir_all(payload.parent().unwrap()).expect("mkdir replacement parent");
+        std::fs::write(&payload, "replacement\n").expect("write replacement");
+        assert_eq!(
+            std::fs::read(ctx.path().join("cfg")).unwrap(),
+            b"replacement\n"
+        );
+        std::fs::remove_dir_all(&current).expect("drop replacement");
+        std::fs::rename(&aside, &current).expect("put original back");
+        assert_eq!(
+            std::fs::read(ctx.path().join("cfg")).unwrap(),
+            b"original\n"
+        );
+        assert_eq!(
+            tag,
+            compute_tag_for("coding", &cfg, Path::new(""))
+                .await
+                .unwrap(),
+            "the restored content keeps its key"
+        );
+
+        let err = ensure_key_still_holds("coding", &cfg, Path::new(""), &no_args, &tag, &before)
+            .await
+            .expect_err("a directory a COPY went through, swapped and put back, is refused");
+        assert!(
+            matches!(err, OutrigError::BuildContextChanged { .. }),
+            "swapped {swapped}: got {err}"
+        );
+    }
+}
+
+/// Stamping a link's ancestors does not hash their unrelated descendants.
+/// Only adding or removing an entry directly on the path costs a rebuild.
+#[tokio::test]
+async fn unrelated_writes_beside_a_link_referent_do_not_refuse_a_build() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\nCOPY cfg /cfg\n"),
+        (".gitignore", "/hidden/\n"),
+        ("hidden/current/f", "original\n"),
+        ("hidden/current/sibling", "one\n"),
+        ("hidden/current/sub/f", "one\n"),
+    ]);
+    std::os::unix::fs::symlink("hidden/current/f", ctx.path().join("cfg")).expect("link cfg");
+    git_init(ctx.path());
+    let cfg = build_cfg(ctx.path());
+    let no_args = BTreeMap::new();
+    let tag = compute_tag_for("coding", &cfg, Path::new(""))
+        .await
+        .unwrap();
+    let before = key_before_build("coding", &cfg, Path::new(""), &no_args, &tag)
+        .await
+        .unwrap();
+
+    std::thread::sleep(TIMESTAMP_TICK);
+    std::fs::write(ctx.path().join("hidden/current/sibling"), "two\n").unwrap();
+    std::fs::write(ctx.path().join("hidden/current/sub/new"), "new\n").unwrap();
+    ensure_key_still_holds("coding", &cfg, Path::new(""), &no_args, &tag, &before)
+        .await
+        .expect("rewriting a sibling or adding an entry off the link path is allowed");
+
+    std::fs::write(ctx.path().join("hidden/current/new"), "new\n").unwrap();
+    std::fs::remove_file(ctx.path().join("hidden/current/new")).unwrap();
+    let err = ensure_key_still_holds("coding", &cfg, Path::new(""), &no_args, &tag, &before)
+        .await
+        .expect_err("an entry added and removed directly on the link path is refused");
+    assert!(
+        matches!(err, OutrigError::BuildContextChanged { .. }),
+        "got {err}"
+    );
+}
+
 /// A Dockerfile in the context that links outside it is stamped as buildah opens it, through
 /// the link, as well as the context walk stamps the link itself.
 #[tokio::test]

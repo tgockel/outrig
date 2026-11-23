@@ -165,3 +165,114 @@ async fn a_context_edited_mid_build_is_not_tagged_under_the_old_key() {
         .args(["rmi", rebuilt.tag.as_str()])
         .output();
 }
+
+/// The key is restored before the build ends, but `COPY` took a replacement
+/// directory under an ignored ancestor (#1016). Stamps must refuse that image.
+#[tokio::test]
+async fn a_link_ancestor_swapped_mid_build_is_not_tagged_under_the_old_key() {
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = dir.path();
+    let marker = ctx.file_name().unwrap().to_str().unwrap();
+    std::fs::create_dir_all(ctx.join("hidden/current")).expect("mkdir current");
+    std::fs::create_dir(ctx.join("hidden/control")).expect("mkdir control");
+    std::fs::write(ctx.join("hidden/current/f"), "original\n").expect("write original");
+    std::fs::write(ctx.join(".gitignore"), "/hidden/\n").expect("write ignore");
+    std::os::unix::fs::symlink("hidden/current/f", ctx.join("cfg")).expect("link cfg");
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        format!(
+            "FROM docker.io/library/alpine:latest\n# cache-bust: {marker}\n\
+             RUN --mount=type=bind,source=hidden/control,target=/control \
+                 echo outrig-swap-ready && \
+                 while [ ! -e /control/swapped ]; do sleep 0.05; done\n\
+             COPY cfg /cfg\n\
+             RUN --mount=type=bind,source=hidden/control,target=/control \
+                 test \"$(cat /cfg)\" = replacement && echo outrig-copy-done && \
+                 while [ ! -e /control/restored ]; do sleep 0.05; done\n",
+        ),
+    )
+    .expect("write Dockerfile");
+    let init = std::process::Command::new("git")
+        .arg("-C")
+        .arg(ctx)
+        .args(["init", "-q"])
+        .status()
+        .expect("git init");
+    assert!(init.success());
+
+    // The read-only bind mount exposes host acknowledgments without letting
+    // RUN write into the context. Control entries are ignored and off cfg's
+    // ancestor path, so the handshake itself does not invalidate its stamps.
+    let logs = tempfile::tempdir().expect("logs tempdir");
+    let log = logs.path().join("build.log");
+    let transcript = outrig::Transcript::create(&log, false)
+        .await
+        .expect("transcript");
+    let cfg = common::fixture_build_config();
+    let original = image::compute_tag(&cfg, ctx).await.expect("compute_tag");
+    let wait_for = |marker: &'static str| {
+        let log = &log;
+        async move {
+            let expected = format!("[buildah] {marker}");
+            loop {
+                let output = tokio::fs::read_to_string(log)
+                    .await
+                    .expect("read transcript");
+                // Match actual RUN output, not the STEP echo of its command.
+                if output.lines().any(|line| line == expected) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    let swap = async {
+        wait_for("outrig-swap-ready").await;
+        std::fs::rename(ctx.join("hidden/current"), ctx.join("hidden/aside"))
+            .expect("move original aside");
+        std::fs::create_dir(ctx.join("hidden/current")).expect("mkdir replacement");
+        std::fs::write(ctx.join("hidden/current/f"), "replacement\n").expect("write replacement");
+        std::fs::write(ctx.join("hidden/control/swapped"), "").expect("release COPY");
+        wait_for("outrig-copy-done").await;
+        std::fs::remove_dir_all(ctx.join("hidden/current")).expect("drop replacement");
+        std::fs::rename(ctx.join("hidden/aside"), ctx.join("hidden/current"))
+            .expect("put original back");
+        std::fs::write(ctx.join("hidden/control/restored"), "").expect("release final RUN");
+    };
+    let run = async {
+        // Use the logged entry point to observe each RUN while it is blocked
+        // on its acknowledgment. The tag uses the same unnamed cache repo.
+        let build = image::ensure_tagged_image_for(
+            "outrig-cache",
+            &cfg,
+            ctx,
+            &original,
+            false,
+            Some(&transcript),
+        );
+        tokio::pin!(build);
+        tokio::select! {
+            built = &mut build => panic!("build finished before the COPY handshake: {built:?}"),
+            () = swap => build.await,
+        }
+    };
+    // This deadline detects hangs; no phase advances based on elapsed time.
+    // Drop and reap a timed-out build before reporting the failure.
+    let built = image::with_build_cleanup(tokio::time::timeout(Duration::from_secs(300), run))
+        .await
+        .expect("timed out waiting for the COPY handshake and build");
+    assert_eq!(image::compute_tag(&cfg, ctx).await.unwrap(), original);
+    let err = built.expect_err("the image holding the replacement must not be cached");
+    assert!(
+        matches!(&err, OutrigError::BuildContextChanged { tag, .. } if tag == original.as_str()),
+        "expected BuildContextChanged for {original}, got {err}"
+    );
+    assert!(
+        !image::probe_cached(&original)
+            .await
+            .expect("probe original key"),
+        "{original} must not exist after a refused build"
+    );
+}

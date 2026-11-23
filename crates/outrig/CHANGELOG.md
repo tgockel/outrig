@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Directory swaps on the path of a copied symlink are now detected even under ignored
+  directories or `.git`, preventing a restored context from caching the replacement image
+  under the original key. Adding or removing an entry directly in a traversed directory
+  also refuses the build; unrelated ignored descendants remain unstamped. (#1016)
+
 - An unignored `sessions/` directory stays in the build cache key when its new, ignored
   children make Git report the directory as excluded; auto sessions no longer trigger a
   false `BuildContextChanged` before building. The ignored-directory check also honors absent

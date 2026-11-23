@@ -3332,9 +3332,11 @@ fn hash_file(path: &Path) -> Result<blake3::Hash> {
 /// link's directory first -- is cleaned before any of it is resolved, so
 /// `alias/..` cancels even where `alias` is itself a link, and a component
 /// that is not there is kept as written. `None` past buildah's limit on links
-/// followed -- a loop. Each link followed is recorded in `stamps`, wherever
-/// it is: one under an ignored directory is no part of the key, yet
-/// re-pointing it changes what the `COPY` of a link through it copies.
+/// followed -- a loop. Each link and real directory traversed is recorded
+/// in `stamps`, wherever it is: one under an ignored directory is no part of
+/// the key, yet swapping it out and back can change what a `COPY` through it
+/// copies. Stamping those directories also refuses entries added or removed
+/// directly in them, but does not stamp unrelated descendants.
 fn resolve_in_context(ctx: &Path, rel: &Path, stamps: &mut Stamps) -> Option<PathBuf> {
     // buildah's maxLoopsFollowed.
     const MAX_LINKS: usize = 64;
@@ -3355,6 +3357,9 @@ fn resolve_in_context(ctx: &Path, rel: &Path, stamps: &mut Stamps) -> Option<Pat
         let next = resolved.join(&name);
         let path = ctx.join(&next);
         let Ok(target) = std::fs::read_link(&path) else {
+            if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                stamps.record(&path, &meta);
+            }
             resolved = next;
             continue;
         };
