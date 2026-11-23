@@ -230,7 +230,11 @@ fn resolve_target(args: &DiscardArgs, store: &SessionStore) -> Result<Target> {
                 .list()?
                 .dangling
                 .into_iter()
-                .filter(|d| d.target == dir)
+                .filter(|d| {
+                    // Compare resolved paths, but keep the original target for
+                    // `unlink_dangling` to revalidate the link before removal.
+                    crate::paths::canonical_or_normalized(&d.target).is_ok_and(|target| target == dir)
+                })
                 .collect();
             let Some(first) = links.first() else {
                 return Err(OutrigError::Configuration(format!(

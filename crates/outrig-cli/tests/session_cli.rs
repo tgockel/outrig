@@ -3154,6 +3154,36 @@ async fn discard_session_dir_removes_links_to_a_gone_directory() {
     assert!(!link_exists(&store, &sid));
 }
 
+/// #1012: the link retains `..` even though the missing argument is normalized.
+#[tokio::test]
+async fn discard_session_dir_removes_a_relative_link_to_a_gone_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = dangling_session(tmp.path());
+    let link = store.symlink_path(&sid);
+    std::fs::remove_file(&link).expect("remove absolute registration");
+    std::os::unix::fs::symlink("../scratch/run-x", &link).expect("relative registration");
+
+    let (mut ew, stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_dir(&dir, true);
+    let rc = discard::execute_with(&mut ew, stdin, &store, &args, |name| async move {
+        assert_eq!(name, "outrig-20260501T141907-9b1c");
+        Ok(false)
+    })
+    .await
+    .expect("discard relative dangling registration");
+    drop(ew);
+
+    assert_eq!(rc, 0);
+    assert!(!link_exists(&store, &sid));
+    assert!(!dir.exists());
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains(&format!("removed {} (symlink to missing ", link.display())),
+        "{err}"
+    );
+}
+
 #[tokio::test]
 async fn discard_session_dir_that_never_existed_is_an_error() {
     let tmp = tempfile::tempdir().expect("tempdir");
