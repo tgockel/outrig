@@ -19,6 +19,9 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **Host programs can supply skills.** `HostProgram::skill_source` shares ordered sources with
+  every session the program enters, with per-session discovery and shadowing diagnostics. (#698)
+
 - **Child-round retries are recorded.** `agent.round.retry` names the failed round, wait,
   failure and model request before the runner backs off, and says whether the round's code
   ran, so its work stands rather than reopening with the same opening. The round number

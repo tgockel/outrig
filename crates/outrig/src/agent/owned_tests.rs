@@ -209,6 +209,101 @@ asyncio.run(main())
     );
 }
 
+/// Every session inherits the program's sources: child code imports project and user skills,
+/// the project wins a shared name, and discovery reports the shadowed user copy each time.
+#[tokio::test]
+async fn a_programs_children_import_its_skill_sources_in_precedence_order() {
+    use crate::harness::DirectorySource;
+
+    let bed = Bed::new();
+    let project = bed.repo.join(".agents/skills");
+    let user = bed.dir.join("home/.agents/skills");
+    for (root, name, value) in [
+        (&project, "shared", "project"),
+        (&project, "project-only", "project-only"),
+        (&user, "shared", "shadowed"),
+        (&user, "user-only", "user-only"),
+    ] {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: The {name} skill.\n---\nInstructions.\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("skill.py"), format!("VALUE = {value:?}\n")).unwrap();
+    }
+    let var = "OUTRIG_TEST_OWNED_SKILL_SOURCES";
+    let (addr, requests, gauge) = mock_http::routed(
+        vec![(
+            "ROLE reader",
+            ready_then(serving(&py(r#"
+            import importlib, outrig
+            d = await runtime.channels['explain'].receive()
+            names = sorted(outrig.skills.catalog())
+            values = [importlib.import_module(f"outrig_skills.{name.replace('-', '_')}.skill").VALUE
+                      for name in names]
+            await d.reply(','.join(values))
+        "#))),
+        )],
+        None,
+    )
+    .await;
+    bed.write(
+        "skills.py",
+        &format!(
+            r#"
+import asyncio, json, outrig
+{READER}
+async def main():
+    for _ in range(2):
+        async with outrig.Session():
+            async with ProjectReader() as agent:
+                print(json.dumps(await agent.explain("skills")), flush=True)
+asyncio.run(main())
+"#
+        ),
+    );
+    let config = configured(&bed, addr, var, "");
+    let sessions = Sessions {
+        secrets: Some(Arc::new(keyed(var))),
+        ..bed.sessions()
+    };
+    let program = bed
+        .start("skills.py", config, sessions, |p| {
+            p.skill_source(
+                "project",
+                DirectorySource::within(&bed.repo, ".agents/skills"),
+            )
+            .skill_source("user", DirectorySource::new(user))
+        })
+        .await;
+    let (ran, records, _) = Owned {
+        bed,
+        program,
+        requests,
+        gauge,
+    }
+    .finish()
+    .await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    assert_eq!(ran.json(), vec![json!("project-only,project,user-only"); 2]);
+    let discoveries = of_kind(&records, "skill.discovered");
+    assert_eq!(discoveries.len(), 2, "one discovery per session");
+    for discovery in discoveries {
+        assert_eq!(discovery["skills"].as_array().unwrap().len(), 3);
+        let shadowed: Vec<_> = discovery["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| d["code"] == "shadowed")
+            .collect();
+        assert_eq!(shadowed.len(), 1, "{discovery}");
+        assert_eq!(shadowed[0]["skill"], "shared");
+        assert_eq!(shadowed[0]["source"], "user");
+    }
+}
+
 /// A host program's class that defines `__outrig_instructions__`: the hook runs once, in the
 /// program, and its sections cross with the declaration, appear in the child's instructions after
 /// the docstring as returned, and are listed by the start event; a class whose hook returns a

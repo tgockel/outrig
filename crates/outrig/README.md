@@ -23,7 +23,10 @@ library crate. It does two things:
   [`harness::SkillSource`]s it is given, each skill's files fetched from the host as the
   agent's code imports or reads them, with nothing mounted for them; a user's `/name`, sent with
   [`harness::UserChannel::send_directive`], asks the agent to run one, which its code does with
-  `outrig.skills.invoke`.
+  `outrig.skills.invoke`. [`harness::HostProgram::skill_source`] supplies ordered sources to
+  every session a host program enters; library callers get no implicit sources. The CLI supplies
+  `.agents/skills` in the repository and then `~/.agents/skills` for both interactive sessions and
+  host programs, with the repository's copy winning a shared name.
 
 The `outrig` command-line tool lives in the companion
 [`outrig-cli`](https://crates.io/crates/outrig-cli) crate.

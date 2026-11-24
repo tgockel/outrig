@@ -67,6 +67,9 @@ pub async fn execute(
         cfg.default_image = Some(name.to_string());
     }
     let mut host = HostProgram::new(cfg, script).repo_root(&repo.root).args(args);
+    for (name, source) in super::skills::sources(&repo.root) {
+        host = host.skill_source(name, source);
+    }
     if let Some(secs) = grace {
         host = host.grace(Duration::from_secs(secs));
     }

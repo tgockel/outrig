@@ -74,7 +74,7 @@ use tokio_util::sync::CancellationToken;
 use self::program::Forward;
 use crate::config::{Config, LlmProvider};
 use crate::error::OutrigError;
-use crate::harness::{ShutdownReport, Stopped, Verdict, chosen_repo_root};
+use crate::harness::{ShutdownReport, SkillSource, Stopped, Verdict, chosen_repo_root};
 use crate::python::program::{Launched, Spec, cannot_run, launch};
 
 /// A trusted Python program to run on the host, under the Python OutRig carries, as
@@ -90,15 +90,35 @@ use crate::python::program::{Launched, Spec, cannot_run, launch};
 /// It leads a process group of its own, and ends with this process: killed, this process takes
 /// the program's group with it. It does not read the terminal, which its group does not hold;
 /// a read from it fails.
-#[derive(Debug)]
 pub struct HostProgram {
     config: Config,
     script: PathBuf,
     args: Vec<OsString>,
     repo_root: Option<PathBuf>,
     grace: Option<Duration>,
+    skill_sources: Vec<(String, Arc<dyn SkillSource>)>,
     #[cfg(test)]
     testing: tests::Testing,
+}
+
+impl std::fmt::Debug for HostProgram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostProgram")
+            .field("config", &self.config)
+            .field("script", &self.script)
+            .field("args", &self.args)
+            .field("repo_root", &self.repo_root)
+            .field("grace", &self.grace)
+            .field(
+                "skill_sources",
+                &self
+                    .skill_sources
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl HostProgram {
@@ -116,6 +136,7 @@ impl HostProgram {
             args: Vec::new(),
             repo_root: None,
             grace: None,
+            skill_sources: Vec::new(),
             #[cfg(test)]
             testing: tests::Testing::default(),
         }
@@ -135,6 +156,22 @@ impl HostProgram {
     /// resolves against; the working directory when not given.
     pub fn repo_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.repo_root = Some(root.into());
+        self
+    }
+
+    /// Serve the skills `source` holds in every session the program enters. Sources rank in
+    /// the order given, as with [`crate::harness::SessionBuilder::skill_source`]: the first
+    /// copy of a skill wins, and later copies are reported as shadowed. An empty or duplicate
+    /// source name fails each session's start.
+    ///
+    /// No sources are supplied by default. The source is shared across sessions, but each
+    /// session discovers its skills anew and publishes its own `skill.discovered` event.
+    pub fn skill_source(
+        mut self,
+        name: impl Into<String>,
+        source: impl SkillSource + 'static,
+    ) -> Self {
+        self.skill_sources.push((name.into(), Arc::new(source)));
         self
     }
 
@@ -192,6 +229,7 @@ impl HostProgram {
         #[cfg(test)]
         let live = sessions.live.clone();
         let context = Arc::new(session::Context {
+            skill_sources: self.skill_sources,
             config: self.config,
             repo_root,
             shutdowns: Arc::clone(&shutdowns),

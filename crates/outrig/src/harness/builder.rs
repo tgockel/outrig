@@ -443,12 +443,17 @@ impl SessionBuilder {
     /// run, and the primary agent is told the skills by name and description.
     /// A skill's files reach the container only as its code imports or opens
     /// them, and nothing is mounted for them.
-    pub fn skill_source(
+    pub fn skill_source(self, name: impl Into<String>, source: impl SkillSource + 'static) -> Self {
+        self.shared_skill_source(name.into(), Arc::new(source))
+    }
+
+    /// Share a program's source with one of its sessions, retaining the declared precedence.
+    pub(crate) fn shared_skill_source(
         mut self,
-        name: impl Into<String>,
-        source: impl SkillSource + 'static,
+        name: String,
+        source: Arc<dyn SkillSource>,
     ) -> Self {
-        self.skill_sources.push((name.into(), Arc::new(source)));
+        self.skill_sources.push((name, source));
         self
     }
 
@@ -1124,6 +1129,8 @@ impl SessionBuilder {
     /// id is `test`.
     #[cfg(test)]
     pub(crate) async fn start_on_host(mut self) -> Result<Session, SessionError> {
+        skills::check_sources(&self.skill_sources)
+            .map_err(|e| start_error(OutrigError::Configuration(e)))?;
         let mut resolved = self.resolution()?;
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         services::check_names(&declared, &self.served).map_err(start_error)?;

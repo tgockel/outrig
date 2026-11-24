@@ -41,12 +41,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use clap::Parser;
-use directories::BaseDirs;
 use nix::fcntl::{Flock, FlockArg};
 use outrig::config::{Config, EnvSecrets, EventsMode, HOST_GRACE_SECS_CEILING, ImageConfig};
 use outrig::error::IoPathExt;
 use outrig::harness::{
-    self, DEFAULT_DRAIN, DirectorySource, McpOutcomeKind, McpServiceOutcome, Progress,
+    self, DEFAULT_DRAIN, McpOutcomeKind, McpServiceOutcome, Progress,
     SessionBuilder, Step, Verdict,
 };
 use outrig::image::{self, BuildOutput, ImageTag};
@@ -193,11 +192,9 @@ pub async fn execute(
         .secrets(EnvSecrets)
         .repo_root(&repo_root)
         .approver(approve::TerminalApprover)
-        .progress(progress_lines(say.clone()))
-        .skill_source("project", DirectorySource::within(&repo_root, SKILLS_DIR));
-    let home = BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
-    if let Some(home) = user_skills_home(&repo_root, home) {
-        builder = builder.skill_source("user", DirectorySource::new(home.join(SKILLS_DIR)));
+        .progress(progress_lines(say.clone()));
+    for (name, source) in super::skills::sources(&repo_root) {
+        builder = builder.skill_source(name, source);
     }
     if matches!(cfg.events.mode(), EventsMode::Record) {
         builder = builder.record_events();
@@ -421,22 +418,6 @@ impl Terminals {
 fn hangup_behind(signal: Option<EndSignal>, started: Terminals) -> Option<EndSignal> {
     let streams: [&dyn Stream; 3] = [&std::io::stdin(), &std::io::stdout(), &std::io::stderr()];
     signal.or_else(|| started.hung_up(streams).then_some(EndSignal::Hangup))
-}
-
-/// Where skills live, beneath a repository and beneath a home directory.
-const SKILLS_DIR: &str = ".agents/skills";
-
-/// The home directory whose `.agents/skills` holds the user's skills, served
-/// after the repository's: none when there is no home, or when the home is the
-/// repository root, whose `.agents/skills` the project's source already
-/// serves.
-fn user_skills_home(repo_root: &Path, home: Option<PathBuf>) -> Option<PathBuf> {
-    let home = home?;
-    let same = match (std::fs::canonicalize(&home), std::fs::canonicalize(repo_root)) {
-        (Ok(home), Ok(root)) => home == root,
-        _ => home == repo_root,
-    };
-    (!same).then_some(home)
 }
 
 /// The conversation: on the screen when the terminal can hold one, and in
@@ -976,23 +957,6 @@ mod tests {
             !unrelated.hung_up(all()),
             "a terminal that is not this process's own"
         );
-    }
-
-    /// The user's skills are served after the project's, from the home directory, unless the
-    /// repository is the home directory -- reached through a link or not -- whose
-    /// `.agents/skills` the project's source already serves.
-    #[test]
-    fn the_users_skills_are_served_unless_home_is_the_repository() {
-        let home = tempfile::tempdir().expect("a home");
-        let repo = home.path().join("repo");
-        std::fs::create_dir(&repo).expect("a repository");
-        let at_home = Some(home.path().to_path_buf());
-        assert_eq!(user_skills_home(&repo, at_home.clone()), at_home);
-        assert_eq!(user_skills_home(home.path(), at_home.clone()), None);
-        let link = home.path().join("link");
-        std::os::unix::fs::symlink(&repo, &link).expect("a link to the repository");
-        assert_eq!(user_skills_home(&link, Some(repo.clone())), None);
-        assert_eq!(user_skills_home(&repo, None), None);
     }
 
     /// A config whose image carries a primary server holding a secret and a

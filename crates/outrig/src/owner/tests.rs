@@ -223,7 +223,7 @@ pub(crate) struct Bed {
     /// The program's directory.
     pub(crate) dir: PathBuf,
     sessions: PathBuf,
-    repo: PathBuf,
+    pub(crate) repo: PathBuf,
     global: PathBuf,
     packages: PathBuf,
     approvals: PathBuf,
@@ -1290,6 +1290,54 @@ async fn a_programs_session_imports_its_application() {
         "{:?}",
         left_open(&ran.exit)
     );
+}
+
+/// Source-name validation is the session builder's, including for every session a program
+/// enters; refusing one start does not end the program or hide the next start's error.
+#[tokio::test]
+async fn a_programs_sessions_reject_invalid_skill_source_names() {
+    use crate::harness::DirectorySource;
+
+    for (names, expected) in [
+        (vec![""], "a skill source needs a name"),
+        (vec!["same", "same"], "two skill sources are named \"same\""),
+    ] {
+        let bed = Bed::new();
+        bed.write(
+            "invalid_sources.py",
+            r#"
+            import asyncio, json, outrig
+            async def main():
+                for _ in range(2):
+                    try:
+                        async with outrig.Session():
+                            raise AssertionError("invalid sources were accepted")
+                    except RuntimeError as e:
+                        print(json.dumps(str(e)))
+            asyncio.run(main())
+        "#,
+        );
+        let program = bed
+            .start(
+                "invalid_sources.py",
+                bed.config("", false),
+                bed.sessions(),
+                |mut p| {
+                    for name in names {
+                        p = p.skill_source(name, DirectorySource::new(bed.repo.join("missing")));
+                    }
+                    p
+                },
+            )
+            .await;
+        let ran = bed.finish(program).await;
+        assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+        let lines = ran.json();
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            assert!(line.as_str().unwrap().contains(expected), "{line}");
+        }
+    }
 }
 
 /// A program whose `outrig` package speaks another version of the owner protocol is refused at

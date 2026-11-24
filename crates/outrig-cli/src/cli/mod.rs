@@ -21,6 +21,7 @@ pub mod run_new;
 pub mod run_new_only_keys;
 pub mod session_setup;
 pub mod signals;
+mod skills;
 pub mod volume_arg;
 pub mod watcher;
 

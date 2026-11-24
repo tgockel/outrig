@@ -62,6 +62,7 @@ const INTERRUPTED: &str = "the session's start was interrupted";
 /// What every session a program asks for is started from.
 pub(crate) struct Context {
     pub(crate) config: Config,
+    pub(crate) skill_sources: Vec<(String, Arc<dyn crate::harness::SkillSource>)>,
     pub(crate) repo_root: PathBuf,
     /// How many shutdowns the program asked for are running; its grace waits while any is.
     pub(crate) shutdowns: Arc<AtomicUsize>,
@@ -486,6 +487,9 @@ pub(crate) async fn run(
         .no_primary()
         .repo_root(&context.repo_root)
         .program(cwd);
+    for (name, source) in &context.skill_sources {
+        builder = builder.shared_skill_source(name.clone(), Arc::clone(source));
+    }
     if let Some(application) = application {
         builder = builder.application(application.spec());
     }
@@ -1118,6 +1122,7 @@ mod tests {
             MountAccess::ReadWrite,
         ));
         let context = Context {
+            skill_sources: Vec::new(),
             config,
             repo_root: repo.clone(),
             shutdowns: Arc::new(AtomicUsize::new(0)),

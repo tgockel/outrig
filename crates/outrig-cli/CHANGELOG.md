@@ -319,6 +319,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Host-program sessions receive skills.** `run-new <script.py>` serves repository skills
+  before user skills, just like interactive `run-new`, and reports shadowed copies. (#698)
+
 - **Generated Debian images use Node 24 for the filesystem MCP server.** Even without a
   selected Node toolchain, the recipe installs and checks Node 24 rather than the distro's
   Node 18, which cannot run the current server. (#1009)

@@ -243,8 +243,10 @@ program"). A program's session directory, `<session-root>/<id>/logs`, holds its 
 no `session.json`, so `outrig ls` does not list it yet
 (`plan/next/host-program-sessions-are-listed.md`). What a program does not have in this phase:
 rounds and a user channel, since it has no primary; an approver, which is a `plan/next/` entry;
-skill sources of its own (#698); and the explicit child API. The Python API is fixed at the 0.3.0
-release with the Rust one.
+and the explicit child API. `HostProgram::skill_source` supplies ordered sources to each session,
+which discovers them independently; the CLI supplies the project's and then the user's, as for an
+interactive session (#698). A library caller supplies its own sources; none are implicit. The Python
+API is fixed at the 0.3.0 release with the Rust one.
 
 ## Stopping
 
