@@ -589,6 +589,26 @@ terminal's pace as below, and while the detail view is open, its messages wait f
 terminal that has stopped reading what is written to it holds up what is drawn there and nothing
 else: what you type, Ctrl-C included, still reaches the session.
 
+Agent messages in this screen render a small CommonMark subset, in the conversation and the detail
+view alike: bold and italic emphasis, reverse-video inline code, quiet code gutters, compact bold
+headings, lists, quotes, and links with their destinations in parentheses. Images show their alt
+text and destination; HTML is literal text, not interpreted. Other Markdown extensions, such as
+tables, remain readable source. Your input, Python submissions, and tool logs are not parsed as
+Markdown. Messages above 256 KiB, or with a potential container prefix wider than 128 cells,
+render literally instead. The prefix check conservatively counts leading whitespace, quote and
+list punctuation, and digits, even in code. These limits bound the input and nesting passed to
+the screen's Markdown parser. `NO_COLOR` disables color, not emphasis; code gutters and inline
+reverse video remain readable without color, and emphasis remains understandable on terminals
+without italics.
+
+Fenced and indented code keeps its indentation, blank lines, and trailing spaces; tabs expand to
+four-cell stops. Long code lines soft-wrap without dropping spaces: `│` marks a source line and
+`↪` marks its continuation, rather than inserting newlines into the saved text. Gutters and list
+indentation shrink when the terminal is too narrow, and disappear if needed to fit a character.
+On a one-cell-wide screen a two-cell grapheme displays as `�`; resizing restores it. Displayed
+control characters are omitted, including embedded terminal escape characters. Stored records
+and plain-line output are unchanged by this rendering.
+
 Enter sends what is in the box. Alt-Enter starts a new line in it, as does Enter after a `\` that
 ends the box, and a paste is one message however many lines it has. The usual line-editing keys
 work, and Up and Down recall what you sent, kept in memory and never written to a file. Ctrl-C

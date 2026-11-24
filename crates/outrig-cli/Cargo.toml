@@ -48,6 +48,7 @@ jiff               = { workspace = true, default-features = true }
 # that `cli/mcp.rs` publishes a listening Unix socket with. `socket` carries the
 # nonblocking bind and liveness probe there.
 nix                = { workspace = true, features = ["fs", "resource", "socket", "term", "user"] }
+pulldown-cmark     = { workspace = true }
 rand               = { workspace = true, default-features = true }
 # `scrolling-regions` lets `run-new`'s screen scroll the conversation above it without
 # redrawing it. crossterm comes with it, and is used only through `ratatui::crossterm`, so

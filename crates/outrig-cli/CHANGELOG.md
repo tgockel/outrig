@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Agent messages render as terminal Markdown in `run-new`'s interactive screen.** Both the
+  conversation and detail view show emphasis, inline code, compact headings, lists, quotes, and
+  links with their destinations. Code blocks preserve whitespace and mark soft-wrapped
+  continuations with a different gutter. User input and tool output stay literal; recorded
+  messages and redirected output are unchanged. (#1042)
+
 - **Threaded waits name the call, not just `to_thread`.** The `run-new` status line and
   session renderer use an unnamed task's recorded call, cut to 40 characters. Named tasks
   keep their names; the rendered detail shows the whole call for both. (#1019)

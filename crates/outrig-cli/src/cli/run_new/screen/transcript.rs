@@ -276,6 +276,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cached_markdown_rows_match_conversation_rows_after_push_resize_and_forget() {
+        let theme = Theme::plain();
+        let mut transcript = Transcript::default();
+        let entries = [
+            Entry::new(
+                Kind::Agent,
+                "**日本語** and `code`\n\n```py\n  x = 1\n\n```",
+            ),
+            Entry::new(Kind::Agent, "> a _quote_ and [link](https://example.com)"),
+        ];
+        for width in [16, 1, 5, 40] {
+            let mut expected = VecDeque::new();
+            if transcript.entries.is_empty() {
+                for entry in &entries {
+                    // Open the cache before each insertion as well.
+                    transcript.lines(width, theme);
+                    transcript.push(entry.clone(), theme);
+                }
+            }
+            for entry in &entries {
+                expected.extend(entry_lines(entry, width, theme, false));
+            }
+            assert_eq!(transcript.lines(width, theme), &expected);
+            let counts = &transcript.wrapped.as_ref().unwrap().counts;
+            assert_eq!(counts.iter().sum::<usize>(), expected.len());
+            transcript.forget_lines();
+            assert_eq!(transcript.lines(width, theme), &expected);
+        }
+    }
+
+    #[test]
     fn the_conversation_shows_all_but_the_agents_working() {
         for kind in [Kind::User, Kind::Agent, Kind::Note, Kind::Error, Kind::Hint] {
             assert!(Entry::new(kind, "x").inline(false), "{kind:?}");

@@ -80,6 +80,7 @@ jiff               = { version = "0.2.35",  default-features = false }
 jsonschema         = { version = "0.61.0",  default-features = false }
 miniz_oxide        = { version = "0.9.1",   default-features = false }
 nix                = { version = "0.31.3",  default-features = false }
+pulldown-cmark     = { version = "0.13.6",  default-features = false }
 rand               = { version = "0.10.2",  default-features = false }
 ratatui            = { version = "0.30.2",  default-features = false }
 # Mints the certificate authorities the MCP URL placement's TLS tests trust and refuse.

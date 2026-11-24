@@ -5217,6 +5217,7 @@ dependencies = [
  "nix 0.31.3",
  "outrig",
  "outrig-cli",
+ "pulldown-cmark",
  "rand 0.10.2",
  "ratatui",
  "regex",
@@ -5733,6 +5734,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
+dependencies = [
+ "bitflags 2.13.1",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]

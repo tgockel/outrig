@@ -549,6 +549,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn markdown_on_plain_stdout_is_unchanged_and_has_no_added_escapes() {
+        let log = Log::default();
+        let (out, _failures) = start(&Gate::open("O", &log), &Gate::open("E", &log));
+        let source = "**bold** _italic_ `inline`\n\n```py\n  x = 1\n```";
+        out.room().await.expect("room").send(source.into(), false);
+        out.drain_stdout().await;
+        out.drain_stderr(false).await;
+        assert_eq!(written(&log), [format!("O:{source}\n")]);
+    }
+
+    #[tokio::test]
     async fn a_message_between_rounds_is_written_alone() {
         let log = Log::default();
         let (out, _failures) = start(&Gate::open("O", &log), &Gate::open("E", &log));

@@ -8,6 +8,8 @@
 //! expanded to spaces first. So a row is never wider than the screen, and an
 //! entry never takes more rows than were made for it.
 
+mod markdown;
+
 use std::collections::VecDeque;
 
 use ratatui::buffer::{Buffer, CellWidth};
@@ -213,6 +215,16 @@ pub(super) fn entry_lines(
         ""
     };
     if entry.text.is_empty() {
+        return lines;
+    }
+    if entry.kind == Kind::Agent {
+        for mut line in markdown::lines(&entry.text, width.saturating_sub(indent.len())) {
+            line.style = body;
+            if !indent.is_empty() {
+                line.spans.insert(0, Span::raw(indent));
+            }
+            lines.push(line);
+        }
         return lines;
     }
     for row in wrap(&entry.text, width.saturating_sub(indent.len())) {
@@ -461,6 +473,31 @@ mod tests {
                 assert_eq!(usize::from(end), line.width(), "{line:?} at {width}");
             }
         }
+    }
+
+    #[test]
+    fn only_agent_messages_are_markdown_and_their_source_is_untouched() {
+        let source = "**bold** and `code`";
+        for kind in [
+            Kind::User,
+            Kind::Detail,
+            Kind::Trace,
+            Kind::Note,
+            Kind::Error,
+        ] {
+            let rows = entry_lines(&Entry::new(kind, source), 80, Theme::plain(), false);
+            assert!(texts_of(&rows).join("\n").contains(source), "{kind:?}");
+        }
+        let entry = Entry::new(Kind::Agent, source);
+        let rows = entry_lines(&entry, 80, Theme::plain(), false);
+        assert_eq!(texts_of(&rows), ["bold and code"]);
+        assert_eq!(entry.text, source);
+        let dim = entry_lines(&entry, 80, Theme::plain(), true);
+        assert!(dim[0].style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(rows[0].spans, dim[0].spans);
+        // A following entry has neither the agent's bold nor its code style.
+        let next = entry_lines(&Entry::new(Kind::Agent, "plain"), 80, Theme::plain(), false);
+        assert_eq!(next[0].spans.last().unwrap().style, Style::new());
     }
 
     #[test]
