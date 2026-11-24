@@ -67,6 +67,7 @@ pub mod event;
 pub(crate) mod lifecycle;
 pub(crate) mod mcp;
 pub(crate) mod mcp_placement;
+mod proxy;
 mod registry;
 mod report;
 mod root;
@@ -79,6 +80,8 @@ pub(crate) mod stop;
 use std::time::Duration;
 
 pub use self::application::{ApplicationIdentity, ApplicationSpec};
+pub(crate) use self::proxy::connect_proxy_url;
+
 pub use self::approval::{Approval, ApprovalRequest, ApprovalSubject, Approver};
 pub use self::bindings::BindingSpec;
 pub(crate) use self::builder::chosen_repo_root;

@@ -510,7 +510,8 @@ container cannot. It starts only once you approve that exact entry in that repos
 repository's [binding](../reference/config.md#bindingsname) does: `run-new` shows its URL and
 its headers by name, never a value, and asks once, and any edit asks again. One nobody approved
 connects to nothing and is `unapproved`. An entry in the global config asks nothing. `outrig run`
-and `outrig mcp` start no URL server: they say which they leave out.
+starts no URL server: it says which it leaves out. `outrig mcp` can front a URL entry for an
+external client; it uses the same headers, trust settings, and remembered repository approval.
 
 **A server that holds a credential is never placed beside the interpreter.** A `${VAR}` in a
 command's or a primary view's `env` would be readable from agent Python wherever `/proc` allows,

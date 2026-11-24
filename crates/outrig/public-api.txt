@@ -3163,6 +3163,7 @@ impl<T> outrig::mcp_proxy::BackingClient for alloc::sync::Arc<T> where T: outrig
 pub fn alloc::sync::Arc<T>::call_tool(&self, &str, serde_json::value::Value) -> impl core::future::future::Future<Output = outrig::error::Result<outrig::McpToolResult>> + core::marker::Send
 pub fn alloc::sync::Arc<T>::list_tools(&self) -> impl core::future::future::Future<Output = outrig::error::Result<alloc::vec::Vec<outrig::McpTool>>> + core::marker::Send
 pub fn alloc::sync::Arc<T>::name(&self) -> &str
+pub async fn outrig::mcp_proxy::connect_url_client(&outrig::config::ImageConfig, &str, &str, &std::path::Path, alloc::sync::Arc<dyn outrig::harness::Approver>) -> outrig::error::Result<outrig::McpClient>
 pub mod outrig::network
 pub struct outrig::network::NetworkInterceptor
 impl outrig::network::NetworkInterceptor

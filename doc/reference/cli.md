@@ -805,7 +805,9 @@ sees, and [Python API](python.md) for every name the `outrig` package gives it.
 
 ### `outrig mcp`
 
-Serve the selected image's backing MCP servers as one MCP server over stdio.
+Serve the selected image's backing MCP servers as one MCP server over stdio. A `url` entry
+is dialed from the host, with its declared headers and trust settings, after repository approval;
+see [URL-backed servers](../usage/mcp.md#url-backed-servers).
 
 ```
 outrig mcp [--image <name-or-local-ref>]

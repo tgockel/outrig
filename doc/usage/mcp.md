@@ -1,9 +1,9 @@
 # `outrig mcp`
 
 `outrig mcp` turns an outrig image-config into one MCP server for an external
-client. It starts or attaches to the selected container, launches every
-`[images.<name>.mcp]` backing server inside it, and republishes their tools over this
-process's stdio by default, or over Streamable HTTP when `--listen` is set.
+client. It starts or attaches to the selected container, connects the
+`[images.<name>.mcp]` backing servers in their declared placements, and republishes their tools
+over this process's stdio by default, or over Streamable HTTP when `--listen` is set.
 
 Use `outrig run` when you want outrig to be the LLM client: it resolves an agent,
 builds a Rig agent, and opens the built-in REPL. Use `outrig mcp` when another
@@ -597,3 +597,35 @@ adding built-in auth, exposing a tool-call audit log, proxying MCP `prompts/*` a
 - [Sessions](sessions.md) -- session records and server stderr logs.
 - [Concepts -> MCP Servers](../concepts/mcp-servers.md) -- configuration and routing.
 - [Reference -> CLI](../reference/cli.md) -- all flags and exit behavior.
+
+## URL-backed servers
+
+An entry with `url` fronts a remote streamable-HTTP server alongside container-backed servers:
+
+```toml
+[images.coding.mcp]
+docs = { url = "https://docs.example.com/mcp", headers = { X-Token = "${DOCS_TOKEN}" } }
+```
+
+The host dials the URL directly, outside the container's network policy. The selected primary
+container still starts, even when every backing server is a URL. The client-facing transport
+is independent: both stdio and `--listen` can front URL servers, and the tools keep the same
+`docs__<tool>` namespacing as container-backed tools.
+
+`headers` values resolve on the host, not in the container. A relative `trust-anchor` resolves
+from the repository root for a discovered `.agents/outrig/config.toml`, from the declaring file's
+directory for a global or explicitly named config file, or from the standalone image project's
+directory. `trust`, `allow-stateless`, and `call-timeout-secs` work as they do for a
+[Session's URL services](../concepts/mcp-servers.md). `--env` sets process
+environment variables for container-backed servers; it does not override URL headers. The CLI
+supplies no owner identity headers and never forwards an external client's HTTP headers upstream.
+
+A repository-declared URL requires the same remembered approval as `outrig run-new`: its URL and
+header names are shown, never header values. Approval in either command covers the same declaration
+in the same repository; edits ask again. With stdio connected to an MCP client there is no terminal
+to ask on, so approve it first with `outrig run-new` at a terminal, or declare it in the global
+config. A refused or unapproved URL, or one that cannot connect, fails proxy startup rather than
+silently omitting tools. `show-merged` includes URL entries but does not dial them or ask for
+approval.
+
+Shutdown closes the upstream HTTP session; it does not stop the remote server.

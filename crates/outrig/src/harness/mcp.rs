@@ -1061,7 +1061,9 @@ impl Plan {
     /// own keyed by the name it is bound as, which no sidecar's name can be.
     fn push(&mut self, mut one: Planned) {
         let checked = match &one.launch {
-            Launch::Url(launch) => self.url_misconfigured(launch, &one.env, one.declared_in),
+            Launch::Url(launch) => {
+                url_misconfigured(launch, &one.env, one.declared_in, &self.identity)
+            }
             Launch::Exec(_) | Launch::Entrypoint(_) => env_misconfigured(&one),
         };
         one.misconfigured = one.misconfigured.or(checked);
@@ -1070,62 +1072,62 @@ impl Plan {
         }
         self.services.push(one);
     }
+}
 
-    /// Why the URL server `launch` names, with `headers`, cannot start as
-    /// `declared_in` declared it, if it cannot: found before any request. The
-    /// URL is never quoted -- one with a password in it would put the
-    /// password in the message -- and no header's value is; a value is
-    /// checked once it has one, as it is resolved. An owner's server carries
-    /// the owner's identity headers too, whose names are checked as its own.
-    fn url_misconfigured(
-        &self,
-        launch: &UrlLaunch,
-        headers: &BTreeMap<String, EnvValue>,
-        declared_in: McpDeclaredIn,
-    ) -> Option<String> {
-        let url = match reqwest::Url::parse(&launch.url) {
-            Ok(url) => url,
-            Err(e) => return Some(format!("its url is not a URL: {e}")),
-        };
-        if !url.username().is_empty() || url.password().is_some() {
-            return Some(
-                "its url carries a user name or password; a credential goes in its headers, \
-                 which no one is shown"
-                    .to_string(),
-            );
-        }
-        if !matches!(url.scheme(), "http" | "https") {
-            return Some(format!(
-                "its url's scheme is {:?}, and a URL server is dialed over http or https",
-                url.scheme()
-            ));
-        }
-        if launch.trust == McpTrust::Only && launch.trust_anchor.is_none() {
-            return Some("it trusts only its trust anchor, and names none".to_string());
-        }
-        let mut seen = BTreeSet::new();
-        for name in headers.keys() {
-            if let Some(why) = unsettable(name) {
-                return Some(format!("its header {why}"));
-            }
-            if !seen.insert(name.to_ascii_lowercase()) {
-                return Some(format!("it sets the header {name} twice, in two cases"));
-            }
-        }
-        if let Some(header) = names_identity_header(headers.keys(), &self.identity) {
-            return Some(format!(
-                "its header {header} is one of the owner's identity headers, which only the \
-                 owner sets, on the URL services it declares"
-            ));
-        }
-        if declared_in != McpDeclaredIn::Owner {
-            return None;
-        }
-        self.identity
-            .iter()
-            .find_map(|name| unsettable(name))
-            .map(|why| format!("the owner's identity header {why}"))
+/// Why the URL server `launch` names, with `headers`, cannot start as
+/// `declared_in` declared it, if it cannot: found before any request. The
+/// URL is never quoted -- one with a password in it would put the
+/// password in the message -- and no header's value is; a value is
+/// checked once it has one, as it is resolved. An owner's server carries
+/// the owner's identity headers too, whose names are checked as its own.
+pub(super) fn url_misconfigured(
+    launch: &UrlLaunch,
+    headers: &BTreeMap<String, EnvValue>,
+    declared_in: McpDeclaredIn,
+    identity: &[String],
+) -> Option<String> {
+    let url = match reqwest::Url::parse(&launch.url) {
+        Ok(url) => url,
+        Err(e) => return Some(format!("its url is not a URL: {e}")),
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return Some(
+            "its url carries a user name or password; a credential goes in its headers, \
+             which no one is shown"
+                .to_string(),
+        );
     }
+    if !matches!(url.scheme(), "http" | "https") {
+        return Some(format!(
+            "its url's scheme is {:?}, and a URL server is dialed over http or https",
+            url.scheme()
+        ));
+    }
+    if launch.trust == McpTrust::Only && launch.trust_anchor.is_none() {
+        return Some("it trusts only its trust anchor, and names none".to_string());
+    }
+    let mut seen = BTreeSet::new();
+    for name in headers.keys() {
+        if let Some(why) = unsettable(name) {
+            return Some(format!("its header {why}"));
+        }
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return Some(format!("it sets the header {name} twice, in two cases"));
+        }
+    }
+    if let Some(header) = names_identity_header(headers.keys(), identity) {
+        return Some(format!(
+            "its header {header} is one of the owner's identity headers, which only the \
+             owner sets, on the URL services it declares"
+        ));
+    }
+    if declared_in != McpDeclaredIn::Owner {
+        return None;
+    }
+    identity
+        .iter()
+        .find_map(|name| unsettable(name))
+        .map(|why| format!("the owner's identity header {why}"))
 }
 
 /// Why no request may carry a header named `name`, which it then names, if

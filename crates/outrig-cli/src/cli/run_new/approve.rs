@@ -13,7 +13,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use outrig::harness::{Approval, ApprovalRequest, ApprovalSubject, Approver};
 
 /// Asks on the terminal: the declaration on stderr, the answer from stdin.
-pub(super) struct TerminalApprover;
+pub(crate) struct TerminalApprover;
 
 impl Approver for TerminalApprover {
     fn approve(&self, request: &ApprovalRequest) -> Approval {

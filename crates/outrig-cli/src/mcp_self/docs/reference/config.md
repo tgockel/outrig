@@ -1522,7 +1522,9 @@ image, or declare any other MCP command that should run inside the container.
   itself -- `Accept`, `Content-Type`, `Host`, `Mcp-Session-Id`, `Mcp-Protocol-Version` and the
   like -- or one the session's owner stamps as an identity header is refused.
 - `trust-anchor` (path, optional): a PEM certificate authority, one certificate or several, that
-  `url`'s client trusts, relative to the config file's directory.
+  `url`'s client trusts. A relative path resolves from the repository root for a discovered
+  repo config, the declaring file's directory for a global or explicitly named config file,
+  or the standalone image project's directory.
 - `trust` (string, optional, default: `"with-system-roots"`): `"with-system-roots"` trusts
   `trust-anchor` beside the system's roots; `"only"` trusts it in their place, and needs one.
 - `allow-stateless` (boolean, optional, default: `true`): whether a server that issues no

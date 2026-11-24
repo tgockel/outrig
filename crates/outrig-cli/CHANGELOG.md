@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`outrig mcp` fronts URL-backed servers.** URL declarations are no longer skipped; their
+  tools share the namespaced proxy surface over stdio or `--listen`. Repository URLs require
+  the same remembered approval as `run-new`; an unapproved or failed URL aborts startup.
+  `show-merged` includes URL declarations without dialing them. (#774)
+
 - **Agent messages render as terminal Markdown in `run-new`'s interactive screen.** Both the
   conversation and detail view show emphasis, inline code, compact headings, lists, quotes, and
   links with their destinations. Code blocks preserve whitespace and mark soft-wrapped

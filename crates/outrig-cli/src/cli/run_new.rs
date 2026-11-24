@@ -68,7 +68,7 @@ use self::converse::{Conversed, Frontend, Interrupts};
 use self::output::{Failures, Output};
 use self::screen::{Screen, Started};
 
-mod approve;
+pub(crate) mod approve;
 mod converse;
 mod output;
 mod screen;

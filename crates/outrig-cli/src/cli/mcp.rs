@@ -179,9 +179,9 @@ async fn serve(
         used_builtin_default,
         mut signals,
         session_lock,
-        cfg: _,
+        cfg,
         session: _,
-        repo_root: _,
+        repo_root,
     } = setup;
     // Nothing between here and `teardown` may return early: `teardown` is
     // the only thing that finalizes the session record -- and the only thing
@@ -191,6 +191,8 @@ async fn serve(
     let primary_died = runtime.watcher.as_ref().map(|w| w.primary_died());
     let outcome: Result<i32> = serve_inner(
         &image_cfg_name,
+        cfg.images.get(&image_cfg_name),
+        &repo_root,
         used_builtin_default,
         &image_tag,
         &mut runtime.containers,
@@ -261,6 +263,8 @@ fn parse_listen_addr(s: &str) -> std::result::Result<ListenAddr, String> {
 #[allow(clippy::too_many_arguments)]
 async fn serve_inner(
     image_cfg_name: &str,
+    image_cfg: Option<&outrig::config::ImageConfig>,
+    repo_root: &Path,
     used_builtin_default: bool,
     image_tag: &ImageTag,
     containers: &mut SessionContainers,
@@ -279,13 +283,37 @@ async fn serve_inner(
             containers, mcp_plan, log_dir, cli_env,
         ))
         .await?;
-    if connected.is_empty() {
+    mcp_arcs.extend(connected);
+    // URL servers have no container. Keep each live client in the runtime as it
+    // connects so an error or signal on a later one still tears earlier ones down.
+    for (name, placed) in &mcp_plan.servers {
+        if placed.placement != Placement::Url {
+            continue;
+        }
+        let image = image_cfg.ok_or_else(|| {
+            OutrigError::Configuration("a URL server has no image configuration".to_string())
+        })?;
+        let span = session_setup::ProgressSpan::start(format!("MCP {name}: initializing"));
+        let client = signals
+            .race(outrig::mcp_proxy::connect_url_client(
+                image,
+                image_cfg_name,
+                name,
+                repo_root,
+                Arc::new(super::run_new::approve::TerminalApprover),
+            ))
+            .await?;
+        span.done(format!("MCP {name}: initialized"));
+        mcp_arcs.push(Arc::new(
+            client.with_call_timeout(mcp_plan.call_timeout(placed)),
+        ));
+    }
+    if mcp_arcs.is_empty() {
         return Err(OutrigError::Configuration(
             "outrig mcp with no merged MCP entries has nothing to proxy".to_string(),
         )
         .into());
     }
-    mcp_arcs.extend(connected);
 
     let proxy = signals.race(ProxyServer::build(mcp_arcs.clone())).await?;
     let per_server_counts: Vec<(String, usize)> = proxy
@@ -1239,6 +1267,20 @@ mod tests {
         let args = McpArgs::try_parse_from(["mcp", "--volume", "/h:/c:rw"]).expect("arg parses");
         assert_eq!(args.volume.len(), 1);
         assert_eq!(args.volume[0].container, std::path::PathBuf::from("/c"));
+    }
+
+    #[test]
+    fn show_merged_includes_url_servers() {
+        let plan = plan_from_toml(
+            r#"
+[images.x.mcp]
+docs = { url = "https://docs.example.com/mcp", headers = { X-Token = "${TOKEN}" } }
+"#,
+        );
+        let rendered = render_merged_mcp(&plan);
+        assert!(rendered.contains("# docs: url (config.toml)"), "{rendered}");
+        assert!(rendered.contains("https://docs.example.com/mcp"));
+        assert!(rendered.contains("${TOKEN}"));
     }
 
     #[test]

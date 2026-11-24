@@ -452,3 +452,23 @@ impl<C: BackingClient> ServerHandler for ProxyServer<C> {
 #[cfg(test)]
 #[path = "mcp_proxy_dispatch_tests.rs"]
 mod mcp_proxy_dispatch_tests;
+
+/// Connect one image configuration's `url` entry for an external-client proxy.
+///
+/// Uses the same resolved headers, trust anchor, transport, and remembered repository approval
+/// as a host Session. `approver` is asked only for a repository declaration not yet approved.
+/// A refusal is an error, before any header value is resolved or any request is sent. Relative
+/// trust anchors use [`ImageConfig::base_dir`](crate::config::ImageConfig::base_dir): the repository
+/// root for a discovered repo config, the declaring directory for a global or explicit config
+/// file or standalone image project, and `repo_root` when no source is recorded.
+/// No owner identity headers are supplied: those belong only to owner-declared Session services.
+/// The caller may replace the entry's call timeout with a session-wide default after connecting.
+pub async fn connect_url_client(
+    image: &crate::config::ImageConfig,
+    image_name: &str,
+    name: &str,
+    repo_root: &std::path::Path,
+    approver: Arc<dyn crate::harness::Approver>,
+) -> Result<McpClient> {
+    crate::harness::connect_proxy_url(image, image_name, name, repo_root, approver).await
+}

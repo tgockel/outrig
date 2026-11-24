@@ -19,6 +19,10 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **The MCP proxy can connect URL declarations.** `mcp_proxy::connect_url_client` reuses
+  Session header resolution, trust settings, transport, and remembered repository approval
+  without creating an interpreter. The proxy dispatches URL and stdio clients alike. (#774)
+
 - **Host programs can supply skills.** `HostProgram::skill_source` shares ordered sources with
   every session the program enters, with per-session discovery and shadowing diagnostics. (#698)
 

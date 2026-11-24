@@ -1128,3 +1128,220 @@ docs = { url = "https://d.test/mcp", headers = { X-Token = "${TOKEN}" }, trust-a
     assert!(configured.names.contains("docs"));
     assert!(configured.primary.is_empty() && configured.sidecars.is_empty());
 }
+
+/// A real streamable-HTTP upstream is fronted over the proxy's stdio-equivalent duplex
+/// transport. Headers survive every request, tool names are namespaced, and errors and
+/// structured content survive the round trip. Closing the backing client deletes its session.
+#[tokio::test]
+async fn proxy_url_fronts_a_remote_server() {
+    use crate::mcp_proxy::{ProxyServer, connect_url_client};
+    use rmcp::ServiceExt;
+    use rmcp::model::CallToolRequestParams;
+
+    let toolbox = toolbox();
+    let answer = json!({"content": [{"type": "text", "text": "hello"}],
+        "structuredContent": {"answer": 42}, "isError": false});
+    toolbox.answer("echo", answer.clone());
+    let server = Server::start(&toolbox);
+    let mut image = crate::config::ImageConfig::from_image_name("unused");
+    image.mcp_mut().insert(
+        "docs".to_string(),
+        McpServerSpec::at_url(server.url()).with_headers(BTreeMap::from([
+            ("X-Token".to_string(), EnvValue::Literal(SECRET.to_string())),
+            ("X-Home".to_string(), EnvValue::EnvRef("HOME".to_string())),
+        ])),
+    );
+    let client = connect_url_client(
+        &image,
+        "dev",
+        "docs",
+        std::path::Path::new("/unused"),
+        Arc::new(|_: &ApprovalRequest| panic!("a global declaration needs no approval")),
+    )
+    .await
+    .expect("connected");
+    let backing = Arc::new(client);
+    let proxy = ProxyServer::build(vec![Arc::clone(&backing)])
+        .await
+        .expect("proxy");
+    let (external, internal) = tokio::io::duplex(16384);
+    let serving = tokio::spawn(async move { proxy.serve(internal).await.expect("serving") });
+    let external = ().serve(external).await.expect("external client");
+    let serving = serving.await.expect("server task");
+    let tools = external.list_all_tools().await.expect("listing");
+    assert!(tools.iter().any(|tool| tool.name == "docs__echo"));
+    let result = external
+        .call_tool(CallToolRequestParams::new("docs__echo").with_arguments(serde_json::Map::new()))
+        .await
+        .expect("call");
+    assert_eq!(serde_json::to_value(result).unwrap(), answer);
+    let result = external
+        .call_tool(CallToolRequestParams::new("docs__fails"))
+        .await
+        .expect("tool error is a result");
+    assert_eq!(result.is_error, Some(true));
+    external.cancel().await.expect("close external client");
+    serving.cancel().await.expect("close proxy");
+    Arc::try_unwrap(backing)
+        .expect("proxy released its client")
+        .shutdown()
+        .await
+        .expect("shutdown");
+    until("HTTP session deletion", || {
+        server.seen().iter().any(|seen| seen.http == Method::DELETE)
+    })
+    .await;
+    for seen in server.seen() {
+        assert_eq!(seen.header("x-token"), Some(SECRET), "{seen:?}");
+        assert_eq!(
+            seen.header("x-home"),
+            Some(std::env::var("HOME").unwrap().as_str())
+        );
+        assert_eq!(seen.header("x-fence"), None);
+    }
+    server.stop().await;
+}
+
+/// A repository's URL is approved before secret resolution, and refusing it sends no request.
+#[tokio::test]
+async fn proxy_url_requires_repository_approval() {
+    let server = Server::start(&toolbox());
+    let repo = tempfile::tempdir().expect("repo");
+    let mut image = crate::config::ImageConfig::from_image_name("unused");
+    image.set_config_source(crate::config::ConfigSource::Repo {
+        root: repo.path().to_path_buf(),
+    });
+    image.mcp_mut().insert(
+        "docs".to_string(),
+        McpServerSpec::at_url(server.url()).with_headers(BTreeMap::from([(
+            "X-Token".to_string(),
+            EnvValue::EnvRef("OUTRIG_PROXY_UNRESOLVED_SECRET_774".to_string()),
+        )])),
+    );
+    let (refusing, shown) = keeping(Approval::Refuse);
+    let error = crate::mcp_proxy::connect_url_client(
+        &image,
+        "dev",
+        "docs",
+        repo.path(),
+        Arc::new(refusing),
+    )
+    .await
+    .expect_err("not approved");
+    assert!(error.to_string().contains("did not approve"), "{error}");
+    {
+        let shown = shown.lock().unwrap();
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].declaration.contains("images.dev.mcp.docs"));
+        assert!(
+            !shown[0]
+                .declaration
+                .contains("OUTRIG_PROXY_UNRESOLVED_SECRET_774")
+        );
+        assert!(server.seen().is_empty());
+    }
+    server.stop().await;
+}
+
+/// Proxy startup failures are classified and never include a header's value.
+#[tokio::test]
+async fn proxy_url_reports_http_startup_failure() {
+    let server = Server::start(&toolbox());
+    server.answer([StatusCode::UNAUTHORIZED]);
+    let mut image = crate::config::ImageConfig::from_image_name("unused");
+    image.mcp_mut().insert(
+        "docs".to_string(),
+        McpServerSpec::at_url(server.url()).with_headers(BTreeMap::from([(
+            "X-Token".to_string(),
+            EnvValue::Literal(SECRET.to_string()),
+        )])),
+    );
+    let error = crate::mcp_proxy::connect_url_client(
+        &image,
+        "dev",
+        "docs",
+        std::path::Path::new("/unused"),
+        Arc::new(|_: &ApprovalRequest| Approval::Refuse),
+    )
+    .await
+    .expect_err("401");
+    assert!(!error.to_string().contains(SECRET));
+    let crate::error::OutrigError::McpStartupFailed(failed) = error else {
+        panic!("{error}")
+    };
+    assert_eq!(failed.name, "docs");
+    assert_eq!(failed.kind, McpFailureKind::Protocol);
+    server.stop().await;
+}
+
+/// The proxy resolves a relative custom trust anchor against the declaration's file, not cwd.
+#[tokio::test]
+async fn proxy_url_uses_declared_trust_anchor() {
+    let authority = Authority::mint("proxy test");
+    let server = Server::at(
+        "127.0.0.1:0".parse().unwrap(),
+        &toolbox(),
+        Some(authority.server()),
+    );
+    let dir = tempfile::tempdir().expect("config directory");
+    std::fs::write(dir.path().join("ca.pem"), authority.pem()).expect("PEM");
+    let cfg = crate::config::Config::load_from_str(&format!(
+        r#"
+[images.dev]
+image-name = "unused"
+[images.dev.mcp]
+docs = {{ url = {:?}, trust-anchor = "ca.pem", trust = "only", allow-stateless = false }}
+"#,
+        server.url()
+    ))
+    .expect("config");
+    let mut image = cfg.images["dev"].clone();
+    image.set_config_source(crate::config::ConfigSource::Global {
+        path: dir.path().join("config.toml"),
+    });
+    let client = crate::mcp_proxy::connect_url_client(
+        &image,
+        "dev",
+        "docs",
+        std::path::Path::new("/wrong"),
+        Arc::new(|_: &ApprovalRequest| panic!("global config")),
+    )
+    .await
+    .expect("trusted");
+    assert_eq!(client.list_tools().await.expect("listing").len(), 3);
+    client.shutdown().await.expect("shutdown");
+    server.stop().await;
+}
+
+/// Unsafe URL or header declarations are refused before the upstream sees a request.
+#[tokio::test]
+async fn proxy_url_validates_before_connecting() {
+    let server = Server::start(&toolbox());
+    for spec in [
+        McpServerSpec::at_url("http://user:password@127.0.0.1/mcp"),
+        McpServerSpec::at_url(server.url()).with_headers(BTreeMap::from([(
+            "Mcp-Session-Id".to_string(),
+            EnvValue::Literal(SECRET.to_string()),
+        )])),
+        McpServerSpec::at_url(server.url()).with_headers(BTreeMap::from([(
+            "X-Token".to_string(),
+            EnvValue::Literal(format!("{SECRET}\n")),
+        )])),
+    ] {
+        let mut image = crate::config::ImageConfig::from_image_name("unused");
+        image.mcp_mut().insert("docs".to_string(), spec);
+        let error = crate::mcp_proxy::connect_url_client(
+            &image,
+            "dev",
+            "docs",
+            std::path::Path::new("/unused"),
+            Arc::new(|_: &ApprovalRequest| Approval::Refuse),
+        )
+        .await
+        .expect_err("invalid declaration");
+        assert!(!error.to_string().contains(SECRET));
+        assert!(!error.to_string().contains("password@"));
+    }
+    assert!(server.seen().is_empty());
+    server.stop().await;
+}

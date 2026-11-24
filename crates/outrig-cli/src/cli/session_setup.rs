@@ -812,6 +812,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         session_dir: &session_dir,
         intercept_dns: network.is_some(),
         start_sidecars: args.start_sidecars,
+        proxy_urls: !args.llm_session,
         cli_env: args.cli_env,
         transcript: transcript.as_ref(),
     };
@@ -884,6 +885,8 @@ struct SidecarPhaseArgs<'a> {
     /// entrypoint-stdio sidecar has to have baked in at create.
     intercept_dns: bool,
     start_sidecars: bool,
+    /// External MCP clients may proxy approved host-dialed URL entries.
+    proxy_urls: bool,
     cli_env: &'a CliEnvEntries,
     transcript: Option<&'a Transcript>,
 }
@@ -1034,10 +1037,11 @@ async fn setup_sidecars(
         to_start.push((name, tag, sc));
     }
 
-    // Every label has merged, so a `url` entry has shadowed any label entry of
-    // its name, and can be left out: the host dials one, which only `run-new`
-    // and a host program's session do.
-    skip_url_servers(&mut plan);
+    // A URL still shadows a label of its name even on the legacy run path, which
+    // cannot dial it. The external-client proxy keeps it for its own connector.
+    if !args.proxy_urls {
+        skip_url_servers(&mut plan);
+    }
 
     // The plan is complete. Checked here rather than after `setup` returns so
     // a refusal -- an undeclared name, a label reference no list allows --
@@ -1177,7 +1181,7 @@ fn skip_url_servers(plan: &mut SessionMcpPlan) {
     }
     eprintln!(
         "[outrig] warning: not starting MCP server(s) {}: a `url` entry is started by \
-         `outrig run-new` and a host program's session, not here",
+         `outrig mcp`, `outrig run-new` and a host program's session, not here",
         dialed.join(", ")
     );
     plan.servers
@@ -1779,6 +1783,10 @@ pub async fn connect_mcp_clients(
         Vec::with_capacity(mcp_plan.servers.len());
 
     for (mcp_name, placed) in &mcp_plan.servers {
+        // URL clients are connected by the proxy, not through a container.
+        if placed.placement == Placement::Url {
+            continue;
+        }
         let sidecar_name = placed.placement.sidecar_name().map(str::to_string);
         let Some(container) = containers.container_for(&placed.placement) else {
             // The sidecar never started or was dropped earlier in this loop.
@@ -2000,6 +2008,45 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn container_connector_skips_url_servers_without_a_warning() {
+        use tracing::instrument::WithSubscriber;
+
+        let plan = label_plan(
+            r#"
+[images.x.mcp]
+docs = { url = "http://127.0.0.1:9/mcp" }
+"#,
+        );
+        let mut containers = SessionContainers {
+            abandoned: Vec::new(),
+            sidecars: BTreeMap::new(),
+            instance_salt: instance_salt(),
+            primary: Container::attach("unused", ImageTag::new("unused"), None, None),
+        };
+        let dir = tempfile::tempdir().expect("log directory");
+        let log_path = dir.path().join("warnings.log");
+        let log_file = std::fs::File::create(&log_path).expect("warning log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || log_file.try_clone().expect("warning log handle"))
+            .finish();
+        let clients = connect_mcp_clients(
+            &mut containers,
+            &plan,
+            dir.path(),
+            &CliEnvEntries::default(),
+        )
+        .with_subscriber(subscriber)
+        .await
+        .expect("URL clients are left for the proxy");
+        assert!(clients.is_empty());
+        let logs = std::fs::read_to_string(log_path).expect("warning log");
+        assert!(logs.is_empty(), "unexpected warning: {logs}");
+    }
 
     #[test]
     fn shared_image_error_preserves_message_without_a_configuration_prefix() {
