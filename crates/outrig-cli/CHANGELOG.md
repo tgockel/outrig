@@ -315,6 +315,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Generated Debian images use Node 24 for the filesystem MCP server.** Even without a
+  selected Node toolchain, the recipe installs and checks Node 24 rather than the distro's
+  Node 18, which cannot run the current server. (#1009)
+
 - **One startup warning for settings only `run-new` reads.** `outrig run` lists all applicable
   settings in one warning, including model context windows, rather than warning once per key.
   (#767)

@@ -234,14 +234,41 @@ fn none_toolchain_skips_section() {
 }
 
 #[test]
-fn fs_on_debian_base_installs_node_runtime() {
-    // A debian-family base without the `node` toolchain selected. The MCP
-    // block must add `nodejs npm` so `npm install -g ...` resolves.
-    let out = render::render(BaseImage::DebianBookwormSlim, &[], &[McpServer::Fs]);
-    assert!(
-        out.contains("nodejs npm"),
-        "expected runtime ensure-install for nodejs+npm:\n{out}",
+fn fs_on_debian_base_installs_checked_node_24_runtime() {
+    for base in [
+        BaseImage::DebianBookwormSlim,
+        BaseImage::Ubuntu24_04,
+        BaseImage::Python3_12Slim,
+    ] {
+        let out = render::render(base, &[], &[McpServer::Fs]);
+        let (runtime, mcp) = out
+            .split_once("# Node runtime for MCP servers\n")
+            .expect("missing Node runtime section");
+        assert!(!runtime.contains("setup_$node_major.x"), "{out}");
+        let (runtime, mcp) = mcp.split_once("# MCP servers\n").unwrap();
+        assert!(runtime.contains("setup_$node_major.x"), "{out}");
+        assert!(runtime.contains("case \"$(node --version)\""), "{out}");
+        assert!(runtime.contains("npm --version"), "{out}");
+        assert!(
+            mcp.contains("npm install -g @modelcontextprotocol/server-filesystem"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("nodejs npm"),
+            "must not install distro Node: {out}"
+        );
+    }
+}
+
+#[test]
+fn fs_with_node_toolchain_does_not_duplicate_nodesource_install() {
+    let out = render::render(
+        BaseImage::DebianBookwormSlim,
+        &[Toolchain::Node],
+        &[McpServer::Fs],
     );
+    assert_eq!(out.matches("setup_$node_major.x").count(), 1, "{out}");
+    assert!(!out.contains("# Node runtime for MCP servers"), "{out}");
 }
 
 #[test]
