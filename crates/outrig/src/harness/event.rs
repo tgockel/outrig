@@ -309,6 +309,25 @@ pub enum Payload {
         /// to the next, and each agent counts its own.
         round: u32,
     },
+    /// A child's round failed in a way that may clear, and its runner will
+    /// wait before trying again or deciding from what the child holds then.
+    #[non_exhaustive]
+    AgentRoundRetry {
+        /// The round that failed, not necessarily the next round's number.
+        round: u32,
+        /// How long the runner will wait before deciding again.
+        #[serde(serialize_with = "seconds")]
+        delay: Duration,
+        /// Why the model request failed, without the provider's response body.
+        error: String,
+        /// The request that failed, or `None` when none was recorded.
+        attempt_id: Option<AttemptId>,
+        /// Whether the failed round ran code: if so, its work stands and the
+        /// runner decides from what is open after the wait rather than
+        /// reopening with the same opening. Even without code, invalid tool
+        /// calls can commit turns, advancing the next round's number.
+        after_work: bool,
+    },
     /// A submission that was not run: `holder` held the interpreter, or the
     /// session was closed to new work.
     #[non_exhaustive]
@@ -1727,6 +1746,7 @@ impl Payload {
             Payload::AgentStarted { .. } => "agent.started",
             Payload::AgentStopped {} => "agent.stopped",
             Payload::RoundStarted { .. } => "round.started",
+            Payload::AgentRoundRetry { .. } => "agent.round.retry",
             Payload::ExecRefused { .. } => "exec.refused",
             Payload::ExecCompleted { .. } => "exec.completed",
             Payload::MemoryExhausted { .. } => "memory.exhausted",

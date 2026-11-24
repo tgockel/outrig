@@ -418,6 +418,18 @@ three times for one call before the rejection ends it.
 - `round.started` -- `round`. A round is numbered as its first turn commits, so a round that
   fails or is interrupted before committing one leaves its number to the next. Each agent counts
   its own.
+- `agent.round.retry` -- a child's round failed and its runner is waiting before deciding
+  again: `round`, the failed round; `delay`, seconds to wait; `error`, the last model
+  request's failure without the provider's response body; `attempt_id`, that request or
+  `null` when none was recorded; and `after_work`, whether the round ran code. Published
+  on the child before the wait, after `model.round.failed`. With `after_work: false` the
+  runner reopens with the same opening. Its number stays the same only if no turn committed:
+  an invalid tool call can commit a turn without running code, advancing the next round's
+  number and remaining in its history. With `true` its work stands and the runner decides
+  from what the child holds after the wait, which may open no round. This is not
+  `model.retry`, which retries a request within a model call. No retry event is emitted
+  for a terminal failure, a content-policy refusal, or the last of the repeated failures
+  that exhaust the runner's retries. Closing or releasing the child may prevent another round.
 - `exec.completed` -- how an execution ended, when its result arrived.
   - `execid`, and `status`: `ok`, `error`, `lost` when the interpreter exited first, or
     `refused` when the interpreter refused it.

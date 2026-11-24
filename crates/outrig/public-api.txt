@@ -1469,6 +1469,12 @@ pub outrig::harness::event::Payload::AgentRequestSent::body: alloc::string::Stri
 pub outrig::harness::event::Payload::AgentRequestSent::channel: core::option::Option<alloc::string::String>
 pub outrig::harness::event::Payload::AgentRequestSent::request: outrig::harness::event::AgentRequestId
 pub outrig::harness::event::Payload::AgentRequestSent::sender: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::AgentRoundRetry
+pub outrig::harness::event::Payload::AgentRoundRetry::after_work: bool
+pub outrig::harness::event::Payload::AgentRoundRetry::attempt_id: core::option::Option<outrig::harness::event::AttemptId>
+pub outrig::harness::event::Payload::AgentRoundRetry::delay: core::time::Duration
+pub outrig::harness::event::Payload::AgentRoundRetry::error: alloc::string::String
+pub outrig::harness::event::Payload::AgentRoundRetry::round: u32
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentSpawned
 pub outrig::harness::event::Payload::AgentSpawned::channels: alloc::vec::Vec<outrig::harness::event::ChannelBrief>
 pub outrig::harness::event::Payload::AgentSpawned::depth: u32

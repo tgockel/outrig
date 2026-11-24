@@ -24,10 +24,12 @@
 //! waiting is the change that opens its round.
 //!
 //! A round that fails before its code ran is opened again, with what it opened
-//! with, until it runs: the conversation keeps nothing of it, so its opening
-//! was never read. It is the same request each time, so one that fails
-//! [`ROUND_FAILURES_MAX`] times in a row is not opened again: the child's model
-//! is taken to answer nothing, as if it could never. One that fails after its
+//! with, until it runs. Usually the conversation keeps nothing of it, so its
+//! opening was never read. Invalid tool calls can commit turns without running
+//! Python, though, so reopening then advances the round number and keeps those
+//! turns. One that fails [`ROUND_FAILURES_MAX`] times in a row is not opened
+//! again: the child's model is taken to answer nothing, as if it could never.
+//! One that fails after its
 //! code ran is kept, opening and all, and what that code did -- a completion, a
 //! reply -- stands, so it is not opened again: after the same wait, the rule
 //! decides from what is open then, against the baseline from before it. A
@@ -99,7 +101,7 @@ use super::children::{Registry, Summary};
 use super::{Agent, AgentError};
 use super::{channel, orientation};
 use crate::harness::RoundStop;
-use crate::harness::event::{AttemptId, ChildKind};
+use crate::harness::event::{AttemptId, ChildKind, Payload};
 use crate::harness::stop::{AgentState, RoundFacts};
 
 /// How long a child waits after a round fails before the next opens. Each
@@ -326,7 +328,7 @@ pub(crate) async fn run(
             continue;
         }
         // Opened before a submission is given, so its taking names this round.
-        let opened = agent.history.next_round();
+        let mut opened = agent.history.next_round();
         round = Some(opened);
         if !children.round_opened(&id, opened) {
             return;
@@ -406,10 +408,15 @@ pub(crate) async fn run(
                 }
                 None => return,
             }
+            record_retry(&agent, failed, opened, wait, false);
             back_off(&mut wait).await;
             match registry.upgrade() {
                 Some(children) if !children.closed() => {
-                    // Nothing of the round was kept, so its number is the same.
+                    // Invalid tool calls can commit turns without running
+                    // Python. Capture the next attempt's actual number even
+                    // on this pre-work path: it need not be the same round.
+                    opened = agent.history.next_round();
+                    round = Some(opened);
                     if !children.round_opened(&id, opened) {
                         return;
                     }
@@ -497,6 +504,7 @@ pub(crate) async fn run(
                     "child agent {id}'s round failed after its code ran; deciding again in \
                      {wait:?}: {failed}"
                 );
+                record_retry(&agent, &failed, opened, wait, true);
                 cut = opened_on.map(|submission| (submission, failed));
                 back_off(&mut wait).await;
             }
@@ -587,6 +595,20 @@ fn unavailable(
         round,
         attempt,
     }
+}
+
+/// Record the wait before it starts, on the child whose round failed. This
+/// is the runner's retry, not a retry within a model call: the call's own
+/// retries and failover have already ended.
+fn record_retry(agent: &Agent, failed: &str, round: u32, delay: Duration, after_work: bool) {
+    let (error, attempt_id) = failure(agent, failed);
+    agent.slot().events().emit(Payload::AgentRoundRetry {
+        round,
+        delay,
+        error,
+        attempt_id,
+        after_work,
+    });
 }
 
 /// Wait `wait`, and double it for the failure after, up to [`RETRY_MAX`].

@@ -1127,6 +1127,16 @@ class Builder:
             summary += f": {usage_summary(d.get('usage'))}"
         self.add(summary, href=link(block.anchor) if block is not None else "")
 
+    def on_agent_round_retry(self, d: dict) -> None:
+        action = "decide from outstanding work" if d.get("after_work") else "reopen with the same opening"
+        summary = (
+            f"round {text(d.get('round'))} failed; wait {seconds(d.get('delay'))}, then {action}"
+        )
+        attempt = d.get("attempt_id")
+        if attempt is not None:
+            summary += f" (failed request {text(attempt)})"
+        self.add(summary, parts=[Part("error", text(d.get("error")), True)])
+
     def on_model_retry(self, d: dict) -> None:
         summary = (
             f"{text(d.get('model'))}: attempt {text(d.get('attempt'))} again after "

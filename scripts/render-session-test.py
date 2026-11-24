@@ -782,6 +782,11 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             a,
         ),
         (
+            "agent.round.retry",
+            {"round": 1, "delay": 2.0, "error": "e", "attempt_id": 1, "after_work": False},
+            c,
+        ),
+        (
             "model.retry",
             {
                 "model": "m",
@@ -1937,6 +1942,23 @@ class RenderSession(unittest.TestCase):
             '<div class="label">error</div><pre>unusable response (finish reason content_filter',
             html,
         )
+
+    def test_a_child_round_retry_says_why_it_waits_and_what_happens_next(self) -> None:
+        for after_work, action in (
+            (False, "reopen with the same opening"),
+            (True, "decide from outstanding work"),
+        ):
+            with self.subTest(after_work=after_work):
+                retry = {
+                    "round": 1,
+                    "delay": 2.0,
+                    "error": "HTTP 503 Service Unavailable",
+                    "attempt_id": 7,
+                    "after_work": after_work,
+                }
+                html = self.page(ordinary() + [("agent.round.retry", retry, "agent/c1")])
+                self.assertIn(f"round 1 failed; wait 2.00 s, then {action} (failed request 7)", html)
+                self.assertIn("HTTP 503 Service Unavailable", html)
 
     def test_a_field_its_handler_does_not_read_is_still_shown(self) -> None:
         retry = {"model": "m", "attempt": 1, "delay": 1.0, "error": "e", "novel": "it says"}

@@ -19,6 +19,11 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **Child-round retries are recorded.** `agent.round.retry` names the failed round, wait,
+  failure and model request before the runner backs off, and says whether the round's code
+  ran, so its work stands rather than reopening with the same opening. The round number
+  follows each attempt even when an invalid tool call committed a turn without running code. (#764)
+
 - **Threaded waits say what they run.** Wait events carry a task's `call`, a bounded,
   inert description of an `asyncio.to_thread` call, retained when it finishes. Older logs
   without it remain readable. Long-work examples now name their tasks. (#1019)

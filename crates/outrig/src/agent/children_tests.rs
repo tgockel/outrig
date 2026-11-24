@@ -755,7 +755,7 @@ async fn a_submission_given_to_a_refused_round_waits_for_its_sender() {
     )
     .await;
     round(&mut tree.session, "go").await;
-    let (_, _, requests) = tree.end().await;
+    let (_, events, requests) = tree.end().await;
     assert_eq!(
         printed(&requests, "p1"),
         "True\n",
@@ -766,6 +766,7 @@ async fn a_submission_given_to_a_refused_round_waits_for_its_sender() {
         1,
         "the refused opening, and nothing after it"
     );
+    assert!(kind(&events, "agent.round.retry", None).is_empty());
 }
 
 // ---------------------------------------------------------------------------- request children
@@ -3358,6 +3359,44 @@ async fn a_request_to_an_idle_child_once_the_budget_is_spent_ends_at_once() {
     );
 }
 
+/// The runner's waits belong to the child, follow its failed round, name the
+/// last failed request without its response body, and precede any next round.
+fn round_retries(events: &[Arc<Event>], expected: &[(u32, f64, bool)]) {
+    let retries = kind(events, "agent.round.retry", None);
+    assert_eq!(retries.len(), expected.len());
+    for (retry, &(round, delay, after_work)) in retries.iter().zip(expected) {
+        assert_eq!(retry.subject.as_ref().unwrap().as_str(), "agent/c1");
+        let d = data(retry);
+        assert_eq!(d["round"], round);
+        assert_eq!(d["delay"], delay);
+        assert_eq!(d["after_work"], after_work);
+        let attempt = kind(events, "model.attempt", Some("agent/c1"))
+            .into_iter()
+            .find(|event| data(event)["attempt_id"] == d["attempt_id"])
+            .expect("the failed request is recorded");
+        assert!(attempt.id < retry.id);
+        assert_eq!(d["error"], data(attempt)["error"]);
+        assert!(!d["error"].as_str().unwrap().contains("failed on purpose"));
+        let failed = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.id < retry.id
+                    && event.subject == retry.subject
+                    && event.kind() == "model.round.failed"
+            })
+            .expect("the round failed before its wait");
+        assert_eq!(data(failed)["round"], round);
+        if let Some(next) = events.iter().find(|event| {
+            event.id > failed.id
+                && event.subject == retry.subject
+                && event.kind() == "round.started"
+        }) {
+            assert!(retry.id < next.id, "the wait is recorded before reopening");
+        }
+    }
+}
+
 /// A round that fails is opened again with what it opened with: a work
 /// child's retry shows the submission it was given, inputs and all, rather
 /// than asking for a result the model never saw the request for.
@@ -3404,6 +3443,61 @@ async fn a_failed_round_opens_again_with_what_it_opened_with() {
         kind(&events, "model.round.failed", Some("agent/c1")).len(),
         1
     );
+    round_retries(&events, &[(1, 0.005, false)]);
+}
+
+/// An invalid tool call commits a turn without running Python. Reopening
+/// after its failure then advances the round number, which every later retry
+/// must name, whether that attempt ran code or not.
+#[tokio::test]
+async fn retries_name_the_attempted_round_after_an_invalid_call_commits() {
+    for unknown in [true, false] {
+        for after_work in [false, true] {
+            let invalid = mock_http::message(
+                serde_json::json!([{
+                    "type": "tool_use",
+                    "id": "invalid",
+                    "name": if unknown { "unknown_tool" } else { "submit_python" },
+                    "input": if unknown { serde_json::json!({}) } else { serde_json::json!("not an object") },
+                }]),
+                "tool_use",
+            );
+            let mut script = vec![invalid, mock_http::failure(500)];
+            if after_work {
+                script.push(submit("ran", "print('ran')"));
+            }
+            script.push(mock_http::failure(500));
+            script.extend(child_runs(
+                "complete",
+                "await runtime.complete(Total(total=sum(xs)))",
+            ));
+            let mut tree = tree(
+                "OUTRIG_TEST_CHILD_INVALID_RETRY",
+                "",
+                vec![
+                    ("ROLE flaky", scripted(script)),
+                    (
+                        "",
+                        primary_waits(
+                            r#"
+                        child = await runtime.spawn('f', prompt='ROLE flaky')
+                        print((await child.submit({'xs': [1, 2]}, result=Total)).total)
+                        "#,
+                        ),
+                    ),
+                ],
+            )
+            .await;
+            round(&mut tree.session, "go").await;
+            let (_, events, requests) = tree.end().await;
+            assert_eq!(printed(&requests, "p1"), "3\n");
+            let failed = data_of(&events, "model.round.failed", "agent/c1");
+            assert_eq!(failed.len(), 2);
+            assert_eq!(failed[0]["round"], 1);
+            assert_eq!(failed[1]["round"], 2);
+            round_retries(&events, &[(1, 0.005, false), (2, 0.01, after_work)]);
+        }
+    }
 }
 
 /// A round that fails before its code ran, every time, is the same request
@@ -3451,6 +3545,15 @@ async fn a_round_that_keeps_failing_ends_what_the_child_holds() {
         kind(&events, "model.round.failed", Some("agent/c1")).len(),
         ROUND_FAILURES_MAX as usize
     );
+    round_retries(
+        &events,
+        &[
+            (1, 0.005, false),
+            (1, 0.01, false),
+            (1, 0.02, false),
+            (1, 0.04, false),
+        ],
+    );
 }
 
 /// Failures are counted in a row: a round that runs ends the count, so a child
@@ -3488,6 +3591,25 @@ async fn a_round_that_runs_ends_the_count_of_failed_rounds() {
     assert_eq!(
         kind(&events, "model.round.failed", Some("agent/c1")).len(),
         2 * just_under
+    );
+    // The first completion can leave an idle round before the parent sends
+    // the second submission, so its number is not necessarily 2.
+    let retries = kind(&events, "agent.round.retry", Some("agent/c1"));
+    assert_eq!(retries.len(), 2 * just_under);
+    let second = data(retries[just_under])["round"].as_u64().unwrap() as u32;
+    assert!(second > 1);
+    round_retries(
+        &events,
+        &[
+            (1, 0.005, false),
+            (1, 0.01, false),
+            (1, 0.02, false),
+            (1, 0.04, false),
+            (second, 0.005, false),
+            (second, 0.01, false),
+            (second, 0.02, false),
+            (second, 0.04, false),
+        ],
     );
 }
 
@@ -3544,6 +3666,7 @@ async fn a_round_that_fails_after_its_code_ran_opens_on_what_is_open_then() {
         kind(&events, "model.round.failed", Some("agent/c1")).len(),
         1
     );
+    round_retries(&events, &[(1, 0.005, true)]);
 }
 
 /// With one place among requests in flight, a child's request waiting for it
@@ -3642,13 +3765,14 @@ async fn a_child_whose_model_cannot_answer_fails_what_it_holds() {
     )
     .await;
     round(&mut tree.session, "go").await;
-    let (_, _, requests) = tree.end().await;
+    let (_, events, requests) = tree.end().await;
     assert_eq!(printed(&requests, "p1"), "failed True\nfailed True\n");
     assert_eq!(
         of_agent(&requests, "ROLE refused").len(),
         1,
         "no call after the first refusal"
     );
+    assert!(kind(&events, "agent.round.retry", None).is_empty());
 }
 
 /// `requests-max` at its default: 256 requests sent at once to a child that
