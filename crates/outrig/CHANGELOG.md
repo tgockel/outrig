@@ -1315,6 +1315,11 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Fixed
 
+- **Late-usage events are documented as inactive.** `model.usage.replaced` and
+  `model.usage.refused` are defined and their ledger behavior is tested, but neither is
+  currently published: model calls are non-streaming and no provider billing callback
+  reports late usage. (#763)
+
 - The library agent retries connection failures while reading a successful response body,
   honoring `Retry-After` and the full retry budget before failing over. Incomplete bodies are
   recorded as failed attempts, and complete responses retain their usage accounting (#676).

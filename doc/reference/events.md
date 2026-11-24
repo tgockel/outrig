@@ -591,10 +591,12 @@ between a child's failed rounds is in that read and has no event of its own.
   stays left out, and the call moves to the next of an alias's models or fails. A round's first
   call answers its opening, which holds no results, so it is never sent again so.
 - `model.usage.replaced` -- a usage report that arrived after its attempt's event, taken: it
-  replaces that attempt's `null` usage, once. `call_id`, `attempt_id`, and `usage`.
+  replaces that attempt's `null` usage, once. `call_id`, `attempt_id`, and `usage`. Not currently
+  published: model calls are non-streaming, and no provider billing callback is connected.
 - `model.usage.refused` -- a usage report that changed nothing: `call_id` (`null` for an attempt
   the session has no record of), `attempt_id`, `usage`, and `reason`: `unknown`, `reported` when
   the attempt's own event carried its usage, or `replaced` when an earlier report already had.
+  Not currently published, for the same reason as `model.usage.replaced`.
 - `agent.spawned` -- a child agent was launched; the subject is the child's. `name`, what the
   spawn called it; `parent`, the subject of the agent that launched it, or `owner` for the
   program's; `kind`, `work` or `request`; `model`, the `[models.<name>]` row as the spawn named
@@ -957,7 +959,9 @@ between a child's failed rounds is in that read and has no event of its own.
 
 **Totals.** What a session spent is the sum of its `model.attempt` usage, each `attempt_id`
 counted once, with a `model.usage.replaced` taking the place of its attempt's `null` and a
-`model.usage.refused` changing nothing. A round's `usage` already includes the calls beneath it,
+`model.usage.refused` changing nothing. Those two events are defined for late usage reports but
+are not currently published: usage is recorded only in the response that ends an attempt, or
+as `null` when none was reported. A round's `usage` already includes the calls beneath it,
 so adding a round's total to its `calls` counts each attempt twice; a round's members are its
 `attempts`. A round's `total` holds its descendants' attempts beside its own, so adding the totals
 of a round and of its child's round counts the child's attempts twice; summing `usage` over every

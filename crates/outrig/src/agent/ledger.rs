@@ -15,7 +15,9 @@
 //! record that arrives after its attempt's event replaces that attempt's null
 //! once ([`Ledger::late_usage`]), and every total that counted the attempt
 //! reads the new figure from then on. A parent's inclusive total is never
-//! added to its parts, which would count each attempt twice.
+//! added to its parts, which would count each attempt twice. No production
+//! path calls `late_usage` yet, so `model.usage.replaced` and
+//! `model.usage.refused` are not currently published.
 //!
 //! [`Book`] is the one fold. The live session feeds it as it records, and a
 //! reader of the event log feeds it the same records back, so the two cannot
@@ -268,8 +270,9 @@ impl Ledger {
     ///
     /// Nothing calls this yet: every provider this loop speaks reports usage
     /// in the response that ends its attempt, a request that failed before a
-    /// response reports none, and nothing streams. A streamed reply's closing usage, or a provider's
-    /// billing callback, is what would.
+    /// response reports none, and nothing streams. A streamed reply's closing
+    /// usage or a provider's billing callback must be wired here when added;
+    /// until then neither usage replacement nor refusal events are published.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn late_usage(&self, attempt: AttemptId, usage: Usage) -> Late {
         let mut book = self.book();

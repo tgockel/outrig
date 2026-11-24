@@ -1170,6 +1170,9 @@ pub enum Payload {
     },
     /// A usage record that arrived after its attempt's event, accepted: it
     /// replaces that attempt's null usage, once.
+    ///
+    /// Not currently published: model calls are non-streaming, and no
+    /// provider billing callback is connected to report late usage.
     #[non_exhaustive]
     ModelUsageReplaced {
         /// The model call the attempt served.
@@ -1180,6 +1183,9 @@ pub enum Payload {
         usage: Usage,
     },
     /// A usage record that changed nothing.
+    ///
+    /// Not currently published: model calls are non-streaming, and no
+    /// provider billing callback is connected to report late usage.
     #[non_exhaustive]
     ModelUsageRefused {
         /// The model call the attempt served, or `None` for an attempt the
