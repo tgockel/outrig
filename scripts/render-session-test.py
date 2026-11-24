@@ -665,7 +665,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
                 "execid": 2,
                 "wait": 1,
                 "on": [
-                    {"kind": "task", "name": "n", "code": "c"},
+                    {"kind": "task", "name": "n", "code": "to_thread", "call": "time.sleep(3)"},
                     {"kind": "call", "id": 7, "function": "f", "child": "c1", "name": "n"},
                     {"kind": "request", "id": 8, "channel": "ch", "child": None, "name": None},
                 ],
@@ -2300,6 +2300,28 @@ class RenderSession(unittest.TestCase):
         self.assertIn("call 7 of pkg.review to c1", html)
         self.assertNotIn("Waiting now", html)
         self.assertNotIn("still waiting", html)
+
+    def test_thread_calls_appear_in_wait_summary_and_detail(self) -> None:
+        events = ordinary()
+        at = next(i for i, e in enumerate(events) if e[0] == "exec.completed")
+        from html import unescape
+
+        call = "runlog(['cargo', 'test', '-p', 'outrig-cli'], 'tests')"
+        on = [
+            {"kind": "task", "name": "Task-7", "code": "to_thread", "call": call},
+            {"kind": "task", "name": "nap", "code": "to_thread", "call": "time.sleep(3)"},
+        ]
+        events[at:at] = [
+            ("exec.wait.started", {"execid": 4, "wait": 1, "on": on, "more": 0,
+                                   "return_when": "ALL_COMPLETED", "timeout": None}),
+            ("exec.wait.ended", {"execid": 4, "wait": 1, "how": "returned", "done": on,
+                                 "channels": [], "error": None, "duration": 3}),
+        ]
+        html = unescape(self.page(events))
+        self.assertIn("awaiting " + call[:40] + ", nap", html)
+        self.assertIn("task Task-7 running " + call, html)
+        self.assertIn("task nap running time.sleep(3)", html)
+        self.assertIn("wait over after 3.00 s: " + call[:40] + ", nap done", html)
 
     def test_a_wait_still_open_at_the_end_is_listed_under_its_agent(self) -> None:
         events = ordinary()

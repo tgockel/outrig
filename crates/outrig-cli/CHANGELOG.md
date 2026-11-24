@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Threaded waits name the call, not just `to_thread`.** The `run-new` status line and
+  session renderer use an unnamed task's recorded call, cut to 40 characters. Named tasks
+  keep their names; the rendered detail shows the whole call for both. (#1019)
+
 - **`run-new` dials a configuration's `url` MCP entries.** An `[images.<name>.mcp]` entry with a
   `url` -- and `headers`, `trust-anchor`, `trust`, `allow-stateless` -- is a streamable-HTTP
   server the host dials; see the library's changelog. One a repository's config declares is shown

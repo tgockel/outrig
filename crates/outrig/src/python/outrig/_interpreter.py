@@ -106,7 +106,7 @@ BG_MAX = 2 * 1024  # bytes of other executions' output held for the next result,
 REPR_MAX = 1000  # one echoed value, or one inventory entry
 INVENTORY_MAX = 200  # global names listed in one inventory
 TASKS_MAX = 50  # running tasks named in one listing
-TASK_NAME_MAX = 200  # characters of one task's name
+TASK_NAME_MAX = 200  # characters of one task's name or threaded call
 WAIT_NOTICE_DELAY = 1.0  # seconds a `runtime.wait` is suspended before the host is told of it
 HELP_MAX = 8 * 1024  # characters of one `help()` answer
 DRAIN_TIMEOUT = 5.0  # seconds a result waits for its pipe to reach the end of the body's output
@@ -3308,10 +3308,116 @@ _type_qualname = type.__dict__["__qualname__"].__get__
 _type_bases = type.__dict__["__bases__"].__get__
 
 
-def _describe_awaited(fs, handles):
+def _call_value_parts(value, path=()):
+    """Bounded, inert representations: only exact builtins, never an object's hooks.
+
+    Yield pieces so a long or deeply nested container stops being read as soon as the
+    description is full. Cycles and excessive nesting are elided, not traversed.
+    """
+    cls = type(value)
+    if cls is str or cls is bytes:
+        yield cls.__repr__(value[:TASK_NAME_MAX])[:TASK_NAME_MAX]
+    elif any(cls is c for c in (int, float, bool, type(None))):
+        yield cls.__repr__(value)[:TASK_NAME_MAX]
+    elif any(cls is c for c in (list, tuple, dict)):
+        if id(value) in path or len(path) >= 8:
+            yield "..."
+            return
+        path = (*path, id(value))
+        opening, closing = {list: ("[", "]"), tuple: ("(", ")"), dict: ("{", "}")}[cls]
+        yield opening
+        for i, item in enumerate(value.items() if cls is dict else value):
+            if i:
+                yield ", "
+            if cls is dict:
+                key, val = item
+                yield from _call_value_parts(key, path)
+                yield ": "
+                yield from _call_value_parts(val, path)
+            else:
+                yield from _call_value_parts(item, path)
+        if cls is tuple and len(value) == 1:
+            yield ","
+        yield closing
+    else:
+        yield f"<{_plain_qualname(cls)}>"
+
+
+def _thread_call_parts(func, args, kwargs, namespace, depth=0):
+    """A callable's fields, not its attributes via a proxy or an override."""
+    cls = type(func)
+    if cls is functools.partial and depth < 8:
+        # Keyword keys can be str subclasses: copying them raw could call their hash.
+        keywords = {str.__str__(k): v for k, v in func.keywords.items()}
+        keywords.update((str.__str__(k), v) for k, v in kwargs.items())
+        yield from _thread_call_parts(
+            func.func, func.args + args, keywords, namespace, depth + 1
+        )
+        return
+    if cls is types.MethodType:
+        func = func.__func__  # Never read __self__, which may be a hosted proxy.
+        cls = type(func)
+        module = None
+    elif cls is types.FunctionType or cls is types.BuiltinFunctionType:
+        module = func.__module__
+        if cls is types.FunctionType and func.__globals__ is namespace:
+            module = None
+    else:
+        module = None
+    if cls is types.FunctionType or cls is types.BuiltinFunctionType:
+        if type(module) is str and module:
+            yield module + "."
+        yield str.__str__(func.__qualname__)
+    else:
+        yield f"<{_plain_qualname(cls)}>"
+    yield "("
+    for i, arg in enumerate(args):
+        if i:
+            yield ", "
+        yield from _call_value_parts(arg)
+    for i, (key, value) in enumerate(kwargs.items()):
+        if args or i:
+            yield ", "
+        yield str.__str__(key)
+        yield "="
+        yield from _call_value_parts(value)
+    yield ")"
+
+
+def _thread_calls(fs, namespace):
+    """Read before suspension: a completed to_thread coroutine no longer has its frame.
+
+    Each entry is best effort; an unreadable call must not fail the wait or hide other calls.
+    Neither formatting nor discovering a call invokes any agent or hosted code.
+    """
+    calls = {}
+    for f in fs:
+        try:
+            if not issubclass(type(f), asyncio.Task) or _code_of(f) is not asyncio.to_thread.__code__:
+                continue
+            frame = asyncio.Task.get_coro(f).cr_frame
+            if frame is None:
+                continue
+            fields = frame.f_locals
+            func, args, kwargs = fields["func"], fields["args"], fields["kwargs"]
+            if type(args) is not tuple or type(kwargs) is not dict:
+                continue
+            parts = _thread_call_parts(func, args, kwargs, namespace)
+            call = ""
+            for part in parts:
+                call += part[:TASK_NAME_MAX - len(call)]
+                if len(call) >= TASK_NAME_MAX:
+                    break
+            calls[id(f)] = call
+        except BaseException:
+            pass
+    return calls
+
+
+def _describe_awaited(fs, handles, calls):
     """What a wait's futures are, read from types and fields alone so no agent code runs: a task's
-    name and its coroutine's code, a handle's request and child, a skill's invocation, and any
-    other future's type. At most `TASKS_MAX` of them, sorted by label, and how many more. Every
+    name, coroutine's code and threaded call, a handle's request and child, a skill's invocation,
+    and any other future's type. At most `TASKS_MAX` of them, sorted by label, and how many more. Every
     string is a plain `str`, so sorting and encoding them runs none either, and `handles` is read
     by the futures' identities, so none is hashed."""
     described = []
@@ -3342,6 +3448,7 @@ def _describe_awaited(fs, handles):
                 # `asyncio.Task`'s own method, not an override a subclass of it may carry.
                 "name": str.__str__(asyncio.Task.get_name(f))[:TASK_NAME_MAX],
                 "code": None if code is None else str.__str__(code.co_qualname),
+                "call": calls.get(id(f)),
             }
         else:
             d = {"kind": "future", "type": _plain_qualname(type(f))}
@@ -5044,6 +5151,7 @@ class Runtime:
             described_by.update(_wrapped_handles(fs))
         except Exception as e:
             _diag(f"reading a wait's tasks failed: {_plain_qualname(type(e))}")
+        calls = _thread_calls(fs, self._kernel.globals)
         loop = asyncio.get_running_loop()
         # Woken for asyncio's reasons, as the waiter in `asyncio.tasks._wait` is: by the timer, or
         # by the one callback each future gets, which counts completions as they come. So `N`
@@ -5093,7 +5201,7 @@ class Runtime:
         def announce():
             nonlocal notice
             try:
-                on, more = _describe_awaited(fs, described_by)
+                on, more = _describe_awaited(fs, described_by, calls)
                 notice = {"wait": next(_ids), "exec": execution.id}
                 _notify({"t": "wait", "agent": kernel.agent, **notice, "on": on, "more": more,
                          "return_when": return_when, "timeout": timeout,
@@ -5149,7 +5257,7 @@ class Runtime:
                 # Best effort, and nothing agent code can override: the wait has ended as it
                 # ended, and a record without the end is the cost of one that cannot be read.
                 try:
-                    done, _ = _describe_awaited([f for f in fs if _is_done(f)], described_by)
+                    done, _ = _describe_awaited([f for f in fs if _is_done(f)], described_by, calls)
                     _notify({"t": "waited", "agent": kernel.agent, **notice, "how": how,
                              "done": done, "channels": channels, "error": error,
                              "elapsed": loop.time() - started})

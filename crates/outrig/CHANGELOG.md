@@ -19,6 +19,10 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **Threaded waits say what they run.** Wait events carry a task's `call`, a bounded,
+  inert description of an `asyncio.to_thread` call, retained when it finishes. Older logs
+  without it remain readable. Long-work examples now name their tasks. (#1019)
+
 - **An MCP service may be a server at a URL.** `McpServiceSpec::url`, `outrig.McpUrl` and a
   configuration's `url` entry declare a streamable-HTTP server the host dials, in no container of
   the session's. Each request carries the declaration's `headers` -- each `${VAR}` resolved once,

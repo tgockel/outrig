@@ -591,12 +591,17 @@ pub(in crate::cli::run_new) fn joined(names: &[String], more: u64) -> String {
 }
 
 /// One thing a wait is on, as the line names it: a task by its name, or by
-/// its coroutine when it was left with asyncio's `Task-N`; a handle by its
-/// child, or by its request while the child is unknown; a typed call by its
-/// function.
+/// its threaded call or coroutine when left with asyncio's `Task-N`; a
+/// handle by its child, or by its request while the child is unknown; a
+/// typed call by its function.
 fn awaited_name(awaited: &Awaited) -> String {
     let (what, id, child, name) = match awaited {
-        Awaited::Task { name, code, .. } => {
+        Awaited::Task { name, code, call, .. } => {
+            if is_default_task_name(name)
+                && let Some(call) = call
+            {
+                return call.chars().take(40).collect();
+            }
             return match code {
                 Some(code) if is_default_task_name(name) => code.clone(),
                 _ => name.clone(),
@@ -721,6 +726,21 @@ mod tests {
     /// interpreter's line: the one way this crate can hold one.
     fn one(json: serde_json::Value) -> Awaited {
         serde_json::from_value(json).expect("an awaited")
+    }
+
+    #[test]
+    fn threaded_waits_prefer_names_then_bounded_calls() {
+        let mut task = serde_json::json!({
+            "kind": "task", "name": "Task-7", "code": "to_thread", "call": "time.sleep(3)"
+        });
+        assert_eq!(awaited_name(&one(task.clone())), "time.sleep(3)");
+        task["call"] = serde_json::json!("é".repeat(60));
+        assert_eq!(awaited_name(&one(task.clone())), "é".repeat(40));
+        task["name"] = serde_json::json!("nap");
+        assert_eq!(awaited_name(&one(task.clone())), "nap");
+        task["name"] = serde_json::json!("Task-7");
+        task["call"] = serde_json::Value::Null;
+        assert_eq!(awaited_name(&one(task)), "to_thread");
     }
 
     /// What a wait is on, as the line names it: a task by its name, a handle

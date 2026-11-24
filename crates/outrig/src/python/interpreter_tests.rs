@@ -3786,6 +3786,145 @@ fn a_wait_registers_with_each_future_once() {
     assert_eq!(k.output(1, &source), "(100, 0, 100)\n");
 }
 
+/// Thread calls are captured before their frames disappear, for named tasks too.
+#[test]
+fn a_threaded_wait_records_the_call_at_both_ends() {
+    let mut k = Interpreter::start();
+    let result = k.exec(
+        1,
+        &py(r#"
+        import time
+        tasks = {asyncio.create_task(asyncio.to_thread(time.sleep, 1.5)),
+                 asyncio.create_task(asyncio.to_thread(time.sleep, 1.5), name='nap')}
+        await asyncio.sleep(0)  # both to_thread frames are suspended inside the worker wait
+        await runtime.wait(tasks)
+        "#),
+    );
+    assert_eq!(result["status"], "ok", "{result}");
+    let started = k.notice();
+    assert_eq!(started["on"].as_array().unwrap().len(), 2);
+    for entry in started["on"].as_array().unwrap() {
+        assert_eq!(entry["code"], "to_thread");
+        assert_eq!(entry["call"], "time.sleep(1.5)");
+    }
+    assert!(
+        started["on"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "nap")
+    );
+    assert_eq!(k.notice()["done"], started["on"]);
+}
+
+/// A failed description leaves call null and the wait proceeds, including its
+/// other tasks' descriptions, without depending on a hostile exception's text.
+#[test]
+fn an_unreadable_thread_call_does_not_fail_the_wait() {
+    let mut k = Interpreter::start();
+    let result = k.exec(
+        1,
+        &py(r#"
+        import __main__ as m, time
+        def bad():
+            time.sleep(1.5)
+        real = m._thread_call_parts
+        def describe(func, *args, **kwargs):
+            if func is bad:
+                raise RuntimeError('unreadable')
+            return real(func, *args, **kwargs)
+        m._thread_call_parts = describe
+        try:
+            await runtime.wait({
+                asyncio.create_task(asyncio.to_thread(bad), name='bad'),
+                asyncio.create_task(asyncio.to_thread(time.sleep, 1.5), name='nap')})
+        finally:
+            m._thread_call_parts = real
+        "#),
+    );
+    assert_eq!(result["status"], "ok", "{result}");
+    let started = k.notice();
+    assert_eq!(started["on"][0]["name"], "bad");
+    assert!(started["on"][0]["call"].is_null());
+    assert_eq!(started["on"][1]["call"], "time.sleep(1.5)");
+    assert_eq!(k.notice()["done"], started["on"]);
+}
+
+/// Only exact builtins are formatted. No object, subclass or metaclass hook runs;
+/// partials and bound methods are read without inspecting their receivers.
+#[test]
+fn thread_call_descriptions_are_inert_bounded_and_best_effort() {
+    let mut k = Interpreter::start();
+    let said = k.output(
+        1,
+        &py(r#"
+        import __main__ as m, functools, subprocess, time
+        calls = []
+        def hook(*args):
+            calls.append('called')
+            raise AssertionError('description ran agent code')
+        class Meta(type):
+            __getattribute__ = hook
+            __eq__ = hook
+            __hash__ = hook
+        class Hostile(metaclass=Meta):
+            __repr__ = hook
+            __getattr__ = hook
+            __getattribute__ = hook
+            __hash__ = hook
+            __eq__ = hook
+            __call__ = hook
+            @property
+            def field(self):
+                return hook()
+        class Text(str):
+            __repr__ = hook
+            __str__ = hook
+            __format__ = hook
+            __hash__ = hook
+        class Service:
+            def f(self, x):
+                pass
+        def runlog(*args, **kwargs):
+            pass
+        def describe(fn, *args, **kwargs):
+            t = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+            try:
+                return m._thread_calls([t], globals()).get(id(t))
+            finally:
+                t.cancel()
+        obj = Hostile()
+        assert describe(time.sleep, 3) == 'time.sleep(3)'
+        assert describe(subprocess.run, ['cargo', 'fmt'], check=True) == \
+            "subprocess.run(['cargo', 'fmt'], check=True)"
+        assert describe(runlog, [None, b'x', 1, 2.5, False], k={'a': (2,)}) == \
+            "runlog([None, b'x', 1, 2.5, False], k={'a': (2,)})"
+        assert describe(Service().f, 1) == 'Service.f(1)'
+        assert describe(functools.partial(runlog, 'first', flag=False), 'second', flag=True) == \
+            "runlog('first', 'second', flag=True)"
+        assert describe(lambda: None) == '<lambda>()'
+        assert describe(obj, obj, Text('x'), [obj], {1: obj}) == \
+            '<Hostile>(<Hostile>, <Text>, [<Hostile>], {1: <Hostile>})'
+        # A proxy's attribute trap is not consulted either, as callable or argument.
+        class Proxy:
+            __getattribute__ = hook
+            __repr__ = hook
+        assert describe(Proxy(), Proxy()) == '<Proxy>(<Proxy>)'
+        # Formatting stops at the bound even for huge, nested or cyclic inputs.
+        assert len(describe(runlog, 'é' * 10000)) == 200
+        assert len(describe(runlog, list(range(10000)))) == 200
+        cycle = []; cycle.append(cycle)
+        assert describe(runlog, cycle) == 'runlog([...])'
+        t = asyncio.create_task(asyncio.to_thread(time.sleep, 0))
+        await t
+        assert m._thread_calls([t], globals()) == {}
+        await asyncio.sleep(0)
+        print(calls)
+        "#),
+    );
+    assert_eq!(said, "[]\n");
+}
+
 /// A wait that lasts past a second is told of: what it waits on -- a task by
 /// its name and its coroutine -- with `return_when`, the timeout, and the
 /// execution; and how it ended, with what was done by then.
@@ -3810,7 +3949,7 @@ fn a_long_wait_is_told_of_and_its_end_says_what_was_done() {
     assert_eq!(started["exec"], 1);
     assert_eq!(
         started["on"],
-        json!([{"kind": "task", "name": "ci_run", "code": "ci_run"}])
+        json!([{"kind": "task", "name": "ci_run", "code": "ci_run", "call": null}])
     );
     assert_eq!(started["more"], 0);
     assert_eq!(started["return_when"], "ALL_COMPLETED");
@@ -3962,7 +4101,7 @@ fn describing_a_wait_runs_no_agent_code() {
         started["on"],
         json!([
             {"kind": "future", "type": "Loud"},
-            {"kind": "task", "name": "job", "code": "job"},
+            {"kind": "task", "name": "job", "code": "job", "call": null},
         ]),
         "{started}"
     );
@@ -3970,7 +4109,7 @@ fn describing_a_wait_runs_no_agent_code() {
     let ended = k.notice();
     assert_eq!(
         ended["done"],
-        json!([{"kind": "task", "name": "job", "code": "job"}])
+        json!([{"kind": "task", "name": "job", "code": "job", "call": null}])
     );
     assert!(!k.stderr().contains("RAN"), "{}", k.stderr());
 }
@@ -4139,7 +4278,7 @@ fn a_completion_before_the_deadline_is_not_a_timeout() {
     assert_eq!(ended["how"], "returned", "{ended}");
     assert_eq!(
         ended["done"],
-        json!([{"kind": "task", "name": "job", "code": "job"}])
+        json!([{"kind": "task", "name": "job", "code": "job", "call": null}])
     );
 }
 

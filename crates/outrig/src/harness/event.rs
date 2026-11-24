@@ -2446,7 +2446,8 @@ pub struct Held {
 #[serde(tag = "kind", rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum Awaited {
-    /// A task: its name, and its coroutine's qualified name when it has one.
+    /// A task: its name, its coroutine's qualified name when it has one, and
+    /// the call it runs when it is an `asyncio.to_thread` task.
     /// A task nobody named whose only work is `asyncio.ensure_future` of a
     /// handle or a skill's invocation is listed as that handle or invocation
     /// instead.
@@ -2457,6 +2458,10 @@ pub enum Awaited {
         /// The qualified name of its coroutine's code, or `None` when it has
         /// none.
         code: Option<String>,
+        /// The call an `asyncio.to_thread` task runs, read before the wait, or
+        /// `None` when unavailable. At most 200 characters; absent in older logs.
+        #[serde(default)]
+        call: Option<String>,
     },
     /// A submission to a child agent: the request's id, and the child's id
     /// and spawn name once the child exists.

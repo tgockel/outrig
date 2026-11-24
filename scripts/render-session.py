@@ -434,8 +434,8 @@ def awaited_name(a: dict) -> str:
     kind = text(a.get("kind"))
     child, name = text(a.get("child")), text(a.get("name"))
     if kind == "task":
-        # A task nobody named reads as its coroutine, when it has one.
-        code = text(a.get("code"))
+        # A task nobody named reads as its threaded call, or its coroutine.
+        code = text(a.get("call"))[:40] or text(a.get("code"))
         return code if code and re.fullmatch(r"Task-\d+", name) else name
     if kind in ("submission", "request"):
         if child:
@@ -468,7 +468,7 @@ def awaited_lines(on: list[dict]) -> list[str]:
         else:
             to = "child not yet known"
         if kind == "task":
-            code = text(a.get("code"))
+            code = text(a.get("call")) or text(a.get("code"))
             line = f"task {name}" + (f" running {code}" if code else "")
         elif kind == "submission":
             line = f"submission {id_} {to}"

@@ -2142,3 +2142,37 @@ fn a_programs_end_ends_its_own_calls_and_unbinds_its_own_objects() {
         "the process's call goes on"
     );
 }
+
+/// Describing to_thread's callable and arguments reads no hosted attribute, even
+/// for a real proxy. Proxy creation is complete before the record is sampled.
+#[test]
+fn describing_threaded_proxies_makes_no_hosted_request() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    relay.output(1, &with_stub("root = K.hosted('fx')\nmethod = root.record"));
+    let before = relay.hosted_events().len();
+    let out = relay.output(
+        2,
+        &py(r#"
+        import __main__ as m, types
+        def local(x):
+            pass
+        tasks = [asyncio.create_task(asyncio.to_thread(root, root)),
+                 asyncio.create_task(asyncio.to_thread(method, root)),
+                 asyncio.create_task(asyncio.to_thread(types.MethodType(local, root), root))]
+        descriptions = m._thread_calls(tasks, globals())
+        for task in tasks:
+            call = descriptions[id(task)]
+            assert '<' in call, call
+            task.cancel()
+        await asyncio.sleep(0)
+        print(len(descriptions))
+        "#),
+    );
+    assert_eq!(out, "3\n");
+    assert_eq!(
+        relay.hosted_events().len(),
+        before,
+        "describing made a request"
+    );
+}

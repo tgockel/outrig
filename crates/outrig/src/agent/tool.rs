@@ -217,7 +217,8 @@ impl Tool for SubmitPython {
              turning while it keeps a CPU busy is taken for a runaway after about half a minute \
              and interrupted. Waiting on a subprocess or a sleep is not one, and {interrupt}: \
              run long work -- a test suite, a build, a network \
-             call -- as a task, `t = asyncio.create_task(asyncio.to_thread(...))`, and wait with \
+             call -- as a task, `t = asyncio.create_task(asyncio.to_thread(...), name=\"tests\")`, \
+             and wait with \
              `await runtime.wait({{t}}, timeout=...)`."
         )
     }
@@ -500,7 +501,8 @@ fn summary(outcome: &Outcome) -> String {
 
 /// What a runaway's status adds, so the model does not write another.
 const RUNAWAY_ADVICE: &str = "Run long computations as a task, \
-     `asyncio.create_task(asyncio.to_thread(...))`, which keeps the loop turning, and wait on it \
+     `asyncio.create_task(asyncio.to_thread(...), name=\"tests\")`, which keeps the loop turning, \
+     and wait on it \
      with `runtime.wait` and a `timeout=`.";
 
 /// What stopping Python leaves running.

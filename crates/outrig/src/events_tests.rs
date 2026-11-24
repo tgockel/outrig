@@ -867,7 +867,8 @@ fn each_event_has_exactly_its_data_fields() {
                 wait: 1,
                 on: vec![Awaited::Task {
                     name: text("ci_run"),
-                    code: Some(text("watch")),
+                    code: Some(text("to_thread")),
+                    call: Some(text("time.sleep(3)")),
                 }],
                 more: 0,
                 return_when: ReturnWhen::FirstCompleted,
@@ -1758,7 +1759,7 @@ fn each_event_has_exactly_its_data_fields() {
     let started = serde_json::to_value(case("exec.wait.started")).expect("encodes");
     assert_eq!(
         started["on"],
-        json!([{"kind": "task", "name": "ci_run", "code": "watch"}])
+        json!([{"kind": "task", "name": "ci_run", "code": "to_thread", "call": "time.sleep(3)"}])
     );
     assert_eq!(started["return_when"], json!("FIRST_COMPLETED"));
     assert_eq!(started["timeout"], json!(1.5), "seconds, as a number");
@@ -2088,4 +2089,16 @@ async fn an_unbuilt_stream_ends_its_subscriptions() {
     let mut subscription = stream.subscribe(4);
     drop(stream);
     assert!(subscription.recv().await.is_none());
+}
+
+/// Old records lack a thread call; new records carry it even for named tasks.
+#[test]
+fn awaited_tasks_from_older_logs_have_no_call() {
+    let task: crate::harness::event::Awaited =
+        serde_json::from_value(json!({"kind": "task", "name": "Task-7", "code": "to_thread"}))
+            .expect("older task entry");
+    assert_eq!(
+        serde_json::to_value(task).unwrap()["call"],
+        serde_json::Value::Null
+    );
 }

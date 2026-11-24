@@ -1322,7 +1322,7 @@ async fn a_wait_told_of_is_recorded_and_listed_until_it_is_over() {
         .expect("submitted");
     let id = execution.id();
     fake.exec(id).await;
-    let on = json!([{"kind": "task", "name": "ci_run", "code": "watch"}]);
+    let on = json!([{"kind": "task", "name": "ci_run", "code": "watch", "call": null}]);
     fake.send(json!({
         "t": "wait", "agent": PRIMARY, "wait": 1, "exec": id, "on": on, "more": 0,
         "return_when": "FIRST_COMPLETED", "timeout": 30.0, "elapsed": 1.0,
@@ -1348,6 +1348,7 @@ async fn a_wait_told_of_is_recorded_and_listed_until_it_is_over() {
         [Awaited::Task {
             name: "ci_run".into(),
             code: Some("watch".into()),
+            call: None,
         }]
     );
     assert_eq!(primary.return_when, ReturnWhen::FirstCompleted);

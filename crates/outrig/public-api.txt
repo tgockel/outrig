@@ -1309,6 +1309,7 @@ pub outrig::harness::event::Awaited::Submission::child: core::option::Option<all
 pub outrig::harness::event::Awaited::Submission::id: core::option::Option<u64>
 pub outrig::harness::event::Awaited::Submission::name: core::option::Option<alloc::string::String>
 #[non_exhaustive] pub outrig::harness::event::Awaited::Task
+pub outrig::harness::event::Awaited::Task::call: core::option::Option<alloc::string::String>
 pub outrig::harness::event::Awaited::Task::code: core::option::Option<alloc::string::String>
 pub outrig::harness::event::Awaited::Task::name: alloc::string::String
 #[non_exhaustive] pub enum outrig::harness::event::ChildKind

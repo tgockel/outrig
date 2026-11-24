@@ -909,7 +909,7 @@ async fn the_system_prompt_is_the_orientation_then_the_configured_preamble() {
         .as_str()
         .expect("a tool description");
     assert!(
-        description.contains("asyncio.create_task(asyncio.to_thread(...))")
+        description.contains("asyncio.create_task(asyncio.to_thread(...), name=\"tests\")")
             && description.contains("`await runtime.wait({t}, timeout=...)`")
             && !description.contains("`await asyncio.to_thread(")
             && description.contains("only the user's Ctrl-C ends a bare `await`"),
@@ -1033,7 +1033,7 @@ async fn a_childs_tool_description_names_its_owner_not_ctrl_c() {
     assert!(!description.contains("Ctrl-C"), "{description}");
     for instruction in [
         "only your owner's release or the session's close ends a bare `await`",
-        "asyncio.create_task(asyncio.to_thread(...))",
+        "asyncio.create_task(asyncio.to_thread(...), name=\"tests\")",
         "`await runtime.wait({t}, timeout=...)`",
     ] {
         assert!(description.contains(instruction), "{description}");
@@ -7178,7 +7178,7 @@ fn what_was_done_is_rendered_with_the_outcome_it_led_to() {
         "{raised_runaway}"
     );
     assert!(
-        raised_runaway.contains("asyncio.create_task(asyncio.to_thread(...))")
+        raised_runaway.contains("asyncio.create_task(asyncio.to_thread(...), name=\"tests\")")
             && raised_runaway.contains("`runtime.wait` and a `timeout=`"),
         "{raised_runaway}"
     );

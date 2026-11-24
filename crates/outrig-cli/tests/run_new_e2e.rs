@@ -2976,17 +2976,17 @@ async fn on_a_terminal_the_conversation_is_what_was_sent() {
 
 /// While the round's code is in a `runtime.wait` long enough for the session to record, the
 /// status line says what it awaits in place of `Python running` -- a task nobody named by its
-/// coroutine, not asyncio's `Task-N` -- and the detail view gets a line as the wait starts and one
+/// threaded call, not asyncio's `Task-N` -- and the detail view gets a line as the wait starts and one
 /// as it ends; once the code moves on, the line reads `Python running` again.
 #[tokio::test]
 async fn on_a_terminal_the_status_line_says_what_python_awaits() {
     let (addr, _requests) = start_mock_http(vec![
         submit(
             "toolu_wait",
-            "await runtime.channels['user'].receive()\nimport os\n\
-             async def ci_run():\n    while not os.path.exists('release-1'):\n        \
-             await asyncio.sleep(0.05)\n\
-             t = asyncio.create_task(ci_run())\n\
+            "await runtime.channels['user'].receive()\nimport os, time\n\
+             def wait_for_release(path):\n    while not os.path.exists(path):\n        \
+             time.sleep(0.05)\n\
+             t = asyncio.create_task(asyncio.to_thread(wait_for_release, 'release-1'))\n\
              done, pending = await runtime.wait({t})\n\
              while not os.path.exists('release-2'):\n    await asyncio.sleep(0.05)",
         ),
@@ -2999,17 +2999,27 @@ async fn on_a_terminal_the_status_line_says_what_python_awaits() {
 
     terminal.shows("Ctrl-O detail").await;
     terminal.press("go\r");
-    terminal.shows("awaiting ci_run · execution").await;
+    terminal
+        .shows("awaiting wait_for_release('release-1') · execution")
+        .await;
     terminal.press("\x0f");
-    terminal.shows(": awaiting ci_run").await;
+    terminal
+        .shows(": awaiting wait_for_release('release-1')")
+        .await;
     terminal.press("\x1b");
-    terminal.hides(": awaiting ci_run").await;
+    terminal
+        .hides(": awaiting wait_for_release('release-1')")
+        .await;
 
     std::fs::write(repo.path().join("release-1"), b"").expect("release the wait");
     terminal.shows("Python running · execution").await;
-    terminal.hides("awaiting ci_run").await;
+    terminal
+        .hides("awaiting wait_for_release('release-1')")
+        .await;
     terminal.press("\x0f");
-    terminal.shows("wait over: ci_run done").await;
+    terminal
+        .shows("wait over: wait_for_release('release-1') done")
+        .await;
     terminal.press("\x1b");
 
     std::fs::write(repo.path().join("release-2"), b"").expect("release the round");

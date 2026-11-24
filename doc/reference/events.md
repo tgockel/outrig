@@ -450,8 +450,8 @@ three times for one call before the rejection ends it.
   code runs for it.
   - `execid`, and `wait`, the interpreter's id for the wait, which its end carries too.
   - `on`: what it waits on, at most 50 entries, and `more`, those past them. Each entry is one of
-    `{kind: "task", name, code}`, a task by its name and its coroutine's qualified name, or
-    `null` when it has none; `{kind: "submission", id, child, name}` or
+    `{kind: "task", name, code, call}`, a task by its name and its coroutine's qualified name
+    (`code`, or `null` when it has none); `{kind: "submission", id, child, name}` or
     `{kind: "request", id, channel, child, name}`, a handle's submission to, or request on a
     channel of, the child `child`, whose spawn name is `name`, both `null` until the child
     exists; `{kind: "call", id, function, child, name}`, a typed call of the `@outrig.agent`
@@ -461,6 +461,13 @@ three times for one call before the rejection ends it.
     work is `asyncio.ensure_future` of a handle or a skill's invocation is listed as that handle
     or invocation, as it is when the code gives `runtime.wait` the handle itself; a task with a
     name of its own, given before or while the wait runs, is listed by it.
+  - A task's `call` is the call an `asyncio.to_thread` task runs, such as `time.sleep(3)`,
+    read before the wait while its coroutine still has a frame and kept for its end too. It is
+    at most 200 characters, with builtin values rendered without calling agent code; other
+    objects read as their type in angle brackets. It is `null` for other tasks or when the call
+    cannot be read, and absent in older logs. The terminal and session page name an unnamed
+    task by its call (at most 40 characters), then its code; a named task keeps its name. The
+    session page's detail includes the whole call even for a named task.
   - `return_when`: asyncio's `FIRST_COMPLETED`, `FIRST_EXCEPTION`, or `ALL_COMPLETED`.
   - `timeout`: seconds, or `null`; and `elapsed`, how many seconds the wait had lasted when it
     was recorded, from which the timeout counts.
