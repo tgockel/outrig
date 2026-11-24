@@ -8,7 +8,6 @@ edition       = "2024"
 rust-version  = "1.97.1"
 license       = "Apache-2.0"
 authors       = ["Travis Gockel <travis@gockelhut.com>"]
-homepage      = "https://tgockel.github.io/outrig/"
 documentation = "https://tgockel.github.io/outrig/"
 repository    = "https://github.com/tgockel/outrig"
 keywords      = ["llm", "agent", "mcp", "podman", "sandbox"]
