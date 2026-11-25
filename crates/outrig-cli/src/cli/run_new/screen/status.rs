@@ -16,9 +16,6 @@ use crate::cli::session_setup::plural;
 /// How many characters of a retried or moved call's error the line shows.
 const ERROR_MAX: usize = 60;
 
-/// How many characters of what the model said the line shows.
-const SAID_MAX: usize = 200;
-
 #[derive(Debug)]
 pub(super) struct Status {
     phase: Phase,
@@ -39,9 +36,6 @@ pub(super) struct Status {
     round_failed: bool,
     /// What the last round's code left running.
     still_running: Option<String>,
-    /// What the model last said this round, which stands in for "is working"
-    /// until it says more.
-    said: Option<String>,
     /// Whether the agent has sent the user anything since the round started.
     sent: bool,
 }
@@ -103,7 +97,6 @@ impl Default for Status {
             waiting: Some(0),
             round_failed: false,
             still_running: None,
-            said: None,
             sent: false,
         }
     }
@@ -128,7 +121,6 @@ impl Status {
                 self.sent = false;
                 self.round_failed = false;
                 self.still_running = None;
-                self.said = None;
             }
             Fact::Submitted { exec, .. } => {
                 self.running = Some(Running {
@@ -208,7 +200,6 @@ impl Status {
             Fact::RoundEnded { tokens, error, .. } => {
                 self.tokens += tokens.unwrap_or(0);
                 self.failed = None;
-                self.said = None;
                 // The call that failed is forgotten with the round; how the
                 // round ended is kept until another round ends. Reading it
                 // from each end as well as clearing it at the next start
@@ -233,7 +224,7 @@ impl Status {
                 self.sent = true;
                 return false;
             }
-            Fact::Said(text) => self.said = Some(text.clone()),
+            Fact::Said(_) => return false,
             // The gap may have hidden the end of a wait as well as a message;
             // the loop asks the session what is open and restores it.
             Fact::Missed(_) => {
@@ -337,16 +328,11 @@ impl Status {
         }
     }
 
-    /// What the model is doing while no retry waits: the latest thing it
-    /// said, or that it is working.
+    /// Compact activity; model text has its own persistent transcript entries.
     fn working(&self) -> String {
-        match (&self.said, &self.model) {
-            (Some(said), _) => {
-                let said = said.split_whitespace().collect::<Vec<_>>().join(" ");
-                cut(&said, SAID_MAX)
-            }
-            (None, Some(model)) => format!("{model} is working"),
-            (None, None) => "the model is working".to_string(),
+        match &self.model {
+            Some(model) => format!("{model} is working"),
+            None => "the model is working".to_string(),
         }
     }
 }
@@ -471,10 +457,10 @@ mod tests {
         assert_eq!(status.shown(now).text, "sonnet is working");
     }
 
-    /// What the model said stands in for "is working", each message replaces
-    /// the last, and the round's start and end clear it.
+    /// Thinking belongs to the transcript, not the activity line, and does not
+    /// count as an explicit user-channel send.
     #[test]
-    fn the_latest_thing_the_model_said_replaces_is_working() {
+    fn model_text_does_not_replace_activity_or_count_as_a_message() {
         let now = Instant::now();
         let mut status = after(
             &[
@@ -485,23 +471,9 @@ mod tests {
             ],
             now,
         );
-        assert!(status.apply(&Fact::Said("Reading\n  the   code".into()), now));
-        assert_eq!(status.shown(now).text, "Reading the code");
-        status.apply(&Fact::Said("Now testing".into()), now);
-        assert_eq!(status.shown(now).text, "Now testing");
-        // It outlasts the call it came from, and the Python that call ran.
-        status.apply(&Fact::Phase(Phase::Python), now);
-        status.apply(&Fact::Phase(Phase::Model), now);
-        status.apply(
-            &Fact::Calling {
-                model: "sonnet".into(),
-                call: 2,
-            },
-            now,
-        );
-        assert_eq!(status.shown(now).text, "Now testing");
-        status.apply(&Fact::RoundStarted { round: 2 }, now);
+        assert!(!status.apply(&Fact::Said("Reading\n  the   code".into()), now));
         assert_eq!(status.shown(now).text, "sonnet is working");
+        assert!(!status.ended(None), "thinking is not a message to the user");
     }
 
     /// A failover names the model now called, and the one it moved from and

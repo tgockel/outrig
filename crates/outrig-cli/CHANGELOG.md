@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`run-new` shows intermediate model text in the terminal conversation.** Subdued `Thinking`
+  blocks use the same Markdown rendering as agent messages and remain in scrollback and Ctrl-O
+  detail without `-v`. User-channel messages stay visually distinct, the status line stays compact,
+  and round completion no longer repeats the final text. Child model text and execution logs keep
+  their existing filtering and verbosity paths.
+
 - **`outrig mcp` fronts URL-backed servers.** URL declarations are no longer skipped; their
   tools share the namespaced proxy surface over stdio or `--listen`. Repository URLs require
   the same remembered approval as `run-new`; an unapproved or failed URL aborts startup.

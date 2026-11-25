@@ -570,36 +570,46 @@ and to fix what the error names and then start a new session. With `[events] mod
 event log records each retry and each move, and names the model that answered each call.
 
 **On a terminal.** When stdin and stdout are both the terminal `run-new` was started from, it holds
-that terminal with a screen. The conversation -- each line you send, marked `›`, and each message
-the agent sends you -- is printed into the terminal's own scrollback, where it stays after the
-session ends, and a status line and an input box sit below it. The status line says what the session
-is doing: the model working -- the latest thing it said, once it has said anything, each message
-replacing the last -- Python running and for how long, and what it awaits once its code has been
-in `runtime.wait` for a second, a failed call and when it is retried, the model a call moved from
-and why, how many of your messages the agent has yet to read -- `2 messages unread by the agent`,
-or `unread messages: unknown` after a gap in the events -- what the last round left running, and
-the tokens spent. An idle session reads `ready`, or `last round failed` when the round that ended
-last ended on an error, until the next round begins; why it failed is on the error line printed
-into the conversation. The agent's working -- the model's own text in
-full, each submission's source and what it printed, retries and failovers, and log lines -- stays
-out of the conversation. Ctrl-O opens it in a view of its own, scrolled with the arrow keys, PgUp
-and PgDn, Home and End, and closed with Esc; with `-v` it is printed in the conversation too. A
-round in which the agent sent you nothing ends on a line saying so. The agent is held to the
-terminal's pace as below, and while the detail view is open, its messages wait for it to close. A
-terminal that has stopped reading what is written to it holds up what is drawn there and nothing
-else: what you type, Ctrl-C included, still reaches the session.
+that terminal with a screen. The conversation -- each line you send, marked `›`, each message
+on the user channel, and the model's intermediate text -- is printed into the terminal's own
+scrollback, where it stays after the session ends. Model text appears once per accepted call in
+indented, subdued blocks labeled `Thinking`; explicit user-channel messages keep normal contrast.
+Here, thinking means text already exposed by the model's event stream, including commentary, not
+private reasoning that a provider does not expose. Child agents' own model text stays out of this
+main-agent conversation. No text is replayed at round completion.
 
-Agent messages in this screen render a small CommonMark subset, in the conversation and the detail
-view alike: bold and italic emphasis, reverse-video inline code, quiet code gutters, compact bold
-headings, lists, quotes, and links with their destinations in parentheses. Images show their alt
-text and destination; HTML is literal text, not interpreted. Other Markdown extensions, such as
-tables, remain readable source. Your input, Python submissions, and tool logs are not parsed as
-Markdown. Messages above 256 KiB, or with a potential container prefix wider than 128 cells,
-render literally instead. The prefix check conservatively counts leading whitespace, quote and
-list punctuation, and digits, even in code. These limits bound the input and nesting passed to
-the screen's Markdown parser. `NO_COLOR` disables color, not emphasis; code gutters and inline
-reverse video remain readable without color, and emphasis remains understandable on terminals
-without italics.
+A status line and an input box sit below the conversation. The status line says what the session
+is doing: the model working, Python running and for how long, and what it awaits once its code has
+been in `runtime.wait` for a second, a failed call and when it is retried, the model a call moved
+from and why, how many of your messages the agent has yet to read -- `2 messages unread by the
+agent`, or `unread messages: unknown` after a gap in the events -- what the last round left running,
+and the tokens spent. An idle session reads `ready`, or `last round failed` when the round that
+ended last ended on an error, until the next round begins; why it failed is on the error line
+printed into the conversation.
+
+Execution detail -- each submission's source and what it printed, retries and failovers, and log
+lines -- stays out of the conversation. Ctrl-O opens the transcript, including the thinking blocks,
+in a view of its own, scrolled with the arrow keys, PgUp and PgDn, Home and End, and closed with
+Esc; with `-v`, execution detail is printed in the conversation too, without repeating thinking
+blocks.
+The detail view retains whole entries within its existing 4 MiB text budget, dropping the oldest
+entries when needed. A round in which the agent sent no message on the user channel ends on a line
+saying so, even if thinking was visible. Reasoning-only diagnostics remain labeled as such in the
+detail view. The agent is held to the terminal's pace as below, and while the detail view is open,
+its messages wait for it to close. A terminal that has stopped reading what is written to it holds
+up what is drawn there and nothing else: what you type, Ctrl-C included, still reaches the session.
+
+Agent messages and thinking blocks in this screen render a small CommonMark subset, in the
+conversation and the detail view alike: bold and italic emphasis, reverse-video inline code, quiet
+code gutters, compact bold headings, lists, quotes, and links with destinations in parentheses.
+Images show their alt text and destination; HTML is literal text, not interpreted. Other Markdown
+extensions, such as tables, remain readable source. Your input, Python submissions, and tool logs
+are not parsed as Markdown. Messages above 256 KiB, or with a potential container prefix wider than
+128 cells, render literally instead. The prefix check conservatively counts leading whitespace,
+quote and list punctuation, and digits, even in code. These limits bound the input and nesting
+passed to the screen's Markdown parser. `NO_COLOR` disables color, not emphasis; the `Thinking`
+label, code gutters, and inline reverse video remain readable without color, and emphasis remains
+understandable on terminals without italics.
 
 Fenced and indented code keeps its indentation, blank lines, and trailing spaces; tabs expand to
 four-cell stops. Long code lines soft-wrap without dropping spaces: `│` marks a source line and

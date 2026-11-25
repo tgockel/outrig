@@ -2904,12 +2904,13 @@ impl OnTerminal {
     }
 }
 
-/// On a terminal the conversation is what the user and the agent sent each other: a typed line
-/// brings the agent's send into view, and not the Python that sent it, which the detail view
-/// shows. The status line says what runs and what waits, and a line typed meanwhile waits for a
-/// later round, since the round it was typed in was told of it and ended. Ctrl-C, which raw mode
-/// reads as a key, still exits twice pressed. The terminal is given back as the shell gave it,
-/// with the session's closing lines below the conversation.
+/// On a terminal the conversation shows user-channel messages and labeled Thinking blocks,
+/// but not the Python that sent the messages, which the detail view shows. Model commentary
+/// stays visible once its round ends, without being replayed. The status line says what runs
+/// and what waits. A line typed meanwhile waits for a later round: the current round was told
+/// of it and ended. Ctrl-C, which raw mode reads as a key, still exits twice pressed. The
+/// terminal is given back as the shell gave it, with the session's closing lines below the
+/// conversation.
 #[tokio::test]
 async fn on_a_terminal_the_conversation_is_what_was_sent() {
     let (addr, _requests) = start_mock_http(vec![
@@ -2955,15 +2956,52 @@ async fn on_a_terminal_the_conversation_is_what_was_sent() {
     terminal.shows("echo: hello").await;
 
     std::fs::write(repo.path().join("release"), b"").expect("release the first round");
+    terminal.shows("commentary on the first").await;
     terminal.shows("ready · 1 message unread").await;
+    let screen = terminal.screen();
+    assert!(
+        screen.contains("Thinking\n  commentary on the first"),
+        "{screen}"
+    );
+    assert_eq!(
+        screen.matches("commentary on the first").count(),
+        1,
+        "{screen}"
+    );
+    assert_eq!(screen.matches("Thinking").count(), 1, "{screen}");
+
     // A round of its own, whose code reads the oldest message waiting.
     terminal.press("third\r");
     terminal.shows("got second").await;
+    terminal.shows("commentary on the second").await;
     terminal.shows("ready · 1 message unread").await;
+    let screen = terminal.screen();
     assert!(
-        !terminal.screen().contains("commentary"),
-        "the model's own text is detail:\n{}",
-        terminal.screen()
+        screen.contains("Thinking\n  commentary on the second"),
+        "{screen}"
+    );
+    assert_eq!(screen.matches("Thinking").count(), 2, "{screen}");
+    for text in ["commentary on the first", "commentary on the second"] {
+        assert_eq!(screen.matches(text).count(), 1, "{screen}");
+    }
+    let positions = [
+        "echo: hello",
+        "commentary on the first",
+        "got second",
+        "commentary on the second",
+    ]
+    .map(|text| {
+        screen
+            .find(text)
+            .unwrap_or_else(|| panic!("missing {text:?}:\n{screen}"))
+    });
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("ch.receive()"),
+        "the Python is still detail:\n{screen}"
     );
 
     terminal.press("\x03");

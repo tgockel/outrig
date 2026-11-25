@@ -557,6 +557,9 @@ fn read_catalog(shown: &mut Subscription, term: &Terminal<'_>) -> HashSet<String
 
 /// Queue `messages` to be shown, each as room is made for it.
 async fn show(view: Frontend<'_>, messages: Vec<String>) {
+    if let Frontend::Screen(screen) = view {
+        screen.draining();
+    }
     for text in messages {
         let Some(room) = view.room().await else {
             return;
@@ -818,7 +821,7 @@ impl Terminal<'_> {
                 }
             }
             Frontend::Screen(screen) => {
-                screen.ended(&end.reply, reasoning, closing, still_running(running));
+                screen.ended(reasoning, closing, still_running(running));
             }
         }
     }

@@ -701,6 +701,11 @@ mod tests {
             })
         );
         assert_eq!(of_child("helper", ended(None)), None);
+        assert_eq!(
+            of_child("helper", Fact::Said("child commentary".into())),
+            None
+        );
+        assert_eq!(of_child("helper", Fact::AgentSent), None);
     }
 
     /// A child is labeled by the name its launch gave it, and by its id alone

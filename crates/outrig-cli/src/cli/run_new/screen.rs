@@ -1,12 +1,12 @@
 //! `run-new` on a terminal: the conversation in the terminal's own scrollback,
 //! and a status line and an input box below it.
 //!
-//! What the user sends and what the agent sends them are the conversation,
-//! and print as they happen, into history the terminal keeps after the session
-//! ends. The agent's working -- the model's own text, each submission and what
-//! it printed, retries -- is detail, which Ctrl-O shows in a view of its own
-//! and `-v` prints in the conversation. The status line says what the session
-//! is doing meanwhile, from its events.
+//! User-channel messages and subdued, labeled model-text blocks print as they
+//! happen, into history the terminal keeps after the session ends. Execution
+//! detail -- each submission and what it printed, retries -- stays behind
+//! Ctrl-O unless `-v` prints it in the conversation too. Ctrl-O retains the
+//! model-text blocks once alongside that detail. The status line says what
+//! the session is doing meanwhile, from its events.
 //!
 //! The screen is used only when stdin and stdout are both the controlling
 //! terminal, and on a terminal rustyline would drive: see [`wanted`].
@@ -31,6 +31,7 @@
 
 mod editor;
 mod facts;
+mod order;
 mod render;
 mod status;
 mod transcript;
@@ -164,6 +165,7 @@ pub(super) struct Screen {
     logs: Option<Diverted>,
     /// What the children's launches named them, for labeling their events.
     names: Mutex<facts::Names>,
+    order: Mutex<order::Order>,
 }
 
 /// A started screen, and what it hands the loop: the lines typed, each
@@ -227,6 +229,7 @@ impl Screen {
                 finished: false,
                 logs: Some(logs),
                 names: Mutex::default(),
+                order: Mutex::default(),
             },
             typed,
             keys,
@@ -236,7 +239,7 @@ impl Screen {
 
     fn say(&self, item: ToScreen) {
         // A thread that has gone has said why through `Failures`.
-        let _ = self.queue.send(item);
+        lock(&self.order).push(item, &self.queue);
     }
 
     fn entry(&self, kind: Kind, text: &str) {
@@ -270,19 +273,18 @@ impl Screen {
         }
     }
 
-    /// A round ended: the model's own text and a reasoning-only report are
-    /// detail, and the line it closes on is the conversation's.
+    /// A round ended. Model text is recorded only from `ModelText`, emitted
+    /// once per accepted turn (including the final reply), before its tools
+    /// run. The subscription is drained before this call: replaying `reply`
+    /// here would duplicate the last turn, not recover intermediate turns.
+    /// Reasoning-only reports remain diagnostic detail.
     pub(super) fn ended(
         &self,
-        reply: &str,
         reasoning: Option<String>,
         closing: Option<String>,
         still_running: Option<String>,
     ) {
         let mut entries = Vec::new();
-        if !reply.trim().is_empty() {
-            entries.push(Entry::titled(Kind::Detail, "the model said", reply));
-        }
         if let Some(reasoning) = reasoning {
             entries.push(Entry::new(Kind::Detail, reasoning));
         }
@@ -319,6 +321,12 @@ impl Screen {
         })
     }
 
+    /// The conversation no longer polls events. Flush unmatched outbox items
+    /// too: shutdown may drain messages whose event boundaries were not read.
+    pub(super) fn draining(&self) {
+        lock(&self.order).release(&self.queue);
+    }
+
     /// The user has asked to go: nothing waits on the screen from here.
     pub(super) fn abandon(&self) {
         self.abandoned.store(true, Ordering::SeqCst);
@@ -331,6 +339,7 @@ impl Screen {
         if self.abandoned.load(Ordering::SeqCst) {
             return;
         }
+        self.draining();
         let (done, written) = oneshot::channel();
         self.say(ToScreen::Written(done));
         tokio::select! {
@@ -353,6 +362,7 @@ impl Screen {
             return;
         }
         let (done, finished) = oneshot::channel();
+        self.draining();
         if self.queue.send(ToScreen::Finish(done)).is_ok() {
             tokio::select! {
                 _ = finished => {}
@@ -828,7 +838,8 @@ impl Terminal {
                         self.record(
                             Entry::new(
                                 Kind::Hint,
-                                "(the agent sent you nothing this round; Ctrl-O shows what it did)",
+                                "(the agent sent no message on the user channel this round; \
+                                 Ctrl-O shows execution detail)",
                             ),
                             None,
                         );
@@ -1093,6 +1104,42 @@ mod tests {
         );
         assert!(!decide(false, false, term, true), "piped stdin");
         assert!(!decide(true, true, Some("dumb"), true));
+    }
+
+    #[test]
+    fn round_completion_does_not_replay_model_text_and_keeps_reasoning_diagnostic() {
+        let (queue, mut inbox) = mpsc::unbounded_channel();
+        let screen = Screen {
+            queue,
+            outbox: Arc::new(Semaphore::new(1)),
+            abandoned: AtomicBool::new(false),
+            finished: true,
+            logs: None,
+            names: Mutex::default(),
+            order: Mutex::default(),
+        };
+        // The final reply was already emitted by on_model_turn_finished;
+        // ended deliberately has no reply argument to accidentally replay.
+        screen.say(ToScreen::Fact(Fact::Said("final reply".into())));
+        screen.ended(None, None, None);
+        let Some(ToScreen::Fact(Fact::Said(text))) = inbox.try_recv().ok() else {
+            panic!("model text");
+        };
+        assert_eq!(text, "final reply");
+        let Some(ToScreen::Ended { entries, .. }) = inbox.try_recv().ok() else {
+            panic!("round end");
+        };
+        assert!(entries.is_empty());
+        assert!(inbox.try_recv().is_err());
+
+        // A no-text, reasoning-only round still reports what it actually was.
+        screen.ended(Some("[reasoning only] diagnostic".into()), None, None);
+        let Some(ToScreen::Ended { entries, .. }) = inbox.try_recv().ok() else {
+            panic!("round end");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, Kind::Detail);
+        assert!(entries[0].text.contains("[reasoning only]"));
     }
 
     /// A keyboard, its box empty, showing what it sends on `echo`; and where

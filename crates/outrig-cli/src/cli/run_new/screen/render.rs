@@ -195,14 +195,14 @@ pub(super) fn entry_lines(
             return lines;
         }
         Kind::Agent => Style::new(),
-        Kind::Note | Kind::Trace => theme.dim(),
+        Kind::Thinking | Kind::Note | Kind::Trace => theme.dim(),
         Kind::Error => theme.error(),
         Kind::Hint => theme.dim().add_modifier(Modifier::ITALIC),
         Kind::Detail => Style::new(),
     };
     let body = if dim { body.patch(theme.dim()) } else { body };
     let indent = if let Some(title) = &entry.title {
-        let style = if dim {
+        let style = if dim || entry.kind == Kind::Thinking {
             theme.dim()
         } else {
             theme.accent().add_modifier(Modifier::BOLD)
@@ -210,14 +210,14 @@ pub(super) fn entry_lines(
         for row in wrap(title, width) {
             lines.push(Line::styled(row, style));
         }
-        INDENT
+        &INDENT[..MARGIN.min(width.saturating_sub(1))]
     } else {
         ""
     };
     if entry.text.is_empty() {
         return lines;
     }
-    if entry.kind == Kind::Agent {
+    if matches!(entry.kind, Kind::Agent | Kind::Thinking) {
         for mut line in markdown::lines(&entry.text, width.saturating_sub(indent.len())) {
             line.style = body;
             if !indent.is_empty() {
@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn only_agent_messages_are_markdown_and_their_source_is_untouched() {
+    fn only_agent_and_thinking_text_are_markdown_and_their_source_is_untouched() {
         let source = "**bold** and `code`";
         for kind in [
             Kind::User,
@@ -498,6 +498,34 @@ mod tests {
         // A following entry has neither the agent's bold nor its code style.
         let next = entry_lines(&Entry::new(Kind::Agent, "plain"), 80, Theme::plain(), false);
         assert_eq!(next[0].spans.last().unwrap().style, Style::new());
+    }
+
+    #[test]
+    fn thinking_is_labeled_indented_and_dim_even_without_color() {
+        for theme in [Theme::plain(), Theme { color: true }] {
+            let entry = Entry::titled(Kind::Thinking, "Thinking", "**Reading** the code");
+            let rows = entry_lines(&entry, 80, theme, false);
+            assert_eq!(texts_of(&rows), ["Thinking", "  Reading the code"]);
+            assert!(rows[0].style.add_modifier.contains(Modifier::DIM));
+            assert!(rows[1].style.add_modifier.contains(Modifier::DIM));
+            let explicit = entry_lines(
+                &Entry::new(Kind::Agent, "Reading the code"),
+                80,
+                theme,
+                false,
+            );
+            assert!(!explicit[0].style.add_modifier.contains(Modifier::DIM));
+            assert_eq!(entry.text, "**Reading** the code");
+        }
+    }
+
+    #[test]
+    fn thinking_markdown_fits_even_a_one_cell_terminal() {
+        let entry = Entry::titled(Kind::Thinking, "Thinking", "**日本語**\n\n```py\nx = 1\n```");
+        for width in 1..20 {
+            let rows = entry_lines(&entry, width, Theme::plain(), false);
+            assert!(rows.iter().all(|line| line.width() <= usize::from(width)), "{width}: {rows:?}");
+        }
     }
 
     #[test]

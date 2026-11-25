@@ -26,6 +26,8 @@ pub(super) enum Kind {
     User,
     /// A message the agent sent the user.
     Agent,
+    /// Model text already exposed by the event stream, not a user-channel message.
+    Thinking,
     /// What the session says about itself in the conversation.
     Note,
     /// An error, in the conversation.
@@ -72,7 +74,9 @@ impl Entry {
     /// Whether the conversation shows it, and not only the detail view.
     pub(super) fn inline(&self, verbose: bool) -> bool {
         match self.kind {
-            Kind::User | Kind::Agent | Kind::Note | Kind::Error | Kind::Hint => true,
+            Kind::User | Kind::Agent | Kind::Thinking | Kind::Note | Kind::Error | Kind::Hint => {
+                true
+            }
             Kind::Detail => verbose,
             Kind::Trace => false,
         }
@@ -92,6 +96,7 @@ impl Entry {
     /// What the transcript records of `fact`, if anything.
     pub(super) fn from_fact(fact: &Fact) -> Option<Self> {
         let entry = match fact {
+            Fact::Said(text) => Self::titled(Kind::Thinking, "Thinking", text.clone()),
             Fact::RoundStarted { round } => {
                 Self::titled(Kind::Detail, format!("round {round}"), "")
             }
@@ -182,8 +187,7 @@ impl Entry {
             | Fact::Attempted
             | Fact::Posted
             | Fact::Taken
-            | Fact::AgentSent
-            | Fact::Said(_) => return None,
+            | Fact::AgentSent => return None,
         };
         Some(entry)
     }
@@ -276,6 +280,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn thinking_retains_the_whole_event_once_in_the_bounded_detail_transcript() {
+        let theme = Theme::plain();
+        let text = "full intermediate text ".repeat(100);
+        let entry = Entry::from_fact(&Fact::Said(text.clone())).unwrap();
+        assert_eq!(entry.kind, Kind::Thinking);
+        assert_eq!(entry.text, text);
+        let mut transcript = Transcript::default();
+        transcript.push(entry, theme);
+        assert_eq!(transcript.entries.len(), 1);
+        assert_eq!(transcript.entries[0].text, text);
+        transcript.push(Entry::new(Kind::Agent, "x".repeat(BOUND)), theme);
+        assert_eq!(transcript.dropped(), 1);
+        assert_eq!(transcript.entries.len(), 1);
+    }
+
+    #[test]
     fn cached_markdown_rows_match_conversation_rows_after_push_resize_and_forget() {
         let theme = Theme::plain();
         let mut transcript = Transcript::default();
@@ -285,6 +305,7 @@ mod tests {
                 "**日本語** and `code`\n\n```py\n  x = 1\n\n```",
             ),
             Entry::new(Kind::Agent, "> a _quote_ and [link](https://example.com)"),
+            Entry::titled(Kind::Thinking, "Thinking", "**Reading**\n\n```py\nx = 1\n```"),
         ];
         for width in [16, 1, 5, 40] {
             let mut expected = VecDeque::new();
@@ -308,7 +329,14 @@ mod tests {
 
     #[test]
     fn the_conversation_shows_all_but_the_agents_working() {
-        for kind in [Kind::User, Kind::Agent, Kind::Note, Kind::Error, Kind::Hint] {
+        for kind in [
+            Kind::User,
+            Kind::Agent,
+            Kind::Thinking,
+            Kind::Note,
+            Kind::Error,
+            Kind::Hint,
+        ] {
             assert!(Entry::new(kind, "x").inline(false), "{kind:?}");
         }
         assert!(!Entry::new(Kind::Detail, "x").inline(false));
@@ -364,7 +392,6 @@ mod tests {
             Fact::Posted,
             Fact::Taken,
             Fact::AgentSent,
-            Fact::Said("hello".into()),
             Fact::Attempted,
             Fact::AgentStarted { model: "m".into() },
         ] {
