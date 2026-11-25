@@ -194,7 +194,7 @@ pub(super) fn entry_lines(
             }
             return lines;
         }
-        Kind::Agent => Style::new(),
+        Kind::Agent | Kind::Question => Style::new(),
         Kind::Thinking | Kind::Note | Kind::Trace => theme.dim(),
         Kind::Error => theme.error(),
         Kind::Hint => theme.dim().add_modifier(Modifier::ITALIC),
@@ -237,14 +237,19 @@ pub(super) fn entry_lines(
 /// them.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Layout {
-    rows: Vec<String>,
-    cursor: (usize, usize),
+    pub(super) rows: Vec<String>,
+    pub(super) cursor: (usize, usize),
 }
 
 /// `editor`'s box laid out for a viewport `width` cells wide.
 pub(super) fn layout(editor: &Editor, width: u16) -> Layout {
     let width = usize::from(width).saturating_sub(MARGIN);
     input_rows(editor.text(), editor.cursor(), width)
+}
+
+/// A modal field without the conversation prompt's margin.
+pub(super) fn field_layout(editor: &Editor, width: u16) -> Layout {
+    input_rows(editor.text(), editor.cursor(), usize::from(width))
 }
 
 /// The input box's rows at `width` cells, after its prompt. Rows break at each
@@ -312,25 +317,7 @@ pub(super) fn draw_viewport(
     if area.height == 0 || area.width == 0 {
         return None;
     }
-    let mut left = vec![];
-    if status.busy {
-        left.push(Span::styled(SPINNER[frame % SPINNER.len()], theme.accent()));
-        left.push(Span::raw(" "));
-    }
-    left.push(Span::raw(status.text.as_str()));
-    let left = Line::from(left);
-    let hint_width = cells(hint);
-    let fits = left.width() + 2 + hint_width <= usize::from(area.width);
-    buf.set_line(area.x, area.y, &left, area.width);
-    if fits && !hint.is_empty() {
-        let x = area.x + area.width - hint_width as u16;
-        buf.set_line(
-            x,
-            area.y,
-            &Line::styled(hint, theme.dim()),
-            hint_width as u16,
-        );
-    }
+    draw_status(buf, status, frame, hint, theme);
 
     let box_area = Rect {
         y: area.y + 1,
@@ -372,6 +359,39 @@ pub(super) fn draw_viewport(
     }
     let x = box_area.x + (MARGIN + column).min(usize::from(box_area.width) - 1) as u16;
     Some(Position::new(x, box_area.y + (row - first) as u16))
+}
+
+/// The status row, shared by the editor and modal views.
+pub(super) fn draw_status(
+    buf: &mut Buffer,
+    status: &Shown,
+    frame: usize,
+    hint: &str,
+    theme: Theme,
+) {
+    let area = buf.area;
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let mut left = vec![];
+    if status.busy {
+        left.push(Span::styled(SPINNER[frame % SPINNER.len()], theme.accent()));
+        left.push(Span::raw(" "));
+    }
+    left.push(Span::raw(status.text.as_str()));
+    let left = Line::from(left);
+    let hint_width = cells(hint);
+    let fits = left.width() + 2 + hint_width <= usize::from(area.width);
+    buf.set_line(area.x, area.y, &left, area.width);
+    if fits && !hint.is_empty() {
+        let x = area.x + area.width - hint_width as u16;
+        buf.set_line(
+            x,
+            area.y,
+            &Line::styled(hint, theme.dim()),
+            hint_width as u16,
+        );
+    }
 }
 
 /// Draw the detail view in `buf`: a title row, then `lines` scrolled `scroll`
@@ -521,10 +541,17 @@ mod tests {
 
     #[test]
     fn thinking_markdown_fits_even_a_one_cell_terminal() {
-        let entry = Entry::titled(Kind::Thinking, "Thinking", "**日本語**\n\n```py\nx = 1\n```");
+        let entry = Entry::titled(
+            Kind::Thinking,
+            "Thinking",
+            "**日本語**\n\n```py\nx = 1\n```",
+        );
         for width in 1..20 {
             let rows = entry_lines(&entry, width, Theme::plain(), false);
-            assert!(rows.iter().all(|line| line.width() <= usize::from(width)), "{width}: {rows:?}");
+            assert!(
+                rows.iter().all(|line| line.width() <= usize::from(width)),
+                "{width}: {rows:?}"
+            );
         }
     }
 

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `run-new` answers questions in a modal terminal dialog, with keyboard choice selection,
+  free text and declines, draft-preserving deferral, Esc/Ctrl-Q set-aside and recall, and
+  question/answer entries in scrollback. Line mode keeps its explicit `/answer` interface (#1071).
+
 - `run-new` prints typed questions on stderr (or the screen) and accepts explicit `/answer`
   lines, including multi-select, declines, and the not-relevant preset (#1069).
 

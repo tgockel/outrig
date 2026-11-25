@@ -29,9 +29,11 @@
 
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+mod chooser;
 mod editor;
 mod facts;
 mod order;
+mod questions;
 mod render;
 mod status;
 mod transcript;
@@ -84,7 +86,19 @@ const SPIN: Duration = Duration::from_millis(100);
 const FINISH_GRACE: Duration = Duration::from_secs(2);
 
 /// Lines typed, as they reach the conversation's loop.
-pub(super) type Typed = mpsc::UnboundedReceiver<io::Result<String>>;
+pub(super) enum InputEvent {
+    Line(String),
+    Answer(u64, outrig::harness::Settle),
+}
+impl InputEvent {
+    pub(super) fn is_activity(&self) -> bool {
+        match self {
+            Self::Line(text) => !text.trim_end_matches('\r').is_empty(),
+            Self::Answer(..) => true,
+        }
+    }
+}
+pub(super) type Typed = mpsc::UnboundedReceiver<io::Result<InputEvent>>;
 
 /// How long a start given up on is waited for, once the terminal is put back,
 /// to be done with it: past that, it is stuck on a terminal that stopped
@@ -143,6 +157,13 @@ enum ToScreen {
     /// held until it is drawn.
     Entry(Entry, Option<OwnedSemaphorePermit>),
     Fact(Fact),
+    Question(
+        outrig::harness::event::AgentRequestId,
+        String,
+        outrig::harness::Question,
+    ),
+    QuestionClosed(u64),
+    QuestionRetry(u64),
     /// A round ended: what it said, and what it left running.
     Ended {
         entries: Vec<Entry>,
@@ -191,6 +212,36 @@ impl Room<'_> {
 }
 
 impl Screen {
+    #[cfg(test)]
+    pub(super) fn capture_questions() -> (Self, impl FnMut() -> Vec<String>) {
+        let (queue, mut inbox) = mpsc::unbounded_channel();
+        let screen = Self {
+            queue,
+            outbox: Arc::new(Semaphore::new(1)),
+            abandoned: AtomicBool::new(false),
+            finished: true,
+            logs: None,
+            names: Mutex::default(),
+            order: Mutex::default(),
+        };
+        (screen, move || {
+            let mut updates = Vec::new();
+            while let Ok(item) = inbox.try_recv() {
+                match item {
+                    ToScreen::QuestionClosed(id) => updates.push(format!("closed:{id}")),
+                    ToScreen::QuestionRetry(id) => updates.push(format!("retry:{id}")),
+                    ToScreen::Entry(entry, _) => updates.push(format!(
+                        "{}:{}",
+                        entry.title.unwrap_or_default(),
+                        entry.text
+                    )),
+                    _ => panic!("unexpected question update"),
+                }
+            }
+            updates
+        })
+    }
+
     /// Take the terminal. With `verbose`, the detail is printed in the
     /// conversation too. Fails, leaving the terminal as it was, when the
     /// terminal cannot be put in raw mode.
@@ -271,6 +322,28 @@ impl Screen {
         if let Some(fact) = fact {
             self.say(ToScreen::Fact(fact));
         }
+    }
+
+    /// Questions use their lossless queue, not the possibly held event/outbox join.
+    pub(super) fn question(
+        &self,
+        id: outrig::harness::event::AgentRequestId,
+        asker: String,
+        q: outrig::harness::Question,
+    ) {
+        let _ = self.queue.send(ToScreen::Question(id, asker, q));
+    }
+    pub(super) fn question_closed(&self, id: u64) {
+        let _ = self.queue.send(ToScreen::QuestionClosed(id));
+    }
+    pub(super) fn question_retry(&self, id: u64) {
+        let _ = self.queue.send(ToScreen::QuestionRetry(id));
+    }
+    pub(super) fn question_entry(&self, title: String, body: String) {
+        self.say(ToScreen::Entry(
+            Entry::titled(Kind::Question, title, body),
+            None,
+        ));
     }
 
     /// A round ended. Model text is recorded only from `ModelText`, emitted
@@ -398,7 +471,7 @@ struct Links {
 fn serve(
     tty: File,
     links: Links,
-    typed: mpsc::UnboundedSender<io::Result<String>>,
+    typed: mpsc::UnboundedSender<io::Result<InputEvent>>,
     verbose: bool,
     ready: oneshot::Sender<io::Result<()>>,
 ) {
@@ -469,7 +542,8 @@ enum Pending {
 /// it stopped.
 struct Input {
     editor: Editor,
-    typed: mpsc::UnboundedSender<io::Result<String>>,
+    questions: questions::Dialogs,
+    typed: mpsc::UnboundedSender<io::Result<InputEvent>>,
 }
 
 /// The input box, shared: the keyboard's thread edits it, and the drawing
@@ -525,7 +599,14 @@ impl Keyboard {
                 Event::Key(key) => self.key(key),
                 Event::Paste(pasted) => {
                     let edit = match lock(&self.input).as_mut() {
-                        Some(input) if !self.detail => input.editor.paste(&pasted),
+                        Some(input) if !self.detail => {
+                            if input.questions.visible() {
+                                input.questions.paste(&pasted);
+                                Edit::Changed
+                            } else {
+                                input.editor.paste(&pasted)
+                            }
+                        }
                         _ => Edit::None,
                     };
                     if edit == Edit::Changed {
@@ -549,7 +630,28 @@ impl Keyboard {
         }
         let edit = match lock(&self.input).as_mut() {
             Some(input) => {
-                let edit = input.editor.key(key);
+                // Control keys retain their meaning even in a text-answer field.
+                let global = ended_key(key);
+                if input.questions.visible() && global == Edit::None {
+                    if let Some((id, answer)) = input.questions.key(key) {
+                        let _ = input.typed.send(Ok(InputEvent::Answer(id, answer)));
+                    }
+                    self.tell(Ui::Changed);
+                    return;
+                }
+                if key.kind != KeyEventKind::Release
+                    && key.code == KeyCode::Char('q')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    input.questions.sent();
+                    self.tell(Ui::Changed);
+                    return;
+                }
+                let edit = if input.questions.visible() {
+                    global
+                } else {
+                    input.editor.key(key)
+                };
                 if let Edit::Submit(text) = &edit {
                     // Shown before the loop has it, on the queue it answers
                     // on, so that whatever it answers is shown after.
@@ -557,7 +659,8 @@ impl Keyboard {
                         let entry = Entry::new(Kind::User, text.as_str());
                         let _ = echo.send(ToScreen::Entry(entry, None));
                     }
-                    let _ = input.typed.send(Ok(text.clone()));
+                    let _ = input.typed.send(Ok(InputEvent::Line(text.clone())));
+                    input.questions.sent();
                 }
                 edit
             }
@@ -703,7 +806,7 @@ impl Terminal {
     fn open(
         tty: File,
         links: Links,
-        typed: mpsc::UnboundedSender<io::Result<String>>,
+        typed: mpsc::UnboundedSender<io::Result<InputEvent>>,
         verbose: bool,
     ) -> io::Result<Self> {
         let mut out = CrosstermBackend::new(BufWriter::new(Held::new(tty)));
@@ -711,7 +814,11 @@ impl Terminal {
         let editor = Editor::default();
         let layout = render::layout(&editor, out.size()?.width);
         let viewport = Viewport::open(&mut out, render::viewport_height(Some(&layout)))?;
-        let input = Arc::new(Mutex::new(Some(Input { editor, typed })));
+        let input = Arc::new(Mutex::new(Some(Input {
+            editor,
+            questions: questions::Dialogs::default(),
+            typed,
+        })));
         let keys = Keys::start(
             Arc::clone(&input),
             links.echo.clone(),
@@ -821,6 +928,26 @@ impl Terminal {
             };
             match item {
                 ToScreen::Entry(entry, place) => self.record(entry, place),
+                ToScreen::Question(id, asker, q) => {
+                    if let Some(input) = lock(&self.input).as_mut() {
+                        input
+                            .questions
+                            .asked(id.get(), asker, q, input.editor.text().is_empty());
+                    }
+                    self.dirty = true;
+                }
+                ToScreen::QuestionClosed(id) => {
+                    if let Some(input) = lock(&self.input).as_mut() {
+                        input.questions.closed(id, input.editor.text().is_empty());
+                    }
+                    self.dirty = true;
+                }
+                ToScreen::QuestionRetry(id) => {
+                    if let Some(input) = lock(&self.input).as_mut() {
+                        input.questions.retry(id, input.editor.text().is_empty());
+                    }
+                    self.dirty = true;
+                }
                 ToScreen::Fact(fact) => {
                     self.dirty |= self.status.apply(&fact, Instant::now());
                     if let Some(entry) = Entry::from_fact(&fact) {
@@ -907,12 +1034,28 @@ impl Terminal {
         queue!(self.out, BeginSynchronizedUpdate)?;
         let drawn = self.flush_pending()?;
         let width = self.viewport.screen().width;
-        let input = lock(&self.input)
-            .as_ref()
-            .map(|input| render::layout(&input.editor, width));
-        self.viewport
-            .set_height(&mut self.out, render::viewport_height(input.as_ref()))?;
-        let shown = self.status.shown(Instant::now());
+        let (input, dialog, question_hint) = {
+            let mut held = lock(&self.input);
+            match held.as_mut() {
+                Some(input) => (
+                    Some(render::layout(&input.editor, width)),
+                    input.questions.view(width),
+                    input.questions.hint(),
+                ),
+                None => (None, None, None),
+            }
+        };
+        self.viewport.set_height(
+            &mut self.out,
+            dialog.as_ref().map_or_else(
+                || render::viewport_height(input.as_ref()),
+                questions::View::height,
+            ),
+        )?;
+        let mut shown = self.status.shown(Instant::now());
+        if let Some(hint) = question_hint {
+            shown.text = hint;
+        }
         let hint = match (&input, shown.busy) {
             (Some(_), true) => "Ctrl-C stops · Ctrl-O detail",
             (Some(_), false) => "Alt-Enter newline · Ctrl-O detail",
@@ -920,7 +1063,12 @@ impl Terminal {
         };
         let (frame, theme) = (self.frame, self.theme);
         self.viewport.draw(&mut self.out, |buf| {
-            render::draw_viewport(buf, &shown, frame, hint, input.as_ref(), theme)
+            if let Some(dialog) = &dialog {
+                render::draw_status(buf, &shown, frame, hint, theme);
+                dialog.draw(buf)
+            } else {
+                render::draw_viewport(buf, &shown, frame, hint, input.as_ref(), theme)
+            }
         })?;
         tty::viewport_at(self.viewport.area().y);
         queue!(self.out, EndSynchronizedUpdate)?;
@@ -1158,6 +1306,7 @@ mod tests {
         let keyboard = Keyboard {
             input: Arc::new(Mutex::new(Some(Input {
                 editor: Editor::default(),
+                questions: questions::Dialogs::default(),
                 typed: typed_to,
             }))),
             echo: echo.downgrade(),
@@ -1192,7 +1341,9 @@ mod tests {
         let (queue, _inbox) = mpsc::unbounded_channel();
         let (mut keyboard, mut typed, mut pressed, heard) = keyboard(&queue);
         send(&mut keyboard, "/q");
-        assert_eq!(typed.try_recv().expect("sent").expect("a line"), "/q");
+        assert!(
+            matches!(typed.try_recv().expect("sent").expect("a line"), InputEvent::Line(text) if text == "/q")
+        );
 
         // In the detail view, keys move through it, and Ctrl-C still goes.
         keyboard.key(ctrl('o'));
@@ -1217,6 +1368,102 @@ mod tests {
             matches!(typed.try_recv(), Err(TryRecvError::Disconnected)),
             "Ctrl-D at an empty box ends input"
         );
+    }
+
+    #[test]
+    fn modal_answers_break_the_consecutive_interrupt_sequence_like_typed_answers() {
+        for input in [
+            InputEvent::Answer(1, outrig::harness::Settle::Fail("not relevant".into())),
+            InputEvent::Line("/answer 1 --not-relevant".into()),
+        ] {
+            assert!(input.is_activity());
+        }
+        assert!(!InputEvent::Line("\r".into()).is_activity());
+    }
+
+    fn question() -> outrig::harness::Question {
+        outrig::harness::Question {
+            text: "Pick?".into(),
+            choices: vec![outrig::harness::Choice {
+                label: "first".into(),
+                description: String::new(),
+            }],
+            multiple: false,
+            other: true,
+            context: None,
+        }
+    }
+
+    #[test]
+    fn modal_answers_are_not_user_messages_and_drafts_survive_recall_and_aside() {
+        let (queue, mut echo) = mpsc::unbounded_channel();
+        let (mut keyboard, mut typed, _, _) = keyboard(&queue);
+        {
+            let mut held = lock(&keyboard.input);
+            let input = held.as_mut().unwrap();
+            input.editor.paste("my draft");
+            input
+                .questions
+                .asked(7, "main".into(), question(), input.editor.text().is_empty());
+            assert!(!input.questions.visible());
+        }
+        keyboard.key(ctrl('q'));
+        keyboard.key(press(KeyCode::Esc));
+        assert_eq!(
+            lock(&keyboard.input).as_ref().unwrap().editor.text(),
+            "my draft"
+        );
+        keyboard.key(press(KeyCode::Enter));
+        assert!(
+            matches!(typed.try_recv().unwrap().unwrap(), InputEvent::Line(text) if text == "my draft")
+        );
+        assert!(lock(&keyboard.input).as_ref().unwrap().questions.visible());
+        assert!(matches!(
+            echo.try_recv().unwrap(),
+            ToScreen::Entry(
+                Entry {
+                    kind: Kind::User,
+                    ..
+                },
+                _
+            )
+        ));
+        keyboard.key(press(KeyCode::Char('1')));
+        assert!(matches!(
+            typed.try_recv().unwrap().unwrap(),
+            InputEvent::Answer(7, outrig::harness::Settle::Reply(_))
+        ));
+        assert!(
+            echo.try_recv().is_err(),
+            "a dialog answer is not a typed message"
+        );
+    }
+
+    #[test]
+    fn modal_control_keys_keep_their_meaning_and_paste_outside_fields_is_ignored() {
+        let (queue, _) = mpsc::unbounded_channel();
+        let (mut keyboard, mut typed, mut interrupts, ui) = keyboard(&queue);
+        lock(&keyboard.input)
+            .as_mut()
+            .unwrap()
+            .questions
+            .asked(1, "main".into(), question(), true);
+        keyboard.key(ctrl('c'));
+        assert!(interrupts.try_recv().is_ok());
+        keyboard.key(ctrl('l'));
+        assert_eq!(ui.try_recv().unwrap(), Ui::Redraw);
+        keyboard.key(ctrl('z'));
+        assert_eq!(ui.try_recv().unwrap(), Ui::Suspend);
+        keyboard.key(ctrl('o'));
+        assert_eq!(ui.try_recv().unwrap(), Ui::OpenDetail);
+        keyboard.key(ctrl('o'));
+        assert_eq!(ui.try_recv().unwrap(), Ui::CloseDetail);
+        let mut held = lock(&keyboard.input);
+        let input = held.as_mut().unwrap();
+        input.questions.paste("not an answer");
+        assert_eq!(input.editor.text(), "");
+        assert!(input.questions.visible());
+        assert!(typed.try_recv().is_err());
     }
 
     /// The loop, answering on the screen's queue the moment a line is handed
@@ -1244,7 +1491,9 @@ mod tests {
         let mut waiting = std::task::Context::from_waker(&answers);
         assert!(typed.poll_recv(&mut waiting).is_pending());
         send(&mut keyboard, "/help");
-        assert_eq!(typed.try_recv().expect("sent").expect("a line"), "/help");
+        assert!(
+            matches!(typed.try_recv().expect("sent").expect("a line"), InputEvent::Line(text) if text == "/help")
+        );
 
         let mut shown = Vec::new();
         while let Ok(ToScreen::Entry(entry, _)) = inbox.try_recv() {

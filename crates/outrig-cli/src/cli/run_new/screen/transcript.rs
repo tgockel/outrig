@@ -30,6 +30,8 @@ pub(super) enum Kind {
     Thinking,
     /// What the session says about itself in the conversation.
     Note,
+    /// An asked question or its settlement.
+    Question,
     /// An error, in the conversation.
     Error,
     /// A word about the screen itself.
@@ -74,9 +76,13 @@ impl Entry {
     /// Whether the conversation shows it, and not only the detail view.
     pub(super) fn inline(&self, verbose: bool) -> bool {
         match self.kind {
-            Kind::User | Kind::Agent | Kind::Thinking | Kind::Note | Kind::Error | Kind::Hint => {
-                true
-            }
+            Kind::User
+            | Kind::Agent
+            | Kind::Thinking
+            | Kind::Note
+            | Kind::Question
+            | Kind::Error
+            | Kind::Hint => true,
             Kind::Detail => verbose,
             Kind::Trace => false,
         }
@@ -305,7 +311,11 @@ mod tests {
                 "**日本語** and `code`\n\n```py\n  x = 1\n\n```",
             ),
             Entry::new(Kind::Agent, "> a _quote_ and [link](https://example.com)"),
-            Entry::titled(Kind::Thinking, "Thinking", "**Reading**\n\n```py\nx = 1\n```"),
+            Entry::titled(
+                Kind::Thinking,
+                "Thinking",
+                "**Reading**\n\n```py\nx = 1\n```",
+            ),
         ];
         for width in [16, 1, 5, 40] {
             let mut expected = VecDeque::new();

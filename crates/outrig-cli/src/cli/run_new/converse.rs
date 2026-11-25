@@ -68,7 +68,7 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Mutex, mpsc};
 
 use super::output::{self, Failures, Output, PROMPT};
-use super::screen::{self, Screen, Typed};
+use super::screen::{self, InputEvent, Screen, Typed};
 use crate::cli::signals::{EndSignal, Signals};
 use crate::error::Result;
 use crate::repl::{HelpEntry, INTERRUPT_NOTICE, compose_help};
@@ -379,11 +379,7 @@ async fn drive(
                 let deadline = tokio::time::Instant::now() + ANSWER_GRACE;
                 drain_receipts(&mut acks, &mut answers, deadline, |receipt| match receipt {
                     Receipt::Message(queued, mid_round) => term.answered(queued, mid_round),
-                    Receipt::Answer(id, answer) => {
-                        if let Some(error) = questions_state.answered(id, answer) {
-                            term.note(&format!("[outrig] {error}"));
-                        }
-                    }
+                    Receipt::Answer(receipt) => receipt.apply(&mut questions_state, view),
                 })
                 .await;
                 let signalled = tokio::select! {
@@ -442,20 +438,31 @@ async fn drive(
                 match notice {
                     QuestionNotice::Asked(item) => {
                         if let (Some(id), Ok(question)) = (item.request, serde_json::from_value::<outrig::harness::Question>(item.body)) {
-                            term.note(&format_question(id.get(), &question));
+                            match view {
+                                Frontend::Screen(screen) => {
+                                    screen.question_entry(format!("Question #{} · {}", id, item.sender), format_question_body(&question));
+                                    screen.question(id, item.sender, question.clone());
+                                }
+                                Frontend::Lines(_) => term.note(&format_question(id.get(), &question)),
+                            }
                             questions_state.ids.insert(id.get(), id);
                             questions_state.open.insert(id.get(), question);
                         }
                     }
                     QuestionNotice::Withdrawn(notice) => {
-                        questions_state.close(notice.request.get());
-                        term.note(&format!("[outrig.question.closed] {}", notice.request));
+                        questions_state.withdrawn(notice.request.get(), notice.end, view);
                     }
                     QuestionNotice::Settled(notice)
                         if !matches!(notice.outcome, outrig::harness::Settlement::Refused { .. }) =>
                     {
-                        questions_state.close(notice.request.get());
-                        term.note(&format!("[outrig.question.closed] {}", notice.request));
+                        if !questions_state.finish(notice.request.get()) { continue; }
+                        match view {
+                            Frontend::Screen(screen) => {
+                                screen.question_closed(notice.request.get());
+                                screen.question_entry(format!("Question #{} settled", notice.request), format_settlement(&notice.outcome));
+                            }
+                            Frontend::Lines(_) => term.note(&format!("[outrig.question.closed] {}", notice.request)),
+                        }
                     }
                     _ => {}
                 }
@@ -506,10 +513,8 @@ async fn drive(
                     }
                 }
             }
-            Some((id, answer)) = answers.next() => {
-                if let Some(error) = questions_state.answered(id, answer) {
-                    term.note(&format!("[outrig] {error}"));
-                }
+            Some(receipt) = answers.next() => {
+                receipt.apply(&mut questions_state, view);
                 if round.is_none() { round = Some(start(&session)); }
             }
             Some((queued, mid_round)) = acks.next() => term.answered(queued, mid_round),
@@ -532,7 +537,18 @@ async fn drive(
                     term.reading = false;
                     continue;
                 };
-                let line = line?;
+                let input = line?;
+                if input.is_activity() { last_was_interrupt = false; }
+                let line = match input {
+                    InputEvent::Line(line) => line,
+                    InputEvent::Answer(id, settle) => {
+                        if let Some(request) = questions_state.ids.get(&id) {
+                            answers.push(settle_answer(&question_channel, *request, settle));
+                        }
+                        if round.is_none() { round = Some(start(&session)); }
+                        continue;
+                    }
+                };
                 let line = line.trim_end_matches('\r');
                 if line.is_empty() {
                     if round.is_none() {
@@ -540,13 +556,12 @@ async fn drive(
                     }
                     continue;
                 }
-                last_was_interrupt = false;
                 let built_in = answer_command(line, skills.contains("answer"));
                 if let Some(raw) = built_in {
                     let result = parse_answer(raw, &questions_state);
                     match result {
                         Ok((id, settle)) => {
-                            answers.push(question_channel.settle(id, settle).map(move |answer| (id.get(), answer)));
+                            answers.push(settle_answer(&question_channel, id, settle));
                         }
                         Err(e) => term.note(&format!("[outrig] {e}")),
                     }
@@ -709,7 +724,7 @@ pub(super) fn read_lines() -> std::io::Result<Typed> {
                 bytes.clear();
                 let line = match stdin.read_until(b'\n', &mut bytes) {
                     Ok(0) => return,
-                    Ok(_) => Ok(decode_line(&bytes)),
+                    Ok(_) => Ok(InputEvent::Line(decode_line(&bytes))),
                     Err(e) => Err(e),
                 };
                 let failed = line.is_err();
@@ -922,9 +937,55 @@ impl Terminal<'_> {
 struct Questions {
     open: BTreeMap<u64, Question>,
     ids: BTreeMap<u64, AgentRequestId>,
+    /// Which authoritative outcomes have been shown, never provisional cancel requests.
+    reported: HashSet<u64>,
+    /// Cancellation is a request to withdraw, not the kernel's final outcome.
+    cancellation_requested: HashSet<u64>,
 }
 
 impl Questions {
+    fn finish(&mut self, id: u64) -> bool {
+        self.close(id);
+        self.cancellation_requested.remove(&id);
+        self.reported.insert(id)
+    }
+
+    fn withdrawn(&mut self, id: u64, end: outrig::harness::WithdrawEnd, view: Frontend<'_>) {
+        self.close(id);
+        if self.reported.contains(&id) {
+            return;
+        }
+        let cancelled = matches!(end, outrig::harness::WithdrawEnd::Cancelled);
+        // A queued owner answer can still win on the kernel. Remove the modal
+        // now, but record only the cancellation request, never a final outcome
+        // that would suppress that answer's authoritative receipt. This also
+        // holds if the keyboard's answer has yet to reach the conversation loop.
+        if cancelled {
+            if !self.cancellation_requested.insert(id) {
+                return;
+            }
+        } else if !self.finish(id) {
+            return;
+        }
+        match view {
+            Frontend::Screen(screen) => {
+                screen.question_closed(id);
+                if cancelled {
+                    screen.question_entry(
+                        format!("Question #{id} cancellation requested"),
+                        "Asking agent requested cancellation".into(),
+                    );
+                } else {
+                    screen.question_entry(
+                        format!("Question #{id} closed"),
+                        "Asking agent released or session closed".into(),
+                    );
+                }
+            }
+            Frontend::Lines(out) => out.line(&format!("[outrig.question.closed] {id}")),
+        }
+    }
+
     fn close(&mut self, id: u64) {
         self.open.remove(&id);
     }
@@ -946,9 +1007,73 @@ impl Questions {
     }
 }
 
+/// Owner settlements acknowledge directly; they do not echo a Settled notice.
+/// Retain what was submitted until that acknowledgement, including during EOF drain.
+struct AnswerReceipt {
+    id: u64,
+    submitted: Settle,
+    result: std::result::Result<(), SettleError>,
+}
+
+async fn settle_answer(
+    channel: &outrig::harness::Channel,
+    id: AgentRequestId,
+    submitted: Settle,
+) -> AnswerReceipt {
+    let result = channel.settle(id, submitted.clone()).await;
+    AnswerReceipt {
+        id: id.get(),
+        submitted,
+        result,
+    }
+}
+
+impl AnswerReceipt {
+    fn apply(self, state: &mut Questions, view: Frontend<'_>) {
+        let Self {
+            id,
+            submitted,
+            result,
+        } = self;
+        let accepted = result.is_ok();
+        let error = state.answered(id, result);
+        if let Some(error) = error {
+            let text = format!("[outrig] {error}");
+            match view {
+                Frontend::Lines(out) => out.line(&text),
+                Frontend::Screen(screen) => screen.note(&text),
+            }
+        }
+        if accepted {
+            if state.finish(id)
+                && let Frontend::Screen(screen) = view
+            {
+                screen.question_closed(id);
+                let text = match submitted {
+                    Settle::Reply(value) => {
+                        format_settlement(&outrig::harness::Settlement::Replied(value))
+                    }
+                    Settle::Fail(reason) => {
+                        format_settlement(&outrig::harness::Settlement::Failed(reason))
+                    }
+                    Settle::Cancel(reason) => format!("Cancelled: {reason}"),
+                    _ => format!("{submitted:?}"),
+                };
+                screen.question_entry(format!("Question #{id} settled"), text);
+            }
+        } else if let Frontend::Screen(screen) = view {
+            if state.open.contains_key(&id) {
+                screen.question_retry(id);
+            } else {
+                screen.question_closed(id);
+            }
+        }
+    }
+}
+
 enum Receipt {
     Message(std::result::Result<usize, BoxError>, bool),
-    Answer(u64, std::result::Result<(), SettleError>),
+    Answer(AnswerReceipt),
 }
 
 /// EOF owes diagnostics for both kinds of input, under one shared deadline.
@@ -959,13 +1084,13 @@ async fn drain_receipts<A, B>(
     mut received: impl FnMut(Receipt),
 ) where
     A: Stream<Item = (std::result::Result<usize, BoxError>, bool)> + Unpin,
-    B: Stream<Item = (u64, std::result::Result<(), SettleError>)> + Unpin,
+    B: Stream<Item = AnswerReceipt> + Unpin,
 {
     loop {
         let next = async {
             tokio::select! {
                 Some((queued, mid_round)) = acks.next() => Some(Receipt::Message(queued, mid_round)),
-                Some((id, answer)) = answers.next() => Some(Receipt::Answer(id, answer)),
+                Some(receipt) = answers.next() => Some(Receipt::Answer(receipt)),
                 else => None,
             }
         };
@@ -1024,6 +1149,45 @@ fn format_question(id: u64, q: &outrig::harness::Question) -> String {
         }
     }
     lines.join("\n")
+}
+
+fn format_question_body(q: &Question) -> String {
+    let mut text = q.text.clone();
+    for (n, c) in q.choices.iter().enumerate() {
+        text.push_str(&format!("\n{}. {} -- {}", n + 1, c.label, c.description));
+    }
+    if let Some(context) = &q.context {
+        text.push_str(&format!("\n{}", context.description));
+        for r in &context.references {
+            let at = r.line.map_or(String::new(), |n| format!(":{n}"));
+            let end = r.end_line.map_or(String::new(), |n| format!("-{n}"));
+            text.push_str(&format!("\n{}{at}{end} {}", r.path, r.description));
+        }
+    }
+    text
+}
+
+fn format_settlement(outcome: &outrig::harness::Settlement) -> String {
+    use outrig::harness::Settlement;
+    match outcome {
+        Settlement::Replied(value) => {
+            match serde_json::from_value::<outrig::harness::Answer>(value.clone()) {
+                Ok(answer) => format!(
+                    "Answered: {}{}",
+                    if answer.choices.is_empty() && answer.text.is_none() {
+                        "(no selections)".into()
+                    } else {
+                        answer.choices.join(", ")
+                    },
+                    answer.text.map_or(String::new(), |t| format!(" · {t}"))
+                ),
+                Err(_) => format!("Answered: {value}"),
+            }
+        }
+        Settlement::Failed(reason) => format!("Declined: {reason}"),
+        Settlement::Cancelled { reason, .. } => format!("Cancelled: {reason}"),
+        _ => format!("{outcome:?}"),
+    }
 }
 
 fn answer_command(line: &str, skill: bool) -> Option<&str> {
@@ -1141,11 +1305,20 @@ mod tests {
     /// none.
     #[test]
     fn a_round_closes_on_what_stopped_it_and_what_still_runs() {
-        let names = |names: &[&str]| names.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        let names = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
         let (none, one, two) = (names(&[]), names(&["ci_run"]), names(&["ci_run", "review"]));
         assert_eq!(closing_line(None, Some((&none, 0))), None);
         assert_eq!(
-            closing_line(Some("tool-call iteration max (8) reached"), Some((&none, 0))).as_deref(),
+            closing_line(
+                Some("tool-call iteration max (8) reached"),
+                Some((&none, 0))
+            )
+            .as_deref(),
             Some("(round ended: tool-call iteration max (8) reached)")
         );
         assert_eq!(
@@ -1225,6 +1398,42 @@ mod question_tests {
     }
 
     #[test]
+    fn screen_entries_show_answers_declines_and_empty_selections_literally() {
+        use outrig::harness::{Answer, Settlement};
+        let empty = serde_json::to_value(Answer {
+            choices: Vec::new(),
+            text: None,
+            by: "user".into(),
+            chain: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            format_settlement(&Settlement::Replied(empty)),
+            "Answered: (no selections)"
+        );
+        assert_eq!(
+            format_settlement(&Settlement::Failed("not relevant".into())),
+            "Declined: not relevant"
+        );
+        assert_eq!(
+            format_settlement(&Settlement::Failed(" ask later ".into())),
+            "Declined:  ask later "
+        );
+        let reply = serde_json::to_value(Answer {
+            choices: vec!["one".into()],
+            text: Some("typed 123".into()),
+            by: "user".into(),
+            chain: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            format_settlement(&Settlement::Replied(reply)),
+            "Answered: one · typed 123"
+        );
+        assert!(format_question_body(&question()).contains("1. a -- first"));
+    }
+
+    #[test]
     fn answers_are_explicit_and_a_skill_can_shadow_the_command() {
         assert_eq!(answer_command("ordinary reply", false), None);
         assert_eq!(answer_command("/answer 42 1,2", false), Some("42 1,2"));
@@ -1284,16 +1493,202 @@ mod question_tests {
         assert!(state.open.contains_key(&42));
     }
 
+    #[test]
+    fn successful_owner_receipts_close_and_record_once_without_a_backend_notice() {
+        // Both modal submissions and explicit /answer use this receipt path.
+        // No QuestionNotice::Settled follows a successful owner settlement.
+        for raw in [
+            "1,2 typed text",
+            "",
+            "--decline ask later",
+            "--not-relevant",
+        ] {
+            let (screen, mut updates) = Screen::capture_questions();
+            let mut state = Questions::default();
+            state.open.insert(42, question());
+            state.open.insert(43, question());
+            let submitted = answer_value(raw, &question()).unwrap();
+            AnswerReceipt {
+                id: 42,
+                submitted: submitted.clone(),
+                result: Ok(()),
+            }
+            .apply(&mut state, Frontend::Screen(&screen));
+            assert!(!state.open.contains_key(&42));
+            assert_eq!(state.open.len(), 1);
+            let shown = updates();
+            assert_eq!(shown.len(), 2, "{shown:?}");
+            assert_eq!(shown[0], "closed:42");
+            let expected = match &submitted {
+                Settle::Reply(value) => {
+                    format_settlement(&outrig::harness::Settlement::Replied(value.clone()))
+                }
+                Settle::Fail(reason) => format!("Declined: {reason}"),
+                _ => unreachable!(),
+            };
+            assert_eq!(shown[1], format!("Question #42 settled:{expected}"));
+            // Repeated receipts or a late terminal notice cannot duplicate an entry.
+            AnswerReceipt {
+                id: 42,
+                submitted,
+                result: Ok(()),
+            }
+            .apply(&mut state, Frontend::Screen(&screen));
+            assert!(updates().is_empty());
+            assert!(!state.finish(42));
+        }
+    }
+
+    #[test]
+    fn provisional_withdrawals_never_hide_an_accepted_owner_answer_in_either_order() {
+        use outrig::harness::WithdrawEnd;
+        for withdrawal_first in [false, true] {
+            for raw in ["1 typed answer", "--decline not now"] {
+                let (screen, mut updates) = Screen::capture_questions();
+                let mut state = Questions::default();
+                state.open.insert(42, question());
+                if withdrawal_first {
+                    state.withdrawn(42, WithdrawEnd::Cancelled, Frontend::Screen(&screen));
+                    assert!(state.open.is_empty(), "remove the dialog immediately");
+                    assert!(
+                        !state.reported.contains(&42),
+                        "a withdrawal is not a final outcome"
+                    );
+                    assert_eq!(
+                        updates(),
+                        [
+                            "closed:42",
+                            "Question #42 cancellation requested:Asking agent requested cancellation"
+                        ]
+                    );
+                    // A repeat cannot duplicate the provisional note either.
+                    state.withdrawn(42, WithdrawEnd::Cancelled, Frontend::Screen(&screen));
+                    assert!(updates().is_empty());
+                }
+                // The kernel accepts the owner settlement despite the withdrawal.
+                // This also covers input whose receipt starts after notice delivery.
+                let submitted = answer_value(raw, &question()).unwrap();
+                AnswerReceipt {
+                    id: 42,
+                    submitted,
+                    result: Ok(()),
+                }
+                .apply(&mut state, Frontend::Screen(&screen));
+                let shown = updates();
+                assert_eq!(shown.len(), 2);
+                assert_eq!(shown[0], "closed:42");
+                assert!(shown[1].starts_with("Question #42 settled:"));
+                assert!(shown[1].contains(if raw.starts_with("--decline") {
+                    "Declined: not now"
+                } else {
+                    "Answered: a · typed answer"
+                }));
+                assert!(state.reported.contains(&42));
+                assert!(!state.cancellation_requested.contains(&42));
+                state.withdrawn(42, WithdrawEnd::Cancelled, Frontend::Screen(&screen));
+                assert!(
+                    updates().is_empty(),
+                    "a late withdrawal cannot contradict the receipt"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_cancellation_request_without_an_owner_answer_is_removed_but_not_called_final() {
+        use outrig::harness::WithdrawEnd;
+        let (screen, mut updates) = Screen::capture_questions();
+        let mut state = Questions::default();
+        state.open.insert(42, question());
+        state.withdrawn(42, WithdrawEnd::Cancelled, Frontend::Screen(&screen));
+        assert!(state.open.is_empty());
+        assert!(!state.reported.contains(&42));
+        assert_eq!(
+            updates(),
+            [
+                "closed:42",
+                "Question #42 cancellation requested:Asking agent requested cancellation"
+            ]
+        );
+        // Release, unlike a cancel request, reports a request that already ended.
+        state.withdrawn(42, WithdrawEnd::Released, Frontend::Screen(&screen));
+        assert!(state.reported.contains(&42));
+        assert_eq!(
+            updates(),
+            [
+                "closed:42",
+                "Question #42 closed:Asking agent released or session closed"
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_owner_receipts_retry_without_an_answer_entry_and_can_later_succeed() {
+        let (screen, mut updates) = Screen::capture_questions();
+        let mut state = Questions::default();
+        state.open.insert(42, question());
+        AnswerReceipt {
+            id: 42,
+            submitted: Settle::Reply(serde_json::json!({})),
+            result: Err(SettleError::InvalidAnswer("missing answer".into())),
+        }
+        .apply(&mut state, Frontend::Screen(&screen));
+        assert!(state.open.contains_key(&42));
+        assert!(!state.reported.contains(&42));
+        assert_eq!(
+            updates(),
+            [":[outrig] invalid answer: missing answer", "retry:42",]
+        );
+        AnswerReceipt {
+            id: 42,
+            submitted: answer_value("1", &question()).unwrap(),
+            result: Ok(()),
+        }
+        .apply(&mut state, Frontend::Screen(&screen));
+        assert!(state.open.is_empty());
+        assert_eq!(updates().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn eof_drain_reconciles_successful_answers_too() {
+        use futures_util::stream;
+        let (screen, mut updates) = Screen::capture_questions();
+        let mut state = Questions::default();
+        state.open.insert(42, question());
+        let mut acks = stream::empty();
+        let mut answers = stream::iter([AnswerReceipt {
+            id: 42,
+            submitted: Settle::Fail("not relevant".into()),
+            result: Ok(()),
+        }]);
+        drain_receipts(
+            &mut acks,
+            &mut answers,
+            tokio::time::Instant::now() + ANSWER_GRACE,
+            |receipt| match receipt {
+                Receipt::Answer(receipt) => receipt.apply(&mut state, Frontend::Screen(&screen)),
+                _ => panic!("no user messages"),
+            },
+        )
+        .await;
+        assert!(state.open.is_empty());
+        assert_eq!(
+            updates(),
+            ["closed:42", "Question #42 settled:Declined: not relevant"]
+        );
+    }
+
     #[tokio::test]
     async fn eof_drains_a_final_answer_refusal_and_message_receipts() {
         use futures_util::stream;
         let mut state = Questions::default();
         state.open.insert(42, question());
         let mut acks = stream::iter([(Ok(0), false)]);
-        let mut answers = stream::iter([(
-            42,
-            Err(SettleError::InvalidAnswer("duplicate selections".into())),
-        )]);
+        let mut answers = stream::iter([AnswerReceipt {
+            id: 42,
+            submitted: Settle::Fail("not used".into()),
+            result: Err(SettleError::InvalidAnswer("duplicate selections".into())),
+        }]);
         let mut errors = Vec::new();
         let mut messages = 0;
         drain_receipts(
@@ -1302,7 +1697,9 @@ mod question_tests {
             tokio::time::Instant::now() + ANSWER_GRACE,
             |receipt| match receipt {
                 Receipt::Message(_, _) => messages += 1,
-                Receipt::Answer(id, answer) => errors.extend(state.answered(id, answer)),
+                Receipt::Answer(receipt) => {
+                    errors.extend(state.answered(receipt.id, receipt.result))
+                }
             },
         )
         .await;
@@ -1315,7 +1712,7 @@ mod question_tests {
     async fn eof_receipt_drain_still_has_a_deadline() {
         use futures_util::stream;
         let mut acks = stream::empty::<(std::result::Result<usize, BoxError>, bool)>();
-        let mut answers = stream::pending::<(u64, std::result::Result<(), SettleError>)>();
+        let mut answers = stream::pending::<AnswerReceipt>();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
         tokio::time::timeout(
             std::time::Duration::from_secs(1),

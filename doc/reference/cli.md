@@ -1124,10 +1124,43 @@ reaches a container unless an MCP server's `env` or `--env` names it; see
 
 ### Answering `run-new` questions
 
-In line mode, questions go to **stderr**, never stdout. Stdout continues to carry only messages
-the agent sends on the user channel. The screen currently shows the same question text as a note;
-a dedicated dialog is separate work. A pipe is a supported answerer, not a reason to decline.
+#### Interactive screen
 
+A question opens a modal dialog in place of an **empty** input box, without a keypress. It shows
+its asker, text, choices, and position among outstanding questions (`Question 1 of 3`). If you
+have a draft, it stays intact: the status line names the asker and counts the questions instead.
+Sending your message sends it to the user channel as usual, then opens the oldest question.
+
+- **Esc** sets the dialog aside without answering or cancelling it. It returns after your next
+  message, or with **Ctrl-Q** (also available while a draft is present; the draft is preserved).
+- **Up/Down** moves between choices. **Enter** picks a single choice; **1-9** picks directly.
+  In a multi-select, **Space** and **1-9** toggle, and **Enter** confirms, including no selections.
+  Use arrows for choices beyond nine.
+- **Other**, when offered, opens a text field. Enter accepts its text; in a multi-select, Enter
+  then confirms the combined choices and text. An empty Other edit removes previously accepted
+  text without changing the selections. A free-form question starts in the text field.
+  Digits and spaces are literal text there. **Ctrl-J** confirms like Enter, including typed-ahead
+  newline input. **Ctrl-B** returns from a field to the choices.
+- **Ctrl-N** declines immediately with `not relevant`. **Ctrl-R** opens a decline-reason field;
+  Enter sends the reason as typed. These keys also work inside an answer field.
+- **Tab/Shift-Tab** steps through questions without settling them, preserving partial answers.
+  After settling one, the oldest remaining question opens. **PageUp/PageDown** scrolls one row
+  at a time through long text or wrapped choice labels, even on short terminals. Editing or moving
+  the text-field cursor returns it to view. Choices use `>` and `[x]`, not color alone.
+- **Ctrl-C**, **Ctrl-O**, **Ctrl-L**, and **Ctrl-Z** still stop, open detail, redraw, and suspend.
+
+The dialog uses the input box's height budget; long lists scroll inside it and resize with the
+terminal. Agent messages continue above it. Questions and their answers, declines, or cancellations
+remain labeled entries in the conversation and Ctrl-O detail. A cancellation request removes a
+question even mid-answer, discarding that partial answer and showing the next question or the input
+box. The note records a cancellation request, not a final outcome: an answer already on its way to
+the agent may still be accepted, in which case its accepted answer is recorded afterward.
+Questions have no answer timeout. Explicit `/answer` commands remain available on the screen too.
+
+#### Line mode and pipes
+
+In line mode, questions go to **stderr**, never stdout. Stdout continues to carry only messages
+the agent sends on the user channel. A pipe is a supported answerer, not a reason to decline.
 The stable line format is:
 
 ```text
