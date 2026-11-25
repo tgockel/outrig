@@ -19,6 +19,10 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- Typed owner questions: `runtime.ask`, `Question`, `Choice`, and `Answer`; structured background
+  and file references, independent handles, validation and limits, Rust and Python owner APIs, lifecycle
+  events, and question rendering in the session report (#1069).
+
 - **Embedded host environment references** in MCP `env`, URL `headers`, `build-args`,
   and `--env`: `"Bearer ${TOKEN}"` and `"a-${X}-b-${Y}"` now join literal text with
   host variables (or session `Secrets`), expanded once. Every reference is subject to
@@ -1336,6 +1340,13 @@ without touching each other, from one ensured image. [The container facade besid
   remove the spelling.
 
 ### Fixed
+
+- Keep question exception inspection non-observing: standard `asyncio.wait` with
+  `FIRST_EXCEPTION` leaves unread notices intact until await/result acknowledges the decline.
+
+- Fix question-handle waits and observation, validate custom backend withdrawal replies and
+  authorize recovery by the actual asker. Preserve host settlement receipts through cancellation
+  and reclaim withdrawn questions that were never received.
 
 - Header expansion failures now report only the header name and resolution error, never
   a template's literal credential text. Repository template allowlist checks use membership

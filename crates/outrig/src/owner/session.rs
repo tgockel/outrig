@@ -413,6 +413,8 @@ impl Live {
 
 /// A program's request about a session it asked for.
 pub(crate) enum Command {
+    /// Settle an owner question.
+    Question(Value),
     Close {
         reply: Value,
     },
@@ -483,7 +485,9 @@ pub(crate) async fn run(
     let requests_max = config.limits(None).requests_max;
     let configured: Vec<String> = config.bindings.keys().cloned().collect();
 
+    let (question_backend, mut questions) = crate::harness::QuestionBackend::new();
     let mut builder = SessionBuilder::new(config.clone(), None, None)
+        .question_backend(question_backend)
         .no_primary()
         .repo_root(&context.repo_root)
         .program(cwd);
@@ -615,14 +619,31 @@ pub(crate) async fn run(
     let told = tokio::spawn(forward(handle, children.attach_owner(), out.clone()));
     #[cfg(test)]
     context.testing.started(handle, &session);
+    let question_channel = session
+        .channel(crate::harness::QUESTION_CHANNEL)
+        .expect("built-in questions");
     let closer = session.closer();
     for reply in closes {
         close(&closer, reply, &out).await;
     }
     loop {
         tokio::select! {
+            Some(notice) = questions.recv() => {
+                use crate::harness::QuestionNotice;
+                let line = match notice {
+                    QuestionNotice::Asked(item) => json!({"t": "question.asked", "session": handle, "request": item.request, "asker": item.sender, "body": item.body}),
+                    QuestionNotice::Withdrawn(notice) => json!({"t": "question.closed", "session": handle, "request": notice.request}),
+                    QuestionNotice::Settled(notice) => json!({"t": "question.closed", "session": handle, "request": notice.request}),
+                };
+                out.send(line).await;
+            }
             command = commands.recv() => match command {
                 Some(Command::Close { reply }) => close(&closer, reply, &out).await,
+                Some(Command::Question(line)) => {
+                    let channel = question_channel.clone();
+                    let out = out.clone();
+                    tokio::spawn(async move { answer_question(&channel, line, &out).await; });
+                }
                 Some(Command::Agent(line)) => children.owner_line(line),
                 Some(Command::Inject { reply, live }) => {
                     let line = match session.inject(live.brief()).await {
@@ -779,7 +800,7 @@ async fn refuse_the_rest(mut commands: mpsc::UnboundedReceiver<Command>, out: &O
 /// module's. A notice is not answered.
 async fn refuse(command: Command, out: &Out) {
     let id = match command {
-        Command::Agent(line) => line["id"].clone(),
+        Command::Agent(line) | Command::Question(line) => line["id"].clone(),
         Command::Close { reply }
         | Command::Shutdown { reply, .. }
         | Command::Inject { reply, .. } => reply,
@@ -994,6 +1015,32 @@ fn report_json(report: &ShutdownReport) -> Value {
         serde_json::to_value(report).unwrap_or_else(|e| json!({"error": e.to_string()}));
     value["verdict"] = json!(report.verdict());
     value
+}
+
+async fn answer_question(channel: &crate::harness::Channel, line: Value, out: &Out) {
+    use crate::harness::{Settle, event::AgentRequestId};
+    let reply = line["id"].clone();
+    let Some(request) = line["request"].as_u64() else {
+        out.refuse(reply, "invalid question id").await;
+        return;
+    };
+    let settle = match line["outcome"].as_str() {
+        Some("answer") => Settle::Reply(line["answer"].clone()),
+        Some("decline") => Settle::Fail(line["reason"].as_str().unwrap_or_default().to_string()),
+        Some("cancel") => Settle::Cancel(line["reason"].as_str().unwrap_or_default().to_string()),
+        _ => {
+            out.refuse(reply, "invalid question outcome").await;
+            return;
+        }
+    };
+    match channel.settle(AgentRequestId::new(request), settle).await {
+        Ok(()) => {
+            out.send(json!({"t": "question.settle", "id": reply})).await;
+        }
+        Err(why) => {
+            out.refuse(reply, why.to_string()).await;
+        }
+    }
 }
 
 #[cfg(test)]

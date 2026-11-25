@@ -3285,3 +3285,56 @@ async fn a_program_declares_a_url_server() {
         ran.stdout
     );
 }
+
+#[tokio::test]
+async fn a_host_program_receives_and_answers_typed_questions() {
+    let bed = Bed::new();
+    bed.write(
+        "questions.py",
+        r#"
+        import asyncio, outrig, json, wait
+        async def main():
+            async with outrig.Session() as session:
+                wait.raise_flag('session-ready')
+                questions = [await session.questions.receive() for _ in range(3)]
+                assert len({q.id for q in questions}) == 3
+                for n in (2, 1, 0):
+                    q = questions[n]
+                    assert q.asker == 'asker'
+                    if n == 0:
+                        assert q.body.context.description == 'longer background'
+                        ref = q.body.context.references[0]
+                        assert (ref.path, ref.line, ref.end_line) == ('src/parser.rs', 12, 18)
+                        await q.answer(outrig.Answer(text='hello'))
+                    elif n == 1:
+                        try: await q.answer(outrig.Answer(choices=['missing']))
+                        except RuntimeError: pass
+                        else: raise AssertionError('invalid answer accepted')
+                        assert not q.closed
+                        await q.answer(outrig.Answer(choices=['b']))
+                    else: await q.answer(outrig.Answer(choices=['b', 'a'], text='also'))
+                await wait.flag('agent-done')
+                print(json.dumps({'answered': [q.closed for q in questions]}))
+        asyncio.run(main())
+    "#,
+    );
+    let program = bed
+        .start("questions.py", bed.config("", false), bed.sessions(), |p| p)
+        .await;
+    bed.raised("session-ready").await;
+    let interpreter = interpreter(&program, 1);
+    run_in(&bed, &interpreter, "asker", r#"
+        import outrig
+        hs = [runtime.ask(q) for q in [outrig.Question('free', context=outrig.QuestionContext(description='longer background', references=[outrig.QuestionReference('src/parser.rs', line=12, end_line=18)])), outrig.Question('single', choices=['a', 'b'], other=False), outrig.Question('multi', choices=['a', 'b'], multiple=True)]]
+        answers = [await h for h in hs]
+        assert answers[0].text == 'hello'
+        assert answers[1].choices == ['b']
+        assert answers[2].choices == ['a', 'b'] and answers[2].text == 'also'
+    "#, "agent-done").await;
+    let ran = bed.finish(program).await;
+    assert_eq!(ran.exit.code(), 0, "{}", ran.stderr);
+    assert_eq!(
+        ran.json()[0]["answered"],
+        serde_json::json!([true, true, true])
+    );
+}

@@ -2478,9 +2478,10 @@ def _load_outrig(directory):
     """Import OutRig's own package from `directory`, and give it this process's executions:
     `outrig.runtime` and `outrig.bindings` are those of the execution reading them. Its skills
     module gets the way to ask the host for a skill's files, and puts its finder in place."""
-    global _schema, _agents, _skills, _serve, _services_mod, _mcp_mod
+    global _schema, _agents, _skills, _serve, _services_mod, _mcp_mod, _HANDLES
     sys.path.append(directory)
     import outrig._agents
+    import outrig._questions
     import outrig._kernel
     import outrig._mcp
     import outrig._serve
@@ -2504,6 +2505,7 @@ def _load_outrig(directory):
     )
     _schema = outrig.schema
     _agents = outrig._agents
+    _HANDLES = (_agents.Handle, outrig._questions.QuestionHandle)
     _skills = outrig.skills
     _serve = outrig._serve
     _services_mod = outrig._services
@@ -3426,7 +3428,7 @@ def _describe_awaited(fs, handles, calls):
         if h is not None and issubclass(type(f), asyncio.Task) and not _is_unnamed(f):
             # A task stands for the handle it only awaits while nobody has named it.
             h = None
-        if type(h) is _agents.Handle:
+        if type(h) in _HANDLES:
             work = h._work
             if type(work) is _Call:
                 # Not `declaration.name`, which formats the two raw: a declared function's
@@ -3437,8 +3439,9 @@ def _describe_awaited(fs, handles, calls):
             else:
                 d = {"kind": work.kind, "id": work.id, "channel": work.channel}
             child = work.child
-            d["child"] = None if child is None else child.id
-            d["name"] = None if child is None else child.name
+            external = type(child) is _Outbound
+            d["child"] = None if child is None or external else child.id
+            d["name"] = None if child is None or external else child.name
         elif type(h) is _skills.Invocation:
             d = {"kind": "skill", "id": h.id, "skill": h.skill}
         elif issubclass(type(f), asyncio.Task):
@@ -3475,7 +3478,7 @@ def _wrapped_handles(fs):
         code = _code_of(f) if issubclass(type(f), asyncio.Task) else None
         if code and str.__str__(code.co_qualname) == "ensure_future.<locals>._wrap_awaitable":
             awaited = inspect.getcoroutinelocals(asyncio.Task.get_coro(f)).get("awaitable")
-            if type(awaited) is _agents.Handle or type(awaited) is _skills.Invocation:
+            if type(awaited) in _HANDLES or type(awaited) is _skills.Invocation:
                 wrapped[id(f)] = awaited
     return wrapped
 
@@ -4530,7 +4533,21 @@ class _Outbound(_RequestChannel):
     def __init__(self, *args):
         super().__init__(*args)
         # Nothing arrives on it to read.
-        self._counted = False
+        self._counted = self._name == "__questions"
+        self._question_ends = 0
+        self._question_unread = set()
+
+    def _counts(self):
+        with self._lock:
+            return {"pending": len(self._question_unread), "delivered": self._question_ends,
+                    "requests": False}
+
+    def settled(self, work):
+        super().settled(work)
+        if self._name == "__questions":
+            with self._lock:
+                self._question_ends += 1
+                self._question_unread.add(work.id)
 
     @property
     def id(self):
@@ -4589,6 +4606,11 @@ class _Outbound(_RequestChannel):
         encoded = self._encoded(body, line, _encode_strict)
         with self._lock:
             if len(self._open) >= self._bound:
+                if self._name == "__questions":
+                    raise _agents.AgentLimitReached(
+                        f"open questions limit ({self._bound}) reached; cancel a question or "
+                        "wait for an answer"
+                    )
                 raise _agents.AgentLimitReached(
                     f"channel {self._name!r} already has {self._bound} requests outstanding, its "
                     f"bound, so nothing was sent; cancel one, or wait for an answer"
@@ -4606,6 +4628,9 @@ class _Outbound(_RequestChannel):
             with _works_lock:
                 _works.pop(work.id, None)
             raise
+        if self._name == "__questions":
+            from outrig._questions import QuestionHandle
+            return QuestionHandle(work)
         return _agents.Handle(work)
 
 
@@ -4698,6 +4723,8 @@ def _claim(agent, names, taken=()):
     `taken`, a channel of the agent's own."""
     with _channels_lock:
         for name in names:
+            if name == "__questions":
+                raise ValueError("the question route cannot be granted as a channel facility")
             endpoint = _CHANNELS.get(name)
             if endpoint is None:
                 raise LookupError(f"the session declares no channel {name!r}")
@@ -4726,7 +4753,8 @@ def _unclaim(endpoints):
 def _unheld():
     """The name of every declared channel no kernel holds, in the order they were declared."""
     with _channels_lock:
-        return [name for name, endpoint in _CHANNELS.items() if endpoint._claimant is None]
+        return [name for name, endpoint in _CHANNELS.items()
+                if name != "__questions" and endpoint._claimant is None]
 
 
 def _named_channels(facilities):
@@ -4794,7 +4822,14 @@ def _channel_close(message):
     endpoint = _CHANNELS.get(message.get("channel"))
     if endpoint is None:
         raise ValueError(f"no channel {message.get('channel')!r} to close")
-    endpoint._close(str(message.get("reason") or ""))
+    reason = str(message.get("reason") or "")
+    endpoint._close(reason)
+    if message.get("channel") == "__questions":
+        # Each owner-facing asker has its own endpoint, unlike application channels.
+        for kernel in list(_kernels.values()):
+            question_endpoint = kernel.externals.get("__questions")
+            if question_endpoint is not None:
+                question_endpoint._close(reason)
 
 
 def _channel_cancel(message):
@@ -4924,6 +4959,17 @@ class Runtime:
                 "`await d.reply(value)`, or end it with `await d.fail(message)`"
             )
         raise AttributeError(f"'runtime' has no attribute {name!r}")
+
+    def ask(self, question):
+        """Return a question handle at once. See help(outrig.Question)."""
+        from outrig._questions import Question
+        if type(question) is not Question:
+            raise TypeError("runtime.ask takes an outrig.Question")
+        question._validate()
+        endpoint = self._channels.get("__questions")
+        if endpoint is None:
+            raise RuntimeError("child questions are not supported yet")
+        return endpoint.request(question)
 
     async def spawn(self, name, *, prompt, model=None, inputs=None, requests=None,
                     model_requests=None):
@@ -5141,7 +5187,7 @@ class Runtime:
         # itself. By the view's identity, which the handle keeps alive: reading the map hashes
         # nothing, so describing the wait runs no future's `__hash__`.
         handles = {}
-        for f in [f for f in fs if type(f) is _agents.Handle or type(f) is _skills.Invocation]:
+        for f in [f for f in fs if type(f) in _HANDLES or type(f) is _skills.Invocation]:
             handles[id(f.future)] = f
             fs.discard(f)
             fs.add(f.future)
@@ -5178,7 +5224,7 @@ class Runtime:
             nonlocal remaining
             remaining -= 1
             # asyncio's own test. Only `FIRST_EXCEPTION` reads an exception, which marks it
-            # retrieved, as asyncio's reading does.
+            # retrieved, as asyncio's reading does, but does not acknowledge a question.
             if (
                 remaining <= 0
                 or return_when == asyncio.FIRST_COMPLETED
@@ -5363,6 +5409,7 @@ _instances = {}  # each agent class instance (`outrig.Agent`) not yet released, 
 # an agent class instance's requests before its child exists to say its own.
 _requests_max = 256
 _ENDED = ("accepted", "failed")
+_HANDLES = ()  # Exact runtime-owned classes; never dispatch through an arbitrary subclass.
 _agents = None  # `outrig._agents`, once the package is loaded
 # The parent of each root child, as its requests' sender: the program on the host that owns the
 # session, which the host tells of each step of them. Its loop is closed, since nothing here waits.
@@ -6029,6 +6076,7 @@ class _Sent(_Work):
     def _notice(self, reason, error, reply, said):
         return {"t": "channel.ended", "agent": self.sender.agent, "channel": self.channel,
                 "request": self.id, "outcome": reason or "accepted",
+                "answer": reply if self.channel == "__questions" and _observing else None,
                 "error": None if error is None else str(error)[:OWNER_TEXT_MAX], **said}
 
     def cancel(self, **said):
@@ -6044,6 +6092,14 @@ class _Sent(_Work):
             _notify({"t": "channel.withdraw", "agent": self.sender.agent, "channel": self.channel,
                      "request": self.id})
         return True
+
+    def observed(self):
+        with self.child._lock:
+            first = self.id in self.child._question_unread
+            self.child._question_unread.discard(self.id)
+        if first:
+            _notify({"t": "channel.observed", "agent": self.sender.agent,
+                     "channel": self.channel, "request": self.id})
 
     def moved(self, state):
         """The far end took it, `waiting`, or it is not known whether it took it, or what became
@@ -6070,7 +6126,7 @@ class _Sent(_Work):
                 self.end("failed", error=_agents.AgentRequestFailed(why),
                          message=_agents.cut(why), problems=problems, **said)
                 return
-            self.end(None, value=value, **said)
+            self.end(None, value=value, reply=message.get("value"), **said)
             return
         if outcome == "failed":
             reason, error = "failed", _agents.AgentRequestFailed(text)
@@ -6842,6 +6898,17 @@ class Kernel:
         # The session's channels this kernel holds, by name, which it claimed as it was built
         # (`_claim`).
         self.externals = externals or {}
+        # The question channel is a fixed owner route, with an independent endpoint
+        # and open-question bound for each primary/root, never an inherited facility.
+        if (child is None or child.parent is _OWNER) and "__questions" in _CHANNELS:
+            from outrig._questions import Question, Answer, QUESTIONS_MAX
+            template = _CHANNELS["__questions"]
+            endpoint = _Outbound("__questions", Answer, Question, QUESTIONS_MAX,
+                                 template._wake, template._description)
+            endpoint._claimant = agent
+            endpoint._closed = template._closed
+            self.externals["__questions"] = endpoint
+
         for endpoint in self.externals.values():
             endpoint._kernel = self
         # Set once the host has ended this kernel: it takes no more work, and is going.
@@ -6941,9 +7008,12 @@ class Kernel:
         record = self.child
         # Claimed first, so a channel another kernel holds refuses the construction with nothing
         # of the record changed.
+        question_endpoint = self.externals.get("__questions")
         self.externals = _claim(
             self.agent, _named_channels(instance.facilities), taken=instance.channels
         )
+        if question_endpoint is not None:
+            self.externals["__questions"] = question_endpoint
         for endpoint in self.externals.values():
             endpoint._kernel = self
         record.channels, record.instance = instance.channels, instance.id

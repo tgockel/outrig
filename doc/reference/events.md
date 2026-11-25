@@ -758,6 +758,27 @@ between a child's failed rounds is in that read and has no event of its own.
   for a message still uncertain at the close. It never sends the item again. An outbound request
   whose send is resolved `accepted` moves to `waiting`, and `not_accepted` ends it; one whose
   withdrawal is resolved settles as the answer says.
+### Questions to the owner
+
+Question events carry the asker's `subject` and a `question` request-handle id. The underlying
+outbound request channel also records its normal transport events.
+
+- `agent.question.asked` -- a question was asked: `question`; `body`, its bounded JSON text,
+  including `text`, `choices` (labels and descriptions), `multiple`, `other`, and optional
+  `context` (longer `description` and file `references`, each with `path`, `line`, `end_line`,
+  and `description`). Context is inert data within the same question-size bound.
+- `agent.question.answered` -- it ended with an explicit answer: `question`; `answer`, with
+  `choices`, `text`, `by`, and `chain`, or null when observation is disabled.
+- `agent.question.declined` -- it failed at the answerer: `question`; `reason`.
+- `agent.question.cancelled` -- it was withdrawn: `question`; `reason`, `cancelled`, `closed`,
+  or `released`. A session close ends every open question `closed`.
+- `agent.question.refused` -- an invalid or late answer changed nothing: `question`; `reason`.
+  An invalid answer leaves the question open. A late answer never changes its prior outcome.
+
+The session renderer shows the question at its asking position, choices, asker, settlement,
+answer or decline reason, and elapsed open time. An unsettled question is marked still open
+when the record ended. Question text is untrusted data, not executable markup.
+
 - `channel.request.sent` -- the subject asked an outbound request channel's far end: `channel`;
   `request`, its handle's `id`, by which the owner settles it; `item`, the id its send was
   given, which its backend was given beside `request`; and `body`, the request as JSON text. Its

@@ -203,6 +203,12 @@ Making one checks its inputs and starts nothing:
   container after it take bounded times of their own.
 - `application`: an `Application`, the code this program's agent classes are in, which every
   kernel of the session imports from; or `None`.
+`session.questions` receives questions asked by its root agents: `async for q in
+session.questions` (or `await session.questions.receive()`) yields an OpenQuestion with
+`id`, `asker`, `body` (a Question), and `closed`. Run this receiver concurrently with
+the agents. Answers have no timeout. Withdrawal marks the object closed; session end
+closes the iterator. This endpoint is independent of the lossy events subscription.
+
 - `mcp`: the MCP servers it places and binds, each an `McpCommand`, an `McpSidecar`, an
   `McpPrimaryView` or an `McpUrl`; `mcp_policy`, an `McpPolicy`, how they start; and
   `mcp_identity`, a
@@ -414,6 +420,135 @@ class Missed:
 
 `count` records of a session's events lost between the item before this one and the item
 after it, because they were not read in time: see `help(outrig.Session.events)`.
+
+## Questions
+
+Agents ask the session owner with `runtime.ask(outrig.Question(...))`, returning a request handle
+immediately. See [Questions to the session
+owner](../concepts/python-runtime.md#questions-to-the-session-owner).
+
+### `outrig.Question`
+
+```python
+@dataclass
+class Question:
+    text: str
+    choices: list[Choice] = field(default_factory=list)
+    multiple: bool = False
+    other: bool = True
+    context: QuestionContext | None = None
+```
+
+A decision for the session owner, asked with `h = runtime.ask(question)`.
+
+Empty choices means free-form. Otherwise `multiple=False` permits one choice and
+`multiple=True` permits zero or more; `other=False` forbids additional text.
+Strings in choices become Choice(label). At ask, the limits are 32 choices,
+65,536 UTF-8 JSON bytes, and 32 open questions per asker, separate from requests-max.
+`context` optionally carries a QuestionContext: longer background text and file references,
+included in the same size bound. There is no answer timeout: cancel a question you give
+up on. Children cannot ask yet.
+
+### `outrig.Choice`
+
+```python
+@dataclass
+class Choice:
+    label: str
+    description: str = ''
+```
+
+An offered label and optional description. Labels must be nonempty and unique.
+
+### `outrig.QuestionContext`
+
+```python
+@dataclass
+class QuestionContext:
+    description: str = ''
+    references: list[QuestionReference] = field(default_factory=list)
+```
+
+Optional background for a short question prompt: longer prose, file references, or both.
+
+`description` is plain text, not trusted markup. A string in `references` becomes a
+QuestionReference(path). Context is data under the same total question-size bound.
+
+### `outrig.QuestionReference`
+
+```python
+@dataclass
+class QuestionReference:
+    path: str
+    line: int | None = None
+    end_line: int | None = None
+    description: str = ''
+```
+
+An inert file reference accompanying a question, never an instruction to open a file.
+
+`path` is a nonempty path as the asker sees it. `line` and `end_line` are optional
+one-based positions; an end requires a start and must not precede it. `description`
+explains why the file matters. Owners display these as untrusted text, not markup.
+
+### `outrig.Answer`
+
+```python
+@dataclass
+class Answer:
+    choices: list[str] = field(default_factory=list)
+    text: str | None = None
+    by: str = 'application'
+    chain: list[str] = field(default_factory=list)
+```
+
+An explicit answer: choice labels, optional text, answerer, and attribution chain.
+
+Choices are returned in the question's order. A host program passes one to
+`await question.answer(answer)`; invalid answers leave the question open.
+
+## Answering questions
+
+A host program reads `session.questions` independently of its events and explicitly answers,
+declines, or cancels each question. A normal message never answers one.
+
+### `OpenQuestion`
+
+```python
+class OpenQuestion:
+    def __init__(self, session, message): ...
+```
+
+One question asked of a Session owner. Invalid answers leave it open.
+
+`id`, `asker`, and `body` identify the question; `closed` marks withdrawal or
+settlement. `answer(Answer(...))`, `decline(reason)`, or `cancel()` settles it.
+A late answer raises RuntimeError. There is no automatic timeout. Cancellation after
+sending a settlement waits for its receipt, updates closed on success, then propagates.
+
+#### `OpenQuestion.answer`
+
+```python
+async def answer(self, answer): ...
+```
+
+Answer explicitly. Invalid answers raise and leave the question open.
+
+#### `OpenQuestion.decline`
+
+```python
+async def decline(self, reason='not relevant'): ...
+```
+
+Decline with a reason; the preset is 'not relevant'.
+
+#### `OpenQuestion.cancel`
+
+```python
+async def cancel(self): ...
+```
+
+End the question cancelled by the owner.
 
 ## MCP services
 

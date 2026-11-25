@@ -238,6 +238,12 @@ pub(crate) async fn serve(
                     out.refuse(id, why).await;
                 }
             }
+            Some("question.settle") => {
+                let command = Command::Question(Value::Object(request.clone()));
+                if let Err(why) = route(&sessions, &request, command) {
+                    out.refuse(id, why).await;
+                }
+            }
             Some("inject") => {
                 let routed = serde_json::from_value(Value::Object(request.clone()))
                     .map_err(|e| format!("an inject the engine cannot read: {e}"))

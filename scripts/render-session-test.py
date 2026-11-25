@@ -642,6 +642,11 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             {"request": 5, "channel": "asks", "outcome": "failed", "reason": "no"},
             a,
         ),
+        ("agent.question.asked", {"question": 17, "body": '{"text":"pick", "choices":[{"label":"A", "description":"first"}]}'}, a),
+        ("agent.question.answered", {"question": 17, "answer": {"choices": ["A"], "text": None, "by": "user", "chain": []}}, a),
+        ("agent.question.declined", {"question": 18, "reason": "not relevant"}, a),
+        ("agent.question.cancelled", {"question": 19, "reason": "closed"}, a),
+        ("agent.question.refused", {"question": 19, "reason": "late"}, a),
         ("channel.request.refused", {"request": 5, "channel": "asks", "ended": "failed"}, a),
         ("channel.settled", {"request": 5, "channel": "asks", "item": "q-1", "refused": False}, a),
         ("channel.closed", {"channel": "inbox", "reason": "peer gone"}, a),
@@ -1654,6 +1659,38 @@ class RenderSession(unittest.TestCase):
         self.assertIn(
             "request 9: the backend of questions recorded a refused answer to it (item q-1)", html
         )
+
+    def test_questions_are_rendered_where_asked_with_outcomes_and_open_time(self) -> None:
+        a = "agent/primary"
+        asked = []
+        for qid in range(1, 5):
+            asked.append(("agent.question.asked", {
+                "question": qid,
+                "body": json.dumps({"text": "<script>pick</script>", "choices": [
+                    {"label": "A", "description": "first option"},
+                    {"label": "B", "description": "second option"}],
+                    "multiple": True, "other": True,
+                    "context": {"description": "Longer <script>background</script>",
+                                "references": [{"path": "src/parser.rs", "line": 12,
+                                                "end_line": 18, "description": "current parser"}]}}),
+            }, a))
+        asked += [
+            ("agent.question.answered", {"question": 1, "answer": {
+                "choices": ["A"], "text": "also", "by": "user", "chain": []}}, a),
+            ("agent.question.declined", {"question": 2, "reason": "not relevant"}, a),
+            ("agent.question.cancelled", {"question": 3, "reason": "closed"}, a),
+            ("agent.question.refused", {"question": 3, "reason": "late answer"}, a),
+        ]
+        events = ordinary()
+        html = self.page(events[:4] + asked + events[4:])
+        for phrase in ("question 1 asked by", "first option", "second option", "answered",
+                       "declined", "cancelled", "still open when the record ended",
+                       "not relevant", "late answer", "open for", "also", "user",
+                       "Longer &lt;script&gt;background&lt;/script&gt;", "src/parser.rs:12-18",
+                       "current parser"):
+            self.assertIn(phrase, html)
+        self.assertNotIn("<script>pick</script>", html)
+        self.assertIn("&lt;script&gt;pick&lt;/script&gt;", html)
 
     def test_an_outbound_requests_send_is_its_own(self) -> None:
         """What became of an outbound request's send is the request's: it is on the request's

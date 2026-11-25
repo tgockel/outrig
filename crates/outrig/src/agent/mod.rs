@@ -571,6 +571,8 @@ mod external_tests;
 #[cfg(test)]
 #[path = "external_request_tests.rs"]
 mod external_request_tests;
+#[cfg(test)]
+mod question_tests;
 
 #[cfg(test)]
 #[path = "external_positions_tests.rs"]

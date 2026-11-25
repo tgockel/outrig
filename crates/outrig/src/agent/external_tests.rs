@@ -1305,7 +1305,7 @@ async fn a_channel_has_one_holder() {
     let outputs = exec_outputs(&events, &subject);
     assert_eq!(
         outputs.last().map(String::as_str),
-        Some("['ping']\n0 0\nRuntimeError True\n['inbox']\n"),
+        Some("['ping']\n0 0\nRuntimeError True\n['__questions', 'inbox']\n"),
         "{outputs:?}"
     );
     let root_text = system_text(&of_agent(&requests, "ROLE inbox")[0].body);

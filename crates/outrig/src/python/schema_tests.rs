@@ -949,3 +949,161 @@ fn untyped_json_takes_any_json_value_and_copies_it() {
          nests past 128 levels\n"
     );
 }
+
+#[test]
+fn question_future_reads_acknowledge_but_readiness_and_cancellation_do_not() {
+    assert_eq!(
+        run(r#"
+        import asyncio, threading
+        from types import SimpleNamespace
+        from outrig._questions import QuestionHandle
+        class Work:
+            def __init__(self):
+                self.future = asyncio.get_running_loop().create_future()
+                self.read = False
+                self.instance = None
+                self.state = 'waiting'
+                self.lock = threading.Lock()
+                self.value = self.error = None
+            def observed(self): self.read = True
+            def finish(self, error=None):
+                self.state = 'failed' if error else 'accepted'
+                self.error, self.value = error, 'answer'
+                if error:
+                    self.future.set_exception(error)
+                    self.future.exception()
+                else: self.future.set_result(self.value)
+        async def main():
+            for read in ('result', 'exception', 'await'):
+                for error in (None, ValueError('declined')):
+                    work = Work()
+                    h = QuestionHandle(work)
+                    view = h.future
+                    try: view.result()
+                    except asyncio.InvalidStateError: pass
+                    assert not work.read
+                    work.finish(error)
+                    await asyncio.sleep(0)
+                    assert view.done() and not work.read
+                    if read == 'exception':
+                        assert view.exception() is error
+                        assert not work.read
+                    try:
+                        value = await view if read == 'await' else view.result()
+                        assert value == 'answer'
+                    except ValueError as e: assert e is error
+                    assert work.read
+            # Standard asyncio waits inspect exception() internally. Test both
+            # a pending decline and an already-settled one, with another future
+            # still pending so FIRST_EXCEPTION's exception check is exercised.
+            for settled in (False, True):
+                work = Work()
+                h = QuestionHandle(work)
+                view = h.future
+                other = asyncio.get_running_loop().create_future()
+                error = ValueError('declined')
+                if settled:
+                    work.finish(error)
+                    await asyncio.sleep(0)
+                else:
+                    asyncio.get_running_loop().call_soon(work.finish, error)
+                done, pending = await asyncio.wait([view, other],
+                                                  return_when=asyncio.FIRST_EXCEPTION)
+                assert done == {view} and pending == {other}
+                assert view.exception() is error and not work.read
+                try: view.result()
+                except ValueError as e: assert e is error
+                else: raise AssertionError('decline was not preserved')
+                assert work.read
+                other.cancel()
+            work = Work()
+            h = QuestionHandle(work)
+            task = asyncio.ensure_future(h)
+            await asyncio.sleep(0)
+            task.cancel()
+            try: await task
+            except asyncio.CancelledError: pass
+            assert not work.future.cancelled() and not work.read
+            h.future.cancel()
+            work.finish()
+            await asyncio.sleep(0)
+            assert not work.read
+            assert h.future.result() == 'answer' and work.read
+            for through_future in (True, False):
+                work = Work()
+                h = QuestionHandle(work)
+                async def wait_on_it():
+                    return await (h.future if through_future else h)
+                task = asyncio.create_task(wait_on_it())
+                await asyncio.sleep(0)
+                work.finish()
+                asyncio.get_running_loop().call_soon(task.cancel)
+                try: await task
+                except asyncio.CancelledError: pass
+                assert not work.read, ('cancel racing completion', through_future)
+            print('reads and cancellation correct')
+        asyncio.run(main())
+    "#),
+        "reads and cancellation correct\n"
+    );
+}
+
+#[test]
+fn owner_question_receipts_survive_cancellation_and_closed_bodies_are_reclaimed() {
+    assert_eq!(
+        run(r#"
+        import asyncio, concurrent.futures
+        from types import SimpleNamespace
+        from outrig import _host
+        class Connection:
+            def post(self, *a, **kw):
+                self.receipt = concurrent.futures.Future()
+                return self.receipt
+        def asked(ident):
+            return {'t':'question.asked', 'request':ident, 'asker':'primary',
+                    'body':{'text':'body', 'choices':[], 'multiple':False, 'other':True}}
+        async def main():
+            session = SimpleNamespace(_handle=1)
+            session.questions = endpoint = _host._Questions(session)
+            connection = _host._connection = Connection()
+            for n, operation in enumerate(('answer', 'decline', 'cancel'), 1):
+                endpoint.push(asked(n))
+                q = await endpoint.receive()
+                task = asyncio.create_task(q.answer(outrig.Answer(text='yes')) if operation == 'answer'
+                                           else getattr(q, operation)())
+                await asyncio.sleep(0)
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not connection.receipt.cancelled() and not task.done()
+                connection.receipt.set_result({'t':'question.settle'})
+                try: await task
+                except asyncio.CancelledError: pass
+                else: raise AssertionError('cancellation lost')
+                assert q.closed and not endpoint.open and not endpoint.pending
+            endpoint.push(asked(4))
+            q = await endpoint.receive()
+            task = asyncio.create_task(q.answer(outrig.Answer(text='invalid')))
+            await asyncio.sleep(0)
+            task.cancel()
+            connection.receipt.set_exception(RuntimeError('invalid answer'))
+            try: await task
+            except asyncio.CancelledError: pass
+            assert not q.closed and q.id in endpoint.open
+            endpoint.push({'t':'question.closed', 'request':4})
+            for n in range(1000):
+                endpoint.push(asked(n))
+                endpoint.push({'t':'question.closed', 'request':n})
+                assert not endpoint.open and not endpoint.pending
+            for n in range(3): endpoint.push(asked(n))
+            endpoint.push({'t':'question.closed', 'request':1})
+            assert (await endpoint.receive()).id == 0
+            assert (await endpoint.receive()).id == 2
+            endpoint.push(asked(3))
+            endpoint.push({'t':'events.end'})
+            assert not endpoint.open and not endpoint.pending
+            print('receipts and reclamation correct')
+        asyncio.run(main())
+    "#),
+        "receipts and reclamation correct\n"
+    );
+}

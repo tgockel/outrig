@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `run-new` prints typed questions on stderr (or the screen) and accepts explicit `/answer`
+  lines, including multi-select, declines, and the not-relevant preset (#1069).
+
 - **Embedded host environment references** in MCP `env`, URL `headers`, `build-args`,
   and `--env`: `"Bearer ${TOKEN}"` and `"a-${X}-b-${Y}"` now join literal text with
   host variables (or session `Secrets`), expanded once. Every reference is subject to
@@ -343,6 +346,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lockfile loses the several hundred crates that only `--features local-llm` pulled in.
 
 ### Fixed
+
+- Release terminal question bodies while retaining IDs for late-answer diagnostics, and drain
+  answer acknowledgements at EOF so a final piped refusal is not lost.
 
 - Header expansion failures now report only the header name and resolution error, never
   a template's literal credential text. Repository template allowlist checks use membership

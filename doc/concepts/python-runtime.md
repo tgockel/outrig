@@ -607,3 +607,100 @@ something first imports it.
 - [Host programs](../usage/host-programs.md) -- a Python program on the host that owns sessions.
 - [Python API](../reference/python.md) -- the `outrig` package a host program imports.
 - [Event Log](../reference/events.md) -- what a session records.
+
+
+## Questions to the session owner
+
+For a decision rather than a plain message, a primary agent uses:
+
+```python
+h = runtime.ask(outrig.Question(
+    "Which branch?", choices=["main", outrig.Choice("release", "the affected version")],
+    multiple=False, other=True,
+))
+answer = await h
+print(answer.choices, answer.text, answer.by)
+```
+
+`Question(text, choices=[], multiple=False, other=True, context=None)` is data. Strings in
+`choices` become
+`Choice(label, description="")`. No choices means free-form text; otherwise `multiple=False`
+allows one choice, and `multiple=True` allows zero or more. With choices, `other=False` forbids
+text. An `Answer(choices=[], text=None, by="application", chain=[])` names choices by label;
+OutRig returns them in the question's order, not the order the answerer selected them.
+
+Keep `text` short; optional context carries longer background and references:
+
+```python
+q = outrig.Question(
+    "Extend the parser or replace it?", choices=["extend", "replace"],
+    context=outrig.QuestionContext(
+        description="The existing parser handles the old format. Extending it would ...",
+        references=[outrig.QuestionReference(
+            path="src/parser.rs", line=120, end_line=165,
+            description="Current parsing logic",
+        )],
+    ),
+)
+```
+
+`QuestionContext(description="", references=[])` can hold prose, file references, or both.
+Strings in `references` become `QuestionReference(path)`. File positions are optional one-based
+line numbers; an inclusive `end_line` requires a `line` and cannot precede it. Paths and
+explanations are untrusted display data: OutRig does not read a referenced file, interpret markup,
+or grant access to a host path. All context counts toward the same total question-size limit.
+
+`ask` returns a request handle immediately: await it, pass it to `runtime.wait`, inspect `status`,
+or call `cancel()`. Several questions can remain open independently. There is no answer timeout;
+cancel a question you give up on. A decline raises `outrig.AgentRequestFailed` with its reason,
+separately from cancellation and session close. Ordinary user-channel messages never answer a
+question. A settlement can open a round, without putting the answer in the model's history:
+code must still read the handle to see it.
+
+The per-asker open-question limit is 32, separate from `requests-max`. The question-size limit is
+65,536 UTF-8 JSON bytes and the choice-count limit is 32. Empty text, empty or duplicate labels,
+and these limits are refused at `ask`. The reserved outbound channel `__questions` has the fixed
+`outrig.Question`/`outrig.Answer` contract; it cannot be declared or granted as a facility. Child
+questions to a parent are not yet supported. Roots constructed by a host program ask that program.
+
+A host program receives questions independently of its lossy event subscription:
+
+```python
+async def answer_questions(session):
+    async for question in session.questions:  # or await session.questions.receive()
+        print(question.id, question.asker, question.body.text)
+        await question.answer(outrig.Answer(text="main"))
+        # Or: await question.decline("not relevant")
+        # Or: await question.cancel()
+```
+
+Each open question has `id`, `asker`, `body` (a `Question`), and `closed`. Invalid answers raise
+at the owner and leave the question open. Late answers raise and are recorded as refused.
+Withdrawal and session close mark it closed; the iterator ends when the session ends. There is
+one question receiver per session. Run the receiver concurrently with the program's agents.
+
+A Rust embedder gives `SessionBuilder::question_backend` a `ChannelBackend`. Its `send` receives
+an outbound request with id, JSON body, and sender; settle it through
+`session.channel(QUESTION_CHANNEL).unwrap().settle(id, Settle::Reply(answer_json))`, or use
+`Settle::Fail(reason)` to decline and `Settle::Cancel(reason)` to cancel. `QuestionBackend::new()`
+provides an in-memory backend and a receiver of `QuestionNotice` values, including withdrawals.
+Invalid answers return `SettleError::InvalidAnswer` without ending the question. Without a
+backend, questions fail with "this application does not take questions" instead of waiting.
+
+`outrig.skills.SkillNeedsClarification` remains the skill parser's synchronous exception, not a
+`Question`: the agent can relay its `question` using `runtime.ask(outrig.Question(e.question))`.
+
+
+Question handles work with `runtime.wait` both before and after settlement, and their `future`
+views work with standard `asyncio.wait`. Readiness waits, including `FIRST_EXCEPTION`, do not
+consume the settlement notice. Only awaiting the handle or its `future`, or calling `result()`
+on either, acknowledges the answer or decline. Inspecting `future.exception()` is non-observing,
+since waiters also call it internally; use await/result to acknowledge a decline after inspection.
+Cancelling a waiter does not cancel the question. The reserved endpoint's `request` method returns
+the same question-aware handle as `runtime.ask`.
+
+Custom question backends retain the outbound request channel's recovery interface. Only the
+request's own asker can resolve its send or withdrawal. Replies returned during withdrawal or
+withdrawal recovery undergo the same validation and choice ordering as explicit owner answers.
+An invalid withdrawal reply is refused and leaves the handle uncertain, not completed; its asker
+can resolve the withdrawal again or its owner can explicitly settle it with a valid answer.

@@ -45,6 +45,17 @@ use crate::harness::services::ServiceBrief;
 use crate::harness::skills::{Catalog, SkillBrief};
 use crate::harness::{ChannelKind, Direction, Wake};
 
+/// The question API for primary agents and owner-constructed roots.
+const QUESTIONS: &str = "For a decision, prefer `h = runtime.ask(outrig.Question(text, \
+    choices=[\"label\", outrig.Choice(\"another\", \"description\")], multiple=False, other=True))` \
+    to a plain message. It returns a request handle at once; `await h` gives an `outrig.Answer` \
+    with `choices` (labels in the question's order), `text`, and `by`, or raises the owner's \
+    decline reason. Several questions may stay open together and normal messages keep flowing. \
+    Keep the prompt short; `context=outrig.QuestionContext(description=..., references=[\
+    outrig.QuestionReference(path=..., line=..., end_line=..., description=...)])` adds longer \
+    background and inert file references. There is no answer timeout: cancel a question you \
+    give up on with `h.cancel()`.\n\n";
+
 /// What every agent is told first: how it acts.
 const ACT: &str = "You act on this project by writing Python. Your one tool, `submit_python`, runs \
                    code in a persistent interpreter inside the project's container; it is the \
@@ -241,6 +252,7 @@ pub(crate) fn preamble(
          with it, with a `timeout=`, for anything that may not return -- tests, builds, \
          network calls.\n\n",
     );
+    text.push_str(QUESTIONS);
     if !holdings.channels.is_empty() {
         text.push_str(&externals(holdings.channels, !holdings.skills.is_empty()));
     }
@@ -487,6 +499,12 @@ pub(crate) fn child_preamble(
     if !external.is_empty() {
         let directive = matches!(brief, ChildBrief::Instance { skills, .. } if !skills.is_empty());
         text.push_str(&externals(external, directive));
+    }
+    if external
+        .iter()
+        .any(|c| c.name == crate::harness::QUESTION_CHANNEL)
+    {
+        text.push_str(QUESTIONS);
     }
     let messages = announcing(external);
     // An inbound request channel of the session's owner brings requests, held to the same rule.

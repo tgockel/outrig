@@ -3242,3 +3242,83 @@ async fn sigterm_at_the_question_about_a_binding_exits_without_an_answer() {
         "a container outlived the start: {record:#}"
     );
 }
+
+/// A pipe is an answerer: only /answer settles a question, and stdout remains messages only.
+#[tokio::test]
+async fn piped_questions_are_answered_explicitly_while_messages_keep_flowing() {
+    let (addr, _requests) = start_mock_http(vec![
+        submit(
+            "ask",
+            r#"
+import outrig
+await runtime.channels['user'].receive()
+h = runtime.ask(outrig.Question('pick', choices=['a', 'b'], multiple=True))
+d = await runtime.channels['user'].receive()
+await runtime.channels['user'].send('ordinary: ' + d.body)
+a = await h
+await runtime.channels['user'].send(','.join(a.choices) + ': ' + str(a.text))
+"#,
+        ),
+        text_reply("finished asking"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().unwrap();
+    let mut session = Session::start(repo.path(), sessions.path());
+    session.type_line("ask me").await;
+    wait_for(&session.stderr, "[outrig.question]", TEST_TIMEOUT).await;
+    let stderr = session.stderr.lock().unwrap().clone();
+    let id = stderr
+        .lines()
+        .find_map(|line| {
+            line.split_once("[outrig.question] ")
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .map(str::to_string)
+        })
+        .unwrap();
+    session.type_line("bare reply").await;
+    wait_for(&session.stdout, "ordinary: bare reply", STEP_TIMEOUT).await;
+    session
+        .type_line(&format!("/answer {id} 2,1 and also this"))
+        .await;
+    wait_for(&session.stdout, "a,b: and also this", STEP_TIMEOUT).await;
+    wait_for(&session.stderr, "finished asking", STEP_TIMEOUT).await;
+    // Closed questions retain only an ID, so late answers still reach the
+    // backend's authoritative refusal without retaining their original bodies.
+    session.type_line(&format!("/answer {id} late")).await;
+    wait_for(
+        &session.stderr,
+        "the request had already ended",
+        STEP_TIMEOUT,
+    )
+    .await;
+    let (status, stdout, stderr) = session.exit(true).await;
+    assert!(status.success(), "{stderr}");
+    assert!(!stdout.contains("[outrig.question]"), "{stdout}");
+}
+
+#[tokio::test]
+async fn a_final_invalid_answer_before_eof_is_reported() {
+    let (addr, _requests) = start_mock_http(vec![
+        submit("ask", "import outrig\nawait runtime.channels['user'].receive()\nh = runtime.ask(outrig.Question('pick', choices=['a', 'b'], multiple=True))"),
+        text_reply("question is open"),
+    ]).await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().unwrap();
+    let mut session = Session::start(repo.path(), sessions.path());
+    session.type_line("ask me").await;
+    wait_for(&session.stderr, "question is open", TEST_TIMEOUT).await;
+    let stderr = session.stderr.lock().unwrap().clone();
+    let id = stderr
+        .lines()
+        .find_map(|line| {
+            line.split_once("[outrig.question] ")
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .map(str::to_string)
+        })
+        .unwrap();
+    session.type_line(&format!("/answer {id} 1,1")).await;
+    let (status, _, stderr) = session.exit(true).await;
+    assert!(status.success(), "{stderr}");
+    assert!(stderr.contains("unknown or duplicate choice"), "{stderr}");
+}

@@ -76,6 +76,21 @@ SECTIONS = [
         ],
     ),
     (
+        "Questions",
+        "Agents ask the session owner with `runtime.ask(outrig.Question(...))`, returning a "
+        "request handle immediately. See [Questions to the session owner]"
+        "(../concepts/python-runtime.md#questions-to-the-session-owner).",
+        "_questions.py",
+        ["outrig.Question", "outrig.Choice", "outrig.QuestionContext", "outrig.QuestionReference", "outrig.Answer"],
+    ),
+    (
+        "Answering questions",
+        "A host program reads `session.questions` independently of its events and explicitly "
+        "answers, declines, or cancels each question. A normal message never answers one.",
+        "_host.py",
+        ["OpenQuestion"],
+    ),
+    (
         "MCP services",
         "A session places the MCP servers a program declares with `outrig.Session(mcp=[...])` -- "
         "an `outrig.McpCommand`, an `outrig.McpSidecar`, an `outrig.McpPrimaryView` or an "

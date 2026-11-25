@@ -1291,6 +1291,46 @@ pub enum Payload {
         /// Why, as the owner said.
         reason: String,
     },
+    /// The subject asked its session owner a typed question.
+    #[non_exhaustive]
+    QuestionAsked {
+        /// Request handle id.
+        question: AgentRequestId,
+        /// Question JSON, bounded as a message body is.
+        body: String,
+    },
+    /// An explicit owner answer settled a question.
+    #[non_exhaustive]
+    QuestionAnswered {
+        /// Request handle id.
+        question: AgentRequestId,
+        /// Answer JSON, when observation is enabled.
+        answer: Option<Value>,
+    },
+    /// The owner declined a question, failing its handle.
+    #[non_exhaustive]
+    QuestionDeclined {
+        /// Request handle id.
+        question: AgentRequestId,
+        /// Why the owner declined.
+        reason: String,
+    },
+    /// The asker cancelled, or its session closed.
+    #[non_exhaustive]
+    QuestionCancelled {
+        /// Request handle id.
+        question: AgentRequestId,
+        /// `cancelled`, `closed`, or `released`.
+        reason: String,
+    },
+    /// A late or invalid owner answer changed nothing.
+    #[non_exhaustive]
+    QuestionRefused {
+        /// Request handle id.
+        question: AgentRequestId,
+        /// Why it was refused.
+        reason: String,
+    },
     /// The event's subject asked an outbound request channel's far end: its
     /// request went to the backend as item `item`.
     #[non_exhaustive]
@@ -1840,6 +1880,11 @@ impl Payload {
             Payload::ChannelClosed { .. } => "channel.closed",
             Payload::ChannelItemOutcome { .. } => "channel.item.outcome",
             Payload::ChannelItemResolved { .. } => "channel.item.resolved",
+            Payload::QuestionAsked { .. } => "agent.question.asked",
+            Payload::QuestionAnswered { .. } => "agent.question.answered",
+            Payload::QuestionDeclined { .. } => "agent.question.declined",
+            Payload::QuestionCancelled { .. } => "agent.question.cancelled",
+            Payload::QuestionRefused { .. } => "agent.question.refused",
             Payload::ChannelRequestSent { .. } => "channel.request.sent",
             Payload::ChannelRequestEnded { .. } => "channel.request.ended",
             Payload::ChannelRequestRefused { .. } => "channel.request.refused",

@@ -600,7 +600,15 @@ async fn the_registry_lists_what_each_channel_holds() {
         .iter()
         .map(|snapshot| snapshot.name.as_str())
         .collect();
-    assert_eq!(names, ["inbox", "questions", "asks"]);
+    assert_eq!(
+        names,
+        [
+            "inbox",
+            "questions",
+            "asks",
+            crate::harness::QUESTION_CHANNEL
+        ]
+    );
     for snapshot in &snapshots {
         assert_disjoint(snapshot);
     }

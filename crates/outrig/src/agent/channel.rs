@@ -278,6 +278,12 @@ pub(crate) fn announcement(channels: &Channels) -> Option<String> {
         .iter()
         .filter(|(_, counts)| counts.pending > 0)
         .map(|(channel, counts)| {
+            if channel == crate::harness::QUESTION_CHANNEL {
+                return format!(
+                    "{} question handle(s) settled; inspect them with await or result()",
+                    counts.pending
+                );
+            }
             let words = match (counts.requests, counts.pending) {
                 (false, 1) => "message is",
                 (false, _) => "messages are",

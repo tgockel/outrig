@@ -821,6 +821,15 @@ async fn kernels_a_session_with_no_primary_opens_reach_its_bindings() {
         [("a".to_string(), named("a")), ("b".to_string(), named("b"))]
     );
     for event in &seen {
+        // Kernels also attach their built-in owner question route before executing.
+        if let Payload::ChannelAttached { channel, .. } = &event.payload {
+            assert_eq!(channel, crate::harness::QUESTION_CHANNEL);
+            assert!(matches!(
+                event.subject.as_ref().map(|s| s.as_str()),
+                Some("agent/a" | "agent/b")
+            ));
+            continue;
+        }
         let agent = match &event.payload {
             Payload::HostedReceived { agent, .. }
             | Payload::HostedDispatched { agent, .. }

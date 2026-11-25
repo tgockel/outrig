@@ -4089,12 +4089,14 @@ async fn a_recorded_session_is_the_agents_timeline() {
     let records = events::recorded(dir.path());
     let kinds = events::kinds(&records);
     // The session's own states bracket the agent's: starting first, and the
-    // report's last; the agent starts before anything else, and stops before
+    // report's last; built-in channel attachment precedes the agent's start, which stops before
     // the report.
     assert_eq!(kinds.first().map(String::as_str), Some("session.state"));
     assert_eq!(records[0]["data"], json!({"state": "starting"}));
     assert_eq!(
-        kinds.iter().find(|kind| !kind.starts_with("session.")),
+        kinds
+            .iter()
+            .find(|kind| !kind.starts_with("session.") && *kind != "channel.attached"),
         Some(&"agent.started".to_string())
     );
     assert_eq!(

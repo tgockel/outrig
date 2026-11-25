@@ -50,18 +50,19 @@
 //! Everything above about stdout and stderr is then the line mode's, which
 //! `run-new` keeps whenever the screen is not used.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::future::Future;
 use std::io::BufRead;
 use std::pin::Pin;
 
-use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
-use futures_util::stream::{FuturesOrdered, StreamExt};
-use outrig::harness::event::{Payload, Received, Subscription};
+use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
+use futures_util::{FutureExt, Stream};
+use outrig::harness::event::{AgentRequestId, Payload, Received, Subscription};
 use outrig::harness::{
-    RoundEnd, RoundOutcome, RoundStop, Session, SessionError, StillRunning, Tasks, Waits,
+    Question, RoundEnd, RoundOutcome, RoundStop, Session, SessionError, Settle, SettleError,
+    StillRunning, Tasks, Waits,
 };
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Mutex, mpsc};
@@ -86,8 +87,15 @@ const DIRECTIVE_HELP: HelpEntry = HelpEntry {
 /// run in -- native code holding it -- takes this long.
 const ANSWER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The terminal's independent input streams: events may be lossy, questions never are.
+pub(super) struct Updates<'a> {
+    pub(super) questions: &'a mut mpsc::UnboundedReceiver<outrig::harness::QuestionNotice>,
+    pub(super) events: &'a mut Subscription,
+}
+
 /// A round in flight, borrowing the session for as long as it runs.
-type Round<'a> = Pin<Box<dyn Future<Output = std::result::Result<RoundOutcome, SessionError>> + 'a>>;
+type Round<'a> =
+    Pin<Box<dyn Future<Output = std::result::Result<RoundOutcome, SessionError>> + 'a>>;
 
 /// The session, behind a lock a round holds across its awaits.
 type Shared<'a> = Mutex<&'a mut Session>;
@@ -134,8 +142,8 @@ type Shared<'a> = Mutex<&'a mut Session>;
 /// carries it. A signal that lands while what the session showed is still being
 /// written ends that wait as a Ctrl-C does, and is returned all the same.
 pub(super) async fn converse(
+    updates: Updates<'_>,
     session: &mut Session,
-    shown: &mut Subscription,
     view: Frontend<'_>,
     typed: Typed,
     interrupts: &mut Interrupts,
@@ -148,7 +156,7 @@ pub(super) async fn converse(
         waits: session.waits(),
     };
     let left = drive(
-        session, shown, &mut term, typed, interrupts, failures, signals,
+        updates, session, &mut term, typed, interrupts, failures, signals,
     )
     .await;
     let (mut signal, result) = match left {
@@ -303,32 +311,45 @@ pub(super) fn reconcile(left: Result<()>, failures: &mut Failures) -> Result<()>
 /// [`converse`]'s to wait for. A SIGTERM or SIGHUP is returned as the signal
 /// it was.
 async fn drive(
+    updates: Updates<'_>,
     session: &mut Session,
-    shown: &mut Subscription,
     term: &mut Terminal<'_>,
     mut lines: Typed,
     interrupts: &mut Interrupts,
     failures: &mut Failures,
     signals: &mut Signals,
 ) -> Result<Option<EndSignal>> {
+    let Updates {
+        questions,
+        events: shown,
+    } = updates;
     // `run-new` always starts its session with a primary agent.
     let (Some(user), Some(interrupt)) = (session.user_channel(), session.interrupter()) else {
         return Err(SessionError::NoPrimary.into());
     };
+    let question_channel = session
+        .channel(outrig::harness::QUESTION_CHANNEL)
+        .expect("built-in question channel");
+    let mut questions_state = Questions::default();
     let closer = session.closer();
     let view = term.view;
     let session = Mutex::new(session);
     // Read before any line is, so a `/name` typed at once finds its skill.
     let skills = read_catalog(shown, term);
-    let help = compose_help(if skills.is_empty() {
+    let mut help = compose_help(if skills.is_empty() {
         &[]
     } else {
         &[DIRECTIVE_HELP]
     });
 
+    help.push_str("\n/answer <id> <numbers and/or text | --decline [reason] | --not-relevant>\n//answer always invokes the built-in, even with an answer skill.\n");
+
     let mut round: Option<Round<'_>> = None;
     // Each posted line's answer, and whether it was typed while a round ran.
     let mut acks = FuturesOrdered::new();
+    // Answer validation runs on the asker's kernel. A held kernel must not hold
+    // up input, output, or interrupts while its settlement is acknowledged.
+    let mut answers = FuturesUnordered::new();
     // A directive's answer, and whether it was typed while a round ran: no
     // line is taken until it comes.
     let mut directing: Option<BoxFuture<'static, (std::result::Result<usize, BoxError>, bool)>> =
@@ -356,11 +377,15 @@ async fn drive(
                 // sent, are shown first. An answer is waited for only so long,
                 // and a task still sending not at all.
                 let deadline = tokio::time::Instant::now() + ANSWER_GRACE;
-                while let Ok(Some((queued, mid_round))) =
-                    tokio::time::timeout_at(deadline, acks.next()).await
-                {
-                    term.answered(queued, mid_round);
-                }
+                drain_receipts(&mut acks, &mut answers, deadline, |receipt| match receipt {
+                    Receipt::Message(queued, mid_round) => term.answered(queued, mid_round),
+                    Receipt::Answer(id, answer) => {
+                        if let Some(error) = questions_state.answered(id, answer) {
+                            term.note(&format!("[outrig] {error}"));
+                        }
+                    }
+                })
+                .await;
                 let signalled = tokio::select! {
                     () = show(view, user.receive_waiting()) => None,
                     _ = interrupts.recv() => {
@@ -412,6 +437,29 @@ async fn drive(
                 last_was_interrupt = true;
                 term.prompt();
             }
+            Some(notice) = questions.recv() => {
+                use outrig::harness::QuestionNotice;
+                match notice {
+                    QuestionNotice::Asked(item) => {
+                        if let (Some(id), Ok(question)) = (item.request, serde_json::from_value::<outrig::harness::Question>(item.body)) {
+                            term.note(&format_question(id.get(), &question));
+                            questions_state.ids.insert(id.get(), id);
+                            questions_state.open.insert(id.get(), question);
+                        }
+                    }
+                    QuestionNotice::Withdrawn(notice) => {
+                        questions_state.close(notice.request.get());
+                        term.note(&format!("[outrig.question.closed] {}", notice.request));
+                    }
+                    QuestionNotice::Settled(notice)
+                        if !matches!(notice.outcome, outrig::harness::Settlement::Refused { .. }) =>
+                    {
+                        questions_state.close(notice.request.get());
+                        term.note(&format!("[outrig.question.closed] {}", notice.request));
+                    }
+                    _ => {}
+                }
+            }
             Some(failed) = failures.recv() => return Err(failed.into()),
             // A message is taken only with room made for it, so a terminal
             // slower than the agent leaves the rest with the agent, whose code
@@ -458,6 +506,12 @@ async fn drive(
                     }
                 }
             }
+            Some((id, answer)) = answers.next() => {
+                if let Some(error) = questions_state.answered(id, answer) {
+                    term.note(&format!("[outrig] {error}"));
+                }
+                if round.is_none() { round = Some(start(&session)); }
+            }
             Some((queued, mid_round)) = acks.next() => term.answered(queued, mid_round),
             (queued, mid_round) = async {
                 directing.as_mut().expect("polled only while directing").await
@@ -487,6 +541,18 @@ async fn drive(
                     continue;
                 }
                 last_was_interrupt = false;
+                let built_in = answer_command(line, skills.contains("answer"));
+                if let Some(raw) = built_in {
+                    let result = parse_answer(raw, &questions_state);
+                    match result {
+                        Ok((id, settle)) => {
+                            answers.push(question_channel.settle(id, settle).map(move |answer| (id.get(), answer)));
+                        }
+                        Err(e) => term.note(&format!("[outrig] {e}")),
+                    }
+                    if round.is_none() { round = Some(start(&session)); }
+                    continue;
+                }
                 if let Some(raw) = line.strip_prefix('/') {
                     match raw.split_whitespace().collect::<Vec<_>>()[..] {
                         ["quit"] => {
@@ -850,6 +916,185 @@ impl Terminal<'_> {
     }
 }
 
+/// Keep bodies only while open. Compact IDs let late answers reach the
+/// backend's authoritative refusal path without retaining prompts or context.
+#[derive(Default)]
+struct Questions {
+    open: BTreeMap<u64, Question>,
+    ids: BTreeMap<u64, AgentRequestId>,
+}
+
+impl Questions {
+    fn close(&mut self, id: u64) {
+        self.open.remove(&id);
+    }
+
+    fn answered(
+        &mut self,
+        id: u64,
+        answer: std::result::Result<(), SettleError>,
+    ) -> Option<String> {
+        if answer.is_ok()
+            || matches!(
+                answer,
+                Err(SettleError::Ended(_) | SettleError::Rejected(_) | SettleError::Gone)
+            )
+        {
+            self.close(id);
+        }
+        answer.err().map(|error| error.to_string())
+    }
+}
+
+enum Receipt {
+    Message(std::result::Result<usize, BoxError>, bool),
+    Answer(u64, std::result::Result<(), SettleError>),
+}
+
+/// EOF owes diagnostics for both kinds of input, under one shared deadline.
+async fn drain_receipts<A, B>(
+    acks: &mut A,
+    answers: &mut B,
+    deadline: tokio::time::Instant,
+    mut received: impl FnMut(Receipt),
+) where
+    A: Stream<Item = (std::result::Result<usize, BoxError>, bool)> + Unpin,
+    B: Stream<Item = (u64, std::result::Result<(), SettleError>)> + Unpin,
+{
+    loop {
+        let next = async {
+            tokio::select! {
+                Some((queued, mid_round)) = acks.next() => Some(Receipt::Message(queued, mid_round)),
+                Some((id, answer)) = answers.next() => Some(Receipt::Answer(id, answer)),
+                else => None,
+            }
+        };
+        match tokio::time::timeout_at(deadline, next).await {
+            Ok(Some(receipt)) => received(receipt),
+            _ => break,
+        }
+    }
+}
+
+fn question_text(text: &str) -> String {
+    serde_json::to_string(text)
+        .unwrap()
+        .chars()
+        .map(|c| {
+            if c.is_control() {
+                format!("\\u{:04x}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// JSON strings keep untrusted text on one physical line without terminal escapes.
+fn format_question(id: u64, q: &outrig::harness::Question) -> String {
+    let mut lines = vec![format!("[outrig.question] {id} {}", question_text(&q.text))];
+    for (n, c) in q.choices.iter().enumerate() {
+        lines.push(format!(
+            "[outrig.choice] {id} {} {} {}",
+            n + 1,
+            question_text(&c.label),
+            question_text(&c.description)
+        ));
+    }
+    if let Some(context) = &q.context {
+        lines.push(format!(
+            "[outrig.context] {id} {}",
+            question_text(&context.description)
+        ));
+        for reference in &context.references {
+            let body = serde_json::to_value(reference).expect("reference JSON");
+            // Re-escape C1 controls as well as JSON's mandatory C0 escaping.
+            let body: String = body
+                .to_string()
+                .chars()
+                .map(|c| {
+                    if c.is_control() {
+                        format!("\\u{:04x}", c as u32)
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect();
+            lines.push(format!("[outrig.reference] {id} {body}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn answer_command(line: &str, skill: bool) -> Option<&str> {
+    let (command, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    match command {
+        "//answer" => Some(rest),
+        "/answer" if !skill => Some(rest),
+        _ => None,
+    }
+}
+
+fn parse_answer(
+    raw: &str,
+    questions: &Questions,
+) -> std::result::Result<(AgentRequestId, Settle), String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("usage: /answer <id> <answer>".into());
+    }
+    let (id, rest) = raw.split_once(char::is_whitespace).unwrap_or((raw, ""));
+    let id: u64 = id.parse().map_err(|_| "invalid question id")?;
+    let request = *questions.ids.get(&id).ok_or("no question with that id")?;
+    let Some(question) = questions.open.get(&id) else {
+        // Keep only IDs after closure. The backend refuses this late settlement
+        // before reading its body, preserving its lifecycle event and diagnostic.
+        return Ok((request, Settle::Fail("late answer".into())));
+    };
+    Ok((request, answer_value(rest, question)?))
+}
+
+fn answer_value(
+    rest: &str,
+    question: &outrig::harness::Question,
+) -> std::result::Result<outrig::harness::Settle, String> {
+    use outrig::harness::{Answer, Settle};
+    let rest = rest.trim();
+    if rest == "--not-relevant" {
+        return Ok(Settle::Fail("not relevant".into()));
+    }
+    if rest == "--decline" || rest.starts_with("--decline ") {
+        return Ok(Settle::Fail(
+            rest.strip_prefix("--decline").unwrap().trim().to_string(),
+        ));
+    }
+    let (first, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let mut choices = Vec::new();
+    let text = if !question.choices.is_empty()
+        && !first.is_empty()
+        && first.chars().all(|c| c.is_ascii_digit() || c == ',')
+    {
+        for n in first.split(',') {
+            let n: usize = n.parse().map_err(|_| "invalid choice number")?;
+            let choice = n
+                .checked_sub(1)
+                .and_then(|n| question.choices.get(n))
+                .ok_or("choice number out of range")?;
+            choices.push(choice.label.clone());
+        }
+        (!tail.trim().is_empty()).then(|| tail.trim().to_string())
+    } else {
+        (!rest.is_empty()).then(|| rest.to_string())
+    };
+    let answer = Answer {
+        choices,
+        text,
+        by: "user".into(),
+        chain: Vec::new(),
+    };
+    Ok(Settle::Reply(serde_json::to_value(answer).unwrap()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -923,5 +1168,160 @@ mod tests {
     fn a_round_a_release_ended_asks_again() {
         assert!(asks_again(None));
         assert!(asks_again(Some(&RoundStop::Released)));
+    }
+}
+
+#[cfg(test)]
+mod question_tests {
+    use super::*;
+    use outrig::harness::{Choice, Question};
+    fn question() -> Question {
+        Question {
+            text: "pick\n\u{1b}[31m\u{9b}".into(),
+            choices: vec![
+                Choice {
+                    label: "a".into(),
+                    description: "first".into(),
+                },
+                Choice {
+                    label: "b".into(),
+                    description: "second".into(),
+                },
+            ],
+            multiple: true,
+            other: true,
+            context: None,
+        }
+    }
+    #[test]
+    fn questions_have_stable_safe_physical_lines() {
+        assert_eq!(
+            format_question(42, &question()),
+            "[outrig.question] 42 \"pick\\n\\u001b[31m\\u009b\"\n[outrig.choice] 42 1 \"a\" \"first\"\n[outrig.choice] 42 2 \"b\" \"second\""
+        );
+    }
+
+    #[test]
+    fn question_context_and_file_references_are_safe_inert_data() {
+        use outrig::harness::{QuestionContext, QuestionReference};
+        let mut q = question();
+        q.context = Some(QuestionContext {
+            description: "longer\nbackground".into(),
+            references: vec![QuestionReference {
+                path: "src/parser.rs".into(),
+                line: Some(12),
+                end_line: Some(18),
+                description: "parser\u{1b}".into(),
+            }],
+        });
+        let shown = format_question(42, &q);
+        assert!(
+            shown.contains("[outrig.context] 42 \"longer\\nbackground\""),
+            "{shown}"
+        );
+        assert!(shown.contains("[outrig.reference] 42 {"), "{shown}");
+        assert!(shown.contains("src/parser.rs"), "{shown}");
+        assert!(!shown.contains('\u{1b}'), "{shown}");
+    }
+
+    #[test]
+    fn answers_are_explicit_and_a_skill_can_shadow_the_command() {
+        assert_eq!(answer_command("ordinary reply", false), None);
+        assert_eq!(answer_command("/answer 42 1,2", false), Some("42 1,2"));
+        assert_eq!(answer_command("/answer 42 1,2", true), None);
+        assert_eq!(answer_command("//answer 42 1,2", true), Some("42 1,2"));
+        assert_eq!(answer_command("/answer", false), Some(""));
+        assert_eq!(answer_command("/answering 42", false), None);
+    }
+    #[test]
+    fn numbered_text_and_decline_answers_parse() {
+        use outrig::harness::Settle;
+        let q = question();
+        for (input, choices, text) in [
+            ("", vec![], None),
+            ("2", vec!["b"], None),
+            ("1,2 and also this", vec!["a", "b"], Some("and also this")),
+            ("free text", vec![], Some("free text")),
+        ] {
+            let Settle::Reply(value) = answer_value(input, &q).unwrap() else {
+                panic!("not a reply");
+            };
+            assert_eq!(value["choices"], serde_json::json!(choices));
+            assert_eq!(value["text"], serde_json::json!(text));
+        }
+        assert_eq!(
+            answer_value("--not-relevant", &q),
+            Ok(Settle::Fail("not relevant".into()))
+        );
+        assert_eq!(
+            answer_value("--decline not now", &q),
+            Ok(Settle::Fail("not now".into()))
+        );
+        assert_eq!(
+            answer_value("--decline", &q),
+            Ok(Settle::Fail(String::new()))
+        );
+        assert!(answer_value("3", &q).is_err());
+    }
+
+    #[test]
+    fn completed_questions_drop_bodies_but_invalid_answers_keep_them() {
+        let mut state = Questions::default();
+        for id in 0..1000 {
+            state.open.insert(id, question());
+            assert!(state.answered(id, Ok(())).is_none());
+            assert!(state.open.is_empty());
+            state.open.insert(id, question());
+            state.close(id); // Withdrawal or terminal backend notice.
+            assert!(state.open.is_empty());
+        }
+        state.open.insert(42, question());
+        assert!(
+            state
+                .answered(42, Err(SettleError::InvalidAnswer("duplicate".into())))
+                .is_some()
+        );
+        assert!(state.open.contains_key(&42));
+    }
+
+    #[tokio::test]
+    async fn eof_drains_a_final_answer_refusal_and_message_receipts() {
+        use futures_util::stream;
+        let mut state = Questions::default();
+        state.open.insert(42, question());
+        let mut acks = stream::iter([(Ok(0), false)]);
+        let mut answers = stream::iter([(
+            42,
+            Err(SettleError::InvalidAnswer("duplicate selections".into())),
+        )]);
+        let mut errors = Vec::new();
+        let mut messages = 0;
+        drain_receipts(
+            &mut acks,
+            &mut answers,
+            tokio::time::Instant::now() + ANSWER_GRACE,
+            |receipt| match receipt {
+                Receipt::Message(_, _) => messages += 1,
+                Receipt::Answer(id, answer) => errors.extend(state.answered(id, answer)),
+            },
+        )
+        .await;
+        assert_eq!(messages, 1);
+        assert_eq!(errors, ["invalid answer: duplicate selections"]);
+        assert!(state.open.contains_key(&42));
+    }
+
+    #[tokio::test]
+    async fn eof_receipt_drain_still_has_a_deadline() {
+        use futures_util::stream;
+        let mut acks = stream::empty::<(std::result::Result<usize, BoxError>, bool)>();
+        let mut answers = stream::pending::<(u64, std::result::Result<(), SettleError>)>();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            drain_receipts(&mut acks, &mut answers, deadline, |_| panic!("no receipts")),
+        )
+        .await
+        .expect("bounded EOF drain");
     }
 }

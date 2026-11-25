@@ -103,6 +103,7 @@ pub struct SessionBuilder {
     served: Vec<(String, Arc<dyn Service>)>,
     /// Channels given through [`SessionBuilder::channel`], in order.
     channels: Vec<(ChannelDefinition, Arc<dyn ChannelBackend>)>,
+    question_backend: Option<Arc<dyn ChannelBackend>>,
     /// How the session's services are called.
     service_policy: Option<ServicePolicy>,
     /// MCP services given through [`SessionBuilder::mcp`], in order.
@@ -184,6 +185,7 @@ impl SessionBuilder {
             bound: Vec::new(),
             served: Vec::new(),
             channels: Vec::new(),
+            question_backend: None,
             service_policy: None,
             mcp: Vec::new(),
             mcp_policy: None,
@@ -365,6 +367,13 @@ impl SessionBuilder {
     /// `mcp-connect-budget-secs`.
     pub fn mcp_policy(mut self, policy: McpPolicy) -> Self {
         self.mcp_policy = Some(policy);
+        self
+    }
+
+    /// Receive the primary agent's questions as outbound requests on the reserved
+    /// `__questions` channel. Without a backend, questions fail clearly rather than waiting.
+    pub fn question_backend(mut self, backend: Arc<dyn ChannelBackend>) -> Self {
+        self.question_backend = Some(backend);
         self
     }
 
@@ -726,6 +735,13 @@ impl SessionBuilder {
         lifecycle: &Arc<Lifecycle>,
         catalog: &Arc<Catalog>,
     ) -> Channels {
+        let backend = self.question_backend.take().unwrap_or_else(|| {
+            let (backend, receiver) = super::questions::QuestionBackend::new();
+            drop(receiver);
+            backend
+        });
+        self.channels
+            .push((super::questions::definition(), backend));
         Channels::new(
             std::mem::take(&mut self.channels),
             interpreter,

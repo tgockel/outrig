@@ -68,6 +68,11 @@ pub(crate) mod lifecycle;
 pub(crate) mod mcp;
 pub(crate) mod mcp_placement;
 mod proxy;
+mod questions;
+pub use questions::{
+    Answer, Choice, QUESTION_BYTES_MAX, QUESTION_CHANNEL, QUESTION_CHOICES_MAX, QUESTIONS_MAX,
+    Question, QuestionBackend, QuestionContext, QuestionNotice, QuestionReference,
+};
 mod registry;
 mod report;
 mod root;

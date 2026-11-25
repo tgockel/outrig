@@ -188,7 +188,9 @@ pub async fn execute(
     // stderr whose reader has stopped would hold it up for good.
     let (out, mut failures) = Output::stdio()?;
     let say = out.say();
+    let (question_backend, mut questions) = outrig::harness::QuestionBackend::new();
     let mut builder = SessionBuilder::new(cfg.clone(), agent_name.as_deref(), args.model.as_deref())
+        .question_backend(question_backend)
         .secrets(EnvSecrets)
         .repo_root(&repo_root)
         .approver(approve::TerminalApprover)
@@ -321,6 +323,7 @@ pub async fn execute(
     }));
 
     let conversed = conversation(
+        &mut questions,
         &mut running,
         &mut shown,
         &out,
@@ -425,6 +428,7 @@ fn hangup_behind(signal: Option<EndSignal>, started: Terminals) -> Option<EndSig
 /// this returns, so what the session says as it closes is written below the
 /// conversation, through `out`, as in the line mode.
 async fn conversation(
+    questions: &mut tokio::sync::mpsc::UnboundedReceiver<outrig::harness::QuestionNotice>,
     running: &mut harness::Session,
     shown: &mut harness::event::Subscription,
     out: &Output,
@@ -482,8 +486,8 @@ async fn conversation(
             Err(e) => return Conversed::failed(e.into()),
         };
         return converse::converse(
+            converse::Updates { questions, events: shown },
             running,
-            shown,
             Frontend::Lines(out),
             typed,
             &mut interrupts,
@@ -494,8 +498,8 @@ async fn conversation(
     };
     interrupts.listen(keys);
     let conversed = converse::converse(
+        converse::Updates { questions, events: shown },
         running,
-        shown,
         Frontend::Screen(&screen),
         typed,
         &mut interrupts,

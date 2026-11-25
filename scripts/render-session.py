@@ -532,6 +532,7 @@ class Builder:
         self.execs: dict[int | str, Exec] = {}
         self.messages: dict[int | str, Msg] = {}
         self.requests: dict[int | str, Request] = {}
+        self.questions: dict[int | str, tuple[Item, str]] = {}
         # Each outbound request on an external channel, by the item its send was given: what
         # became of that send is the request's, not a message's.
         self.request_items: dict[int | str, Request] = {}
@@ -554,6 +555,7 @@ class Builder:
         self.waiting: dict[str, list[Item]] = {}
         self.kind = ""
         self.time = ""
+        self.instant = ""
         self.subject = ""
         # The row the event being handled last added, for the fields its handler did not read.
         self.last: Item | None = None
@@ -709,6 +711,7 @@ class Builder:
         name = kind.removeprefix(PREFIX) if kind.startswith(PREFIX) else ""
         handler = getattr(self, "on_" + name.replace(".", "_"), None) if name else None
         self.kind = name if handler else kind or "(no type)"
+        self.instant = text(record.get("time"))
         self.time = clock(record.get("time"))
         self.subject = text(record.get("subject"))
         if self.subject:
@@ -796,6 +799,63 @@ class Builder:
         before = count(d.get("spent_before"), d.get("limit_before"))
         after = count(d.get("spent_after"), d.get("limit_after"))
         self.add(f"model-request count changed by its {text(d.get('by'))}: {before} -> {after}")
+
+    def on_agent_question_asked(self, d: dict) -> None:
+        qid = key(d.get("question"))
+        body = text(d.get("body"))
+        try:
+            q = obj(json.loads(body))
+        except (ValueError, TypeError, RecursionError):
+            q = {}
+        parts = [Part("question", text(q.get("text", body)), True), Part("question data", body)]
+        for n, choice in enumerate(objs(q.get("choices")), 1):
+            parts.append(Part(f"choice {n}: {text(choice.get('label'))}",
+                              text(choice.get("description")), True))
+        context = obj(q.get("context"))
+        if context:
+            parts.append(Part("context", text(context.get("description")), True))
+            for reference in objs(context.get("references")):
+                at = text(reference.get("path"))
+                if reference.get("line") is not None:
+                    at += ":" + text(reference.get("line"))
+                    if reference.get("end_line") is not None:
+                        at += "-" + text(reference.get("end_line"))
+                parts.append(Part("reference: " + at, text(reference.get("description")), True))
+        parts.append(Part("outcome", "still open when the record ended", True))
+        row = self.add(f"question {qid} asked by {self.label(self.subject)}",
+                       anchor=anchor("question", qid), parts=parts)
+        self.questions[qid] = (row, self.instant)
+
+    def question_end(self, d: dict, outcome: str) -> None:
+        qid = key(d.get("question"))
+        detail = text(d.get("answer") if outcome == "answered" else d.get("reason"))
+        row_start = self.questions.get(qid)
+        if row_start is not None:
+            row, start = row_start
+            try:
+                elapsed = (datetime.fromisoformat(self.instant.replace("Z", "+00:00")) -
+                           datetime.fromisoformat(start.replace("Z", "+00:00"))).total_seconds()
+                duration = f"; open for {elapsed:g}s"
+            except ValueError:
+                duration = ""
+            row.parts.append(Part(outcome + duration, detail, True))
+            for part in row.parts:
+                if part.label == "outcome": part.body = outcome
+        self.add(f"question {qid}: {outcome}", href=link(anchor("question", qid)),
+                 parts=[Part(outcome, detail, True)])
+
+    def on_agent_question_answered(self, d: dict) -> None:
+        self.question_end(d, "answered")
+
+    def on_agent_question_declined(self, d: dict) -> None:
+        self.question_end(d, "declined")
+
+    def on_agent_question_cancelled(self, d: dict) -> None:
+        self.question_end(d, "cancelled")
+
+    def on_agent_question_refused(self, d: dict) -> None:
+        self.add(f"question {text(d.get('question'))}: answer refused",
+                 parts=[Part("reason", text(d.get("reason")), True)])
 
     def request_outcome(self, req: Request, outcome: object) -> None:
         req.outcome = text(outcome)

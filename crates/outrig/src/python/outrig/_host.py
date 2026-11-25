@@ -145,6 +145,7 @@ class _Connection:
         # A session's handle -> the `_Events` its pushes go to, from its entry to its
         # `events.end`, under the same rule.
         self.events = {}
+        self.questions = {}
         # Why requests can no longer be answered, once they cannot.
         self._broken = None
         threading.Thread(target=self._read, name="outrig-engine", daemon=True).start()
@@ -228,6 +229,10 @@ class _Connection:
                 handle = message["session"]
                 if message["t"] == "events.end":
                     self.events.pop(handle).push(message)
+                    questions = self.questions.pop(handle, None)
+                    if questions is not None: questions.push(message)
+                elif message["t"].startswith("question."):
+                    self.questions[handle].push(message)
                 elif message["t"] in ("event", "missed"):
                     self.events[handle].push(message)
                 else:
@@ -254,6 +259,8 @@ class _Connection:
         # Nor will any more of a session's events come, nor of its agent class instances.
         for events in list(self.events.values()):
             events.push({"t": "events.end"})
+        for questions in list(self.questions.values()):
+            questions.push({"t": "events.end"})
         _closed(list(_roots.values()), terminated=True)
 
 
@@ -1107,6 +1114,12 @@ class Session:
       container after it take bounded times of their own.
     - `application`: an `Application`, the code this program's agent classes are in, which every
       kernel of the session imports from; or `None`.
+    `session.questions` receives questions asked by its root agents: `async for q in
+    session.questions` (or `await session.questions.receive()`) yields an OpenQuestion with
+    `id`, `asker`, `body` (a Question), and `closed`. Run this receiver concurrently with
+    the agents. Answers have no timeout. Withdrawal marks the object closed; session end
+    closes the iterator. This endpoint is independent of the lossy events subscription.
+
     - `mcp`: the MCP servers it places and binds, each an `McpCommand`, an `McpSidecar`, an
       `McpPrimaryView` or an `McpUrl`; `mcp_policy`, an `McpPolicy`, how they start; and
       `mcp_identity`, a
@@ -1208,6 +1221,7 @@ class Session:
         self._server = None
         self._handle = next(_handles)
         self._events = _Events()
+        self.questions = _Questions(self)
         self._entered = False
         self._reading = False
         # How many requests an agent class instance may hold unsettled, which entry says.
@@ -1229,6 +1243,7 @@ class Session:
                     "a session starts in the program `outrig run-new` started, not a fork"
                 )
             _connection.events[self._handle] = self._events
+            _connection.questions[self._handle] = self.questions
             start = _connection.post(
                 "session.start",
                 session=self._handle,
@@ -1956,3 +1971,100 @@ def _pushed(message):
         handle = message["session"]
         _closed([root for root in list(_roots.values()) if root.session._handle == handle],
                 message["terminated"])
+
+
+class OpenQuestion:
+    """One question asked of a Session owner. Invalid answers leave it open.
+
+    `id`, `asker`, and `body` identify the question; `closed` marks withdrawal or
+    settlement. `answer(Answer(...))`, `decline(reason)`, or `cancel()` settles it.
+    A late answer raises RuntimeError. There is no automatic timeout. Cancellation after
+    sending a settlement waits for its receipt, updates closed on success, then propagates.
+    """
+    def __init__(self, session, message):
+        from ._questions import Question
+        self._session = session
+        self.id = message["request"]
+        self.asker = message["asker"]
+        self.body = schema.declare(Question).decode(message["body"])
+        self.closed = False
+
+    async def _settle(self, outcome, **fields):
+        receipt = _connection.post(
+            "question.settle", session=self._session._handle, request=self.id,
+            outcome=outcome, **fields)
+        cancelled = await _settled(receipt)
+        if receipt.exception() is None:
+            self.closed = True
+            with self._session.questions.lock:
+                self._session.questions.open.pop(self.id, None)
+                self._session.questions.pending.pop(self.id, None)
+        if cancelled is not None:
+            raise cancelled
+        receipt.result()
+
+    async def answer(self, answer):
+        """Answer explicitly. Invalid answers raise and leave the question open."""
+        from ._questions import Answer
+        if type(answer) is not Answer:
+            raise TypeError("answer takes an outrig.Answer")
+        await self._settle("answer", answer=dataclasses.asdict(answer))
+
+    async def decline(self, reason="not relevant"):
+        """Decline with a reason; the preset is 'not relevant'."""
+        if type(reason) is not str:
+            raise TypeError("decline reason must be str")
+        await self._settle("decline", reason=reason)
+
+    async def cancel(self):
+        """End the question cancelled by the owner."""
+        await self._settle("cancel")
+
+
+class _Questions:
+    """Reliable question endpoint, independent of the lossy event subscription."""
+    def __init__(self, session):
+        self.session = session
+        self.lock = threading.Lock()
+        self.pending = collections.OrderedDict()
+        self.open = {}
+        self.ended = False
+        self.waiter = None
+
+    def push(self, message):
+        with self.lock:
+            if message["t"] == "events.end":
+                self.ended = True
+                for q in self.open.values(): q.closed = True
+                self.open.clear()
+                self.pending.clear()
+            elif message["t"] == "question.asked":
+                q = OpenQuestion(self.session, message)
+                self.open[q.id] = q
+                self.pending[q.id] = q
+            else:
+                q = self.open.pop(message["request"], None)
+                self.pending.pop(message["request"], None)
+                if q is not None: q.closed = True
+            waiter, self.waiter = self.waiter, None
+        if waiter is not None:
+            with contextlib.suppress(RuntimeError):
+                waiter.get_loop().call_soon_threadsafe(_wake, waiter)
+
+    def __aiter__(self):
+        return self
+
+    async def receive(self):
+        return await self.__anext__()
+
+    async def __anext__(self):
+        while True:
+            with self.lock:
+                while self.pending:
+                    _, q = self.pending.popitem(last=False)
+                    if not q.closed: return q
+                if self.ended: raise StopAsyncIteration
+                if self.waiter is not None and not self.waiter.done():
+                    raise RuntimeError("only one question receiver may wait at once")
+                self.waiter = waiter = asyncio.get_running_loop().create_future()
+            await waiter

@@ -313,7 +313,7 @@ impl ChannelDefinition {
                 if module.is_empty() || name.is_empty() {
                     return Some(format!("its type {path:?} is not given as module:Name"));
                 }
-                if !application {
+                if !application && !matches!(path.as_str(), "outrig:Question" | "outrig:Answer") {
                     return Some(format!(
                         "its type {path} names application code, and the session has none"
                     ));
@@ -977,6 +977,9 @@ pub enum SettleError {
     /// failed, naming each problem -- which its backend is told too.
     #[error("the reply does not fit the channel's reply type, so the request failed: {}", .0.join("; "))]
     Rejected(Vec<String>),
+    /// An invalid question answer was refused; the question remains open.
+    #[error("invalid answer: {0}")]
+    InvalidAnswer(String),
     /// The session ended before the request did.
     #[error("the session ended before the request did")]
     Gone,
@@ -1149,9 +1152,12 @@ pub(crate) fn check(
             .iter()
             .map(|(earlier, _)| earlier.name.as_str());
         let why = super::services::name_taken(name, "channel", declared, earlier)
-            .or_else(|| {
-                (name == "user")
-                    .then(|| "takes the name of the primary agent's user channel".to_string())
+            .or_else(|| match name.as_str() {
+                "user" => Some("takes the name of the primary agent's user channel".to_string()),
+                super::QUESTION_CHANNEL => {
+                    Some("takes the reserved question route's name".to_string())
+                }
+                _ => None,
             })
             .or_else(|| {
                 served
@@ -1244,6 +1250,8 @@ struct Chan {
     backend: Arc<dyn ChannelBackend>,
     permits: Arc<Semaphore>,
     holder: Option<String>,
+    question_holders: std::collections::BTreeSet<String>,
+    question_changes: HashMap<String, (u64, std::collections::BTreeSet<u64>)>,
     closed: Option<String>,
     /// Each item the owner pushed that the channel took, or is taking, by the
     /// owner's id for it.
@@ -1513,7 +1521,7 @@ impl Chan {
         line: &Value,
     ) -> Result<Query, String> {
         let name = &self.definition.name;
-        if self.holder.as_deref() != Some(agent) {
+        if self.holder.as_deref() != Some(agent) && !self.question_holders.contains(agent) {
             return Err(format!("channel {name:?} is not held by agent {agent:?}"));
         }
         let query = |item, request, reference| Query {
@@ -1758,6 +1766,7 @@ impl Chan {
 
 /// An outbound request its backend has not settled.
 struct Outgoing {
+    question: Option<super::Question>,
     /// The agent that made it.
     agent: String,
     /// The id its send was given, and the backend's reference once it took it.
@@ -1964,6 +1973,8 @@ impl Channels {
                 backend,
                 permits: Arc::new(Semaphore::new(CALLS_MAX)),
                 holder: None,
+                question_holders: Default::default(),
+                question_changes: Default::default(),
                 closed: None,
                 items: HashMap::new(),
                 asked: BTreeMap::new(),
@@ -2113,7 +2124,8 @@ impl Channels {
     /// The plain channels `agent` holds whose arrivals are announced, as its
     /// announcer counts them: what waits unread, and every item ever queued.
     pub(crate) fn counts_of(&self, agent: &str) -> BTreeMap<String, Counts> {
-        self.0
+        let mut counts: BTreeMap<String, Counts> = self
+            .0
             .state
             .borrow()
             .channels
@@ -2135,7 +2147,24 @@ impl Channels {
                     },
                 )
             })
-            .collect()
+            .collect();
+        if let Some((delivered, unread)) = self
+            .0
+            .state
+            .borrow()
+            .find(super::QUESTION_CHANNEL)
+            .and_then(|c| c.question_changes.get(agent))
+        {
+            counts.insert(
+                super::QUESTION_CHANNEL.into(),
+                Counts {
+                    pending: unread.len(),
+                    delivered: *delivered,
+                    requests: false,
+                },
+            );
+        }
+        counts
     }
 
     /// What `agent`'s instructions say of each channel it holds, in the order
@@ -2146,7 +2175,9 @@ impl Channels {
             .borrow()
             .channels
             .iter()
-            .filter(|chan| chan.holder.as_deref() == Some(agent))
+            .filter(|chan| {
+                chan.holder.as_deref() == Some(agent) || chan.question_holders.contains(agent)
+            })
             .map(|chan| {
                 let definition = &chan.definition;
                 ExternalText {
@@ -2359,6 +2390,17 @@ impl Table {
                 Some(id) => self.withdraw(&channel, id),
                 None => tracing::warn!("ignored a withdrawal naming no request: {line}"),
             },
+            "channel.observed" if channel == super::QUESTION_CHANNEL => {
+                self.with(|state| {
+                    if let Some((_, unread)) = state
+                        .find_mut(&channel)
+                        .and_then(|c| c.question_changes.get_mut(&agent))
+                        && let Some(id) = line["request"].as_u64()
+                    {
+                        unread.remove(&id);
+                    }
+                });
+            }
             "channel.ended" => match line["request"].as_u64() {
                 Some(id) => self.outbound_ended(&agent, &channel, id, &line),
                 None => tracing::warn!("ignored an end naming no request: {line}"),
@@ -2374,7 +2416,11 @@ impl Table {
     fn attached(&self, agent: &str, channel: &str) {
         let found = self.with(|state| {
             let chan = state.find_mut(channel)?;
-            chan.holder = Some(agent.to_string());
+            if channel == super::QUESTION_CHANNEL {
+                chan.question_holders.insert(agent.to_string());
+            } else {
+                chan.holder = Some(agent.to_string());
+            }
             let definition = &chan.definition;
             Some(Payload::ChannelAttached {
                 channel: channel.to_string(),
@@ -2397,7 +2443,11 @@ impl Table {
 
     fn detached(&self, agent: &str, channel: &str) {
         self.changing(|state| match state.find_mut(channel) {
-            Some(chan) if chan.holder.as_deref() == Some(agent) => {
+            Some(chan)
+                if chan.holder.as_deref() == Some(agent)
+                    || chan.question_holders.contains(agent) =>
+            {
+                chan.question_holders.remove(agent);
                 chan.holder = None;
                 for flight in chan.flights.values().filter(|flight| flight.agent == agent) {
                     flight.unsent.cancel();
@@ -2837,8 +2887,18 @@ impl Table {
                 .find(channel)
                 .map(|chan| (chan.definition.sends.clone(), chan.sending.clone()))
         };
-        let refused = contract.and_then(|(sends, schema)| {
-            unsendable(channel, &sends, schema.as_deref(), &body, text.len())
+        let question_problem = if channel == super::QUESTION_CHANNEL {
+            serde_json::from_value::<super::Question>(body.clone())
+                .map_err(|e| e.to_string())
+                .and_then(|q| q.validate(text.len()))
+                .err()
+        } else {
+            None
+        };
+        let refused = question_problem.or_else(|| {
+            contract.and_then(|(sends, schema)| {
+                unsendable(channel, &sends, schema.as_deref(), &body, text.len())
+            })
         });
         let unsent = CancellationToken::new();
         let decided = self.with(|state| {
@@ -2848,7 +2908,7 @@ impl Table {
                     &format!("the session declares no channel {channel:?}"),
                 ));
             };
-            if chan.holder.as_deref() != Some(agent) {
+            if chan.holder.as_deref() != Some(agent) && !chan.question_holders.contains(agent) {
                 return Err(Ended::refused(
                     "refused",
                     &format!("channel {channel:?} is not held by agent {agent:?}"),
@@ -2887,6 +2947,11 @@ impl Table {
                 chan.outgoing.insert(
                     id,
                     Outgoing {
+                        question: if channel == super::QUESTION_CHANNEL {
+                            serde_json::from_value(body.clone()).ok()
+                        } else {
+                            None
+                        },
                         agent: agent.to_string(),
                         item,
                         reference: None,
@@ -2912,6 +2977,14 @@ impl Table {
                 item,
                 body: text,
             }),
+        }
+        if channel == super::QUESTION_CHANNEL
+            && let Some(id) = waiter.request()
+        {
+            events.emit_with(|| Payload::QuestionAsked {
+                question: AgentRequestId::new(id),
+                body: body.to_string(),
+            });
         }
         let (calls, body_type) = match decided {
             Ok(decided) => decided,
@@ -3049,10 +3122,17 @@ impl Table {
         query: &Query,
         operation: ChannelOperation,
     ) -> (Resolution, Option<(&'static str, Value)>) {
-        let resolution = match self.permit(calls).await {
+        let mut resolution = match self.permit(calls).await {
             Ok(_permit) => self.resolution(calls, query, operation).await,
             Err(reason) => Resolution::Uncertain { reason },
         };
+        if let (Resolution::Replied(value), Some(request)) = (&mut resolution, query.request)
+            && let Err(error) = self.validate_reply(&query.channel, request, agent, value)
+        {
+            resolution = Resolution::Uncertain {
+                reason: error.to_string(),
+            };
+        }
         self.resolved(agent, query, operation, &resolution);
         let told = self.with(|state| {
             let chan = state.find_mut(&query.channel)?;
@@ -3228,7 +3308,15 @@ impl Table {
             let (id, end) = (withdrawal.request.get(), withdrawal.end);
             let answer = table
                 .call(&calls, || calls.backend.withdrawn(withdrawal))
-                .await;
+                .await
+                .and_then(|mut answer| {
+                    if let WithdrawAnswer::Replied(value) = &mut answer {
+                        table
+                            .validate_reply(&channel, AgentRequestId::new(id), &agent, value)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok(answer)
+                });
             let outstanding = table.with(|state| {
                 let Some(chan) = state.find_mut(&channel) else {
                     return false;
@@ -3362,6 +3450,36 @@ impl Table {
         let Some(giving) = given else {
             return;
         };
+        if channel == super::QUESTION_CHANNEL {
+            self.with(|state| {
+                if let Some(chan) = state.find_mut(channel) {
+                    let (delivered, unread) =
+                        chan.question_changes.entry(agent.to_string()).or_default();
+                    *delivered += 1;
+                    unread.insert(id);
+                }
+            });
+            if let Some(rounds) = self.rounds.get() {
+                (rounds.wake)(agent);
+            }
+            let payload = match end {
+                RequestEnd::Accepted => Payload::QuestionAnswered {
+                    question: request,
+                    answer: line.get("answer").filter(|v| !v.is_null()).cloned(),
+                },
+                RequestEnd::Cancelled | RequestEnd::Closed | RequestEnd::Released => {
+                    Payload::QuestionCancelled {
+                        question: request,
+                        reason: format!("{end:?}").to_lowercase(),
+                    }
+                }
+                _ => Payload::QuestionDeclined {
+                    question: request,
+                    reason: message.clone(),
+                },
+            };
+            self.events.for_agent(agent).emit(payload);
+        }
         self.events
             .for_agent(agent)
             .emit(Payload::ChannelRequestEnded {
@@ -3589,9 +3707,57 @@ impl Table {
         Ok(())
     }
 
+    /// Check and normalize any reply to a question before a producer changes its state.
+    /// Direct owner settlements, withdrawals, and recovered withdrawals share this path.
+    fn validate_reply(
+        &self,
+        name: &str,
+        id: AgentRequestId,
+        agent: &str,
+        value: &mut Value,
+    ) -> Result<(), SettleError> {
+        if name != super::QUESTION_CHANNEL {
+            return Ok(());
+        }
+        let checked = {
+            let state = self.state.borrow();
+            state.find(name).and_then(|channel| {
+                if channel.finished.contains_key(&id.get()) {
+                    // A cleanup/recovery receipt can arrive after close. Its reply
+                    // is no longer delivered; the terminal-state paths arbitrate it.
+                    return Some(Ok(value.clone()));
+                }
+                channel
+                    .outgoing
+                    .get(&id.get())
+                    .and_then(|out| out.question.as_ref())
+                    .map(|question| question.answer(value))
+            })
+        };
+        match checked {
+            Some(Ok(normalized)) => {
+                *value = normalized;
+                Ok(())
+            }
+            Some(Err(reason)) => {
+                self.events_of(Some(agent)).emit(Payload::QuestionRefused {
+                    question: id,
+                    reason: reason.clone(),
+                });
+                Err(SettleError::InvalidAnswer(reason))
+            }
+            None => Err(SettleError::Unknown(id)),
+        }
+    }
+
     /// Begin the owner's `settle` of outbound request `id` on `name`: the
     /// settle's number, which its end names if this settle made it.
-    fn settle(&self, name: &str, id: AgentRequestId, settle: Settle) -> Result<u64, SettleError> {
+    fn settle(
+        &self,
+        name: &str,
+        id: AgentRequestId,
+        mut settle: Settle,
+    ) -> Result<u64, SettleError> {
         let number = self
             .settles
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -3614,6 +3780,9 @@ impl Table {
             }
             None => return Err(SettleError::Unknown(id)),
         };
+        if let Settle::Reply(value) = &mut settle {
+            self.validate_reply(name, id, &agent, value)?;
+        }
         let mut line = settle_line(settle);
         line["by"] = json!("owner");
         line["settle"] = json!(number);
@@ -3650,6 +3819,12 @@ impl Table {
     /// The owner's settle of request `id` on `name`, `agent`'s, came after it
     /// ended `end`, and was refused.
     fn refused_settle(&self, name: &str, id: AgentRequestId, end: RequestEnd, agent: Option<&str>) {
+        if name == super::QUESTION_CHANNEL {
+            self.events_of(agent).emit(Payload::QuestionRefused {
+                question: id,
+                reason: format!("question already ended: {end:?}"),
+            });
+        }
         self.events_of(agent).emit(Payload::ChannelRequestRefused {
             channel: name.to_string(),
             request: id,

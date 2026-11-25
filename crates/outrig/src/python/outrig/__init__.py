@@ -40,6 +40,7 @@ error, and an `outrig.McpError` saying whether a call that failed reached the se
 """
 
 from . import schema, skills
+from ._questions import Question, Choice, Answer, QuestionContext, QuestionReference
 from ._agents import (
     Agent,
     AgentError,
@@ -92,6 +93,7 @@ from ._mcp import (
 from ._services import Service, ServiceError, ServiceMethod
 
 __all__ = [
+    "Question", "Choice", "Answer", "QuestionContext", "QuestionReference",
     "schema",
     "skills",
     "AdmissionClosed",

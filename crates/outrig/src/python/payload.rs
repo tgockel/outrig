@@ -75,6 +75,7 @@ pub(super) const PROGRAM: &str = "outrig/_interpreter.py";
 const PACKAGE: &[(&str, &str)] = &[
     ("outrig/__init__.py", include_str!("outrig/__init__.py")),
     ("outrig/_agents.py", include_str!("outrig/_agents.py")),
+    ("outrig/_questions.py", include_str!("outrig/_questions.py")),
     ("outrig/_host.py", include_str!("outrig/_host.py")),
     (PROGRAM, include_str!("outrig/_interpreter.py")),
     ("outrig/_kernel.py", include_str!("outrig/_kernel.py")),

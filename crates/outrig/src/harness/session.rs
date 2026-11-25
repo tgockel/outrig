@@ -343,7 +343,9 @@ impl Session {
     /// acknowledged, the requests received and outstanding, the sends whose
     /// outcome is uncertain, and what each agent sent in its latest rounds.
     /// Read from what the session keeps as items cross, never from its
-    /// events, and of one moment: each id is in one place in it.
+    /// events, and of one moment: each id is in one place in it. The built-in
+    /// `QUESTION_CHANNEL` route is included; it has no single holder, since
+    /// each primary or owner-constructed root can ask its session owner.
     pub fn channels(&self) -> Vec<ChannelSnapshot> {
         self.channels.snapshot()
     }

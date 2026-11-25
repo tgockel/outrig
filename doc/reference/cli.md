@@ -1120,3 +1120,44 @@ reaches a container unless an MCP server's `env` or `--env` names it; see
 
 - [Usage](../usage/README.md) -- narrative for each subcommand.
 - [Reference -> Config](config.md) -- `config.toml` schema.
+
+
+### Answering `run-new` questions
+
+In line mode, questions go to **stderr**, never stdout. Stdout continues to carry only messages
+the agent sends on the user channel. The screen currently shows the same question text as a note;
+a dedicated dialog is separate work. A pipe is a supported answerer, not a reason to decline.
+
+The stable line format is:
+
+```text
+[outrig.question] 42 "Which branch?"
+[outrig.choice] 42 1 "main" ""
+[outrig.choice] 42 2 "release" "the affected version"
+```
+
+When present, longer background follows as `[outrig.context] <id> <JSON description>`, then
+one `[outrig.reference] <id> <JSON object>` per file reference, with `path`, `line`, `end_line`,
+and `description`. No referenced file is opened automatically.
+
+Text fields are JSON strings, escaping newlines and control characters. IDs are decimal request
+IDs; choice numbers are one-based in display order. Structured drivers can instead read
+`agent.question.asked` in the session's events. Answer explicitly:
+
+```text
+/answer 42 2
+/answer 42 1,2
+/answer 42 some free text
+/answer 42 1,2 and also this
+/answer 42 --decline I do not know
+/answer 42 --not-relevant
+```
+
+A leading comma-separated list of numbers selects choices, with remaining text as additional
+text. For a multi-select question, `/answer <id>` selects nothing. For a free-form question,
+the entire answer is text. `--decline` permits an empty reason;
+`--not-relevant` is the preset reason "not relevant". A session skill named `answer` replaces
+`/answer`; `//answer` always invokes the built-in. A bare reply remains an ordinary message and
+never settles a question. Existing `/help`, `/quit`, and skill directives retain their meanings.
+Invalid answers report an error and leave the question open. Questions have no answer timeout.
+`[outrig.question.closed] <id>` withdraws an outstanding question from display.
