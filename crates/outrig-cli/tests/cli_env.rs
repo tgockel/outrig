@@ -201,3 +201,23 @@ fn cli_overlay_onto_config_env() {
         "new CLI entry added"
     );
 }
+
+#[test]
+fn embedded_references_and_escapes_share_config_syntax() {
+    let entries = CliEnvEntries::parse(&[
+        "AUTH=Bearer ${TOKEN}".to_string(),
+        "srv:ESC=$${X}".to_string(),
+    ])
+    .unwrap();
+    let resolved = outrig::config::ResolvedEnvValue::resolve_with(
+        entries.global["AUTH"].clone(),
+        &|var: &str| (var == "TOKEN").then(|| "secret".into()),
+    )
+    .unwrap();
+    assert_eq!(resolved.value(), "Bearer secret");
+    let literal =
+        outrig::config::ResolvedEnvValue::resolve(entries.per_server["srv"]["ESC"].clone())
+            .unwrap();
+    assert_eq!(literal.value(), "${X}");
+    assert!(CliEnvEntries::parse(&["K=prefix-${lower}".into()]).is_err());
+}

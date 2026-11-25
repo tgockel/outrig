@@ -50,7 +50,8 @@ Each entry is one of:
 - A **bare array** (short form): `["bin", "arg1", ...]`. Equivalent to
   `{ command = ["bin", "arg1", ...] }` with no extra env.
 - A **table** (full form): `{ command = [...], env = { KEY = "value", ... } }`. The `env` map is
-  added to the `podman exec` invocation for this server. A `${VAR}` value is passed by name,
+  added to the `podman exec` invocation for this server. A value containing `${VAR}` references is
+  passed by name,
   off podman's command line, and outrig shows it only as the reference; see
   [the value syntax](../reference/config.md#mcp-env-value-syntax). In a repo config a `${VAR}`
   may name only a variable the global config lists in
@@ -483,9 +484,16 @@ server is bound under its own name, or with `-` read as `_` when that is free --
 configuration's `url` entry:
 
 ```toml
-[images.coding.mcp]
-docs = { url = "https://docs.example.com/mcp", headers = { X-Token = "${DOCS_TOKEN}" } }
+[images.coding.mcp.docs]
+url = "https://docs.example.com/mcp"
+headers = { Authorization = "Bearer ${DOCS_TOKEN}" }
 ```
+
+A header may combine literal text and any number of `${VAR}` references, as in `Bearer ${TOKEN}`.
+The same syntax works in `env`, `build-args`, and `--env`; `$${` escapes a literal `${`.
+Malformed references are refused at load. Names refer to host variables (or session `Secrets`),
+not container variables: `PATH = "/opt/bin:${PATH}"` would insert the host's `PATH`. Every name
+in a repository value must appear in the global `[repo] env-allow` list.
 
 Each request carries those headers -- `initialize`, every call and listing, the server's standing
 event stream, a cancel notice and the request that ends the session -- each `${VAR}` resolved once,
@@ -513,7 +521,8 @@ connects to nothing and is `unapproved`. An entry in the global config asks noth
 starts no URL server: it says which it leaves out. `outrig mcp` can front a URL entry for an
 external client; it uses the same headers, trust settings, and remembered repository approval.
 
-**A server that holds a credential is never placed beside the interpreter.** A `${VAR}` in a
+**A server that holds a credential is never placed beside the interpreter.** A `${VAR}`, even
+embedded among literal text, in a
 command's or a primary view's `env` would be readable from agent Python wherever `/proc` allows,
 so such a server does not start; a credentialed server is a sidecar, or a URL whose headers the
 host sends. A `${VAR}` under a key podman reads itself (see

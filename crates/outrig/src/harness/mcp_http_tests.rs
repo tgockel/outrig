@@ -439,7 +439,10 @@ async fn headers_reach_every_request_and_show_nowhere() {
         .mcp_identity([("X-Fence", "fence-1"), ("X-Owner", "owner-1")])
         .mcp(
             "fs",
-            McpServiceSpec::url(server.url()).with_header("X-Token", token()),
+            McpServiceSpec::url(server.url()).with_header(
+                "Authorization",
+                EnvValue::from_raw("Bearer ${TOKEN}".into()).unwrap(),
+            ),
         );
     let (session, mut events) = dialed(builder, quick(Duration::from_secs(5)), starts()).await;
     let said = output(
@@ -483,11 +486,15 @@ print(' '.join(said))
     for request in &seen {
         assert_eq!(
             (
-                request.header("x-token"),
+                request.header("authorization"),
                 request.header("x-fence"),
                 request.header("x-owner")
             ),
-            (Some(SECRET), Some("fence-1"), Some("owner-1")),
+            (
+                Some(format!("Bearer {SECRET}").as_str()),
+                Some("fence-1"),
+                Some("owner-1")
+            ),
             "{request:?}"
         );
     }
@@ -503,6 +510,64 @@ print(' '.join(said))
         ("events", events.concat()),
     ] {
         assert!(!text.contains(SECRET), "the token is in the {what}: {text}");
+    }
+}
+
+/// Failed expansion must not disclose even the literal pieces of a header.
+/// A partly resolved template must expose neither those pieces nor a secret
+/// resolved before the missing variable was reached.
+#[tokio::test]
+async fn missing_header_references_never_disclose_literal_credentials() {
+    const STATIC: &str = "private-static-key-1049-canary";
+    let server = Server::start(&toolbox());
+    let mut builder = builder();
+    for (name, raw) in [
+        ("missing", format!("{STATIC}-${{TENANT}}")),
+        ("partial", format!("{STATIC}-${{TOKEN}}-${{TENANT}}")),
+    ] {
+        builder = builder.mcp(
+            name,
+            McpServiceSpec::url(server.url())
+                .with_header("X-Api-Key", EnvValue::from_raw(raw).unwrap()),
+        );
+    }
+    let (session, mut events) = dialed(builder, quick(Duration::from_secs(5)), starts()).await;
+    for name in ["missing", "partial"] {
+        let McpServiceOutcome::Misconfigured(cause) = outcome(&session, name) else {
+            panic!("{:?}", outcome(&session, name));
+        };
+        assert_eq!(cause.attempts, 0);
+        assert!(cause.message.contains("header X-Api-Key"), "{cause:?}");
+        assert!(cause.message.contains("TENANT"), "{cause:?}");
+    }
+    assert!(
+        server.seen().is_empty(),
+        "failed expansion sends no request"
+    );
+    let outcomes = serde_json::to_string(&session.mcp().outcomes()).unwrap();
+    let debug = format!("{:?}", session.mcp().outcomes());
+    let report = serde_json::to_string(&stop(session).await).unwrap();
+    let events = taken(&mut events);
+    assert_eq!(of_kind(&events, "mcp.service.failed").len(), 2);
+    let events = serde_json::to_string(
+        &events
+            .iter()
+            .map(|event| &event.payload)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    for (what, text) in [
+        ("outcomes", outcomes),
+        ("debug", debug),
+        ("report", report),
+        ("events", events),
+    ] {
+        for canary in [STATIC, SECRET] {
+            assert!(
+                !text.contains(canary),
+                "a credential is in the {what}: {text}"
+            );
+        }
     }
 }
 

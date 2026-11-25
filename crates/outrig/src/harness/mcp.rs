@@ -1165,10 +1165,7 @@ fn env_misconfigured(one: &Planned) -> Option<String> {
     let references: Vec<&str> = one
         .env
         .iter()
-        .filter_map(|(key, value)| match value {
-            EnvValue::EnvRef(_) => Some(key.as_str()),
-            EnvValue::Literal(_) => None,
-        })
+        .filter_map(|(key, value)| value.has_references().then_some(key.as_str()))
         .collect();
     let place = match one.placement {
         McpPlacementKind::Command => Some("the primary container, beside the interpreter"),
@@ -2754,11 +2751,16 @@ impl Failed {
 /// a value has none.
 fn resolve(planned: &Planned, secrets: &Once<'_>) -> Result<Server, String> {
     let headers = matches!(planned.launch, Launch::Url(_));
-    let what = if headers { "header" } else { "env" };
     let mut env = BTreeMap::new();
     for (key, value) in &planned.env {
-        let resolved = ResolvedEnvValue::resolve_with(value.clone(), secrets)
-            .map_err(|e| format!("its {what} {key} = {}: {e}", value.to_raw()))?;
+        let resolved = ResolvedEnvValue::resolve_with(value.clone(), secrets).map_err(|e| {
+            if headers {
+                // Even the literal pieces of a header template can be credentials.
+                format!("its header {key}: {e}")
+            } else {
+                format!("its env {key} = {}: {e}", value.to_raw())
+            }
+        })?;
         // A header's value is checked once it has one, and never shown.
         if headers {
             crate::mcp::http_header(key, resolved.value())?;

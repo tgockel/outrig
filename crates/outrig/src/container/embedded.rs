@@ -1477,6 +1477,25 @@ mod tests {
     }
 
     #[test]
+    fn a_label_template_checks_every_variable() {
+        let spec = full(
+            &["probe"],
+            &[(
+                "TOKEN",
+                EnvValue::from_raw("Bearer ${X}-${Y}-${X}".into()).unwrap(),
+            )],
+        );
+        let err = check_label_server_env("img", "probe", &spec, &[]).unwrap_err();
+        assert!(matches!(err, OutrigError::EmbeddedMcpEnvRef { var, .. } if var == "X, Y"));
+        check_label_server_env("img", "probe", &spec, &allow(&["X", "Y"])).unwrap();
+        let escaped = full(
+            &["probe"],
+            &[("TOKEN", EnvValue::from_raw("$${X}".into()).unwrap())],
+        );
+        check_label_server_env("img", "probe", &escaped, &[]).unwrap();
+    }
+
+    #[test]
     fn a_listed_reference_a_literal_and_no_env_pass() {
         let listed = full(&["srv"], &[("TOKEN", env_ref("SECRET"))]);
         let literal = full(

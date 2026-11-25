@@ -518,9 +518,11 @@ pub enum ConfigValidationError {
     // `{:?}`: a control character in one would otherwise reach the operator's
     // terminal. `var` cannot hold one -- it matched the reference grammar.
     #[error(
-        "repo config may not reference ${{{var}}} in image {image:?} build-arg {key:?}{}: \
-         list {var:?} in [repo] env-allow in global config to allow it",
-        declared_in_clause(declared_in)
+        "repo config may not reference {references} in image {image:?} build-arg {key:?}{}: \
+         list {allowed} in [repo] env-allow in global config to allow it",
+        declared_in_clause(declared_in),
+        references = super::reference_names(var),
+        allowed = super::allow_names(var)
     )]
     #[non_exhaustive]
     RepoBuildArgRef {
@@ -533,9 +535,11 @@ pub enum ConfigValidationError {
     },
 
     #[error(
-        "repo config may not reference ${{{var}}} in image {image:?} mcp server {server:?} \
-         env key {key:?}{}: list {var:?} in [repo] env-allow in global config to allow it",
-        declared_in_clause(declared_in)
+        "repo config may not reference {references} in image {image:?} mcp server {server:?} \
+         env key {key:?}{}: list {allowed} in [repo] env-allow in global config to allow it",
+        declared_in_clause(declared_in),
+        references = super::reference_names(var),
+        allowed = super::allow_names(var)
     )]
     #[non_exhaustive]
     RepoMcpEnvRef {
@@ -552,9 +556,11 @@ pub enum ConfigValidationError {
     // as `RepoMcpEnvRef` would cost this enum its niche, growing every
     // `Result` that carries it.
     #[error(
-        "repo config may not reference ${{{var}}} in image {image:?} mcp server {server:?} \
-         header {header:?}{}: list {var:?} in [repo] env-allow in global config to allow it",
-        declared_in_clause(&declared_in.as_deref().map(Path::to_path_buf))
+        "repo config may not reference {references} in image {image:?} mcp server {server:?} \
+         header {header:?}{}: list {allowed} in [repo] env-allow in global config to allow it",
+        declared_in_clause(&declared_in.as_deref().map(Path::to_path_buf)),
+        references = super::reference_names(var),
+        allowed = super::allow_names(var)
     )]
     #[non_exhaustive]
     RepoMcpHeaderRef {
@@ -1292,7 +1298,7 @@ fn validate_repo_env_refs(
     if !image.repo_declared {
         return Ok(());
     }
-    let unlisted = |value: &EnvValue| value.unlisted_ref(cfg.repo.env_allow()).map(str::to_string);
+    let unlisted = |value: &EnvValue| value.unlisted_ref(cfg.repo.env_allow());
     for (key, value) in &image.build_args {
         if let Some(var) = unlisted(value) {
             return Err(ConfigValidationError::RepoBuildArgRef {

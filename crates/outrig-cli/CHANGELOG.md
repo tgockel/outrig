@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Embedded host environment references** in MCP `env`, URL `headers`, `build-args`,
+  and `--env`: `"Bearer ${TOKEN}"` and `"a-${X}-b-${Y}"` now join literal text with
+  host variables (or session `Secrets`), expanded once. Every reference is subject to
+  repository `env-allow` and the existing credential protections. **Compatibility:**
+  embedded `${UPPER_CASE}` text that used to be literal now expands, and fails if unset
+  or unlisted. Use `$${` to write a literal `${`. Malformed references such as `${lower}`
+  or `${X` are now refused at load; `api-key` stays whole-value-only.
+
 - **`run-new` shows intermediate model text in the terminal conversation.** Subdued `Thinking`
   blocks use the same Markdown rendering as agent messages and remain in scrollback and Ctrl-O
   detail without `-v`. User-channel messages stay visually distinct, the status line stays compact,
@@ -335,6 +343,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lockfile loses the several hundred crates that only `--features local-llm` pulled in.
 
 ### Fixed
+
+- Header expansion failures now report only the header name and resolution error, never
+  a template's literal credential text. Repository template allowlist checks use membership
+  sets rather than scanning previously missing names, preserving source-order diagnostics
+  without quadratic work for large templates.
 
 - **Host-program sessions receive skills.** `run-new <script.py>` serves repository skills
   before user skills, just like interactive `run-new`, and reports shadowed copies. (#698)

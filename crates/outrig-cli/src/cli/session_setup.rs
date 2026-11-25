@@ -2169,12 +2169,11 @@ lint = { command = ["mcp-lint"], sidecar = "lint" }
         sidecar::plan_from_config(&cfg, &cfg.images["x"])
     }
 
-    /// An exec server with one `env` entry, written as a config file writes
-    /// it: exactly `${VAR}` is a reference, anything else a literal.
+    /// An exec server with one `env` entry, parsed as a config value.
     fn with_env(key: &str, raw: &str) -> McpServerSpec {
         McpServerSpec::exec(["srv"]).with_env(BTreeMap::from([(
             key.to_string(),
-            outrig::config::EnvValue::from_raw(raw.to_string()),
+            outrig::config::EnvValue::from_raw(raw.to_string()).unwrap(),
         )]))
     }
 

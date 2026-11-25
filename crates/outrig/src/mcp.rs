@@ -1672,18 +1672,21 @@ pub(crate) mod tests {
         let config_env = BTreeMap::from([
             (
                 "KEEP".to_string(),
-                EnvValue::from_raw("literal".to_string()),
+                EnvValue::from_raw("literal".to_string()).unwrap(),
             ),
-            ("BOTH".to_string(), EnvValue::from_raw("config".to_string())),
+            (
+                "BOTH".to_string(),
+                EnvValue::from_raw("config".to_string()).unwrap(),
+            ),
         ]);
         let extra_env = BTreeMap::from([
             (
                 "BOTH".to_string(),
-                EnvValue::from_raw("overlay".to_string()),
+                EnvValue::from_raw("overlay".to_string()).unwrap(),
             ),
             (
                 "REF".to_string(),
-                EnvValue::from_raw("${OUTRIG_TEST_MCP_ENV}".to_string()),
+                EnvValue::from_raw("${OUTRIG_TEST_MCP_ENV}".to_string()).unwrap(),
             ),
         ]);
 
@@ -2258,7 +2261,7 @@ pub(crate) mod tests {
     fn resolve_mcp_env_missing_ref_names_server_and_key() {
         let config_env = BTreeMap::from([(
             "TOKEN".to_string(),
-            EnvValue::from_raw("${OUTRIG_TEST_MCP_ENV_MISSING}".to_string()),
+            EnvValue::from_raw("${OUTRIG_TEST_MCP_ENV_MISSING}".to_string()).unwrap(),
         )]);
         let err = resolve_mcp_env("svc", config_env, &BTreeMap::new())
             .expect_err("unset host var must fail resolution");

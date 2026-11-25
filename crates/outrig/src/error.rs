@@ -232,8 +232,10 @@ pub enum OutrigError {
     // cannot hold one.
     #[error(
         "mcp server {server:?} from the org.outrig.mcp label of image {image:?} may not \
-         reference ${{{var}}} in env key {key:?}: list {var:?} in [repo] env-allow in global \
-         config to allow it"
+         reference {references} in env key {key:?}: list {allowed} in [repo] env-allow in global \
+         config to allow it",
+        references = crate::config::reference_names(var),
+        allowed = crate::config::allow_names(var)
     )]
     #[non_exhaustive]
     EmbeddedMcpEnvRef {

@@ -7649,7 +7649,7 @@ mod repo_env_allow {
         for (server, entry, key, var) in [
             (
                 "fetch",
-                r#"{ command = ["fetch"], env = { PLAIN = "x", TOKEN = "${FETCH_TOKEN}" } }"#,
+                r#"{ command = ["fetch"], env = { PLAIN = "x", TOKEN = "Bearer ${FETCH_TOKEN}" } }"#,
                 "TOKEN",
                 "FETCH_TOKEN",
             ),
@@ -7739,9 +7739,26 @@ mod repo_env_allow {
         );
     }
 
-    /// A value is a reference only when it is `${VAR}` whole, so a literal
-    /// -- including one that merely looks like a reference -- names no host
-    /// variable and needs no entry.
+    #[test]
+    fn every_embedded_variable_must_be_listed() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), LIST_GITHUB);
+        write_build_arg_repo(tmp.path(), r#"{ GH = "a-${X}-${GITHUB_TOKEN}-${Y}-${X}" }"#);
+        let err = expect_load_validation_err(Config::load(tmp.path(), Some(&global)).unwrap_err());
+        assert!(
+            matches!(&err, ConfigValidationError::RepoBuildArgRef { var, .. } if var == "X, Y"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("reference ${X}, ${Y}"), "{err}");
+        assert!(err.to_string().contains("list \"X\", \"Y\""), "{err}");
+        let global = write_global_cfg(
+            tmp.path(),
+            "[repo]\nenv-allow = [\"GITHUB_TOKEN\", \"X\", \"Y\"]\n",
+        );
+        Config::load(tmp.path(), Some(&global)).expect("every reference is listed");
+    }
+
+    /// Escaped reference openers name no host variable and need no entry.
     #[test]
     fn literals_and_non_references_need_no_entry() {
         let tmp = tempdir().unwrap();
@@ -7752,10 +7769,10 @@ mod repo_env_allow {
 [images.dev]
 dockerfile = "Dockerfile"
 context    = "."
-build-args = { NODE_VERSION = "20", LOWER = "${lower}", EMBEDDED = "pre-${X}-post", BARE = "$FOO" }
+build-args = { NODE_VERSION = "20", LOWER = "$${lower}", EMBEDDED = "pre-$${X}-post", BARE = "$FOO" }
 
 [images.dev.mcp]
-fetch = { command = ["fetch"], env = { CARGO_HOME = "/workspace/.cargo", LOWER = "${lower}" } }
+fetch = { command = ["fetch"], env = { CARGO_HOME = "/workspace/.cargo", LOWER = "$${lower}" } }
 "#,
         );
         fs::write(tmp.path().join("Dockerfile"), "FROM scratch\n").unwrap();
@@ -8109,7 +8126,7 @@ mod mcp_url {
                 tmp,
                 "[images.dev]\nimage-name = \"docker.io/library/debian\"\n\n\
                  [images.dev.mcp]\n\
-                 docs = { url = \"https://d.test/mcp\", headers = { X-Token = \"${DOCS_TOKEN}\" } }\n",
+                 docs = { url = \"https://d.test/mcp\", headers = { X-Token = \"Bearer ${DOCS_TOKEN}\" } }\n",
             );
         };
         let tmp = tempdir().unwrap();

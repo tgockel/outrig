@@ -1,7 +1,8 @@
 //! Shared `${VAR}` parser used by `ApiKeyRef` and `EnvValue`, the name check
 //! behind `[repo] env-allow`, and the grammar an `env` or `build-args` key is
 //! held to. Variable names match `^[A-Z_][A-Z0-9_]*$`; the regex is anchored
-//! on both ends, so a value either *is* `${VAR}` whole or it isn't. A key is
+//! on both ends. `ApiKeyRef` uses whole-value references; `EnvValue` also uses
+//! this name grammar for references embedded among literal text. A key is
 //! held to the wider `^[A-Za-z_][A-Za-z0-9_]*$` -- see [`is_env_key`].
 
 use std::sync::OnceLock;

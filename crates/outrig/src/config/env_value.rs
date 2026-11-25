@@ -1,12 +1,8 @@
-//! Env-var values for config tables such as MCP server `env` entries and
-//! Dockerfile `build-args`. Each value is either a literal string, used as-is,
-//! or a `${VAR}` reference resolved from the host environment at the call site.
-//! Unlike `ApiKeyRef`, literals are accepted -- existing configs use them for
-//! in-container paths like `CARGO_HOME = "/workspace/.cargo"` and Dockerfile
-//! args like `NODE_VERSION = "20"`. The `${VAR}` form uses the same syntax as
-//! `api-key` for consistency.
+//! Values with host-side `${VAR}` substitutions. Expansion is single-pass;
+//! `$${` escapes a literal `${`. API keys retain their whole-value grammar.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
@@ -15,11 +11,17 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::env_ref::parse_env_ref;
+use super::env_ref::{is_env_var_name, parse_env_ref};
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum EnvValueError {
+    /// Invalid reference syntax; deliberately does not echo a possibly secret value.
+    #[error(
+        "invalid env reference at byte {offset}: expected ${{NAME}} (^[A-Z_][A-Z0-9_]*$); use $${{ for a literal opener"
+    )]
+    InvalidReference { offset: usize },
+
     #[error("env var {var} is not set")]
     NotPresent { var: String },
 
@@ -31,49 +33,127 @@ pub enum EnvValueError {
     Unresolved { var: String },
 }
 
-/// A single entry of a config value table -- either a literal value passed
-/// through verbatim, or a reference to a host env var resolved at the call
-/// site that needs the concrete string.
+/// A parsed substitution template. Resolved variable values are never stored
+/// here, but literal pieces may still be credentials: header callers must
+/// hide the source spelling too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvTemplate {
+    raw: String,
+    parts: Vec<EnvValue>,
+}
+
+/// A config value, resolved on the host only where a concrete value is needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EnvValue {
     Literal(String),
     EnvRef(String),
+    Template(EnvTemplate),
 }
 
 impl EnvValue {
-    /// A value is treated as a reference iff it whole-matches `${VAR}`;
-    /// anything else (lower-case names, embedded `${X}`, unmatched braces) is
-    /// a literal. There is no embedded-substitution syntax.
-    pub fn from_raw(raw: String) -> Self {
-        match parse_env_ref(&raw) {
-            Some(var) => Self::EnvRef(var.to_string()),
-            None => Self::Literal(raw),
+    /// Parse single-pass `${NAME}` substitutions and `$${` escapes.
+    /// Malformed reference openers are refused, without echoing the value.
+    pub fn from_raw(raw: String) -> Result<Self, EnvValueError> {
+        if let Some(var) = parse_env_ref(&raw) {
+            return Ok(Self::EnvRef(var.to_string()));
         }
+        if !raw.contains("${") {
+            return Ok(Self::Literal(raw));
+        }
+        let mut parts = Vec::new();
+        let mut literal = String::new();
+        let mut offset = 0;
+        while offset < raw.len() {
+            let tail = &raw[offset..];
+            if tail.starts_with("$${") {
+                literal.push_str("${");
+                offset += 3;
+            } else if let Some(tail) = tail.strip_prefix("${") {
+                let end = tail
+                    .find('}')
+                    .ok_or(EnvValueError::InvalidReference { offset })?;
+                let var = &tail[..end];
+                if !is_env_var_name(var) {
+                    return Err(EnvValueError::InvalidReference { offset });
+                }
+                if !literal.is_empty() {
+                    parts.push(Self::Literal(std::mem::take(&mut literal)));
+                }
+                parts.push(Self::EnvRef(var.to_string()));
+                offset += end + 3;
+            } else {
+                let ch = tail.chars().next().expect("nonempty tail");
+                literal.push(ch);
+                offset += ch.len_utf8();
+            }
+        }
+        if !literal.is_empty() {
+            parts.push(Self::Literal(literal));
+        }
+        Ok(Self::Template(EnvTemplate { raw, parts }))
     }
 
-    /// The host variable this value references when `allow` does not list it,
-    /// which is what `[repo] env-allow` refuses. A literal references nothing.
-    ///
-    /// The one definition of that refusal, for a reference in a repo config
-    /// file and in a server an image's `org.outrig.mcp` label declares alike.
-    /// Matched without a `_` arm: a new way to name a host variable has to say
-    /// here whether it needs listing.
-    pub(crate) fn unlisted_ref(&self, allow: &[String]) -> Option<&str> {
+    /// All host variable names, in source order (including repetitions).
+    pub fn references(&self) -> Vec<&str> {
         match self {
-            Self::EnvRef(var) if !allow.contains(var) => Some(var),
-            Self::EnvRef(_) | Self::Literal(_) => None,
+            Self::Literal(_) => Vec::new(),
+            Self::EnvRef(var) => vec![var],
+            Self::Template(template) => template.parts.iter().flat_map(Self::references).collect(),
         }
     }
 
-    /// The config-file spelling this value round-trips through: the literal
-    /// text, or `${VAR}` for a reference. Inverse of [`EnvValue::from_raw`].
+    /// Whether the value carries credentials, even among literal text.
+    pub fn has_references(&self) -> bool {
+        match self {
+            Self::Literal(_) => false,
+            Self::EnvRef(_) => true,
+            Self::Template(template) => template.parts.iter().any(Self::has_references),
+        }
+    }
+
+    /// Every unlisted variable in this value, reported together.
+    pub(crate) fn unlisted_ref(&self, allow: &[String]) -> Option<String> {
+        let references = self.references();
+        if references.is_empty() {
+            return None;
+        }
+        let allow: HashSet<&str> = allow.iter().map(String::as_str).collect();
+        let mut seen = HashSet::new();
+        let mut missing = Vec::new();
+        for var in references {
+            if !allow.contains(var) && seen.insert(var) {
+                missing.push(var);
+            }
+        }
+        (!missing.is_empty()).then(|| missing.join(", "))
+    }
+
+    /// The config spelling, with literal reference openers escaped. This does
+    /// not resolve references, but header callers must still hide its contents.
     pub fn to_raw(&self) -> String {
         match self {
-            Self::Literal(s) => s.clone(),
+            Self::Literal(s) => s.replace("${", "$${"),
             Self::EnvRef(var) => format!("${{{var}}}"),
+            Self::Template(template) => template.raw.clone(),
         }
     }
+}
+
+// Error variants retain their `var: String` surface. A template can report a
+// comma-separated set of valid names; render each as a distinct reference/list entry.
+pub(crate) fn reference_names(vars: &str) -> String {
+    vars.split(", ")
+        .map(|var| format!("${{{var}}}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(crate) fn allow_names(vars: &str) -> String {
+    vars.split(", ")
+        .map(|var| format!("{var:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// An [`EnvValue`] resolved against the host environment, kept beside the
@@ -94,31 +174,43 @@ pub struct ResolvedEnvValue {
 }
 
 impl ResolvedEnvValue {
-    /// Resolve `source`, keeping it. A `Literal` is its own value; an `EnvRef`
-    /// reads `std::env::var` and maps `VarError` into a typed error naming the
-    /// missing variable.
+    /// Resolve `source` once on the host, keeping its original spelling. A missing
+    /// or non-Unicode variable produces a typed error naming only the variable.
     pub fn resolve(source: EnvValue) -> Result<Self, EnvValueError> {
         Self::resolve_with(source, &super::EnvSecrets)
     }
 
-    /// Resolve `source` through `secrets`, keeping it: a `Literal` is its own
-    /// value, and an `EnvRef` is what `secrets` gives its variable. The
-    /// process environment is not read unless `secrets` reads it.
+    /// Resolve each reference through `secrets` and join the pieces, keeping
+    /// the source. Resolved strings are never expanded again. The process
+    /// environment is not read unless `secrets` reads it.
     pub fn resolve_with(
         source: EnvValue,
         secrets: &(impl super::Secrets + ?Sized),
     ) -> Result<Self, EnvValueError> {
-        let value = match &source {
-            EnvValue::Literal(s) => s.clone(),
-            EnvValue::EnvRef(var) => secrets.resolve(var).map_err(|err| {
-                let var = var.clone();
-                match err {
-                    super::ApiKeyError::NotPresent { .. } => EnvValueError::NotPresent { var },
-                    super::ApiKeyError::NotUnicode { .. } => EnvValueError::NotUnicode { var },
-                    _ => EnvValueError::Unresolved { var },
+        fn expand(
+            source: &EnvValue,
+            secrets: &(impl super::Secrets + ?Sized),
+        ) -> Result<String, EnvValueError> {
+            match source {
+                EnvValue::Literal(s) => Ok(s.clone()),
+                EnvValue::EnvRef(var) => secrets.resolve(var).map_err(|err| {
+                    let var = var.clone();
+                    match err {
+                        super::ApiKeyError::NotPresent { .. } => EnvValueError::NotPresent { var },
+                        super::ApiKeyError::NotUnicode { .. } => EnvValueError::NotUnicode { var },
+                        _ => EnvValueError::Unresolved { var },
+                    }
+                }),
+                EnvValue::Template(template) => {
+                    let mut value = String::new();
+                    for part in &template.parts {
+                        value.push_str(&expand(part, secrets)?);
+                    }
+                    Ok(value)
                 }
-            })?,
-        };
+            }
+        }
+        let value = expand(&source, secrets)?;
         Ok(Self { value, source })
     }
 
@@ -173,7 +265,7 @@ impl Serialize for EnvValue {
 impl<'de> Deserialize<'de> for EnvValue {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
-        Ok(Self::from_raw(raw))
+        Self::from_raw(raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -187,7 +279,7 @@ impl JsonSchema for EnvValue {
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        json_schema!({ "type": "string" })
+        json_schema!({ "type": "string", "description": "Host-side ${NAME} substitutions may appear anywhere; names match ^[A-Z_][A-Z0-9_]*$. Use $${ for a literal ${. Malformed references are refused. Expansion is single-pass, never in the container." })
     }
 }
 
@@ -201,19 +293,46 @@ mod tests {
 
     #[test]
     fn a_reference_is_refused_unless_the_list_names_it() {
-        let value = EnvValue::from_raw("${TOKEN}".to_string());
+        let value = EnvValue::from_raw("${TOKEN}".to_string()).unwrap();
 
-        assert_eq!(value.unlisted_ref(&[]), Some("TOKEN"));
-        assert_eq!(value.unlisted_ref(&names(&["OTHER"])), Some("TOKEN"));
+        assert_eq!(value.unlisted_ref(&[]), Some("TOKEN".to_string()));
+        assert_eq!(
+            value.unlisted_ref(&names(&["OTHER"])),
+            Some("TOKEN".to_string())
+        );
         assert_eq!(value.unlisted_ref(&names(&["OTHER", "TOKEN"])), None);
     }
 
-    /// A value that is not exactly `${VAR}` is a literal, passed verbatim, so
-    /// it reads nothing from the host and has nothing to list.
+    /// Both membership checks must scale with repository-controlled templates:
+    /// neither a large allowlist nor many distinct missing names should cause
+    /// a scan through all previously seen names for every reference.
+    #[test]
+    fn large_templates_report_unlisted_names_once_in_source_order() {
+        const COUNT: usize = 80_000;
+        let vars: Vec<String> = (0..COUNT).map(|i| format!("VAR_{i}")).collect();
+        let raw = vars
+            .iter()
+            .map(|var| format!("${{{var}}}"))
+            .collect::<String>();
+        let value = EnvValue::from_raw(format!("{raw}{raw}")).unwrap();
+        assert_eq!(value.unlisted_ref(&[]).unwrap(), vars.join(", "));
+        let allow: Vec<String> = vars.iter().step_by(2).cloned().collect();
+        let expected = vars
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(value.unlisted_ref(&allow).unwrap(), expected);
+        assert_eq!(value.unlisted_ref(&vars), None);
+    }
+
+    /// Plain text and escaped openers read nothing from the host.
     #[test]
     fn a_literal_names_no_variable() {
-        for raw in ["/workspace/.cargo", "prefix-${TOKEN}-suffix", "${lower}"] {
-            let value = EnvValue::from_raw(raw.to_string());
+        for raw in ["/workspace/.cargo", "$${TOKEN}"] {
+            let value = EnvValue::from_raw(raw.to_string()).unwrap();
 
             assert_eq!(value.unlisted_ref(&[]), None, "{raw:?}");
         }
@@ -231,7 +350,7 @@ mod tests {
         };
 
         let resolved = ResolvedEnvValue::resolve_with(
-            EnvValue::from_raw("${OUTRIG_TEST_ENV_VALUE_UNSET}".into()),
+            EnvValue::from_raw("${OUTRIG_TEST_ENV_VALUE_UNSET}".into()).unwrap(),
             &secrets,
         )
         .expect("the resolver has it");
@@ -240,13 +359,16 @@ mod tests {
         assert!(!format!("{resolved:?}").contains("from-secrets"));
 
         let literal =
-            ResolvedEnvValue::resolve_with(EnvValue::from_raw("/a/path".into()), &secrets).unwrap();
+            ResolvedEnvValue::resolve_with(EnvValue::from_raw("/a/path".into()).unwrap(), &secrets)
+                .unwrap();
         assert_eq!(literal.value(), "/a/path");
         assert_eq!(asked.lock().unwrap().len(), 1, "a literal asks nothing");
 
-        let missing =
-            ResolvedEnvValue::resolve_with(EnvValue::from_raw("${OTHER}".into()), &secrets)
-                .expect_err("the resolver has none");
+        let missing = ResolvedEnvValue::resolve_with(
+            EnvValue::from_raw("${OTHER}".into()).unwrap(),
+            &secrets,
+        )
+        .expect_err("the resolver has none");
         assert!(matches!(&missing, EnvValueError::Unresolved { var } if var == "OTHER"));
         assert_eq!(
             missing.to_string(),

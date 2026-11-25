@@ -23,6 +23,9 @@ use outrig::config::{EnvValue, is_env_key};
 /// Errors specific to `--env` parsing.
 #[derive(Debug, Error)]
 pub enum CliEnvParseError {
+    #[error("invalid --env value: {source}")]
+    InvalidValue { source: outrig::config::EnvValueError },
+
     #[error("invalid value '{raw}' for '--env <KEY=VALUE>': missing '='")]
     MissingEquals { raw: String },
 
@@ -66,7 +69,7 @@ impl CliEnvEntries {
                 return Err(CliEnvParseError::EmptyKey { raw: entry.clone() });
             }
 
-            let env_value = EnvValue::from_raw(value_side.to_string());
+            let env_value = EnvValue::from_raw(value_side.to_string()).map_err(|source| CliEnvParseError::InvalidValue { source })?;
 
             // Check for `SERVER:KEY` form. A colon in the key-side means
             // per-server -- but only if there's text on both sides of the

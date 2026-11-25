@@ -398,8 +398,11 @@ pub outrig::config::ConfigWarningKind::UnknownKey
 #[non_exhaustive] pub enum outrig::config::EnvValue
 pub outrig::config::EnvValue::EnvRef(alloc::string::String)
 pub outrig::config::EnvValue::Literal(alloc::string::String)
+pub outrig::config::EnvValue::Template(outrig::config::EnvTemplate)
 impl outrig::config::EnvValue
-pub fn outrig::config::EnvValue::from_raw(alloc::string::String) -> Self
+pub fn outrig::config::EnvValue::from_raw(alloc::string::String) -> core::result::Result<Self, outrig::config::EnvValueError>
+pub fn outrig::config::EnvValue::has_references(&self) -> bool
+pub fn outrig::config::EnvValue::references(&self) -> alloc::vec::Vec<&str>
 pub fn outrig::config::EnvValue::to_raw(&self) -> alloc::string::String
 impl schemars::JsonSchema for outrig::config::EnvValue
 pub fn outrig::config::EnvValue::inline_schema() -> bool
@@ -410,6 +413,8 @@ pub fn outrig::config::EnvValue::serialize<S: serde_core::ser::Serializer>(&self
 impl<'de> serde_core::de::Deserialize<'de> for outrig::config::EnvValue
 pub fn outrig::config::EnvValue::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 #[non_exhaustive] pub enum outrig::config::EnvValueError
+pub outrig::config::EnvValueError::InvalidReference
+pub outrig::config::EnvValueError::InvalidReference::offset: usize
 pub outrig::config::EnvValueError::NotPresent
 pub outrig::config::EnvValueError::NotPresent::var: alloc::string::String
 pub outrig::config::EnvValueError::NotUnicode
@@ -740,6 +745,7 @@ pub fn outrig::config::ContainerSecurity::default() -> Self
 pub struct outrig::config::EnvSecrets
 impl outrig::config::Secrets for outrig::config::EnvSecrets
 pub fn outrig::config::EnvSecrets::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
+pub struct outrig::config::EnvTemplate
 #[non_exhaustive] pub struct outrig::config::EventsConfig
 impl outrig::config::EventsConfig
 pub fn outrig::config::EventsConfig::mode(&self) -> outrig::config::EventsMode

@@ -1279,7 +1279,7 @@ name must be a valid container image repository component -- see the validation 
   own directory.
 - `context` (path, required\*): path to the build context, same rule.
 - `build-args` (table str->str, optional, default: `{}`): extra Dockerfile `ARG`s.
-  Keys are ARG names. Values are either literal strings or `${VAR}` references resolved
+  Keys are ARG names. Values may embed `${VAR}` references among literal text, resolved
   from the host environment at `outrig build` time. A reference reaches buildah by name and
   outrig shows it only as the reference, as the
   [MCP `env` value syntax](#mcp-env-value-syntax) below describes for podman. buildah itself
@@ -1465,8 +1465,8 @@ image, or declare any other MCP command that should run inside the container.
   form): argv of the MCP server.
 - `env` (table str->str, optional, default: `{}`): env vars set on the `podman exec`
   invocation -- or, for entrypoint-stdio servers, baked in via `podman create --env`, which
-  stores them in the container's config, visible to `podman inspect` on the host. A `${VAR}`
-  value reaches podman by name rather than on its command line; see the
+  stores them in the container's config, visible to `podman inspect` on the host. A value
+  containing `${VAR}` references reaches podman by name rather than on its command line; see the
   [value syntax](#mcp-env-value-syntax). In a repo config, or in an image's `org.outrig.mcp`
   label, a reference may name only a variable the global config lists in [`[repo]`](#repo)
   `env-allow`.
@@ -1516,7 +1516,8 @@ image, or declare any other MCP command that should run inside the container.
   and say which they leave out. See
   [Concepts -> MCP Servers](../concepts/mcp-servers.md#in-a-session-mcp-services).
 - `headers` (table str->str, optional, default: `{}`): what each request to `url` carries, each
-  value a literal or a `${VAR}` [reference](#mcp-env-value-syntax), resolved once when the session
+  value a literal or a template such as `"Bearer ${TOKEN}"`, using the
+  [`env` value syntax](#mcp-env-value-syntax), resolved once when the session
   starts and shown nowhere. In a repo config a reference may name only a variable the global
   config lists in [`[repo]`](#repo) `env-allow`, as in `env`. A header HTTP or the protocol sets
   itself -- `Accept`, `Content-Type`, `Host`, `Mcp-Session-Id`, `Mcp-Protocol-Version` and the
@@ -1552,9 +1553,9 @@ Notes:
   has to rewrite to fit 64 characters keeps the prefix only for a name of 54 characters or
   fewer -- see
   [Concepts -> MCP Servers](../concepts/mcp-servers.md#long-server-names).
-- Each `env` value is either a literal string forwarded verbatim or a `${VAR}` reference
-  resolved from the host environment at MCP startup and shown only as the reference -- see the
-  subsection below. A reference in a repo config file is refused at load, and one in an image
+- Each `env` value may embed `${VAR}` references among literal text, resolved from the host
+  environment at MCP startup and shown only as written -- see the value syntax below. A reference in
+  a repo config file is refused at load, and one in an image
   label when the session starts, unless the global config's [`[repo]`](#repo) `env-allow` lists
   the variable.
 - Images can provide the same table via their `org.outrig.mcp` OCI label (placement keys and
@@ -1655,8 +1656,8 @@ Each entry on the right-hand side of an `env` table is one of:
 build = { command = ["cargo-mcp"], env = {
   CARGO_HOME = "/workspace/.cargo",  # literal -- forwarded to podman as-is
   GH_TOKEN   = "${GITHUB_TOKEN}",    # reference -- resolved from host env at MCP startup
-  STILL_LIT  = "${lower_case}",      # literal -- doesn't match ^[A-Z_][A-Z0-9_]*$
-  ALSO_LIT   = "prefix-${X}-suffix", # literal -- embedded substitution is not supported
+  DATABASE_URL = "postgres://app:${DB_PASSWORD}@db/app", # embedded reference
+  STILL_LIT  = "$${X}",             # literal ${X} -- escaped reference opener
 } }
 ```
 
@@ -1668,14 +1669,21 @@ each entry as `KEY=value` and split it at the first `=`, so a key holding one --
 when the config loads, naming the key and the file. The same rule holds a `build-args` key, an
 `org.outrig.mcp` label's `env` key, a standalone `image.toml`'s, and a `--env` key you type.
 
-The reference form is exactly `"${VAR}"`, where `VAR` matches `^[A-Z_][A-Z0-9_]*$` -- the
-same syntax `api-key` accepts. Anything else is treated as a literal and passed through
-verbatim, including malformed-looking references (lower-case names, unmatched braces, or
-embedded substitution). If the named host env var is unset when the MCP server is about to
-start, MCP startup fails with an error naming the variable, the server, and the env key.
+Values may contain any number of `${VAR}` references among literal text, where `VAR` matches
+`^[A-Z_][A-Z0-9_]*$`. `$${` writes a literal `${`; a value with no reference opener is unchanged.
+A malformed opener (for example `${lower}`, `${X`, or `${X:-default}`) is refused when loaded.
+Defaults, alternatives, and nested references are not supported. `api-key` remains a whole-value
+reference only.
+
+Each reference is resolved once and the pieces joined; a variable's value is never expanded again.
+Variables are read **on the host**, or from a host program's session `Secrets`, never inside the
+container. For example, `PATH = "/opt/bin:${PATH}"` puts the **host's** `PATH` into the container,
+not the container's existing `PATH`. If a variable is unset, startup fails naming the variable,
+the server, and the env key. `build-args`, URL `headers`, and `--env` use the same value syntax.
 
 In a repo config file a reference is first held to the global config's [`[repo]`](#repo)
-`env-allow`: a variable that is not listed there is refused when the config loads, whether or
+`env-allow`: every variable in a value must be listed; unlisted names are refused when the config
+loads, whether or
 not it is set. A reference in an image's `org.outrig.mcp` label is held to it too, when the
 session starts and the label has merged in. A literal is not a reference and needs no entry, and
 neither does a value you type with `--env`.
@@ -1712,7 +1720,10 @@ they are built from.
 
 A proxy key that references the variable of its own name, such as
 `HTTPS_PROXY = "${HTTPS_PROXY}"`, is passed by name all the same: podman and buildah already
-have that value and read proxies as they find them. No other key on the list is, even
+have that value and read proxies as they find them. This exception requires an unchanged
+whole-value reference, not a template such as `"prefix-${HTTPS_PROXY}"`. No other key on the list
+is,
+even
 self-referenced, because the engine may rewrite its own copy first -- buildah makes a relative
 `TMPDIR` absolute. To keep a secret off it, give the secret a key outside these -- a key is
 yours to choose, and the server reads whichever name you set.

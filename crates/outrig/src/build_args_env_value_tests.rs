@@ -23,7 +23,7 @@ mod parse {
 [images.coding]
 dockerfile = "D"
 context    = "ctx"
-build-args = { NODE_VERSION = "20", GH_TOKEN = "${GITHUB_TOKEN}", STILL_LIT = "${lower_case}" }
+build-args = { NODE_VERSION = "20", GH_TOKEN = "${GITHUB_TOKEN}", STILL_LIT = "$${lower_case}" }
 "#,
         );
 
@@ -37,7 +37,7 @@ build-args = { NODE_VERSION = "20", GH_TOKEN = "${GITHUB_TOKEN}", STILL_LIT = "$
         );
         assert_eq!(
             image.build_args()["STILL_LIT"],
-            EnvValue::Literal("${lower_case}".to_string()),
+            EnvValue::from_raw("$${lower_case}".to_string()).unwrap(),
         );
     }
 }
@@ -59,7 +59,7 @@ mod resolve {
 [images.coding]
 dockerfile = "D"
 context    = "ctx"
-build-args = {{ NODE_VERSION = "20", GH_TOKEN = "${{{var}}}" }}
+build-args = {{ NODE_VERSION = "20", GH_TOKEN = "Bearer ${{{var}}}" }}
 "#,
         ));
         let resolved = resolve_build_args("coding", &image).expect("resolves");
@@ -72,10 +72,10 @@ build-args = {{ NODE_VERSION = "20", GH_TOKEN = "${{{var}}}" }}
             resolved["NODE_VERSION"].source(),
             &EnvValue::Literal("20".to_string())
         );
-        assert_eq!(resolved["GH_TOKEN"].value(), "secret-token");
+        assert_eq!(resolved["GH_TOKEN"].value(), "Bearer secret-token");
         assert_eq!(
             resolved["GH_TOKEN"].source(),
-            &EnvValue::EnvRef(var.to_string())
+            &EnvValue::from_raw(format!("Bearer ${{{var}}}")).unwrap()
         );
     }
 

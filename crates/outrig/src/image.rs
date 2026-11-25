@@ -2189,10 +2189,11 @@ mod tests {
         let resolved = BTreeMap::from([
             (
                 "GH_TOKEN".to_string(),
-                ResolvedEnvValue::assume(
-                    EnvValue::EnvRef("GITHUB_TOKEN".to_string()),
-                    "secret-token",
-                ),
+                ResolvedEnvValue::resolve_with(
+                    EnvValue::from_raw("Bearer ${GITHUB_TOKEN}".into()).unwrap(),
+                    &|_: &str| Some("secret-token".to_string()),
+                )
+                .unwrap(),
             ),
             (
                 "NODE_VERSION".to_string(),
@@ -2222,11 +2223,11 @@ mod tests {
         );
         assert_eq!(
             cmd.hidden_env(),
-            [("GH_TOKEN".to_string(), "secret-token".to_string())]
+            [("GH_TOKEN".to_string(), "Bearer secret-token".to_string())]
         );
         let rendered = cmd.render();
         assert!(
-            rendered.contains("'GH_TOKEN=${GITHUB_TOKEN}'"),
+            rendered.contains("'GH_TOKEN=Bearer ${GITHUB_TOKEN}'"),
             "{rendered}"
         );
         assert!(rendered.contains("NODE_VERSION=20"), "{rendered}");

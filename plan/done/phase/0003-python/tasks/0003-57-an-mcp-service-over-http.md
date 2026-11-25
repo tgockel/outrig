@@ -194,6 +194,30 @@ same way (`rcgen` is the obvious candidate), each with its test-suite evidence i
 
 ## Decisions
 
+### Follow-up: embedded environment references (#1049)
+
+- `EnvValue::Template(EnvTemplate)` carries validated, private pieces and the original spelling.
+  Whole-value `EnvRef` remains available; common `references()` / `has_references()` queries
+  govern allowlisting, inherited-secret exclusion, credential placement, and engine argv handling.
+- Malformed `${` openers are a **load-time refusal**, not a warning: silently forwarding a typo
+  produces a remote authentication failure with no useful configuration diagnosis. `from_raw` is
+  therefore fallible. Its error reports an offset and grammar, never the input's contents.
+- `$${` escapes a literal `${`, including malformed-looking names. Substitution is single-pass
+  through the existing host/session secret resolver; returned values are never parsed again.
+  Literal values constructed by Rust callers escape openers when serialized, preserving intent.
+- Every unlisted name within a value is reported together, deduplicated in source order. A value
+  containing any reference keeps its original spelling in diagnostics and has the same credential
+  restrictions as a whole-value reference. An escaped-only template is not a credential.
+- Engine-read keys retain their existing exception. Only an unchanged whole-value proxy
+  self-reference may pass such a key by name; a composed proxy would change the engine's own
+  environment. `api-key` keeps its separate whole-value-only grammar.
+- Header-resolution errors omit the entire source value, including literal template pieces:
+  those pieces can themselves be credentials. Only the header name and resolver error are safe.
+- Allowlist and missing-name membership use hash sets; a separate vector preserves source order
+  in the diagnostic. Large repository-controlled templates must not trigger quadratic scans.
+
+### Initial implementation
+
 - **The user's calls (2026-11-21).**
   - Fork 3: plain `http` to a host that is not loopback starts, and `mcp.service.started`
     gains `detail` -- `null` otherwise -- saying the headers went in the clear. No MCP event had a

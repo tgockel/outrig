@@ -23,7 +23,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub use api_key::{ApiKeyError, ApiKeyRef, EnvSecrets, Secrets};
 pub use binding::{Binding, FactoryValue};
 pub use env_ref::is_env_key;
-pub use env_value::{EnvValue, EnvValueError, ResolvedEnvValue};
+pub use env_value::{EnvTemplate, EnvValue, EnvValueError, ResolvedEnvValue};
+pub(crate) use env_value::{allow_names, reference_names};
 pub use lenient::{ConfigWarning, ConfigWarningKind};
 pub use merge::merge;
 pub use validate::{
@@ -833,10 +834,7 @@ impl Config {
                         .flat_map(|server| server.headers().values()),
                 )
         });
-        let refs = values.filter_map(|value| match value {
-            EnvValue::EnvRef(var) => Some(var.clone()),
-            _ => None,
-        });
+        let refs = values.flat_map(|value| value.references().into_iter().map(str::to_string));
         keys.chain(refs).collect()
     }
 
@@ -3800,6 +3798,31 @@ mod tests {
                 "{home:?}",
             );
         }
+    }
+
+    #[test]
+    fn composed_values_contribute_all_host_secret_names() {
+        let config = Config::load_from_str(
+            r#"
+[images.c]
+image-name = "img"
+build-args = { ARG = "${BUILD_X}-${BUILD_Y}" }
+[images.c.mcp.side]
+command = ["server"]
+env = { TOKEN = "Bearer ${ENV_X}" }
+[images.c.mcp.remote]
+url = "https://example.test/mcp"
+headers = { Authorization = "Bearer ${HEADER_X}-$${ESCAPED}" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.env_refs(),
+            ["BUILD_X", "BUILD_Y", "ENV_X", "HEADER_X"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
     }
 
     /// `McpServerSpec` serializes through its derive and deserializes through

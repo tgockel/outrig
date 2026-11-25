@@ -106,7 +106,12 @@ pub(super) async fn placed_under(
 fn viewing(env: &[(&str, &str)]) -> SidecarSpec {
     let env = env
         .iter()
-        .map(|(key, value)| (key.to_string(), EnvValue::from_raw(value.to_string())))
+        .map(|(key, value)| {
+            (
+                key.to_string(),
+                EnvValue::from_raw(value.to_string()).unwrap(),
+            )
+        })
         .collect();
     SidecarSpec::from_image("any", "mcp-image")
         .with_view(SidecarView::Primary)
@@ -117,7 +122,12 @@ fn viewing(env: &[(&str, &str)]) -> SidecarSpec {
 pub(super) fn sidecar(env: &[(&str, &str)]) -> SidecarSpec {
     let env = env
         .iter()
-        .map(|(key, value)| (key.to_string(), EnvValue::from_raw(value.to_string())))
+        .map(|(key, value)| {
+            (
+                key.to_string(),
+                EnvValue::from_raw(value.to_string()).unwrap(),
+            )
+        })
         .collect();
     SidecarSpec::from_image("any", "mcp-image").with_server_env(
         "server",
@@ -551,7 +561,7 @@ async fn a_refusal_is_definitive() {
 #[tokio::test]
 async fn the_credential_rule() {
     let fakes = Fakes::default();
-    let a = || EnvValue::from_raw("${A}".to_string());
+    let a = || EnvValue::from_raw("a-${A}-b-${B}".to_string()).unwrap();
     let (session, _events) = placed(
         &fakes,
         builder()
@@ -567,15 +577,15 @@ async fn the_credential_rule() {
             )
             .mcp(
                 "side",
-                McpServiceSpec::sidecar(sidecar(&[("TOKEN", "${A}")])),
+                McpServiceSpec::sidecar(sidecar(&[("TOKEN", "a-${A}-b-${B}")])),
             )
             .mcp(
                 "viewing",
-                McpServiceSpec::sidecar(viewing(&[("TOKEN", "${A}")])),
+                McpServiceSpec::sidecar(viewing(&[("TOKEN", "a-${A}-b-${B}")])),
             )
             .mcp(
                 "pathed",
-                McpServiceSpec::sidecar(sidecar(&[("PATH", "${A}")])),
+                McpServiceSpec::sidecar(sidecar(&[("PATH", "a-${A}-b-${B}")])),
             ),
     )
     .await;
@@ -598,6 +608,10 @@ async fn the_credential_rule() {
     for host in ["mcp-view", "mcp-viewing", "mcp-pathed"] {
         assert_eq!(fakes.of(host).connects(), 0, "{host}");
     }
+    assert_eq!(
+        fakes.of("mcp-side").envs()[0].1["TOKEN"],
+        "a-value-of-A-b-value-of-B"
+    );
     stop(session).await;
 }
 
@@ -808,7 +822,10 @@ async fn configuration_lowers_into_declarations() {
         .with_server_env(
             "gh",
             vec!["gh-server".to_string()],
-            BTreeMap::from([("TOKEN".to_string(), EnvValue::from_raw("${A}".into()))]),
+            BTreeMap::from([(
+                "TOKEN".to_string(),
+                EnvValue::from_raw("${A}".into()).unwrap(),
+            )]),
         )
         .with_server("grep", vec!["grep-server".to_string()]);
     let configured = ConfiguredMcp {
@@ -1425,7 +1442,7 @@ async fn a_sidecar_that_would_not_stop_stays_a_writer() {
 async fn a_command_that_did_not_start_stays_a_writer() {
     let fakes = Fakes::default();
     fakes.of(PRIMARY).script("refused", [Behavior::Refuse]);
-    let credential = EnvValue::from_raw("${A}".to_string());
+    let credential = EnvValue::from_raw("prefix-${A}-suffix".to_string()).unwrap();
     let (session, _events) = placed(
         &fakes,
         builder()
@@ -1653,7 +1670,7 @@ async fn a_failed_start_is_as_proven_as_its_containers_stop() {
 async fn a_command_is_stopped_with_the_primary() {
     let fakes = Fakes::default();
     fakes.of(PRIMARY).script("refused", [Behavior::Refuse]);
-    let credential = EnvValue::from_raw("${A}".to_string());
+    let credential = EnvValue::from_raw("prefix-${A}-suffix".to_string()).unwrap();
     let (session, mut events) = placed(
         &fakes,
         builder()

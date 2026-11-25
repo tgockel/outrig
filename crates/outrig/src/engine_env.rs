@@ -138,11 +138,11 @@ pub(crate) fn push_keyed(
     source: Option<&EnvValue>,
 ) -> Cmd {
     let cmd = cmd.arg(flag);
-    let Some(EnvValue::EnvRef(var)) = source else {
+    let Some(source) = source.filter(|s| s.has_references()) else {
         return cmd.arg(format!("{key}={value}"));
     };
-    let shown = format!("{key}={}", shown_value(value, source));
-    if by_name(key, var) {
+    let shown = format!("{key}={}", shown_value(value, Some(source)));
+    if source_by_name(key, source) {
         cmd.arg_shown_as(key, shown).env_hidden(key, value)
     } else {
         cmd.arg_shown_as(format!("{key}={value}"), shown)
@@ -161,7 +161,7 @@ pub(crate) fn push_resolved(cmd: Cmd, flag: &str, env: &BTreeMap<String, Resolve
 /// config spelled it, anything else as written.
 pub(crate) fn shown_value(value: &str, source: Option<&EnvValue>) -> String {
     match source {
-        Some(source @ EnvValue::EnvRef(_)) => source.to_raw(),
+        Some(source) if source.has_references() => source.to_raw(),
         _ => value.to_owned(),
     }
 }
@@ -171,7 +171,7 @@ pub(crate) fn shown_value(value: &str, source: Option<&EnvValue>) -> String {
 /// [`push_keyed`] cannot pass by name. A literal is written as given, and is
 /// never one.
 pub(crate) fn reference_on_command_line(key: &str, value: &EnvValue) -> bool {
-    matches!(value, EnvValue::EnvRef(var) if !by_name(key, var))
+    value.has_references() && !source_by_name(key, value)
 }
 
 /// Whether a reference's value can go through the client's environment.
@@ -182,8 +182,10 @@ pub(crate) fn reference_on_command_line(key: &str, value: &EnvValue) -> bool {
 /// whitespace from it, and a key holding `=` would be split by the client into
 /// a different key and a value. Validation makes that unreachable from a
 /// config file; a hand-built `ExecOptions` still arrives here.
-fn by_name(key: &str, var: &str) -> bool {
-    is_env_key(key) && (!is_engine_read(key) || (key == var && is_proxy(key)))
+fn source_by_name(key: &str, source: &EnvValue) -> bool {
+    // Only an unchanged whole-value self-reference can inherit a proxy safely.
+    let unchanged_proxy = is_proxy(key) && matches!(source, EnvValue::EnvRef(var) if key == var);
+    is_env_key(key) && (!is_engine_read(key) || unchanged_proxy)
 }
 
 fn is_engine_read(key: &str) -> bool {
@@ -237,6 +239,25 @@ mod tests {
         assert_eq!(exec, os(&["--env", "GH_TOKEN"]));
         assert_eq!(shown, os(&["--env", "GH_TOKEN=${GITHUB_TOKEN}"]));
         assert_eq!(env, [("GH_TOKEN".to_string(), "s3cret".to_string())]);
+    }
+
+    #[test]
+    fn embedded_references_use_the_environment_and_preserve_the_source() {
+        let source = EnvValue::from_raw("a-${X}-b-${Y}".into()).unwrap();
+        let (exec, shown, env) = pushed("TOKEN", "a-secret-b-other", Some(&source));
+        assert_eq!(exec, os(&["--env", "TOKEN"]));
+        assert_eq!(shown, os(&["--env", "TOKEN=a-${X}-b-${Y}"]));
+        assert_eq!(env, [("TOKEN".into(), "a-secret-b-other".into())]);
+        assert!(!reference_on_command_line("TOKEN", &source));
+        for key in ["PATH", "HTTPS_PROXY", "LD_PRELOAD"] {
+            let (exec, shown, env) = pushed(key, "joined-secret", Some(&source));
+            assert_eq!(exec, os(&["--env", &format!("{key}=joined-secret")]));
+            assert_eq!(shown, os(&["--env", &format!("{key}=a-${{X}}-b-${{Y}}")]));
+            assert!(env.is_empty());
+            assert!(reference_on_command_line(key, &source));
+        }
+        let proxy = EnvValue::from_raw("prefix-${HTTPS_PROXY}".into()).unwrap();
+        assert!(reference_on_command_line("HTTPS_PROXY", &proxy));
     }
 
     #[test]

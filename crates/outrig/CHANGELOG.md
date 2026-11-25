@@ -19,6 +19,16 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **Embedded host environment references** in MCP `env`, URL `headers`, `build-args`,
+  and `--env`: `"Bearer ${TOKEN}"` and `"a-${X}-b-${Y}"` now join literal text with
+  host variables (or session `Secrets`), expanded once. Every reference is subject to
+  repository `env-allow` and the existing credential protections. **Compatibility:**
+  embedded `${UPPER_CASE}` text that used to be literal now expands, and fails if unset
+  or unlisted. Use `$${` to write a literal `${`. Malformed references such as `${lower}`
+  or `${X` are now refused at load; `api-key` stays whole-value-only.
+  `EnvValue::from_raw` is now fallible and `EnvValue::Template` carries parsed templates;
+  `references()` and `has_references()` expose their credential classification.
+
 - **`runtime.facilities` names the agent's description mapping.** It lists hosted bindings,
   services, and plain objects without calling them; channels remain in `runtime.channels`.
   `runtime.bindings` remains a compatibility alias. Agent orientation and help prefer the new
@@ -1326,6 +1336,11 @@ without touching each other, from one ensured image. [The container facade besid
   remove the spelling.
 
 ### Fixed
+
+- Header expansion failures now report only the header name and resolution error, never
+  a template's literal credential text. Repository template allowlist checks use membership
+  sets rather than scanning previously missing names, preserving source-order diagnostics
+  without quadratic work for large templates.
 
 - **Late-usage events are documented as inactive.** `model.usage.replaced` and
   `model.usage.refused` are defined and their ledger behavior is tested, but neither is
