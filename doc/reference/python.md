@@ -880,7 +880,7 @@ it acts through, by name, kept as `reviewer.facilities`; a name is a variable's,
 binding (`help(outrig.Facility)`); a proxy of an object a binding returned, a coroutine and a
 generator are refused, naming the entry; anything else is the object itself, shared. The child
 is told of these and of no other binding -- in its instructions, as globals where the name is
-free, by `outrig.bindings` and `runtime.bindings` -- and without `facilities=` sees what this
+free, by `outrig.bindings` and `runtime.facilities` -- and without `facilities=` sees what this
 agent sees. The mapping decides what an agent is told, not what it may reach, which is the
 session's either way.
 

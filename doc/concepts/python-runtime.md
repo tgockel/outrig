@@ -395,10 +395,16 @@ reviewer = Reviewer(facilities={"files": repo})
 
 The instance keeps a copy as `reviewer.facilities`, and the child's view follows that mapping. Its
 instructions list each entry by name and kind; each is a global of its name where the name is
-free; `outrig.bindings[name]` reaches each; and `runtime.bindings` lists the mapping as it stands,
+free; `outrig.bindings[name]` reaches each; and `runtime.facilities` lists the mapping as it stands,
 read anew each time. No other binding is listed or reached by name: `outrig.bindings["repo"]`
 raises `KeyError` in the child above, though the session binds `repo`. A name follows an input's
 rules, and is not `outrig`, `self`, an input's name or a class bound in the child.
+
+`runtime.facilities` is a read-only mapping of descriptions, not the objects themselves. Each
+record has `name`, `kind` (`binding`, `service`, or `object`), `description`, and `type`; reading
+it calls no facility. Channels are listed separately in `runtime.channels`.
+`runtime.bindings` remains a compatibility alias; new code should use `runtime.facilities`.
+`outrig.bindings[name]`, which resolves a facility to its object, is unchanged.
 
 - **A binding** -- its global, or `outrig.facility(name)` -- becomes a reference to that binding,
   `outrig.Facility`, which resolves in each kernel to that kernel's own proxy. So a child's calls
@@ -407,7 +413,7 @@ rules, and is not `outrig`, `self`, an input's name or a class bound in the chil
 - **A service** -- its global, or `outrig.facility(name)` -- becomes a reference to that service,
   which resolves in each kernel to that kernel's own object of it, so a child's calls are
   attributed to the child. A child given none finds no service: not in its instructions,
-  `runtime.bindings`, its globals or `outrig.bindings`.
+  `runtime.facilities`, its globals or `outrig.bindings`.
 - **A plain object** is the object itself, shared by the agents given it. A call on it is
   ordinary Python in the calling agent: it crosses nothing, and is not evented.
 - **Refused**, naming the entry: a proxy of an object a binding returned (`repo.index`, say),
@@ -483,7 +489,7 @@ help(tracker)                                              # its methods, from t
 ```
 
 The object is the global of the service's name where that name is free, and
-`outrig.bindings[name]` always; `runtime.bindings` lists it with `kind` `service`, and the agent's
+`outrig.bindings[name]` always; `runtime.facilities` lists it with `kind` `service`, and the agent's
 instructions name it beside the bindings.
 
 - **Names.** `tracker.call("file-issue", {"title": "..."})` calls a method by its exact name,

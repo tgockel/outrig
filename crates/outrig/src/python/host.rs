@@ -1548,7 +1548,7 @@ impl Interpreter {
     }
 
     /// Tell the interpreter the session's bindings, before anything runs: what
-    /// `runtime.bindings` answers in every kernel, and the package directories
+    /// `runtime.facilities` answers in every kernel, and the package directories
     /// that go on `sys.path`. `message` is [`bindings_message`]'s. Queued behind
     /// nothing but what the start already sent, so it arrives before the first
     /// execution.

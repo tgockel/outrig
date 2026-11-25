@@ -706,7 +706,7 @@ fn held(bindings: &[Brief], services: &[ServiceBrief]) -> String {
         services.first().map(|service| service.name.as_str()),
     ));
     text.push_str(
-        " `runtime.bindings` lists them, and `outrig.bindings[name]` reaches each wherever its \
+        " `runtime.facilities` lists them, and `outrig.bindings[name]` reaches each wherever its \
          name holds something else: ",
     );
     text.push_str(match services.is_empty() {
@@ -850,7 +850,7 @@ fn facility_rules(given: &[Given]) -> String {
     text.push_str(
         "Each is a global of its name unless your code bound that name first, and \
          `outrig.bindings[name]` reaches each wherever its name holds something else. \
-         `runtime.bindings` lists your facilities as they stand: one given after you began is \
+         `runtime.facilities` lists your facilities as they stand: one given after you began is \
          reached as `outrig.bindings[name]`, never as a global. `outrig.bindings` reaches no \
          other.",
     );

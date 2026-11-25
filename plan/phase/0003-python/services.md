@@ -246,7 +246,7 @@ agent; the execution is read from the context when there is one.
   names that meet one attribute, or an attribute that is also another method's exact name, make
   that attribute raise an ambiguity error naming the exact names and `.method(name)`. Nothing
   picks.
-- **Listed as a binding is.** `runtime.bindings` lists the service with `kind: "service"`, its
+- **Listed as a binding is.** `runtime.facilities` lists the service with `kind: "service"`, its
   description and the generated class's qualified name (`_interpreter.py:4017`; the `Binding` record
   gaining `kind` is `0003-42`'s); `outrig.bindings[name]` is the authoritative lookup, resolving to
   the calling kernel's instance as it resolves a binding's stub
@@ -285,7 +285,7 @@ hands back a ticket and the agent waits with `runtime.wait`, never inside a call
 - **A child's release drops its instance** with its namespace and leaves the service serving its
   parent; a service lives for the session (`facilities.md`, "Lifetime").
 - **An agent whose dict lacks the service does not see it**: not in its orientation, not in
-  `runtime.bindings`, `KeyError` from `outrig.bindings[name]`, `NameError` for the global -- the
+  `runtime.facilities`, `KeyError` from `outrig.bindings[name]`, `NameError` for the global -- the
   presentation-only narrowing `facilities.md` decides, with the grant the session's.
 - **The `task` object may itself be a service** handed in the dict or as the `task` argument
   (`task-agents.md`, `0003-46`); its methods are then recorded calls, where an `object` facility's
@@ -426,8 +426,6 @@ answer, and OR-A3-1 requires the check.
   the Rust-side hook to a later task unless its fork 5 takes it.
 - Whether an application may supply a presenter class from its own provisioned code for a
   service it binds, named by `presenter`, as OutRig's kinds do. Not built here.
-- Whether `runtime.bindings` is renamed once services and plain objects are listed under it
-  (`facilities.md`, "Open questions").
 - Python-host parity: a host program (`0003-29`) binds a Python object with `inject`
   (`0003-36`) and has no Rust object to serve; whether `outrig.Session` should accept a Python
   object described and called through this mechanism rather than through RPyC is an open choice

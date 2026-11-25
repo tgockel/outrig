@@ -586,7 +586,7 @@ factory     = "recorder:failing"
 }
 
 #[tokio::test]
-async fn runtime_bindings_answers_without_asking_the_binding() {
+async fn runtime_facilities_answers_without_asking_the_binding() {
     let bed = Bed::new();
     bed.write(&bed.recorder("rec", 1, "Records what it is given."), "");
     let session = start(bed.builder(bed.load())).await;
@@ -594,7 +594,9 @@ async fn runtime_bindings_answers_without_asking_the_binding() {
     kill(pid, Signal::SIGSTOP).expect("stop the binding");
     let said = output(
         &session,
-        "b = runtime.bindings['rec']\nprint(list(runtime.bindings), b.name, b.description, b.type)",
+        "assert runtime.facilities == runtime.bindings\n\
+         b = runtime.facilities['rec']\n\
+         print(list(runtime.facilities), b.name, b.description, b.type)",
     )
     .await;
     kill(pid, Signal::SIGCONT).expect("continue the binding");

@@ -4848,15 +4848,15 @@ the next request, which you answer with `await d.reply(value)`, or end with
 
 
 # What a runtime says of the bindings its agent sees: the session's, or the facilities it was given.
-_SESSION_BINDINGS = """`runtime.bindings` lists the objects the session hosts for you on the host and the services it
-serves, by name, with what each is; asking makes no request to any of them."""
-_GIVEN_BINDINGS = """`runtime.bindings` lists the facilities you were given, by name, with what each is, as your
+_SESSION_FACILITIES = """`runtime.facilities` describes the session's hosted objects and services by name, without
+calling them."""
+_GIVEN_FACILITIES = """`runtime.facilities` lists the facilities you were given, by name, with what each is, as your
 mapping stands; asking makes no request to any of them, and `outrig.bindings` reaches no other."""
 
 
-def _runtime_doc(channels, bindings=_SESSION_BINDINGS):
+def _runtime_doc(channels, facilities=_SESSION_FACILITIES):
     """A runtime's docstring, `channels` being what that agent is told of its own channels, and
-    `bindings` what it is told of the bindings it sees.
+    `facilities` what it is told of the facilities it sees.
 
     Every runtime's docstring is whole. A kernel binds `runtime` and none of the classes behind
     it, so one that deferred to another class would send the agent reading it to a name it cannot
@@ -4879,7 +4879,7 @@ every call is held to the model's context window: see `help(runtime.context)`.
 `runtime.python` says what this interpreter can import -- `pip install` adds pure-Python
 packages, and nothing compiled loads -- and where code that needs more can run.
 
-{bindings}
+{facilities}
 
 `await runtime.spawn(name, prompt=...)` launches a child agent to give work to, and
 `await runtime.release([child])` ends it: see `help(runtime.spawn)`.
@@ -5082,15 +5082,18 @@ class Runtime:
         return _PYTHON
 
     @property
-    def bindings(self):
+    def facilities(self):
         """What you were given to act through, by name. Read-only.
 
-        Each is a `Binding`: its `name`, the global it is bound as; its `kind`, `binding`,
-        `service` or `object`; its `description`; and its `type`, the qualified name of its
-        object's type. Asking reaches no binding or service, runs no `repr()`, and reads no
-        property.
+        Each `Binding` has `name`, `kind` (`binding`, `service`, or `object`), `description`,
+        and qualified `type`. Reading calls nothing. Channels are in `runtime.channels`.
         """
         return self._kernel.briefs()
+
+    @property
+    def bindings(self):
+        """Compatibility alias for `runtime.facilities`."""
+        return self.facilities
 
     def names(self):
         """Every name you have bound, as `{name: type name}`, sorted by name.
@@ -5307,7 +5310,7 @@ def _given_runtime(cls, channels):
     """`cls`, a child's runtime class, again, but for a docstring that says its agent was given
     facilities: a sibling and not a subclass, so `help(runtime)` reads as `cls`'s does."""
     return type(cls.__name__, cls.__bases__,
-                {**vars(cls), "__doc__": _runtime_doc(channels, _GIVEN_BINDINGS)})
+                {**vars(cls), "__doc__": _runtime_doc(channels, _GIVEN_FACILITIES)})
 
 
 # Each child's runtime class, by the one a kernel built from facilities binds in its place. The
@@ -7056,7 +7059,7 @@ class Kernel:
         return self.facilities
 
     def briefs(self):
-        """What `runtime.bindings` says in this kernel: the session's bindings, or its mapping's
+        """What `runtime.facilities` says in this kernel: the session's bindings, or its mapping's
         entries as they stand, each classified and described now -- but a channel's, which
         `runtime.channels` holds."""
         if self.facilities is None:
@@ -7825,7 +7828,7 @@ def _bindings(message):
     """Take bindings the host declares: the session's own, before anything runs, and each live
     object a program on the host injects later, answered once every kernel has its stub.
 
-    Each binding's record joins `runtime.bindings` for every kernel, and its package directory goes
+    Each binding's record joins `runtime.facilities` for every kernel, and its package directory goes
     on `sys.path`: after the workspace and before the agent's own pip installs, so that the
     container imports the version of a library its binding runs rather than one the agent
     installed, in the order the host gave them, which decides between two bindings that hold

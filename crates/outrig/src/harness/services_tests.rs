@@ -835,7 +835,7 @@ async fn internals_never_cross() {
     assert!(!report.contains(SECRET), "{report}");
 }
 
-/// `runtime.bindings` lists a service with its kind and its class; `outrig.bindings` reaches
+/// `runtime.facilities` lists a service with its kind and its class; `outrig.bindings` reaches
 /// the kernel's own object; a global is bound where the name is free, and not where a builtin
 /// holds it.
 #[tokio::test]
@@ -848,7 +848,8 @@ async fn a_service_is_listed_and_resolved() {
     assert_eq!(
         output(
             &session,
-            "import builtins\nb = runtime.bindings['svc']\n\
+            "import builtins\nassert runtime.facilities == runtime.bindings\n\
+             b = runtime.facilities['svc']\n\
              print(b.kind, b.type, b.description)\n\
              print(outrig.bindings['svc'] is svc, type(svc).__qualname__, \
              sorted(outrig.bindings))\n\

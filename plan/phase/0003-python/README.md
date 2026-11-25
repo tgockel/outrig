@@ -208,7 +208,7 @@ beside the harness for an application that runs both.
 - An `outrig.Agent` subclass's most-derived constructor finishes before OutRig attaches it; an
   optional hook runs after; a constructor that raises spends no model round (`0003-41`).
 - A constructor takes facilities beside data; each agent has its own mapping; a child's view --
-  its orientation, `runtime.bindings`, its convenience globals -- is its mapping and not the
+  its orientation, `runtime.facilities`, its convenience globals -- is its mapping and not the
   session's (`0003-42`).
 - An owner supplies application code that OutRig provisions before construction, diagnoses when it
   cannot import, and provisions again on resume; the model never installs it (`0003-43`).

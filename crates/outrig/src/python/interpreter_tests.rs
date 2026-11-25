@@ -8373,7 +8373,7 @@ fn what_cannot_be_a_facility_is_refused_naming_its_key() {
 }
 
 /// A child given plain objects sees them and nothing else: each is the object itself, bound as
-/// a global and reached through `outrig.bindings`, listed by `runtime.bindings` with its type and
+/// a global and reached through `outrig.bindings`, listed by `runtime.facilities` with its type and
 /// its class's docstring's first line, read without running the object's `repr`; a call on it is
 /// plain Python, which crosses nothing. The spawn names each, and `help(runtime)` says the view is
 /// the mapping. A dict-less instance where the view is the session's has none, and a child given
@@ -8414,15 +8414,17 @@ fn a_child_given_objects_sees_them_and_nothing_else() {
         &py(r#"
             import __main__, outrig, pydoc
             mine = runtime._kernel.facilities
+            assert runtime.facilities == runtime.bindings
             print(task is mine['task'], outrig.bindings['task'] is task, list(outrig.bindings))
             print(task.update_progress('x'), task.updates)
             print([(b.name, b.kind, b.type.rpartition('.')[2], b.description)
-                   for b in runtime.bindings.values()])
+                   for b in runtime.facilities.values()])
             try:
                 outrig.bindings['other']
             except KeyError as e:
                 print('KeyError', e)
             told = pydoc.render_doc(runtime, renderer=pydoc.plaintext)
+            assert 'runtime.facilities' in told and 'Compatibility alias' in told
             print('the facilities you were given' in told, '[help cut at' in told)
             "#),
     );
@@ -8438,7 +8440,7 @@ fn a_child_given_objects_sees_them_and_nothing_else() {
         &py(r#"
             import __main__, pydoc
             print(r.facilities['task'] is task, r.facilities is __main__._kernels['c1'].facilities)
-            print(runtime._kernel.facilities, dict(runtime.bindings), task.updates)
+            print(runtime._kernel.facilities, dict(runtime.facilities), task.updates)
             told = pydoc.render_doc(runtime, renderer=pydoc.plaintext)
             print('the facilities you were given' in told)
             print(os.path.exists(task.path))
@@ -8460,7 +8462,7 @@ fn a_child_given_objects_sees_them_and_nothing_else() {
         k.output_in(
             "c2",
             7,
-            "import outrig\nprint(list(outrig.bindings), dict(runtime.bindings), 'task' in globals())"
+            "import outrig\nprint(list(outrig.bindings), dict(runtime.facilities), 'task' in globals())"
         ),
         "[] {} False\n"
     );
@@ -8486,12 +8488,26 @@ fn a_mapping_is_read_as_it_stands_and_a_dictless_child_inherits_it() {
             import outrig
             mine = runtime._kernel.facilities
             mine['extra'] = 5
-            print(list(runtime.bindings), outrig.bindings['extra'], 'extra' in globals())
+            assert runtime.facilities == runtime.bindings
+            try:
+                runtime.facilities['bad'] = None
+            except TypeError:
+                pass
+            else:
+                raise AssertionError('the listing must be read-only')
+            for name in ('facilities', 'bindings'):
+                try:
+                    setattr(runtime, name, {})
+                except AttributeError:
+                    pass
+                else:
+                    raise AssertionError('the property must be read-only')
+            print(list(runtime.facilities), outrig.bindings['extra'], 'extra' in globals())
             async def co():
                 pass
             mine['co'] = coroutine = co()
             try:
-                runtime.bindings
+                runtime.facilities
             except TypeError as e:
                 print("'co'" in str(e))
             del mine['co']

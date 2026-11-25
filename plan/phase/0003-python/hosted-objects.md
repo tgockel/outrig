@@ -481,7 +481,7 @@ The agent learns its bindings three ways, and none crosses the boundary:
   chain and is three round trips -- with `asyncio.to_thread(...)` as the way to keep the loop
   turning during a long call (`discovery.md`). For a binding whose name a kernel's own code had
   already taken, it names `outrig.bindings[...]` as the way to reach it.
-- **`runtime.bindings`** answers from a local manifest: each binding's name, description and
+- **`runtime.facilities`** answers from a local manifest: each binding's name, description and
   host-side type. Asking what is bound makes no remote call, runs no `repr`, and reads no
   property.
 - **`outrig.bindings[name]`** (`0003-26`) is the authoritative lookup: the calling kernel's proxy of
@@ -498,7 +498,7 @@ from the global config, the repo config, and the embedding API are merged, in th
 binding"). By then a repo entry has replaced a global one of the same name, so a collision between
 bindings is an embedding-API binding that repeats a name already taken. Rebinding the local name
 -- `repo = None`, `del repo` -- changes the namespace and nothing else: the binding, its process,
-and its authority are untouched, `runtime.bindings` still lists it, and `outrig.bindings["repo"]`
+and its authority are untouched, `runtime.facilities` still lists it, and `outrig.bindings["repo"]`
 still returns it.
 
 **Asking about a proxy is a request.** `repr`, `str`, `dir`, `hash` and whatever `help()` reads

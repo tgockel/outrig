@@ -19,6 +19,11 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- **`runtime.facilities` names the agent's description mapping.** It lists hosted bindings,
+  services, and plain objects without calling them; channels remain in `runtime.channels`.
+  `runtime.bindings` remains a compatibility alias. Agent orientation and help prefer the new
+  name; `outrig.bindings[name]` is unchanged. (#775)
+
 - **The MCP proxy can connect URL declarations.** `mcp_proxy::connect_url_client` reuses
   Session header resolution, trust settings, transport, and remembered repository approval
   without creating an interpreter. The proxy dispatches URL and stdio clients alike. (#774)

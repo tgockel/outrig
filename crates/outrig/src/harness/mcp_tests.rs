@@ -185,7 +185,11 @@ async fn three_placements_start_through_one_facility() {
         );
     }
     assert_eq!(
-        output(&session, "print(sorted(runtime.bindings))").await,
+        output(
+            &session,
+            "assert runtime.facilities == runtime.bindings\nprint(sorted(runtime.facilities))"
+        )
+        .await,
         "['cmd', 'side', 'view']\n"
     );
     assert_eq!(

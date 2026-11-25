@@ -185,7 +185,7 @@ def invoke(name, text=None, *, params=None, reload=False):
                 "missing-binding",
                 name,
                 f"[tool.outrig.skill] bind gives parameter {parameter!r} the binding {binding!r}, "
-                "which this session does not have; runtime.bindings lists the ones it does",
+                "which this session does not have; runtime.facilities lists the ones it does",
             )
         bound[parameter] = stub
     invocation = Invocation(kernel, derived, bound)

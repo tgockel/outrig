@@ -160,7 +160,7 @@ print(type(r.facilities['files']).__name__)
 await r.ready()
 print(await r.review('x'))
 await r.release()
-print(sorted(runtime.bindings), type(repo).__name__, sorted(outrig.bindings),
+print(sorted(runtime.facilities), type(repo).__name__, sorted(outrig.bindings),
       runtime._kernel.facilities)
 plain, empty = Plain(), Plain(facilities={})
 await plain.ready()
@@ -180,7 +180,7 @@ await runtime.release([w])
 const REVIEWER: &str = r#"
 import __main__, outrig
 me = runtime._kernel
-print(type(files).__name__, [(b.name, b.kind) for b in runtime.bindings.values()])
+print(type(files).__name__, [(b.name, b.kind) for b in runtime.facilities.values()])
 try:
     outrig.bindings['repo']
 except KeyError:
@@ -205,7 +205,7 @@ print(await s.submit({}, result=str))
 await runtime.release([s])
 self.facilities['rows'] = files.list_records(1)
 try:
-    runtime.bindings
+    runtime.facilities
 except TypeError as e:
     print("'rows'" in str(e))
 del self.facilities['rows']
@@ -216,29 +216,30 @@ self.facilities['extra'] = 5
 /// stands.
 const REVIEW: &str = r#"
 d = await runtime.channels['review'].receive()
-await d.reply(f"{sorted(runtime.bindings)} {'extra' in globals()}")
+await d.reply(f"{sorted(runtime.facilities)} {'extra' in globals()}")
 "#;
 
 /// A helper's launch round: its view, and a call of its own.
 const HELPER: &str = r#"
-print(type(files).__name__, sorted(runtime.bindings), 'repo' in globals(), 'notes' in globals(),
+print(type(files).__name__, sorted(runtime.facilities), 'repo' in globals(), 'notes' in globals(),
       files.ask(f'by-{runtime._kernel.agent}') > 0)
 "#;
 
 /// The reviewer's work child's round: its view, and a call of its own.
 const SPAWNED: &str = r#"
-await runtime.complete(f"{type(files).__name__} {sorted(runtime.bindings)} "
+await runtime.complete(f"{type(files).__name__} {sorted(runtime.facilities)} "
                        f"{'repo' in globals()} {files.ask('by-spawned') > 0}")
 "#;
 
 /// A `Plain`'s launch round: its view.
-const PLAIN: &str = "print(sorted(runtime.bindings), 'repo' in globals(), 'notes' in globals())";
+const PLAIN: &str = "print(sorted(runtime.facilities), 'repo' in globals(), 'notes' in globals())";
 
 /// The primary's work child's round: its view.
-const WIDE: &str = "await runtime.complete(f\"{sorted(runtime.bindings)} {'repo' in globals()}\")";
+const WIDE: &str =
+    "await runtime.complete(f\"{sorted(runtime.facilities)} {'repo' in globals()}\")";
 
 /// An agent given `{"files": repo}` sees `files` and no other binding, in its
-/// instructions, `runtime.bindings`, its globals and `outrig.bindings`, while
+/// instructions, `runtime.facilities`, its globals and `outrig.bindings`, while
 /// its parent's view stays the session's; the children it makes without a
 /// mapping see the same, and one it gives a plain object sees that too. Each
 /// agent's calls on the binding are its own: the primary's, the reviewer's,
@@ -458,7 +459,7 @@ await b.release()
 
 /// The helper's launch round: its view, and a call of its own.
 const SERVED_HELPER: &str = r#"
-print(svc.echo(x=3), type(svc).__qualname__, [(b.name, b.kind) for b in runtime.bindings.values()])
+print(svc.echo(x=3), type(svc).__qualname__, [(b.name, b.kind) for b in runtime.facilities.values()])
 "#;
 
 /// The helper's request: answered with another call of its own.
@@ -478,7 +479,7 @@ try:
     svc
 except NameError:
     print('NameError')
-print(list(runtime.bindings))
+print(list(runtime.facilities))
 "#;
 
 /// A service in a facility dict: the child given it has an object of its own, whose calls are

@@ -883,7 +883,7 @@ async fn the_agent_cannot_reach_the_backend() {
     // What the endpoint holds is the interpreter's own -- its lock, its queue, its contract's
     // schemas, the kernel holding it -- and nothing of any other module's.
     let code = "ch = runtime.channels['inbox']\nd = await ch.receive()\n\
-                print(dict(runtime.bindings), list(runtime.names()))\n\
+                print(dict(runtime.facilities), list(runtime.names()))\n\
                 print([name for name in dir(ch) if 'backend' in name.lower()])\n\
                 own = ('builtins', '_thread', 'collections', 'outrig.schema', '__main__')\n\
                 print(sorted({type(getattr(ch, name)).__module__ for name in dir(ch)\n\

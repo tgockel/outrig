@@ -22,7 +22,7 @@ passes to `super().__init__(facilities=...)`. The base shallow-copies it at once
 has a mapping of its own from its `__init__` on, and a child given its parent's entries shares
 the facilities and not the dict: changing one mapping changes no other. The copy is the
 agent's canonical mapping, reachable on the instance under one attribute (`0003-42`'s fork;
-`facilities` recommended) and, in the agent's kernel, through `runtime.bindings` and
+`facilities` recommended) and, in the agent's kernel, through `runtime.facilities` and
 `outrig.bindings` ("The view is the agent's"). An owner constructing a root passes the same dict
 as an argument, its values facility bindings named by their bound names (`rust-owner.md`,
 "Construction from Rust"; OR-A1-2).
@@ -115,7 +115,7 @@ arise: an argument is data or a facility binding by name, and anything else is r
 *input* stands (`_hosted_name`, `_interpreter.py:4314-4322`); `0003-42` points its message at the
 facilities dict.
 
-A mapping's entries after attachment are read live: `runtime.bindings` and `outrig.bindings`
+A mapping's entries after attachment are read live: `runtime.facilities` and `outrig.bindings`
 classify an entry when they read it, so an entry the agent adds later is listed and resolves,
 an entry it removes is gone, and a netref it puts there raises at the read with the same reason.
 Convenience globals are installed once, at the kernel's build, and the orientation is composed
@@ -138,14 +138,14 @@ reverses the decision not to offer the presentation-only narrowing, and the rati
 refused facilities as inputs, for agents constructed with a dict:
 
 - **A kernel built from a dict presents its dict.** Its orientation's facility manifest lists the
-  mapping's entries and no other binding, service or channel; `runtime.bindings` lists them, each
+  mapping's entries and no other binding, service or channel; `runtime.facilities` lists them, each
   with its `kind`, the description its kind allows and its type; a convenience global is
   installed per key where the name is free, as `bind_stubs` installs every binding's today
   (`_interpreter.py:5439-5445`); and `outrig.bindings[key]` resolves the mapping's entry, raising
   `KeyError` for a session binding the mapping does not name, as it raises today for a name the
   session has not bound.
 - **A kernel built without a dict inherits its maker's view.** Under the CLI's primary that is
-  today's session-wide view -- every binding's stub under its name, `runtime.bindings` from the
+  today's session-wide view -- every binding's stub under its name, `runtime.facilities` from the
   session's manifest (`_BINDINGS`, `_interpreter.py:6173`, `:4016-4025`), the orientation's
   `hosted()` list (`crates/outrig/src/agent/orientation.rs:267-295`), and every service
   (`mcp-presenter.md`, "The Python surface") -- so the primary, its `runtime.spawn` children, a
@@ -271,19 +271,31 @@ once.
 **Rejected: an application-side registry, serializer or transport for facilities.** The reference
 is OutRig's, so the application invents none (`capability-passing.md`).
 
-**Rejected: `runtime.bindings` listing the session's bindings in a dict-constructed kernel.** It
+**Rejected: `runtime.facilities` listing the session's bindings in a dict-constructed kernel.** It
 would advertise what the mapping omits, which is what OR-AG4 forbids.
 
 **Rejected: a kind for MCP beside the service.** The MCP presenter is a service OutRig ships
 (`services.md`; `mcp-presenter.md`), and one kind with one resolver and one manifest shape is what
 OR-A3-5 asks for.
 
+## Runtime listing name (#775)
+
+`runtime.facilities` is the preferred name for the read-only description mapping: its entries
+may be hosted bindings, services (including MCP services), or plain Python objects.
+`runtime.bindings` remains a compatibility alias, with no warning or scheduled removal; both
+names read the same kernel-local view live and make no request to a facility. The record type
+remains `Binding`, with unchanged `name`, `kind`, `description`, and `type` fields.
+
+Channels remain in `runtime.channels`, not in this description mapping. This change names the
+existing listing accurately; it does not broaden an agent's view or change channel access.
+`outrig.bindings[name]` still resolves facilities to their objects and is not renamed.
+
+This section records the decision for the documentation pass: use `runtime.facilities` in
+orientation, help, and new examples, and retain the old spelling only when explaining
+compatibility or historical behavior.
+
 ## Open questions
 
-- Whether `runtime.bindings` is renamed `runtime.facilities` once kinds beyond bindings exist:
-  a service or a plain object listed under "bindings" reads oddly. The phase README fixed
-  `runtime.bindings` as what follows the dict; a rename beside it is a documentation question
-  for `0003-44` or the documentation task.
 - Whether a dict-less child of a dict-constructed parent should inherit the parent's view
   (`task-agents.md`, "Open questions").
 - Whether an `outrig.Agent` instance in a dict is advertised with its request methods.
@@ -302,6 +314,6 @@ OR-A3-5 asks for.
   (`hosted.rs:343-353`) and on each kernel's pool being its own; both are `0003-22`'s and
   `0003-23`'s tested behavior, not re-measured here. A service's attribution is `0003-44`'s to
   build and test.
-- Whether a live read of the mapping in `runtime.bindings` is cheap enough to run on every
+- Whether a live read of the mapping in `runtime.facilities` is cheap enough to run on every
   read was not measured; it reads kinds, names and type names and runs no `repr`, so the cost is
   a dict walk.

@@ -66,7 +66,7 @@ class _Bindings(collections.abc.Mapping):
     The authoritative lookup: `outrig.bindings["repo"]` is the binding whatever this kernel's
     global `repo` now holds -- a global is bound only where its name was free, so an input or a
     builtin of the same name keeps it -- and from a module's code, which has no such global, the
-    way to reach one at all. `runtime.bindings` says what each is without asking it.
+    way to reach one at all. `runtime.facilities` says what each is without asking it.
     """
 
     __slots__ = ()

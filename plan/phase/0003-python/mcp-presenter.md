@@ -97,7 +97,7 @@ server names it, with the tool's `description`, `inputSchema` as `params`, `outp
 server's `call_timeout_secs` is the description's `call_deadline` -- and `call(method, args, cx)`
 dispatches to the service's `McpClient::call_tool`, observing `cx`'s token. The service is bound
 under the declaration's name, so it is a facility of kind `service` (`facilities.md`), reached as
-`outrig.bindings[name]`, listed in `runtime.bindings` beside hosted objects, admitted, checked,
+`outrig.bindings[name]`, listed in `runtime.facilities` beside hosted objects, admitted, checked,
 evented, bounded, cancelled and reported as `services.md` says of every service. What the table
 does not know -- that a server has a process to place and a listing that moves -- is the MCP
 module's, kept in a table of its own beside the service table: each service's declaration, client,
@@ -260,7 +260,7 @@ tool whose exact name is an identifier, with `__signature__` and `__doc__` rende
 name, so `read-file`, `class` and `a__b` are callable without exception, which is what OR-MCP2's
 acceptance asks; the attribute convenience -- `-` to `_`, a trailing `_` for a keyword or a member,
 an ambiguity error naming the exact names where two tools meet one attribute -- and `dir()`; the
-bounded `help()`; the listing in `runtime.bindings` with `kind: "service"` and the class's
+bounded `help()`; the listing in `runtime.facilities` with `kind: "service"` and the class's
 qualified name; `outrig.bindings[name]` as the authoritative lookup; a convenience global where the
 name is free; the schema check in Rust before dispatch, with a tool whose `inputSchema` the
 validator cannot compile dispatched unchecked and never dropped; the service kind's blocking rule
