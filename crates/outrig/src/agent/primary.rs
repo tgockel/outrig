@@ -15,6 +15,7 @@ pub(super) struct Requests {
     registry: Registry,
     baseline: Summary,
     warned: bool,
+    question_resumptions: usize,
     ending: Summary,
 }
 
@@ -31,6 +32,7 @@ impl Requests {
             registry,
             baseline: Summary::default(),
             warned: false,
+            question_resumptions: 0,
             ending: Summary::default(),
         }
     }
@@ -75,7 +77,12 @@ impl Requests {
             // Read announcements after any ends have drained: a request or message
             // arriving during that wait must be counted as told by this opening.
             let news = announcer.opening().await?;
-            let live = children.summary(PRIMARY, ChildKind::Request);
+            let (live, _, resumed) = children.scheduling(PRIMARY, ChildKind::Request);
+            if resumed != self.question_resumptions {
+                self.baseline = Summary::default();
+                self.warned = false;
+                self.question_resumptions = resumed;
+            }
             if live.is_empty() {
                 return Ok(news.map(|lead| Opening {
                     live,

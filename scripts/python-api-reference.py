@@ -84,6 +84,14 @@ SECTIONS = [
         ["outrig.Question", "outrig.Choice", "outrig.QuestionContext", "outrig.QuestionReference", "outrig.Answer"],
     ),
     (
+        "Questions from children",
+        "A child asks its parent with `runtime.ask`. Every agent receives its children's "
+        "questions on `runtime.questions`, a `QuestionEndpoint`; taking one returns a "
+        "`QuestionDelivery`. These are agent-kernel values, not host-program APIs.",
+        "_interpreter.py",
+        ["QuestionEndpoint", "QuestionDelivery"],
+    ),
+    (
         "Answering questions",
         "A host program reads `session.questions` independently of its events and explicitly "
         "answers, declines, or cancels each question. A normal message never answers one.",
@@ -282,7 +290,7 @@ def declaration(node, indent=0):
     body = [
         textwrap.indent(declaration(m, indent + 4), "    ")
         for m in node.body
-        if isinstance(m, ast.AnnAssign)
+        if (isinstance(m, ast.AnnAssign) and not ast.unparse(m.target).startswith("_"))
         or getattr(m, "name", "") == "__init__" and node.name not in HIDDEN_CONSTRUCTORS
     ]
     bases = f"({', '.join(map(ast.unparse, node.bases))})" if node.bases else ""

@@ -766,7 +766,14 @@ outbound request channel also records its normal transport events.
 - `agent.question.asked` -- a question was asked: `question`; `body`, its bounded JSON text,
   including `text`, `choices` (labels and descriptions), `multiple`, `other`, and optional
   `context` (longer `description` and file `references`, each with `path`, `line`, `end_line`,
-  and `description`). Context is inert data within the same question-size bound.
+  and `description`). Context is inert data within the same question-size bound. `chain` lists
+  the originating asker and intermediary agents. The subject is the immediate asker.
+- `agent.question.escalated` -- a parent asked its own answerer: `question`, the original id;
+  `hop`, the new question id; `target`, the parent's agent id or `user`; `chain`, the originating
+  asker followed by intermediaries including this event's subject.
+- `agent.question.forwarded` -- a parent asked a request child: `question`, `hop`, `target`
+  (the request child's id), and `chain`, with the same meaning as on escalation. The hop is an
+  ordinary request on the target's `Question`/`Answer` channel.
 - `agent.question.answered` -- it ended with an explicit answer: `question`; `answer`, with
   `choices`, `text`, `by`, and `chain`, or null when observation is disabled.
 - `agent.question.declined` -- it failed at the answerer: `question`; `reason`.
@@ -777,7 +784,9 @@ outbound request channel also records its normal transport events.
 
 The session renderer shows the question at its asking position, choices, asker, settlement,
 answer or decline reason, and elapsed open time. An unsettled question is marked still open
-when the record ended. Question text is untrusted data, not executable markup.
+when the record ended. Hop events link the original question to each delegated request and show
+its asker chain and target; the final answer appears at the originating child's question.
+Question text is untrusted data, not executable markup.
 
 - `channel.request.sent` -- the subject asked an outbound request channel's far end: `channel`;
   `request`, its handle's `id`, by which the owner settles it; `item`, the id its send was

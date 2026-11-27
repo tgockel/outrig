@@ -661,7 +661,19 @@ The per-asker open-question limit is 32, separate from `requests-max`. The quest
 65,536 UTF-8 JSON bytes and the choice-count limit is 32. Empty text, empty or duplicate labels,
 and these limits are refused at `ask`. The reserved outbound channel `__questions` has the fixed
 `outrig.Question`/`outrig.Answer` contract; it cannot be declared or granted as a facility. Child
-questions to a parent are not yet supported. Roots constructed by a host program ask that program.
+questions go to `runtime.questions` on their parent. Roots constructed by a host program ask
+that program.
+
+A parent receives `d = await runtime.questions.receive()`: its `sender` is the immediate
+child and its `chain` identifies the originating asker and intermediaries. It can
+`await d.answer(Answer(...))` (or `answer(choices=..., text=...)`), `await d.decline(reason)`,
+`await d.escalate()` to its own answerer, or `await d.forward(expert.channels['questions'])`
+to a request child's `Question`/`Answer` channel. Delegation preserves the question and context,
+passes back the outcome, and propagates cancellation through every hop. A parent waiting on a
+child's result should use `runtime.wait`: a question wakes it with `MessageAvailable`, whereas a
+bare await could deadlock. See
+[Questions from children](../reference/python.md#questions-from-children) for lifecycle and delivery
+details.
 
 A host program receives questions independently of its lossy event subscription:
 
@@ -674,7 +686,8 @@ async def answer_questions(session):
         # Or: await question.cancel()
 ```
 
-Each open question has `id`, `asker`, `body` (a `Question`), and `closed`. Invalid answers raise
+Each open question has `id`, `asker`, `chain`, `body` (a `Question`), and `closed`. Invalid answers
+raise
 at the owner and leave the question open. Late answers raise and are recorded as refused.
 Withdrawal and session close mark it closed; the iterator ends when the session ends. There is
 one question receiver per session. Run the receiver concurrently with the program's agents.

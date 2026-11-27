@@ -170,6 +170,7 @@ pub(crate) async fn run(
         hold.notified().await;
     }
     let mut baseline = Summary::default();
+    let mut question_resumptions = 0;
     // Whether the round that ended last on the baseline was the warning: the
     // next to find the summary unchanged cancels what it holds.
     let mut warned = false;
@@ -278,7 +279,15 @@ pub(crate) async fn run(
             sent = None;
             continue;
         }
-        let live = children.summary(&id, kind);
+        let (live, answering_questions, resumed) = children.scheduling(&id, kind);
+        if resumed != question_resumptions {
+            // A reply earns a resumption round, even when the ask happened in a warning
+            // round and the runner never observed the suspended interval.
+            baseline = Summary::default();
+            warned = false;
+            resting = None;
+            question_resumptions = resumed;
+        }
         // What waits, read once: whether a message is news, and, if a round
         // opens, what its opening says, which the announcer counts as told.
         let counts = children.counts(&id);
@@ -310,6 +319,7 @@ pub(crate) async fn run(
             // ends are heard.
             for &request in live.unread.iter().chain(&live.taken) {
                 let (what, without) = match kind {
+                    _ if answering_questions => ("question", "answering"),
                     ChildKind::Work => ("submission", "completing"),
                     ChildKind::Request if live.taken.contains(&request) => ("request", "answering"),
                     ChildKind::Request => ("request", "reading"),
@@ -340,7 +350,7 @@ pub(crate) async fn run(
         let unread = || channel::announcement(&counts).unwrap_or_default();
         let (lead, detail) = match kind {
             _ if orienting.is_some() => (orientation::orienting(task, &unread()), String::new()),
-            ChildKind::Request => {
+            _ if kind == ChildKind::Request || answering_questions => {
                 let outstanding = orientation::requests(&unread(), &children.taken(&id));
                 if warning {
                     orientation::requests_warning(&outstanding, &children.unread_on(&id))
@@ -348,7 +358,7 @@ pub(crate) async fn run(
                     (outstanding, String::new())
                 }
             }
-            ChildKind::Work => match live.taken.first() {
+            _ => match live.taken.first() {
                 Some(&submission) => {
                     opened_on = Some(submission);
                     let result_type = children

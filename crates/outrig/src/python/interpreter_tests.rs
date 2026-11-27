@@ -8705,3 +8705,422 @@ fn a_module_whose_failure_cannot_be_formatted_is_still_answered_for() {
         "Loud: its traceback could not be formatted (SystemExit while formatting it)\n"
     );
 }
+
+/// Both child kinds ask their parent, not the user; each question form retains its contract.
+#[test]
+fn child_questions_are_explicit_answers_with_attribution() {
+    let mut k = Interpreter::start();
+    k.spawn_as(1, "w = await runtime.spawn('w', prompt='p')", "c1");
+    k.spawn_as(
+        2,
+        "r = await runtime.spawn('r', prompt='p', requests={'inbox': (str, str)})",
+        "c2",
+    );
+    for (n, child) in ["c1", "c2"].iter().enumerate() {
+        let id = 10 + n as u64 * 10;
+        let (said, notices) = k.noted(
+            child,
+            id,
+            r#"
+import outrig
+hs = [runtime.ask(outrig.Question('free')),
+      runtime.ask(outrig.Question('single', choices=['a', 'b'], other=False)),
+      runtime.ask(outrig.Question('multi', choices=['a', 'b'], multiple=True))]
+print(len(hs))
+"#,
+        );
+        assert_eq!(said, "3\n");
+        assert_eq!(
+            notices.iter().filter(|n| n["t"] == "agent.request").count(),
+            3
+        );
+        let (said, notices) = k.noted(
+            PRIMARY,
+            id + 1,
+            r#"
+import outrig
+print(runtime.questions.pending())
+ds = [await runtime.questions.receive() for _ in range(3)]
+print([d.sender for d in ds], ds[0].chain)
+try: await ds[1].answer(choices=['missing'])
+except ValueError: print('invalid stays open')
+await ds[0].answer(text='hello')
+await ds[1].answer(outrig.Answer(choices=['b'], by='forged'))
+await ds[2].answer(choices=['b', 'a'])
+"#,
+        );
+        assert!(said.contains("invalid stays open"), "{said}");
+        assert!(said.contains(&format!("('{child}',)")), "{said}");
+        assert_eq!(
+            notices.iter().filter(|n| n["t"] == "agent.ended").count(),
+            3
+        );
+        let (said, _) = k.noted(
+            child,
+            id + 2,
+            r#"
+for h in hs:
+    a = await h
+    print(a.choices, a.text, a.by, a.chain)
+"#,
+        );
+        assert_eq!(
+            said,
+            format!(
+                "[] hello primary ['{child}']\n['b'] None primary ['{child}']\n['a', 'b'] None primary ['{child}']\n"
+            )
+        );
+    }
+}
+
+#[test]
+fn child_questions_forward_decline_cancel_and_close() {
+    let mut k = Interpreter::start();
+    k.output(1, "import outrig");
+    k.spawn_as(2, "w = await runtime.spawn('w', prompt='p')", "c1");
+    k.spawn_as(3, "r = await runtime.spawn('r', prompt='p', requests={'q': (outrig.Question, outrig.Answer)})", "c2");
+    k.noted(
+        "c1",
+        4,
+        "import outrig; h = runtime.ask(outrig.Question('pick', choices=['a']))",
+    );
+    let (_, notices) = k.noted(PRIMARY, 5, "d = await runtime.questions.receive(); relay = asyncio.create_task(d.forward(r.channels['q'])); await asyncio.sleep(0)");
+    let hop = notice(&notices, "agent.question.forwarded");
+    assert_eq!(hop["target"], "c2");
+    assert_eq!(hop["chain"], json!(["c1", "primary"]));
+    k.noted("c2", 6, "import outrig; d = await runtime.channels['q'].receive(); await d.reply(outrig.Answer(choices=['a'], by='c2'))");
+    k.noted(PRIMARY, 7, "await relay");
+    assert_eq!(
+        k.noted("c1", 8, "a = await h; print(a.choices, a.by, a.chain)")
+            .0,
+        "['a'] c2 ['c1', 'primary']\n"
+    );
+    k.noted("c1", 9, "h = runtime.ask(outrig.Question('decline'))");
+    k.noted(
+        PRIMARY,
+        10,
+        "d = await runtime.questions.receive(); await d.decline()",
+    );
+    assert_eq!(
+        k.noted(
+            "c1",
+            11,
+            "try: await h\nexcept outrig.AgentRequestFailed as e: print(e)"
+        )
+        .0,
+        "not relevant\n"
+    );
+    k.noted("c1", 12, "h = runtime.ask(outrig.Question('cancel'))");
+    k.noted(PRIMARY, 13, "d = await runtime.questions.receive(); relay = asyncio.create_task(d.forward(r.channels['q'])); await asyncio.sleep(0)");
+    k.noted("c1", 14, "h.cancel()");
+    k.noted(PRIMARY, 15, "await relay");
+    assert_eq!(
+        k.noted("c2", 16, "print(runtime.channels['q'].pending())")
+            .0,
+        "0\n"
+    );
+    k.noted("c1", 20, "h = runtime.ask(outrig.Question('failure'))");
+    k.noted(PRIMARY, 21, "d = await runtime.questions.receive(); relay = asyncio.create_task(d.forward(r.channels['q'])); await asyncio.sleep(0)");
+    k.noted(
+        "c2",
+        22,
+        "d = await runtime.channels['q'].receive(); await d.fail('not my field')",
+    );
+    k.noted(PRIMARY, 23, "await relay");
+    assert_eq!(
+        k.noted(
+            "c1",
+            24,
+            "try: await h\nexcept outrig.AgentRequestFailed as e: print(e)"
+        )
+        .0,
+        "not my field\n"
+    );
+    k.noted("c1", 25, "hs = [runtime.ask(outrig.Question(str(n))) for n in range(32)]\ntry: runtime.ask(outrig.Question('too many'))\nexcept outrig.AgentLimitReached: print('bounded')");
+    k.noted("c1", 26, "for h in hs: h.cancel()");
+    assert_eq!(
+        k.noted(PRIMARY, 27, "print(runtime.questions.pending())").0,
+        "0\n"
+    );
+    k.spawn_from("c1", 30, "g = await runtime.spawn('g', prompt='p')", "c3");
+    k.noted(
+        "c3",
+        31,
+        "import outrig; h = runtime.ask(outrig.Question('many hops'))",
+    );
+    k.noted("c1", 32, "d = await runtime.questions.receive(); relay = asyncio.create_task(d.escalate()); await asyncio.sleep(0)");
+    k.noted(PRIMARY, 33, "d = await runtime.questions.receive(); relay = asyncio.create_task(d.forward(r.channels['q'])); await asyncio.sleep(0)");
+    k.noted("c3", 34, "h.cancel()");
+    k.noted("c1", 35, "await relay");
+    k.noted(PRIMARY, 36, "await relay");
+    assert_eq!(
+        k.noted("c2", 37, "print(runtime.channels['q'].pending())")
+            .0,
+        "0\n"
+    );
+    assert_eq!(
+        k.noted(
+            "c3",
+            38,
+            "try: await h\nexcept outrig.RequestCancelled: print('withdrawn')"
+        )
+        .0,
+        "withdrawn\n"
+    );
+    k.noted("c1", 17, "h = runtime.ask(outrig.Question('close'))");
+    k.send(json!({"t": "end", "agent": "c1", "id": 18}));
+    // The released asker's inbox entry is withdrawn even though its parent never received it.
+    k.until("ended", Vec::new());
+    assert_eq!(
+        k.noted(PRIMARY, 19, "print(runtime.questions.pending())").0,
+        "0\n"
+    );
+}
+
+#[test]
+fn child_question_settlements_are_bounded_before_they_commit() {
+    for observing in [false, true] {
+        let mut k = Interpreter::start();
+        k.noted(
+            PRIMARY,
+            1,
+            &format!(
+                "import __main__ as engine; import outrig; engine._observing = {}",
+                if observing { "True" } else { "False" }
+            ),
+        );
+        k.spawn_as(2, "w = await runtime.spawn('w', prompt='p')", "c1");
+        k.spawn_as(3, "expert = await runtime.spawn('e', prompt='p', requests={'q': (outrig.Question, outrig.Answer)})", "c2");
+        k.noted(
+            "c1",
+            4,
+            "import outrig; h = runtime.ask(outrig.Question('large answer'))",
+        );
+        let (said, notices) = k.noted(
+            PRIMARY,
+            5,
+            r#"
+d = await runtime.questions.receive()
+for text in ['x' * (17 << 20), '\x00' * (1 << 20), 'é' * (1 << 20)]:
+    try: await d.answer(text=text)
+    except ValueError: print('too big')
+print(d._work.state)
+await d.answer(text='small answer')
+"#,
+        );
+        assert_eq!(said, "too big\ntoo big\ntoo big\nreceived\n");
+        assert_eq!(
+            notices.iter().filter(|n| n["t"] == "agent.ended").count(),
+            1
+        );
+        assert_eq!(
+            k.noted("c1", 6, "print((await h).text)").0,
+            "small answer\n"
+        );
+        k.noted(
+            "c1",
+            7,
+            "h = runtime.ask(outrig.Question('delegated large answer'))",
+        );
+        k.noted(PRIMARY, 8, "d = await runtime.questions.receive(); relay = asyncio.create_task(d.forward(expert.channels['q'])); await asyncio.sleep(0)");
+        k.noted("c2", 9, "import outrig; d = await runtime.channels['q'].receive(); await d.reply(outrig.Answer(text='x' * (17 << 20)))");
+        k.noted(PRIMARY, 10, "await relay");
+        assert_eq!(k.noted("c1", 11, "try: await h\nexcept outrig.AgentRequestFailed as e: print('question settlement' in str(e), h.status.reason)").0, "True failed\n");
+    }
+}
+
+/// Release wins in the precise gap after construction but before registration. No new
+/// request or terminal notice may then create a host-side obligation for a dead asker.
+#[test]
+fn child_question_registration_is_atomic_with_asker_release() {
+    let mut k = Interpreter::start();
+    k.spawn_as(1, "w = await runtime.spawn('w', prompt='p')", "c1");
+    let (said, notices) = k.noted(
+        PRIMARY,
+        2,
+        r#"
+import __main__ as engine, threading, outrig
+original = engine._ChildQuestion.__init__
+def release_after_construction(work, route, sender, body, chain):
+    original(work, route, sender, body, chain)
+    releasing = threading.Thread(target=sender.end)
+    releasing.start()
+    releasing.join()
+engine._ChildQuestion.__init__ = release_after_construction
+try:
+    h = engine._kernels['c1']._parent_questions.request(outrig.Question('too late'))
+finally:
+    engine._ChildQuestion.__init__ = original
+print(runtime.questions.pending(), h.status.reason, h.id in engine._works)
+try: h.result()
+except outrig.AgentReleased: print('asker ended')
+"#,
+    );
+    assert_eq!(said, "0 closed False\nasker ended\n");
+    assert!(
+        notices
+            .iter()
+            .all(|n| n["t"] != "agent.request" && n["t"] != "agent.ended"),
+        "{notices:?}"
+    );
+}
+
+#[test]
+fn child_question_relays_preserve_cancellation_and_release() {
+    let mut k = Interpreter::start();
+    k.noted(PRIMARY, 1, "import outrig");
+    k.spawn_as(2, "p = await runtime.spawn('p', prompt='p')", "c1");
+    k.spawn_from("c1", 3, "g = await runtime.spawn('g', prompt='p')", "c2");
+    k.spawn_as(4, "e = await runtime.spawn('e', prompt='p', requests={'q': (outrig.Question, outrig.Answer)})", "c3");
+    for (i, reason, error) in [
+        (0, "cancelled", "RequestCancelled"),
+        (1, "released", "AgentReleased"),
+    ] {
+        let id = 10 + i * 10;
+        k.noted(
+            "c2",
+            id,
+            "import outrig; h = runtime.ask(outrig.Question('two relays'))",
+        );
+        k.noted("c1", id+1, "d = await runtime.questions.receive(); relay = asyncio.create_task(d.escalate()); await asyncio.sleep(0)");
+        let (_, notices) = k.noted(PRIMARY, id+2, "d = await runtime.questions.receive(); relay = asyncio.create_task(d.forward(e.channels['q'])); await asyncio.sleep(0)");
+        if reason == "cancelled" {
+            let hop = notice(&notices, "agent.question.forwarded")["hop"].clone();
+            k.send(json!({"t":"settle", "agent":"c3", "id":hop, "outcome":"cancelled", "message":"owner cancelled"}));
+            k.until("agent.ended", Vec::new());
+        } else {
+            k.send(json!({"t":"end", "agent":"c3", "id":99}));
+            k.until("ended", Vec::new());
+        }
+        k.noted(PRIMARY, id + 3, "await relay");
+        k.noted("c1", id + 4, "await relay");
+        assert_eq!(
+            k.noted(
+                "c2",
+                id + 5,
+                &format!("try: await h\nexcept outrig.{error}: print(h.status.reason)")
+            )
+            .0,
+            format!("{reason}\n")
+        );
+    }
+}
+
+/// Forced provider/budget/limit/cancellation outcomes cannot ask the host to retry a smaller
+/// diagnostic. Only their wire previews are bounded; the handle keeps its full typed error.
+#[test]
+fn child_question_forced_ends_bound_diagnostics_without_rejecting_settlement() {
+    for observing in [false, true] {
+        let mut k = Interpreter::start();
+        k.noted(
+            PRIMARY,
+            1,
+            &format!(
+                "import __main__ as engine; import outrig; engine._observing = {}",
+                if observing { "True" } else { "False" }
+            ),
+        );
+        k.spawn_as(2, "w = await runtime.spawn('w', prompt='p')", "c1");
+        k.noted(
+            "c1",
+            3,
+            "import outrig; h = runtime.ask(outrig.Question('bounded preview'))",
+        );
+        let (said, notices) = k.noted(
+            PRIMARY,
+            4,
+            r#"
+d = await runtime.questions.receive()
+preview = engine._agents.cut('diagnostic' * (1 << 17))
+engine._settle_work(engine._kernels['primary'], d.id,
+    {'outcome': 'failed', 'message': preview, 'cause': 'short cause'})
+print(d._work.notice['message'] == preview)
+"#,
+        );
+        assert_eq!(said, "True\n");
+        assert_eq!(
+            notices.iter().filter(|n| n["t"] == "agent.ended").count(),
+            1
+        );
+        k.noted(
+            "c1",
+            5,
+            "try: await h\nexcept outrig.AgentRequestFailed: pass",
+        );
+        for (i, (reason, error)) in [
+            ("failed", "AgentRequestFailed"),
+            ("cancelled", "RequestCancelled"),
+            ("budget", "BudgetExhausted"),
+            ("limit", "AgentLimitReached"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let id = 10 + i as u64 * 10;
+            k.noted(
+                "c1",
+                id,
+                "import outrig; h = runtime.ask(outrig.Question('forced end'))",
+            );
+            // Exercise both already-received and still-unread questions. The latter must
+            // leave the inbox even when the diagnostic needs truncation.
+            let take = if i % 2 == 0 {
+                "d = await runtime.questions.receive(); qid = d.id"
+            } else {
+                "qid = next(iter(runtime.questions._queue)).id"
+            };
+            let (said, notices) = k.noted(
+                PRIMARY,
+                id + 1,
+                &format!(
+                    r#"
+{take}
+message = '\x00' * (200 << 10)
+cause = 'é"\n\\' * (200 << 10)
+body = {{'outcome': '{reason}', 'message': message, 'cause': cause}}
+engine._settle_work(engine._kernels['primary'], qid, body)
+print(runtime.questions.pending(), qid in engine._works)
+# A repeated host settlement must not reopen it or produce another terminal event.
+engine._settle_work(engine._kernels['primary'], qid, body)
+"#
+                ),
+            );
+            assert_eq!(said, "0 False\n");
+            let ends: Vec<_> = notices.iter().filter(|n| n["t"] == "agent.ended").collect();
+            assert_eq!(ends.len(), 1, "{notices:?}");
+            let terminal = ends[0];
+            assert_eq!(terminal["outcome"], *reason);
+            assert_eq!(terminal["received"], i % 2 == 0);
+            assert!(
+                terminal["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("more characters")
+            );
+            assert!(
+                terminal["cause"]
+                    .as_str()
+                    .unwrap()
+                    .contains("more characters")
+            );
+            assert!(serde_json::to_vec(terminal).unwrap().len() < 16 * 1024);
+            let (said, _) = k.noted(
+                "c1",
+                id + 2,
+                &format!(
+                    r#"
+try:
+    await h
+except outrig.{error} as e:
+    print(h.status.reason, len(str(e)), len(e.__cause__.message))
+"#
+                ),
+            );
+            // Limit errors add the endpoint description, but must retain the full diagnostic.
+            let words: Vec<_> = said.split_whitespace().collect();
+            assert_eq!(words[0], *reason);
+            assert!(words[1].parse::<usize>().unwrap() >= 200 << 10, "{said}");
+            assert_eq!(words[2].parse::<usize>().unwrap(), 4 * (200 << 10));
+        }
+    }
+}

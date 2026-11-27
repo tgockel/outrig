@@ -1976,7 +1976,7 @@ def _pushed(message):
 class OpenQuestion:
     """One question asked of a Session owner. Invalid answers leave it open.
 
-    `id`, `asker`, and `body` identify the question; `closed` marks withdrawal or
+    `id`, `asker`, `chain`, and `body` identify the question; `closed` marks withdrawal or
     settlement. `answer(Answer(...))`, `decline(reason)`, or `cancel()` settles it.
     A late answer raises RuntimeError. There is no automatic timeout. Cancellation after
     sending a settlement waits for its receipt, updates closed on success, then propagates.
@@ -1986,6 +1986,7 @@ class OpenQuestion:
         self._session = session
         self.id = message["request"]
         self.asker = message["asker"]
+        self.chain = list(message.get("chain", []))
         self.body = schema.declare(Question).decode(message["body"])
         self.closed = False
 

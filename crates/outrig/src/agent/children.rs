@@ -146,6 +146,8 @@ struct State {
     agents: HashMap<String, Node>,
     /// Every request made of a child, by id.
     requests: BTreeMap<u64, Record>,
+    /// Child-to-parent questions, retained for attribution and settlement notices.
+    questions: BTreeMap<u64, ChildQuestion>,
     /// How many children have been launched: the next is `c` and one more.
     launched: u64,
     /// What closed the session's admission, once something has.
@@ -168,6 +170,13 @@ struct State {
     /// lines can arrive in either order. Kept, by the request's id, until the request is heard
     /// of ([`State::record`]); one never heard of stays, for as long as the session does.
     early: HashMap<u64, Value>,
+}
+
+struct ChildQuestion {
+    sender: String,
+    delegated: bool,
+    ended: bool,
+    observed: bool,
 }
 
 #[derive(Default)]
@@ -741,7 +750,17 @@ impl State {
     /// What `child` holds open: see [`Inner::summary`].
     fn summary(&self, child: &str, kind: ChildKind) -> Summary {
         let mut summary = Summary::default();
+        let asking = self.questions.iter().any(|(id, q)| {
+            !q.ended
+                && (q.sender == child
+                    || (q.delegated && self.requests.get(id).is_some_and(|r| r.child == child)))
+        });
         for (id, record) in self.requests.iter().filter(|(_, r)| r.child == child) {
+            if self.questions.get(id).is_some_and(|q| q.delegated)
+                || (asking && !self.questions.contains_key(id))
+            {
+                continue;
+            }
             match record.state {
                 Req::Unread => {
                     summary.unread.insert(*id);
@@ -754,6 +773,17 @@ impl State {
                 }
                 Req::Queued | Req::Ended(_) => {}
             }
+        }
+        // A work child answers its children before being nudged for its submission.
+        if summary
+            .unread
+            .iter()
+            .chain(&summary.taken)
+            .any(|id| self.questions.contains_key(id))
+        {
+            summary.unread.retain(|id| self.questions.contains_key(id));
+            summary.taken.retain(|id| self.questions.contains_key(id));
+            return summary;
         }
         if kind == ChildKind::Work {
             if summary.taken.is_empty() {
@@ -927,6 +957,16 @@ impl Inner {
                 }
             }
             "agent.request" => self.requested(agent, &line),
+            "agent.question.escalated" | "agent.question.forwarded" => {
+                self.question_hop(agent, &kind, &line);
+            }
+            "agent.question.observed" => {
+                if let Some(id) = line["request"].as_u64()
+                    && let Some(q) = self.state().questions.get_mut(&id)
+                {
+                    q.observed = true;
+                }
+            }
             "agent.call" => self.called(agent, &line),
             "agent.call.ended" => self.call_ended(&line),
             "agent.instance.collected"
@@ -1544,6 +1584,24 @@ impl Inner {
             result_type: text(&line["result"]["type"]),
             schema: text(&line["result"]["schema"]),
         });
+        if line["question"].as_bool() == Some(true) {
+            let chain: Vec<String> =
+                serde_json::from_value(line["chain"].clone()).unwrap_or_default();
+            self.state().questions.insert(
+                id,
+                ChildQuestion {
+                    sender: sender.to_string(),
+                    delegated: false,
+                    ended: false,
+                    observed: false,
+                },
+            );
+            self.events_of(sender).emit(Payload::QuestionAsked {
+                question: AgentRequestId::new(id),
+                body: line["body"].as_str().unwrap_or_default().to_string(),
+                chain,
+            });
+        }
         let early = self.state().record(
             id,
             Record {
@@ -1575,6 +1633,33 @@ impl Inner {
         if let Some(ended) = early {
             self.ended(&ended);
         }
+    }
+
+    fn question_hop(&self, agent: &str, kind: &str, line: &Value) {
+        let (Some(id), Some(hop)) = (line["request"].as_u64(), line["hop"].as_u64()) else {
+            return;
+        };
+        if let Some(q) = self.state().questions.get_mut(&id) {
+            q.delegated = true;
+        }
+        let (question, hop) = (AgentRequestId::new(id), AgentRequestId::new(hop));
+        let target = text(&line["target"]);
+        let chain = serde_json::from_value(line["chain"].clone()).unwrap_or_default();
+        self.events_of(agent).emit(if kind.ends_with("escalated") {
+            Payload::QuestionEscalated {
+                question,
+                hop,
+                target,
+                chain,
+            }
+        } else {
+            Payload::QuestionForwarded {
+                question,
+                hop,
+                target,
+                chain,
+            }
+        });
     }
 
     /// A typed call `caller`'s code made -- `@outrig.agent`'s -- whose child
@@ -1819,7 +1904,7 @@ impl Inner {
             return;
         };
         let outcome = RequestEnd::named(line["outcome"].as_str().unwrap_or_default());
-        let (child, attempts, rounds) = {
+        let (child, attempts, rounds, asker) = {
             let mut state = self.state();
             let Some(record) = state.requests.get_mut(&id) else {
                 state.ended_early(id, line);
@@ -1831,11 +1916,36 @@ impl Inner {
             }
             record.state = Req::Ended(outcome);
             let ended = (record.child.clone(), record.attempts, record.rounds.clone());
-            if let Some(node) = state.child(&ended.0) {
-                node.wake.notify_one();
+            let asker = state.questions.get_mut(&id).map(|q| {
+                q.ended = true;
+                q.sender.clone()
+            });
+            // Publish every part of the scheduling predicate before either runner wakes.
+            for agent in std::iter::once(ended.0.as_str()).chain(asker.as_deref()) {
+                if let Some(node) = state.child(agent) {
+                    node.wake.notify_one();
+                }
             }
-            ended
+            (ended.0, ended.1, ended.2, asker)
         };
+        if let Some(asker) = asker {
+            let question = AgentRequestId::new(id);
+            let event = match outcome {
+                RequestEnd::Accepted => Payload::QuestionAnswered {
+                    question,
+                    answer: line.get("answer").filter(|v| !v.is_null()).cloned(),
+                },
+                RequestEnd::Failed | RequestEnd::Rejected => Payload::QuestionDeclined {
+                    question,
+                    reason: line["message"].as_str().unwrap_or_default().to_string(),
+                },
+                _ => Payload::QuestionCancelled {
+                    question,
+                    reason: line["outcome"].as_str().unwrap_or_default().to_string(),
+                },
+            };
+            self.events_of(&asker).emit(event);
+        }
         let events = self.events_of(&child);
         let request = AgentRequestId::new(id);
         match outcome {
@@ -1925,7 +2035,11 @@ impl Inner {
         if kind == ChildKind::Work && state.summary(child, kind).is_empty() {
             // The latest, so an older acceptance does not vouch for a
             // submission that was rejected or cancelled after it.
-            if let Some((id, record)) = state.requests.iter().rev().find(|(_, r)| r.child == child)
+            if let Some((id, record)) = state
+                .requests
+                .iter()
+                .rev()
+                .find(|(_, r)| r.child == child && r.channel.is_none())
                 && record.state == Req::Ended(RequestEnd::Accepted)
             {
                 return Some(RoundStop::Accepted { submission: *id });
@@ -1988,6 +2102,22 @@ impl Inner {
                 }
                 channels
             });
+        // A work child has no declared request channels, but can owe its own children answers.
+        let delivered = state
+            .requests
+            .values()
+            .filter(|r| r.child == child && r.channel.as_deref() == Some("__child_questions"))
+            .count() as u64;
+        if delivered > 0 {
+            channels.insert(
+                "__child_questions".to_string(),
+                Counts {
+                    pending: 0,
+                    delivered,
+                    requests: true,
+                },
+            );
+        }
         for record in state
             .requests
             .values()
@@ -1999,16 +2129,38 @@ impl Inner {
                 counts.pending += 1;
             }
         }
+        let ended = state
+            .questions
+            .values()
+            .filter(|q| q.sender == child && q.ended)
+            .count() as u64;
+        let unread = state
+            .questions
+            .values()
+            .filter(|q| q.sender == child && q.ended && !q.observed)
+            .count();
+        if ended > 0 {
+            channels.insert(
+                crate::harness::QUESTION_CHANNEL.to_string(),
+                Counts {
+                    pending: unread,
+                    delivered: ended,
+                    requests: false,
+                },
+            );
+        }
         channels
     }
 
     /// Each request `child` took and has not answered: its id, its channel,
     /// and how long ago it was taken.
     pub(crate) fn taken(&self, child: &str) -> Vec<(u64, String, Duration)> {
-        self.state()
+        let state = self.state();
+        let live = state.summary(child, ChildKind::Request);
+        state
             .requests
             .iter()
-            .filter(|(_, record)| record.child == child)
+            .filter(|(id, record)| record.child == child && live.taken.contains(id))
             .filter_map(|(id, record)| match (record.state, &record.channel) {
                 (Req::Received(at), Some(channel)) => Some((*id, channel.clone(), at.elapsed())),
                 _ => None,
@@ -2029,6 +2181,26 @@ impl Inner {
             .filter(|(_, counts)| counts.pending > 0)
             .map(|(channel, _)| channel)
             .collect()
+    }
+
+    /// One lock-consistent view of runnable work, question obligations, and resumptions.
+    pub(crate) fn scheduling(&self, child: &str, kind: ChildKind) -> (Summary, bool, usize) {
+        let state = self.state();
+        let live = state.summary(child, kind);
+        let answering = live
+            .held()
+            .iter()
+            .any(|id| state.questions.contains_key(id));
+        let resumed = state
+            .questions
+            .iter()
+            .filter(|(id, q)| {
+                q.ended
+                    && (q.sender == child
+                        || state.requests.get(id).is_some_and(|r| r.child == child))
+            })
+            .count();
+        (live, answering, resumed)
     }
 
     /// The submission request `id` is.
@@ -2176,24 +2348,15 @@ impl Inner {
         self.state().say(child, |_| Some(state));
     }
 
-    /// `child`'s runner found it holding nothing, and waits for a change: it is
-    /// idle. Decided under the lock a request is recorded under: one recorded
-    /// since the runner looked keeps the child as it is, its arrival having
-    /// woken the runner to open its round.
+    /// `child`'s runner found no runnable obligations and waits for a change.
+    /// Suspended submissions can remain open. Recheck under the registry lock: an arrival
+    /// or resumption since the runner looked keeps it running and has already woken it.
     pub(crate) fn idle(&self, child: &str) {
         let mut state = self.state();
-        let open: Vec<&Record> = state
-            .requests
-            .values()
-            .filter(|record| record.child == child && !matches!(record.state, Req::Ended(_)))
-            .collect();
-        // What arrived since the runner looked spans none of the child's rounds. One a round
-        // spanned is a request the runner nudged or warned about, and left open.
-        debug_assert!(
-            open.iter().all(|record| record.rounds.is_empty()),
-            "child {child} was to be idle holding a request its rounds spanned"
-        );
-        if !open.is_empty() {
+        let Some(kind) = state.child(child).map(|node| node.kind) else {
+            return;
+        };
+        if !state.summary(child, kind).is_empty() {
             return;
         }
         let Some(node) = state.child_mut(child) else {

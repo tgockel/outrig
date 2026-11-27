@@ -19,6 +19,10 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Added
 
+- Child questions route to `runtime.questions` on the parent, with explicit answers, declines,
+  escalation to the owner, forwarding to question-answering children, cancellation across hops,
+  attribution chains, and session-report hop rendering (#1070).
+
 - Typed owner questions: `runtime.ask`, `Question`, `Choice`, and `Answer`; structured background
   and file references, independent handles, validation and limits, Rust and Python owner APIs, lifecycle
   events, and question rendering in the session report (#1069).
@@ -1340,6 +1344,14 @@ without touching each other, from one ensured image. [The container facade besid
   remove the spelling.
 
 ### Fixed
+
+- Forced child-question terminations bound diagnostic previews without rejecting settlement;
+  oversized provider failures keep their typed error and full cause on the asker's handle (#1070).
+
+- Child questions suspend and resume work without consuming a stale warning or retaining a running
+  status while idle. Publish settlements atomically before waking either endpoint, preserve delegated
+  cancellation/release errors, reject oversized answers before committing them, and prevent an
+  asker released during construction from publishing a new question (#1070).
 
 - Keep question exception inspection non-observing: standard `asyncio.wait` with
   `FIRST_EXCEPTION` leaves unread notices intact until await/result acknowledges the decline.

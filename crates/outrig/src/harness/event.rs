@@ -1298,6 +1298,32 @@ pub enum Payload {
         question: AgentRequestId,
         /// Question JSON, bounded as a message body is.
         body: String,
+        /// Originating asker followed by intermediary agents.
+        chain: Vec<String>,
+    },
+    /// The subject escalated a child's question to its own answerer.
+    #[non_exhaustive]
+    QuestionEscalated {
+        /// Original question handle id.
+        question: AgentRequestId,
+        /// The delegated request handle id.
+        hop: AgentRequestId,
+        /// Parent agent id, or `user` for the session owner.
+        target: String,
+        /// Originating asker followed by intermediary agents.
+        chain: Vec<String>,
+    },
+    /// The subject forwarded a child's question to a request child.
+    #[non_exhaustive]
+    QuestionForwarded {
+        /// Original question handle id.
+        question: AgentRequestId,
+        /// The delegated request handle id.
+        hop: AgentRequestId,
+        /// Answering child agent id.
+        target: String,
+        /// Originating asker followed by intermediary agents.
+        chain: Vec<String>,
     },
     /// An explicit owner answer settled a question.
     #[non_exhaustive]
@@ -1881,6 +1907,8 @@ impl Payload {
             Payload::ChannelItemOutcome { .. } => "channel.item.outcome",
             Payload::ChannelItemResolved { .. } => "channel.item.resolved",
             Payload::QuestionAsked { .. } => "agent.question.asked",
+            Payload::QuestionEscalated { .. } => "agent.question.escalated",
+            Payload::QuestionForwarded { .. } => "agent.question.forwarded",
             Payload::QuestionAnswered { .. } => "agent.question.answered",
             Payload::QuestionDeclined { .. } => "agent.question.declined",
             Payload::QuestionCancelled { .. } => "agent.question.cancelled",

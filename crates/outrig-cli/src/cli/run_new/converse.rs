@@ -438,12 +438,16 @@ async fn drive(
                 match notice {
                     QuestionNotice::Asked(item) => {
                         if let (Some(id), Ok(question)) = (item.request, serde_json::from_value::<outrig::harness::Question>(item.body)) {
+                            let asker = if item.chain.is_empty() { item.sender } else { item.chain.join(" -> ") };
                             match view {
                                 Frontend::Screen(screen) => {
-                                    screen.question_entry(format!("Question #{} · {}", id, item.sender), format_question_body(&question));
-                                    screen.question(id, item.sender, question.clone());
+                                    screen.question_entry(format!("Question #{} · {}", id, asker), format_question_body(&question));
+                                    screen.question(id, asker, question.clone());
                                 }
-                                Frontend::Lines(_) => term.note(&format_question(id.get(), &question)),
+                                Frontend::Lines(_) => {
+                                    term.note(&format!("[outrig] question from {asker}"));
+                                    term.note(&format_question(id.get(), &question));
+                                }
                             }
                             questions_state.ids.insert(id.get(), id);
                             questions_state.open.insert(id.get(), question);

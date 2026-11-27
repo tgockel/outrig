@@ -45,7 +45,7 @@ use crate::harness::services::ServiceBrief;
 use crate::harness::skills::{Catalog, SkillBrief};
 use crate::harness::{ChannelKind, Direction, Wake};
 
-/// The question API for primary agents and owner-constructed roots.
+/// The question API every agent has; children ask their parents.
 const QUESTIONS: &str = "For a decision, prefer `h = runtime.ask(outrig.Question(text, \
     choices=[\"label\", outrig.Choice(\"another\", \"description\")], multiple=False, other=True))` \
     to a plain message. It returns a request handle at once; `await h` gives an `outrig.Answer` \
@@ -54,7 +54,17 @@ const QUESTIONS: &str = "For a decision, prefer `h = runtime.ask(outrig.Question
     Keep the prompt short; `context=outrig.QuestionContext(description=..., references=[\
     outrig.QuestionReference(path=..., line=..., end_line=..., description=...)])` adds longer \
     background and inert file references. There is no answer timeout: cancel a question you \
-    give up on with `h.cancel()`.\n\n";
+    give up on with `h.cancel()`. In a child, questions go to your parent; a primary or root \
+    asks the session owner.\n\n\
+    Questions from your children arrive on `runtime.questions`: `pending()` counts unread \
+    questions; `d = await runtime.questions.receive()` takes one with `id`, `body`, `sender`, \
+    and `chain`. Answer with `await d.answer(choices=..., text=...)` or `await d.answer(Answer(...))`; \
+    decline with `await d.decline(reason)`; `await d.escalate()` asks your own answerer; \
+    `await d.forward(child.channels[name])` asks your request child's Question/Answer channel. \
+    Delegation passes back the outcome and pauses your answer obligation. Questions open a \
+    round and wake `runtime.wait` with `MessageAvailable`: use it rather than bare-awaiting a \
+    child's result when that child might ask you something. Cancel at the originating handle \
+    to withdraw every hop.\n\n";
 
 /// What every agent is told first: how it acts.
 const ACT: &str = "You act on this project by writing Python. Your one tool, `submit_python`, runs \
@@ -500,12 +510,7 @@ pub(crate) fn child_preamble(
         let directive = matches!(brief, ChildBrief::Instance { skills, .. } if !skills.is_empty());
         text.push_str(&externals(external, directive));
     }
-    if external
-        .iter()
-        .any(|c| c.name == crate::harness::QUESTION_CHANNEL)
-    {
-        text.push_str(QUESTIONS);
-    }
+    text.push_str(QUESTIONS);
     let messages = announcing(external);
     // An inbound request channel of the session's owner brings requests, held to the same rule.
     let asked = external
@@ -1057,10 +1062,18 @@ pub(crate) fn requests_warning(outstanding: &str, unread_on: &[String]) -> (Stri
         "{NOT_A_WAIT} Answer a request with `await d.reply(value)`, or end one you cannot answer \
          with `await d.fail(message)`. "
     );
+    detail.push_str("For a child's question, use `await d.answer(choices=..., text=...)`, \
+        `await d.decline(reason)`, `await d.escalate()`, or `await d.forward(child.channels[name])`. ");
     if !unread_on.is_empty() {
         let receives: Vec<String> = unread_on
             .iter()
-            .map(|channel| format!("`await runtime.channels[{channel:?}].receive()`"))
+            .map(|channel| {
+                if channel == "__child_questions" {
+                    "`await runtime.questions.receive()`".to_string()
+                } else {
+                    format!("`await runtime.channels[{channel:?}].receive()`")
+                }
+            })
             .collect();
         let _ = write!(
             detail,
@@ -1088,9 +1101,13 @@ pub(crate) fn requests(unread: &str, taken: &[(u64, String, Duration)]) -> Strin
         parts.push(unread.to_string());
     }
     for (id, channel, waited) in taken {
+        let endpoint = if channel == "__child_questions" {
+            "runtime.questions".to_string()
+        } else {
+            format!("runtime.channels[{channel:?}]")
+        };
         parts.push(format!(
-            "you took request {id} from runtime.channels[{channel:?}] {} ago and have not \
-             answered it",
+            "you took request {id} from {endpoint} {} ago and have not answered it",
             human(*waited)
         ));
     }

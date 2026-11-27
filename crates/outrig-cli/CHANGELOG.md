@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `run-new` shows the full asker chain when a child's question is escalated to the owner,
+  in both screen and line modes (#1070).
+
 - `run-new` answers questions in a modal terminal dialog, with keyboard choice selection,
   free text and declines, draft-preserving deferral, Esc/Ctrl-Q set-aside and recall, and
   question/answer entries in scrollback. Line mode keeps its explicit `/answer` interface (#1071).

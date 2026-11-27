@@ -579,3 +579,389 @@ async fn a_stored_backend_reply_after_question_close_only_acknowledges_cleanup()
     assert_eq!(cancelled.len(), 1);
     assert_eq!(cancelled[0]["reason"], "closed");
 }
+
+/// A child's wait on its result must wake to answer its own child, not deadlock.
+#[tokio::test]
+async fn child_questions_escalate_through_two_parents_to_the_owner() {
+    use super::children_tests::{serving, tree_built};
+    let (backend, mut notices) = QuestionBackend::new();
+    let grandchild = r#"
+import outrig
+answer = await runtime.ask(outrig.Question('pick', choices=['a', 'b'], other=False,
+    context=outrig.QuestionContext(description='from grandchild')))
+await runtime.complete(answer)
+"#;
+    let child = r#"
+import outrig
+grandchild = await runtime.spawn('grandchild', prompt='ROLE grandchild')
+h = grandchild.submit({}, result=outrig.Answer)
+try: await runtime.wait({h}, timeout=20)
+except runtime.MessageAvailable:
+    d = await runtime.questions.receive()
+    print('child received', d.sender, d.chain)
+    await d.escalate()
+await runtime.complete(await h)
+"#;
+    let primary = r#"
+import outrig
+await runtime.channels['user'].receive()
+child = await runtime.spawn('child', prompt='ROLE child')
+h = child.submit({}, result=outrig.Answer)
+try: await runtime.wait({h}, timeout=20)
+except runtime.MessageAvailable:
+    d = await runtime.questions.receive()
+    print('primary received', d.sender, d.chain)
+    await d.escalate()
+a = await h
+print(a.choices, a.by, a.chain)
+"#;
+    let mut tree = tree_built(
+        "OUTRIG_TEST_CHILD_QUESTION_ESCALATION_KEY",
+        "",
+        vec![
+            ("ROLE grandchild", serving(grandchild)),
+            ("ROLE child", serving(child)),
+            ("", serving(primary)),
+        ],
+        None,
+        |b| b.question_backend(backend),
+    )
+    .await;
+    within(tree.session.user_channel().unwrap().send("go"))
+        .await
+        .unwrap();
+    let ch = tree.session.channel(QUESTION_CHANNEL).unwrap();
+    {
+        let round = tree.session.round();
+        tokio::pin!(round);
+        let item = tokio::select! {
+            notice = notices.recv() => match notice {
+                Some(QuestionNotice::Asked(item)) => item,
+                other => panic!("not asked: {other:?}"),
+            },
+            result = &mut round => panic!("round ended before escalating: {result:?}"),
+        };
+        assert_eq!(item.chain, vec!["c2", "c1", "primary"]);
+        assert_eq!(item.body["context"]["description"], "from grandchild");
+        within(ch.settle(
+            item.request.unwrap(),
+            Settle::Reply(json!({
+                "choices": ["b"], "text": null, "by": "user", "chain": []
+            })),
+        ))
+        .await
+        .unwrap();
+        within(&mut round).await.unwrap();
+    }
+    let (_, events, _) = tree.end().await;
+    assert!(
+        exec_outputs(&events, "agent/primary")
+            .concat()
+            .contains("['b'] user ['c2', 'c1', 'primary']")
+    );
+    assert_eq!(
+        data_of(&events, "agent.question.escalated", "agent/c1").len(),
+        1
+    );
+    assert_eq!(
+        data_of(&events, "agent.question.escalated", "agent/primary").len(),
+        1
+    );
+    assert_eq!(
+        data_of(&events, "agent.question.answered", "agent/c2").len(),
+        1
+    );
+}
+
+/// A request parent that ignores a question gets its warning and cancel, just as for a request.
+#[tokio::test]
+async fn ignored_child_questions_are_warned_then_cancelled() {
+    use super::children_tests::{serving, serving_each};
+    let mock_child = r#"
+import outrig
+h = runtime.ask(outrig.Question('unanswered'))
+try:
+    await h
+except outrig.RequestCancelled:
+    print('question cancelled by host')
+    await runtime.complete('cancelled')
+"#;
+    let parent_first = r#"
+child = await runtime.spawn('asker', prompt='ROLE asker')
+h = child.submit({}, result=str)
+try: await runtime.wait({h}, timeout=20)
+except runtime.MessageAvailable: pass
+"#;
+    let (tree, _app) = holding(
+        "OUTRIG_TEST_IGNORED_CHILD_QUESTION_KEY",
+        vec![
+            (
+                "ROLE inbox",
+                serving_each(vec![parent_first.into(), "print('ignoring')".into()]),
+            ),
+            ("ROLE asker", serving(mock_child)),
+        ],
+        |b| b,
+    )
+    .await;
+    // Constructed root's orienting round launches the child and leaves its question unread.
+    let root = constructed(&tree, holder(&[])).await;
+    within(root.ready()).await.unwrap();
+    tree.seen("agent.question.cancelled", 1).await;
+    tree.seen("agent.request.ended", 2).await;
+    let subject = format!("agent/{}", root.agent().unwrap());
+    let (_, events, requests) = tree.end().await;
+    assert!(
+        exec_outputs(&events, "agent/c2")
+            .concat()
+            .contains("question cancelled by host")
+    );
+    assert_eq!(
+        data_of(&events, "agent.question.cancelled", "agent/c2")[0]["reason"],
+        "cancelled"
+    );
+    assert!(requests.iter().any(|r| {
+        r.body
+            .to_string()
+            .contains("your last round ended with requests unanswered")
+    }));
+    assert!(!data_of(&events, "agent.request.cancelled", &subject).is_empty());
+}
+
+#[tokio::test]
+async fn a_work_child_can_end_its_round_with_a_question_open() {
+    use super::children_tests::{serving, serving_each};
+    let parent = r#"
+child = await runtime.spawn('asker', prompt='ROLE asker')
+h = child.submit({}, result=str)
+d = await runtime.questions.receive()
+await d.answer(text='continue')
+print(await h)
+"#;
+    let (tree, _app) = holding(
+        "OUTRIG_TEST_CHILD_QUESTION_REST_KEY",
+        vec![
+            ("ROLE inbox", serving(parent)),
+            (
+                "ROLE asker",
+                serving_each(vec![
+                    "import outrig; h = runtime.ask(outrig.Question('pause')); print('asked')"
+                        .into(),
+                    "a = await h; await runtime.complete(a.text)".into(),
+                ]),
+            ),
+        ],
+        |b| b,
+    )
+    .await;
+    let root = constructed(&tree, holder(&[])).await;
+    within(root.ready()).await.unwrap();
+    let subject = format!("agent/{}", root.agent().unwrap());
+    let (_, events, _) = tree.end().await;
+    assert!(
+        exec_outputs(&events, &subject)
+            .concat()
+            .contains("continue")
+    );
+    assert!(data_of(&events, "agent.question.cancelled", "agent/c2").is_empty());
+}
+
+#[tokio::test]
+async fn a_decorated_one_call_child_closes_questions_it_leaves_open() {
+    use super::children_tests::{primary_runs, serving, tree};
+    let mut tree = tree(
+        "OUTRIG_TEST_CALL_CHILD_QUESTION_CLOSE_KEY", "",
+        vec![("ROLE onecall", serving("import outrig; q = runtime.ask(outrig.Question('left open')); await runtime.complete('done')")),
+             ("", primary_runs(r#"
+import outrig
+await runtime.channels['user'].receive()
+@outrig.agent
+async def once() -> str:
+    "ROLE onecall"
+print(await once())
+print(runtime.questions.pending())
+"#))],
+    ).await;
+    within(tree.session.user_channel().unwrap().send("go"))
+        .await
+        .unwrap();
+    within(tree.session.round()).await.unwrap();
+    let (_, events, _) = tree.end().await;
+    assert_eq!(exec_outputs(&events, "agent/primary").concat(), "done\n0\n");
+    assert_eq!(
+        data_of(&events, "agent.question.cancelled", "agent/c1")[0]["reason"],
+        "closed"
+    );
+}
+
+/// Delay the answer until after the worker has actually gone idle. The older test could
+/// answer before the worker ended its round and never exercised the suspended interval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_question_resumptions_survive_idle_and_the_warning_baseline() {
+    use super::children_tests::{serving, serving_each};
+    for in_warning in [false, true] {
+        let parent = r#"
+child = await runtime.spawn('asker', prompt='ROLE asker')
+h = child.submit({}, result=str)
+d = await runtime.questions.receive()
+while h.status.child != 'idle':
+    await asyncio.sleep(0.001)
+print('worker suspended')
+await d.answer(text='resumed')
+print(await h)
+"#;
+        let ask =
+            "import outrig; q = runtime.ask(outrig.Question('pause')); print('asked')".to_string();
+        let finish =
+            "print('resumption round'); await runtime.complete((await q).text)".to_string();
+        let sources = if in_warning {
+            vec![
+                "print('initial round')".into(),
+                "print('nudge round')".into(),
+                ask,
+                finish,
+            ]
+        } else {
+            vec![ask, finish]
+        };
+        let (tree, _app) = holding(
+            "OUTRIG_TEST_CHILD_QUESTION_DELAY_KEY",
+            vec![
+                ("ROLE inbox", serving(parent)),
+                ("ROLE asker", serving_each(sources)),
+            ],
+            |b| b,
+        )
+        .await;
+        let root = constructed(&tree, holder(&[])).await;
+        within(root.ready()).await.unwrap();
+        let subject = format!("agent/{}", root.agent().unwrap());
+        let (_, events, _) = tree.end().await;
+        assert!(
+            exec_outputs(&events, &subject)
+                .concat()
+                .contains("worker suspended\nresumed\n")
+        );
+        assert!(
+            exec_outputs(&events, "agent/c2")
+                .concat()
+                .contains("resumption round")
+        );
+        assert!(data_of(&events, "agent.request.cancelled", "agent/c2").is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_question_delegators_resume_on_the_terminal_wake_alone() {
+    use super::children_tests::{serving, serving_each};
+    use crate::harness::{AgentState, RosterState};
+    use crate::python::testing::Flag;
+    for _ in 0..3 {
+        let gate = Flag::new();
+        let parent = format!(
+            r#"
+worker = await runtime.spawn('delegator', prompt='ROLE delegator', inputs={{'gate': {}}})
+print(await worker.submit({{}}, result=str))
+"#,
+            gate.py()
+        );
+        let delegator = r#"
+import outrig
+expert = await runtime.spawn('expert', prompt='ROLE expert', inputs={'gate': gate},
+    requests={'q': (outrig.Question, outrig.Answer)})
+asker = await runtime.spawn('asker', prompt='ROLE asker')
+h = asker.submit({}, result=outrig.Answer)
+d = await runtime.questions.receive()
+relay = asyncio.create_task(d.forward(expert.channels['q']))
+await asyncio.sleep(0)
+"#;
+        let expert = format!(
+            "import outrig\nd = await runtime.channels['q'].receive()\n{}\nawait d.reply(outrig.Answer(text='terminal wake'))",
+            gate.awaited()
+        );
+        let (tree, _app) = holding(
+            "OUTRIG_TEST_DELEGATOR_WAKE_KEY",
+            vec![("ROLE inbox", serving(&parent)),
+                 ("ROLE delegator", serving_each(vec![delegator.into(),
+                    "await relay; await runtime.complete((await h).text)".into()])),
+                 ("ROLE expert", serving(&expert)),
+                 ("ROLE asker", serving("import outrig; a = await runtime.ask(outrig.Question('help')); await runtime.complete(a)"))],
+            |b| b,
+        ).await;
+        let root = constructed(&tree, holder(&[])).await;
+        tree.seen("agent.question.forwarded", 1).await;
+        within(async {
+            loop {
+                if tree.session.roster().agents.iter().any(|a| {
+                    a.name.as_deref() == Some("delegator")
+                        && matches!(&a.state, Some(RosterState::Agent(AgentState::Idle { .. })))
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        gate.raise();
+        within(root.ready()).await.unwrap();
+        let subject = format!("agent/{}", root.agent().unwrap());
+        let (_, events, _) = tree.end().await;
+        assert!(
+            exec_outputs(&events, &subject)
+                .concat()
+                .contains("terminal wake")
+        );
+    }
+}
+
+#[tokio::test]
+async fn child_question_owner_cancellation_is_not_a_decline() {
+    use super::children_tests::serving;
+    let (backend, mut notices) = QuestionBackend::new();
+    let parent = r#"
+child = await runtime.spawn('asker', prompt='ROLE asker')
+h = child.submit({}, result=str)
+d = await runtime.questions.receive()
+await d.escalate()
+print(await h)
+"#;
+    let asker = r#"
+import outrig
+try:
+    await runtime.ask(outrig.Question('cancel me'))
+except outrig.RequestCancelled:
+    await runtime.complete('owner cancelled')
+"#;
+    let (tree, _app) = holding(
+        "OUTRIG_TEST_ESCALATED_CANCEL_KEY",
+        vec![
+            ("ROLE inbox", serving(parent)),
+            ("ROLE asker", serving(asker)),
+        ],
+        |b| b.question_backend(backend),
+    )
+    .await;
+    let root = constructed(&tree, holder(&[])).await;
+    let Some(QuestionNotice::Asked(item)) = within(notices.recv()).await else {
+        panic!("not asked");
+    };
+    within(tree.session.channel(QUESTION_CHANNEL).unwrap().settle(
+        item.request.unwrap(),
+        Settle::Cancel("owner cancelled".into()),
+    ))
+    .await
+    .unwrap();
+    within(root.ready()).await.unwrap();
+    let subject = format!("agent/{}", root.agent().unwrap());
+    let (_, events, _) = tree.end().await;
+    assert!(
+        exec_outputs(&events, &subject)
+            .concat()
+            .contains("owner cancelled")
+    );
+    assert_eq!(
+        data_of(&events, "agent.question.cancelled", "agent/c2")[0]["reason"],
+        "cancelled"
+    );
+    assert!(data_of(&events, "agent.question.declined", "agent/c2").is_empty());
+}

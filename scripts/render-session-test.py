@@ -643,6 +643,8 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             a,
         ),
         ("agent.question.asked", {"question": 17, "body": '{"text":"pick", "choices":[{"label":"A", "description":"first"}]}'}, a),
+        ("agent.question.escalated", {"question": 17, "hop": 20, "target": "user", "chain": ["c1", "primary"]}, a),
+        ("agent.question.forwarded", {"question": 17, "hop": 21, "target": "c2", "chain": ["c1", "primary"]}, a),
         ("agent.question.answered", {"question": 17, "answer": {"choices": ["A"], "text": None, "by": "user", "chain": []}}, a),
         ("agent.question.declined", {"question": 18, "reason": "not relevant"}, a),
         ("agent.question.cancelled", {"question": 19, "reason": "closed"}, a),
@@ -1791,6 +1793,24 @@ class RenderSession(unittest.TestCase):
         session_section = html[html.index('id="agent-0"') : html.index('id="agent-1"')]
         self.assertIn("backend (from alice) -&gt; none on inbox: first", session_section)
         self.assertIn("channel inbox closed: peer gone", session_section)
+
+    def test_child_question_hops_show_chain_and_outcome(self) -> None:
+        events = ordinary()
+        a = "agent/primary"
+        events[1:1] = [
+            ("agent.question.asked", {"question": 71, "body": '{"text":"which?"}',
+                                      "chain": ["c2", "c1"]}, a),
+            ("agent.question.escalated", {"question": 71, "hop": 72, "target": "user",
+                                          "chain": ["c2", "c1", "primary"]}, a),
+            ("agent.question.forwarded", {"question": 73, "hop": 74, "target": "c3",
+                                          "chain": ["c2", "primary"]}, a),
+            ("agent.question.answered", {"question": 71, "answer": {"text": "yes",
+                                          "by": "user", "chain": ["c2", "c1", "primary"]}}, a),
+        ]
+        html = self.page(events)
+        for expected in ["asker chain", "c2 -&gt; c1 -&gt; primary", "escalated to user as 72",
+                         "forwarded to c3 as 74", "question 71: answered"]:
+            self.assertIn(expected, html)
 
     def test_a_message_uncertain_at_the_close_is_in_the_shutdown_summary(self) -> None:
         """A message whose send was uncertain when admission closed is not one of the close's

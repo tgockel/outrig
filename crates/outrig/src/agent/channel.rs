@@ -278,6 +278,14 @@ pub(crate) fn announcement(channels: &Channels) -> Option<String> {
         .iter()
         .filter(|(_, counts)| counts.pending > 0)
         .map(|(channel, counts)| {
+            if channel == "__child_questions" {
+                let verb = if counts.pending == 1 {
+                    "question is"
+                } else {
+                    "questions are"
+                };
+                return format!("{} {verb} waiting on runtime.questions", counts.pending);
+            }
             if channel == crate::harness::QUESTION_CHANNEL {
                 return format!(
                     "{} question handle(s) settled; inspect them with await or result()",

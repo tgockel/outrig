@@ -631,7 +631,7 @@ pub(crate) async fn run(
             Some(notice) = questions.recv() => {
                 use crate::harness::QuestionNotice;
                 let line = match notice {
-                    QuestionNotice::Asked(item) => json!({"t": "question.asked", "session": handle, "request": item.request, "asker": item.sender, "body": item.body}),
+                    QuestionNotice::Asked(item) => json!({"t": "question.asked", "session": handle, "request": item.request, "asker": item.sender, "chain": item.chain, "body": item.body}),
                     QuestionNotice::Withdrawn(notice) => json!({"t": "question.closed", "session": handle, "request": notice.request}),
                     QuestionNotice::Settled(notice) => json!({"t": "question.closed", "session": handle, "request": notice.request}),
                 };

@@ -808,6 +808,8 @@ class Builder:
         except (ValueError, TypeError, RecursionError):
             q = {}
         parts = [Part("question", text(q.get("text", body)), True), Part("question data", body)]
+        if d.get("chain"):
+            parts.append(Part("asker chain", " -> ".join(map(text, seq(d.get("chain")))), True))
         for n, choice in enumerate(objs(q.get("choices")), 1):
             parts.append(Part(f"choice {n}: {text(choice.get('label'))}",
                               text(choice.get("description")), True))
@@ -825,6 +827,23 @@ class Builder:
         row = self.add(f"question {qid} asked by {self.label(self.subject)}",
                        anchor=anchor("question", qid), parts=parts)
         self.questions[qid] = (row, self.instant)
+
+    def question_hop(self, d: dict, kind: str) -> None:
+        qid, hop = key(d.get("question")), key(d.get("hop"))
+        chain = " -> ".join(map(text, seq(d.get("chain"))))
+        parts = [Part("asker chain", chain, True),
+                 Part("delegated request", hop, True)]
+        self.add(f"question {qid} {kind} to {text(d.get('target'))} as {hop}",
+                 href=link(anchor("question", qid)), parts=parts)
+        start = self.questions.get(qid)
+        if start is not None:
+            start[0].parts.append(Part(kind, f"{chain} -> {text(d.get('target'))}; request {hop}", True))
+
+    def on_agent_question_escalated(self, d: dict) -> None:
+        self.question_hop(d, "escalated")
+
+    def on_agent_question_forwarded(self, d: dict) -> None:
+        self.question_hop(d, "forwarded")
 
     def question_end(self, d: dict, outcome: str) -> None:
         qid = key(d.get("question"))

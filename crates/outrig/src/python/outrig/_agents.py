@@ -1295,6 +1295,8 @@ def _declare_class(cls):
                             f"which {wrap} would make it not; remove {wrap}")
         if type(value) is _Marked:
             name = f"{where}.{member}"
+            if member == "__child_questions":
+                raise TypeError(f"{name}: __child_questions is reserved for runtime.questions")
             if member == "user" or any(member in vars(c) for c in Agent.__mro__):
                 taken = "the user channel's" if member == "user" else "a member of outrig.Agent"
                 raise TypeError(f"{name}: a request channel cannot be named {member!r}, which is "

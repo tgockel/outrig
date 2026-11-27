@@ -1811,6 +1811,7 @@ pub outrig::harness::event::Payload::QuestionAnswered::answer: core::option::Opt
 pub outrig::harness::event::Payload::QuestionAnswered::question: outrig::harness::event::AgentRequestId
 #[non_exhaustive] pub outrig::harness::event::Payload::QuestionAsked
 pub outrig::harness::event::Payload::QuestionAsked::body: alloc::string::String
+pub outrig::harness::event::Payload::QuestionAsked::chain: alloc::vec::Vec<alloc::string::String>
 pub outrig::harness::event::Payload::QuestionAsked::question: outrig::harness::event::AgentRequestId
 #[non_exhaustive] pub outrig::harness::event::Payload::QuestionCancelled
 pub outrig::harness::event::Payload::QuestionCancelled::question: outrig::harness::event::AgentRequestId
@@ -1818,6 +1819,16 @@ pub outrig::harness::event::Payload::QuestionCancelled::reason: alloc::string::S
 #[non_exhaustive] pub outrig::harness::event::Payload::QuestionDeclined
 pub outrig::harness::event::Payload::QuestionDeclined::question: outrig::harness::event::AgentRequestId
 pub outrig::harness::event::Payload::QuestionDeclined::reason: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::QuestionEscalated
+pub outrig::harness::event::Payload::QuestionEscalated::chain: alloc::vec::Vec<alloc::string::String>
+pub outrig::harness::event::Payload::QuestionEscalated::hop: outrig::harness::event::AgentRequestId
+pub outrig::harness::event::Payload::QuestionEscalated::question: outrig::harness::event::AgentRequestId
+pub outrig::harness::event::Payload::QuestionEscalated::target: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::QuestionForwarded
+pub outrig::harness::event::Payload::QuestionForwarded::chain: alloc::vec::Vec<alloc::string::String>
+pub outrig::harness::event::Payload::QuestionForwarded::hop: outrig::harness::event::AgentRequestId
+pub outrig::harness::event::Payload::QuestionForwarded::question: outrig::harness::event::AgentRequestId
+pub outrig::harness::event::Payload::QuestionForwarded::target: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::QuestionRefused
 pub outrig::harness::event::Payload::QuestionRefused::question: outrig::harness::event::AgentRequestId
 pub outrig::harness::event::Payload::QuestionRefused::reason: alloc::string::String
@@ -2849,6 +2860,7 @@ pub outrig::harness::OpenWait::wait: u64
 #[non_exhaustive] pub struct outrig::harness::Outbound
 pub outrig::harness::Outbound::body: serde_json::value::Value
 pub outrig::harness::Outbound::body_type: alloc::string::String
+pub outrig::harness::Outbound::chain: alloc::vec::Vec<alloc::string::String>
 pub outrig::harness::Outbound::channel: alloc::string::String
 pub outrig::harness::Outbound::correlation: core::option::Option<alloc::string::String>
 pub outrig::harness::Outbound::item: outrig::harness::event::MessageId

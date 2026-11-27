@@ -55,7 +55,7 @@ class QuestionContext:
 
 @dataclass
 class Question:
-    """A decision for the session owner, asked with `h = runtime.ask(question)`.
+    """A decision for your parent (the session owner for a primary), asked with `runtime.ask`.
 
     Empty choices means free-form. Otherwise `multiple=False` permits one choice and
     `multiple=True` permits zero or more; `other=False` forbids additional text.
@@ -63,7 +63,7 @@ class Question:
     65,536 UTF-8 JSON bytes, and 32 open questions per asker, separate from requests-max.
     `context` optionally carries a QuestionContext: longer background text and file references,
     included in the same size bound. There is no answer timeout: cancel a question you give
-    up on. Children cannot ask yet.
+    up on. A child asks its parent; a primary asks the session owner.
     """
     text: str
     choices: list[Choice] = field(default_factory=list)
@@ -110,6 +110,29 @@ class Answer:
     text: str | None = None
     by: str = "application"
     chain: list[str] = field(default_factory=list)
+
+
+def _answer(question, answer):
+    """Validate and normalize an explicit answer without changing the question."""
+    import copy
+    if type(answer) is not Answer:
+        raise TypeError("answer must be an outrig.Answer")
+    if (type(answer.choices) is not list or any(type(c) is not str for c in answer.choices)
+            or (answer.text is not None and type(answer.text) is not str)):
+        raise TypeError("Answer needs string choices and optional string text")
+    labels = [c.label for c in question.choices]
+    if len(set(answer.choices)) != len(answer.choices) or any(c not in labels for c in answer.choices):
+        raise ValueError("unknown or duplicate choice")
+    if not question.multiple and len(answer.choices) > 1:
+        raise ValueError("a single-choice question takes at most one choice")
+    if question.choices and not question.other and answer.text is not None:
+        raise ValueError("this question does not accept free text (other=False)")
+    if ((not question.multiple or not question.choices) and not answer.choices
+            and (answer.text is None or not answer.text.strip())):
+        raise ValueError("an answer needs a choice or text")
+    answer = copy.deepcopy(answer)
+    answer.choices = [c for c in labels if c in answer.choices]
+    return answer
 
 
 import asyncio

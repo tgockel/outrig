@@ -683,6 +683,8 @@ pub struct Outbound {
     pub body_type: String,
     /// The agent that sent it, as the interpreter's protocol names it.
     pub sender: String,
+    /// For an escalated question, originating asker followed by intermediary agents.
+    pub chain: Vec<String>,
     /// An id it answers or follows, if any.
     pub correlation: Option<String>,
     /// The backend's reference for it, if one is already known.
@@ -1154,6 +1156,7 @@ pub(crate) fn check(
         let why = super::services::name_taken(name, "channel", declared, earlier)
             .or_else(|| match name.as_str() {
                 "user" => Some("takes the name of the primary agent's user channel".to_string()),
+                "__child_questions" => Some("takes runtime.questions' reserved name".to_string()),
                 super::QUESTION_CHANNEL => {
                     Some("takes the reserved question route's name".to_string())
                 }
@@ -2379,11 +2382,23 @@ impl Table {
                 None => tracing::warn!("ignored a consumed notice naming no delivery: {line}"),
             },
             "channel.send" => match line["id"].as_u64() {
-                Some(ask) => self.send(&agent, Waiter::Send(ask), &channel, line["body"].take()),
+                Some(ask) => self.send(
+                    &agent,
+                    Waiter::Send(ask),
+                    &channel,
+                    line["body"].take(),
+                    Vec::new(),
+                ),
                 None => tracing::warn!("ignored a send with no id: {line}"),
             },
             "channel.request" => match line["id"].as_u64() {
-                Some(id) => self.send(&agent, Waiter::Request(id), &channel, line["body"].take()),
+                Some(id) => self.send(
+                    &agent,
+                    Waiter::Request(id),
+                    &channel,
+                    line["body"].take(),
+                    serde_json::from_value(line["chain"].take()).unwrap_or_default(),
+                ),
                 None => tracing::warn!("ignored a request with no id: {line}"),
             },
             "channel.withdraw" => match line["request"].as_u64() {
@@ -2873,7 +2888,17 @@ impl Table {
     /// on the answer, or a request, by its id -- as `waiter` says: given an id,
     /// recorded with the round it has open, and handed to the backend, or
     /// refused.
-    fn send(self: &Arc<Self>, agent: &str, waiter: Waiter, channel: &str, body: Value) {
+    fn send(
+        self: &Arc<Self>,
+        agent: &str,
+        waiter: Waiter,
+        channel: &str,
+        body: Value,
+        mut chain: Vec<String>,
+    ) {
+        if channel == super::QUESTION_CHANNEL {
+            chain.push(agent.to_string());
+        }
         let item = self.interpreter.mint().message();
         // Read before the channels' state is locked, as `push` reads the close.
         let round = self.rounds.get().and_then(|rounds| (rounds.round)(agent));
@@ -2984,6 +3009,7 @@ impl Table {
             events.emit_with(|| Payload::QuestionAsked {
                 question: AgentRequestId::new(id),
                 body: body.to_string(),
+                chain: chain.clone(),
             });
         }
         let (calls, body_type) = match decided {
@@ -3004,6 +3030,7 @@ impl Table {
             request,
             body_type,
             sender: agent.to_string(),
+            chain,
             correlation: None,
             reference: None,
             body,

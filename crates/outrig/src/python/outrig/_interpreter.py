@@ -3821,7 +3821,8 @@ class MessageAvailable(BaseException):
 
     def __init__(self, channels):
         self.channels = tuple(channels)
-        where = ", ".join(f"runtime.channels[{json.dumps(name)}]" for name in self.channels)
+        where = ", ".join("runtime.questions" if name == "__child_questions" else
+                          f"runtime.channels[{json.dumps(name)}]" for name in self.channels)
         super().__init__(
             f"input is waiting on {where}; it has not been read, and the wait cancelled nothing"
         )
@@ -4583,7 +4584,7 @@ class _Outbound(_RequestChannel):
         """
         return await super().resolve(request, operation)
 
-    def request(self, body):
+    def request(self, body, *, _chain=()):
         """Ask the channel's far end `body`, and return the request's handle at once.
 
         `await handle` gives the reply, built into the channel's reply type, or raises how the
@@ -4602,7 +4603,7 @@ class _Outbound(_RequestChannel):
         _refuse_closing()
         work = _Sent(self, kernel)
         line = {"t": "channel.request", "agent": kernel.agent, "id": work.id,
-                "channel": self._name}
+                "channel": self._name, "chain": list(_chain)}
         encoded = self._encoded(body, line, _encode_strict)
         with self._lock:
             if len(self._open) >= self._bound:
@@ -4966,10 +4967,13 @@ class Runtime:
         if type(question) is not Question:
             raise TypeError("runtime.ask takes an outrig.Question")
         question._validate()
-        endpoint = self._channels.get("__questions")
-        if endpoint is None:
-            raise RuntimeError("child questions are not supported yet")
+        endpoint = getattr(self._kernel, "_parent_questions", None) or self._channels.get("__questions")
         return endpoint.request(question)
+
+    @property
+    def questions(self):
+        """Your children's question inbox; see help(runtime.questions)."""
+        return self._kernel.questions
 
     async def spawn(self, name, *, prompt, model=None, inputs=None, requests=None,
                     model_requests=None):
@@ -5021,6 +5025,8 @@ class Runtime:
                 if type(channel) is not str or not channel:
                     raise ValueError(f"a request channel is named by a non-empty str, "
                                      f"not {channel!r}")
+                if channel == "__child_questions":
+                    raise ValueError("__child_questions is reserved for runtime.questions")
                 if channel == "user":
                     raise ValueError("'user' is the user channel's name, which no request channel "
                                      "may take")
@@ -5087,10 +5093,9 @@ class Runtime:
         none: a list naming one twice, or one you did not spawn or have released, is refused
         whole with `ValueError`.
 
-        Releasing a child ends what it holds: every request still open on it ends
-        `outrig.AgentReleased`, its own children are released the same way, its tasks are
-        cancelled and its kernel removed. A child whose code never yields cannot be stopped, and
-        stays, `wedged`, until the session ends. Returns once each has ended or been found wedged.
+        Releasing ends open requests with `outrig.AgentReleased`, releases descendants, cancels
+        tasks, and removes kernels. Non-yielding code stays `wedged` until the session ends.
+        Returns once each child has ended or been found wedged.
         """
         ids = []
         for child in children:
@@ -5157,8 +5162,8 @@ class Runtime:
         back, two sets, once the futures satisfy `return_when` -- `asyncio.FIRST_COMPLETED`,
         `FIRST_EXCEPTION`, or `ALL_COMPLETED` -- or once `timeout` seconds have passed. A timeout
         cancels nothing and raises no `TimeoutError`, so `done` may be empty; giving up on what is
-        still pending is a separate act. A task that failed is done, and its exception is in
-        `task.exception()` rather than raised here.
+        still pending is a separate act. A failed task's exception is in `task.exception()`,
+        not raised here.
 
         While a message waits unread on any channel, one there before the call included, it
         raises `runtime.MessageAvailable` instead, even if the futures are done as well. The
@@ -5269,7 +5274,9 @@ class Runtime:
             while True:
                 # Read again on each pass, so a channel added during the wait is watched from the
                 # next one on.
-                endpoints = list(self._channels.items())
+                endpoints = list(self._channels.items()) + [("__child_questions", self._kernel.questions)]
+                if hasattr(self._kernel, "_parent_questions"):
+                    endpoints.append(("__questions", self._kernel._parent_questions))
                 arrived = loop.create_future()
                 try:
                     # Input first, so it wins over futures that are done and a timeout that has
@@ -6886,6 +6893,261 @@ class RequestEndpoint(Endpoint):
         _wake_all(wake, self._name)
         return True
 
+@dataclasses.dataclass(frozen=True)
+class QuestionDelivery(Delivery):
+    """A child's question. Answer explicitly, decline, escalate, or forward it.
+
+    `id`, `body` (a copy of the Question), `sender` (the immediate child's id), and
+    `received_at` identify the delivery. `chain` lists askers from the originating child
+    through each intermediary.
+    Delegation remains active if the awaiting submission is interrupted; cancelling the
+    original question withdraws every delegated request. Invalid answers leave it open.
+    """
+    _work: object = dataclasses.field(default=None, repr=False, compare=False)
+
+    @property
+    def chain(self):
+        """The originating asker followed by intermediary agents, in order."""
+        return tuple(self._work.chain)
+
+    async def answer(self, answer=None, *, choices=None, text=None):
+        """Settle with Answer(...), or choices= and text=. Attribution is supplied here.
+
+        The complete encoded settlement must fit 1 MiB, whether or not observation is enabled.
+        An oversized answer raises ValueError and leaves the question open for a smaller answer.
+        """
+        from outrig._questions import Answer, _answer
+        if answer is not None and (choices is not None or text is not None):
+            raise TypeError("give an Answer or choices=/text=, not both")
+        answer = _answer(self._work.body, answer if answer is not None else
+                         Answer(choices=[] if choices is None else choices, text=text))
+        answer.by = self._work.child.id
+        answer.chain = list(self.chain)
+        await self._work.answer(answer)
+
+    async def decline(self, reason="not relevant"):
+        """Fail the child's handle with the reason; the preset is 'not relevant'."""
+        await self._work.fail(reason)
+
+    async def escalate(self):
+        """Ask your parent (or the session owner), passing its outcome back unchanged."""
+        return await self._delegate(None)
+
+    async def forward(self, target):
+        """Ask one of your request children's channels, passing its outcome back.
+
+        `target` is a channel declared with `outrig.Request(outrig.Question, outrig.Answer)`,
+        for example `expert.channels['questions']`. A reply must satisfy the original question;
+        cancellation and release keep their typed errors across relays. A failure or invalid
+        reply fails the original handle.
+        """
+        from outrig._questions import Question, Answer
+        if (type(target) is not ChildChannel or target.request_type is not Question
+                or target.reply_type is not Answer or target._child.parent is not _calling()):
+            raise TypeError("forward takes your child's Question/Answer channel")
+        return await self._delegate(target)
+
+    async def _delegate(self, target):
+        from outrig._questions import _answer
+        work = self._work
+        kernel = _sending_kernel("a delegated question")
+        if kernel is not work.child.kernel:
+            raise RuntimeError("only the receiving parent can delegate a question")
+        # Reserve the hop under the same lock as end(): no cancellation can miss it.
+        with work.lock:
+            if work.state in _ENDED:
+                raise work.refused()
+            if work.delegated is not None:
+                raise RuntimeError("this question has already been delegated")
+            if target is None:
+                route = getattr(kernel, "_parent_questions", None) or kernel.channels["__questions"]
+                handle = route.request(work.body, _chain=work.chain)
+                kind, to = "escalated", (kernel.child.parent.agent if kernel.child is not None
+                                         and kernel.child.parent is not _OWNER else "user")
+            else:
+                handle = target.request(work.body)
+                kind, to = "forwarded", target._child.id
+            work.delegated = handle
+            _notify({"t": "agent.question." + kind, "agent": kernel.agent,
+                     "request": work.id, "hop": handle.id, "target": to,
+                     "chain": work.chain + [kernel.agent]})
+        async def relay():
+            try:
+                answer = _answer(work.body, await handle)
+                # Preserve the actual answerer; the intermediary is not the author.
+                answer.chain = work.chain + [kernel.agent] + [
+                    a for a in answer.chain if a not in work.chain + [kernel.agent]]
+                await work.answer(answer)
+            except BaseException as error:
+                if work.state not in _ENDED:
+                    delegated = handle._work
+                    with delegated.lock:
+                        inherited = delegated.state in _ENDED and delegated.error is error
+                        reason = delegated.reason if inherited else "failed"
+                    work.end(reason, error=error if inherited else
+                             _agents.AgentRequestFailed(str(error)),
+                             message=_agents.cut(str(error)))
+        task = asyncio.create_task(relay(), name="question relay")
+        return await asyncio.shield(task)
+
+
+class _ChildQuestion(_Work):
+    def __init__(self, route, sender, body, chain):
+        from outrig._questions import Answer
+        super().__init__(route, sender, "request", "__child_questions", copy.deepcopy(body),
+                         _contract(Answer, "question answer")[1], 3)
+        self.chain = list(chain) + [sender.agent]
+        self.delegated = None
+
+    def observed(self):
+        with self.child._lock:
+            self.child._unread.discard(self.id)
+        _notify({"t": "agent.question.observed", "agent": self.sender.agent,
+                 "request": self.id})
+
+    def end(self, reason, **kwargs):
+        value = kwargs.get("value")
+        kwargs["answer"] = dataclasses.asdict(value) if value is not None else None
+        ended = super().end(reason, **kwargs)
+        if ended:
+            with self.lock:
+                delegated = self.delegated
+            if delegated is not None and delegated.status.state not in _ENDED:
+                # Work cancellation is thread-safe, including owner withdrawal. Do not wait
+                # for the parent's loop: it may be blocked or already ended.
+                delegated.cancel()
+        return ended
+
+    def _notice(self, reason, error, reply, said):
+        if not self.recorded:
+            return None
+        notice = super()._notice(reason, error, reply, said)
+        if reason is None:
+            # An answer can be retried with less data. Check before committing it, with the
+            # same bound without observation, so observation changes no outcomes.
+            _refuse_long(notice, "question settlement", "answer with less")
+        elif len(_encode(notice)) > MESSAGE_MAX:
+            # A forced end cannot be retried with a smaller answer. Fall back to diagnostic
+            # previews, keeping the full typed error and cause on the handle. Leave notices
+            # that already fit unchanged, including existing truncation markers.
+            for field in ("message", "cause", "error"):
+                if type(notice.get(field)) is str:
+                    notice[field] = _agents.cut(notice[field])
+        if reason is not None or not _observing:
+            notice["answer"] = None
+        return notice
+
+
+
+class _ParentQuestions(Endpoint):
+    """A child's fixed route to its parent, independently bounded from requests-max."""
+    state = None
+    def __init__(self, kernel):
+        from outrig._questions import Question
+        super().__init__(kernel.agent, "__questions", receives=(), sends=Question)
+        self._sender = kernel
+        self.kernel = kernel.child.parent
+        self.id = self.kernel.agent
+        self._open = set()
+        self._unread = set()
+        self._ends = 0
+
+    def request(self, body, *, _chain=()):
+        from outrig._questions import Question, QuestionHandle, QUESTIONS_MAX
+        _refuse_closing()
+        if type(body) is not Question:
+            raise TypeError("runtime.ask takes an outrig.Question")
+        body._validate()
+        with self._lock:
+            if len(self._open) >= QUESTIONS_MAX:
+                raise _agents.AgentLimitReached(f"open questions limit ({QUESTIONS_MAX}) reached")
+            work = _ChildQuestion(self, self._sender, body, _chain)
+            self._open.add(work.id)
+        with _works_lock:
+            closed = self._sender.ended
+            if not closed:
+                _works[work.id] = work
+                work.recorded = True
+                # Release uses the same lock: it either prevents publication entirely or
+                # sees this request after its asked notice, never between those steps.
+                _notify({"t": "agent.request", "agent": self._sender.agent, "request": work.id,
+                         "child": self.id, "channel": "__child_questions", "attempts": 3,
+                         "body": json.dumps(dataclasses.asdict(body), ensure_ascii=False)
+                         if _observing else None, "question": True, "chain": work.chain})
+        if closed:
+            work.end("closed", error=_agents.AgentReleased("the asker has ended"))
+            return QuestionHandle(work)
+        if not self.kernel.questions._put(work):
+            work.end("closed", error=_agents.AgentReleased("the parent has ended"))
+        return QuestionHandle(work)
+
+    def withdraw(self, work):
+        return self.kernel.questions._withdraw(work)
+
+    def settled(self, work):
+        with self._lock:
+            self._open.discard(work.id)
+            if not work.recorded:
+                return
+            self._unread.add(work.id)
+            self._ends += 1
+            wake = list(self._receivers)
+        _wake_all(iter(wake), self._name)
+
+    def _counts(self):
+        with self._lock:
+            return {"pending": len(self._unread), "delivered": self._ends, "requests": False}
+
+    def _watch(self, waiter):
+        with self._lock:
+            if self._unread:
+                return True
+            self._receivers.append(waiter)
+            return False
+
+
+class QuestionEndpoint(RequestEndpoint):
+    """`runtime.questions`, the inbox for questions from your children.
+
+    Separate from `runtime.channels`: `pending()` counts unread questions, and
+    `d = await runtime.questions.receive()` takes one. Arrivals open a round, are announced
+    as questions, and wake `runtime.wait` with `MessageAvailable`. Use `runtime.wait`, not
+    a bare await of a child's result, when that child might ask you something.
+
+    A parent that leaves a question unread or unanswered gets the ordinary unanswered-request
+    warning round, then a host cancel; the child receives `outrig.RequestCancelled`.
+    Delegation pauses that obligation while its hop is open. Cancelling the originating handle
+    withdraws every hop, including an owner question. Interrupting code awaiting delegation
+    does not withdraw it: explicitly cancel the original question to give up.
+
+    A child can end a round with its question open and remain `idle`; the handle shows the
+    question's state. Its ordinary answer obligations pause while it awaits an answer.
+    Questions have their own bound of 32 open per asker, separate from `requests-max`.
+    Decorated one-call children close questions left open when their call ends. Releasing either
+    asker or answerer closes the question.
+    """
+    def __init__(self, agent):
+        from outrig._questions import Question, Answer
+        super().__init__(agent, "__child_questions", _Channel(Question, Answer, None, None, None))
+
+    def _take(self):
+        return Endpoint._take(self)
+
+    async def receive(self):
+        """Take the next child's question, waiting until one arrives.
+
+        The returned delivery identifies its sender and asker chain; answer, decline, escalate,
+        or forward it. Your children can ask even during your instance's first round.
+        """
+        work = await self._when(self._receivers, self._take)
+        with work.lock:
+            if work.state == "waiting":
+                work.state = "received"
+        _notify({"t": "agent.received", "agent": self._agent, "request": work.id})
+        return QuestionDelivery(work.id, copy.deepcopy(work.body), work.sender.agent,
+                                datetime.datetime.now(datetime.timezone.utc), work)
+
+
 class Kernel:
     """One agent's execution environment: its namespace, its loop, its slot, its backlog."""
 
@@ -6982,6 +7244,12 @@ class Kernel:
         else:
             self.channels = {"progress": _ProgressOut(agent, child)}
             runtime = WorkRuntime
+        # Every parent has one inbox. Keep it across adoption of an agent-class root.
+        if not hasattr(self, "questions"):
+            self.questions = QuestionEndpoint(agent)
+        if child is not None and child.parent is not _OWNER:
+            if not hasattr(self, "_parent_questions"):
+                self._parent_questions = _ParentQuestions(self)
         # The session's channels it holds, beside its own, whose names `_claim` kept apart.
         self.channels.update(self.externals)
         if self.facilities is not None:
@@ -7255,9 +7523,10 @@ class Kernel:
         finish, or after a second, after which its thread says so and is gone.
         A loop that never turns -- code that never yields -- never stops, and its thread runs on.
         """
-        if self.ended:
-            return
-        self.ended = True
+        with _works_lock:
+            if self.ended:
+                return
+            self.ended = True
         # The session's channels it held are unheld from now on, what waits on each kept for the
         # next kernel to take it.
         # A detach of one the host never heard it take, it ignores. A request channel's
@@ -7269,6 +7538,13 @@ class Kernel:
             _unclaim(self.externals.values())
             for name in self.externals:
                 _notify({"t": "channel.detached", "agent": self.agent, "channel": name})
+        # Questions owed by this parent or sent by this child end with either kernel.
+        with _works_lock:
+            questions = [w for w in _works.values() if type(w) is _ChildQuestion
+                         and (w.sender is self or w.child.kernel is self)]
+        for work in questions:
+            work.end("closed", error=_agents.AgentReleased("the asking or answering agent ended"))
+            work.forget()
         child = self.child
         # An agent class instance's child whose spawn is unanswered leaves what was asked of it
         # to that answer.
@@ -8938,6 +9214,12 @@ def _pending(kernel, request_id, _):
         for name, endpoint in kernel.channels.items()
         if endpoint._counted
     }
+    if hasattr(kernel, "_parent_questions"):
+        counts = kernel._parent_questions._counts()
+        if counts["delivered"]:
+            channels["__questions"] = counts
+    if kernel.questions._counts()["delivered"]:
+        channels["__child_questions"] = {**kernel.questions._counts(), "requests": True}
     _send({"t": "pending", "agent": kernel.agent, "id": request_id, "channels": channels})
 
 

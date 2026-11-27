@@ -439,7 +439,7 @@ class Question:
     context: QuestionContext | None = None
 ```
 
-A decision for the session owner, asked with `h = runtime.ask(question)`.
+A decision for your parent (the session owner for a primary), asked with `runtime.ask`.
 
 Empty choices means free-form. Otherwise `multiple=False` permits one choice and
 `multiple=True` permits zero or more; `other=False` forbids additional text.
@@ -447,7 +447,7 @@ Strings in choices become Choice(label). At ask, the limits are 32 choices,
 65,536 UTF-8 JSON bytes, and 32 open questions per asker, separate from requests-max.
 `context` optionally carries a QuestionContext: longer background text and file references,
 included in the same size bound. There is no answer timeout: cancel a question you give
-up on. Children cannot ask yet.
+up on. A child asks its parent; a primary asks the session owner.
 
 ### `outrig.Choice`
 
@@ -507,6 +507,113 @@ An explicit answer: choice labels, optional text, answerer, and attribution chai
 Choices are returned in the question's order. A host program passes one to
 `await question.answer(answer)`; invalid answers leave the question open.
 
+## Questions from children
+
+A child asks its parent with `runtime.ask`. Every agent receives its children's questions on
+`runtime.questions`, a `QuestionEndpoint`; taking one returns a `QuestionDelivery`. These are
+agent-kernel values, not host-program APIs.
+
+### `QuestionEndpoint`
+
+```python
+class QuestionEndpoint(RequestEndpoint):
+    def __init__(self, agent): ...
+```
+
+`runtime.questions`, the inbox for questions from your children.
+
+Separate from `runtime.channels`: `pending()` counts unread questions, and
+`d = await runtime.questions.receive()` takes one. Arrivals open a round, are announced
+as questions, and wake `runtime.wait` with `MessageAvailable`. Use `runtime.wait`, not
+a bare await of a child's result, when that child might ask you something.
+
+A parent that leaves a question unread or unanswered gets the ordinary unanswered-request
+warning round, then a host cancel; the child receives `outrig.RequestCancelled`.
+Delegation pauses that obligation while its hop is open. Cancelling the originating handle
+withdraws every hop, including an owner question. Interrupting code awaiting delegation
+does not withdraw it: explicitly cancel the original question to give up.
+
+A child can end a round with its question open and remain `idle`; the handle shows the
+question's state. Its ordinary answer obligations pause while it awaits an answer.
+Questions have their own bound of 32 open per asker, separate from `requests-max`.
+Decorated one-call children close questions left open when their call ends. Releasing either
+asker or answerer closes the question.
+
+#### `QuestionEndpoint.receive`
+
+```python
+async def receive(self): ...
+```
+
+Take the next child's question, waiting until one arrives.
+
+The returned delivery identifies its sender and asker chain; answer, decline, escalate,
+or forward it. Your children can ask even during your instance's first round.
+
+### `QuestionDelivery`
+
+```python
+@dataclasses.dataclass(frozen=True)
+class QuestionDelivery(Delivery): ...
+```
+
+A child's question. Answer explicitly, decline, escalate, or forward it.
+
+`id`, `body` (a copy of the Question), `sender` (the immediate child's id), and
+`received_at` identify the delivery. `chain` lists askers from the originating child
+through each intermediary.
+Delegation remains active if the awaiting submission is interrupted; cancelling the
+original question withdraws every delegated request. Invalid answers leave it open.
+
+#### `QuestionDelivery.chain`
+
+```python
+@property
+def chain(self): ...
+```
+
+The originating asker followed by intermediary agents, in order.
+
+#### `QuestionDelivery.answer`
+
+```python
+async def answer(self, answer=None, *, choices=None, text=None): ...
+```
+
+Settle with Answer(...), or choices= and text=. Attribution is supplied here.
+
+The complete encoded settlement must fit 1 MiB, whether or not observation is enabled.
+An oversized answer raises ValueError and leaves the question open for a smaller answer.
+
+#### `QuestionDelivery.decline`
+
+```python
+async def decline(self, reason='not relevant'): ...
+```
+
+Fail the child's handle with the reason; the preset is 'not relevant'.
+
+#### `QuestionDelivery.escalate`
+
+```python
+async def escalate(self): ...
+```
+
+Ask your parent (or the session owner), passing its outcome back unchanged.
+
+#### `QuestionDelivery.forward`
+
+```python
+async def forward(self, target): ...
+```
+
+Ask one of your request children's channels, passing its outcome back.
+
+`target` is a channel declared with `outrig.Request(outrig.Question, outrig.Answer)`,
+for example `expert.channels['questions']`. A reply must satisfy the original question;
+cancellation and release keep their typed errors across relays. A failure or invalid
+reply fails the original handle.
+
 ## Answering questions
 
 A host program reads `session.questions` independently of its events and explicitly answers,
@@ -521,7 +628,7 @@ class OpenQuestion:
 
 One question asked of a Session owner. Invalid answers leave it open.
 
-`id`, `asker`, and `body` identify the question; `closed` marks withdrawal or
+`id`, `asker`, `chain`, and `body` identify the question; `closed` marks withdrawal or
 settlement. `answer(Answer(...))`, `decline(reason)`, or `cancel()` settles it.
 A late answer raises RuntimeError. There is no automatic timeout. Cancellation after
 sending a settlement waits for its receipt, updates closed on success, then propagates.
