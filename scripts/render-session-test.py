@@ -2221,6 +2221,70 @@ class RenderSession(unittest.TestCase):
 
     # -- what a damaged or crafted record does not get to do ----------------------------------
 
+    def test_a_rejected_call_does_not_claim_its_siblings_execution(self) -> None:
+        for id_kind in ("provider", "local"):
+            for explicit_success in (False, True):
+                with self.subTest(id_kind=id_kind, explicit_success=explicit_success):
+                    events = ordinary()
+                    turn = next(data for kind, data in events if kind == "turn.committed")
+                    assistant, results = turn["messages"][1:]
+                    valid = assistant["content"][-1]
+                    rejected_id, valid_id = ("toolu_0", "toolu_1") if id_kind == "provider" else (0, 1)
+                    valid["id"] = {id_kind: valid_id}
+                    results["content"][0]["call"] = valid["id"]
+                    if explicit_success:
+                        results["content"][0]["is_error"] = False
+                    rejected = {
+                        "type": "toolcall",
+                        "id": {id_kind: rejected_id},
+                        "function": {
+                            "name": "submit_python",
+                            "arguments": {**valid["function"]["arguments"], "extra": True},
+                        },
+                    }
+                    assistant["content"][-1:] = [
+                        rejected,
+                        {"type": "text", "text": "Valid call follows."},
+                        valid,
+                    ]
+                    # The error follows the successful result: pair by id, not by position.
+                    results["content"].append(
+                        {
+                            "type": "toolresult",
+                            "call": rejected["id"],
+                            "name": "submit_python",
+                            "content": [{"type": "text", "text": payload("REJECTION")}],
+                            "is_error": True,
+                        }
+                    )
+                    html = self.page(events)
+                    rejected_html, valid_html = html.split("Valid call follows.", 1)
+                    self.assertIn("submit_python, rejected before submission", rejected_html)
+                    self.assertIn(escaped("REJECTION"), rejected_html)
+                    self.assertNotIn("submitted as exec 4", rejected_html)
+                    self.assertIn('submitted as exec 4 -- <a href="#exec-4">', valid_html)
+                    self.assertNotIn("no submission of this source recorded", html)
+                    self.assert_no_markup(html)
+
+    def test_results_without_error_flags_keep_source_matching(self) -> None:
+        events = ordinary()
+        turn = next(data for kind, data in events if kind == "turn.committed")
+        assistant, results = turn["messages"][1:]
+        valid = assistant["content"][-1]
+        assistant["content"][-1:] = [
+            {**valid, "id": {"provider": "toolu_0"}},
+            {"type": "text", "text": "Second call follows."},
+            valid,
+        ]
+        results["content"].insert(
+            0,
+            {**results["content"][0], "call": {"provider": "toolu_0"}},
+        )
+        html = self.page(events)
+        first, second = html.split("Second call follows.", 1)
+        self.assertIn('submitted as exec 4 -- <a href="#exec-4">', first)
+        self.assertIn("submit_python, with no submission of this source recorded", second)
+
     def test_a_call_with_no_recorded_submission_is_not_said_not_to_have_run(self) -> None:
         html = self.page([e for e in ordinary() if e[0] != "exec.submitted"])
         self.assertIn("submit_python, with no submission of this source recorded", html)

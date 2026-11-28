@@ -1679,6 +1679,15 @@ def turn_parts(messages: object, claim) -> list[Part]:
     """A turn's messages, in rig's JSON: tagged by `role`, and each item by `type`. A log
     written before rig 0.45 left assistant items untagged, so those are told apart by their
     fields."""
+    # Results follow the assistant message. Read them first: a rejected call submitted no
+    # source, and must not consume an execution belonging to a sibling with the same source.
+    results = {
+        key(item.get("call")): item
+        for message in objs(messages)
+        if message.get("role") == "user"
+        for item in objs(message.get("content"))
+        if item.get("type") == "toolresult" and item.get("call") is not None
+    }
     parts: list[Part] = []
     for message in objs(messages):
         role = text(message.get("role"))
@@ -1691,7 +1700,7 @@ def turn_parts(messages: object, claim) -> list[Part]:
             if role == "user":
                 parts.append(user_part(item))
             elif role == "assistant":
-                parts.append(assistant_part(item, claim))
+                parts.append(assistant_part(item, claim, results.get(key(item.get("id")))))
             else:
                 parts.append(Part(role or "message", text(item)))
     return parts
@@ -1717,7 +1726,7 @@ def result_block(block: dict) -> str:
     return f"[{kind}]"
 
 
-def assistant_part(item: dict, claim) -> Part:
+def assistant_part(item: dict, claim, result: dict | None = None) -> Part:
     kind = text(item.get("type"))
     if kind == "toolcall" or "function" in item:
         function = obj(item.get("function"))
@@ -1727,6 +1736,12 @@ def assistant_part(item: dict, claim) -> Part:
                 arguments = json.loads(arguments)
         source = obj(arguments).get("source")
         if isinstance(source, str):
+            # Code that ran returns a successful tool result, even if Python raised. Older
+            # logs have no error flag, and keep the source-only matching they used before.
+            if obj(result).get("is_error") is True:
+                name = text(function.get("name"))
+                body = "\n".join(result_block(c) for c in objs(result.get("content")))
+                return Part(f"{name}, rejected before submission", body, True)
             x = claim(source)
             if x is not None:
                 return Part(f"submitted as exec {x.id}", href=link(x.anchor))

@@ -354,6 +354,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `render-session.py` no longer links a rejected `submit_python` call to an execution run by
+  a sibling with the same source. Rejected calls show their error instead; older logs without
+  tool-result error flags keep their existing matching (#801).
+
 - Release terminal question bodies while retaining IDs for late-answer diagnostics, and drain
   answer acknowledgements at EOF so a final piped refusal is not lost.
 
