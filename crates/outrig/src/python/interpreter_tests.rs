@@ -436,6 +436,15 @@ fn a_trailing_expression_echoes_and_none_does_not() {
 }
 
 #[test]
+fn a_trailing_expression_past_the_recursion_limit_still_echoes() {
+    let mut k = Interpreter::start();
+    let source = format!("{}42", "lambda: ".repeat(1100));
+    let output = k.output(1, &source);
+    assert!(output.starts_with("<function <lambda> at "), "{output}");
+    assert!(output.ends_with(">\n"), "{output}");
+}
+
+#[test]
 fn an_echoed_value_is_bounded() {
     let mut k = Interpreter::start();
     let expected = format!("'{}... [5002 chars]\n", "x".repeat(REPR_MAX - 1));
@@ -8152,8 +8161,7 @@ fn the_close_releases_each_instance_once_its_child_exists() {
 #[test]
 fn a_submission_nesting_functions_past_the_recursion_limit_still_runs() {
     // Recording the source against every code object compiled walks the whole nest, which can
-    // be deeper than the recursion limit. The result is read in a second execution: a trailing
-    // bare expression this deep would not compile.
+    // be deeper than the recursion limit.
     let mut k = Interpreter::start();
     let depth = 1100;
     let source = format!("f = {}42", "lambda: ".repeat(depth));

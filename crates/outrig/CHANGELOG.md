@@ -1345,6 +1345,9 @@ without touching each other, from one ensured image. [The container facade besid
 
 ### Fixed
 
+- A trailing bare Python expression nested past the recursion limit now compiles and echoes its
+  value, just as the same expression assigned to a name runs (#680).
+
 - Forced child-question terminations bound diagnostic previews without rejecting settlement;
   oversized provider failures keep their typed error and full cause on the asker's handle (#1070).
 

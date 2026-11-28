@@ -3175,11 +3175,9 @@ def _compile(source):
     tree = ast.parse(source, "<execution>", "exec")
     if tree.body and isinstance(tree.body[-1], ast.Expr):
         last = tree.body[-1]
-        call = ast.Call(
-            func=ast.Name(id="__outrig_echo__", ctx=ast.Load()), args=[last.value], keywords=[]
-        )
+        echo = ast.copy_location(ast.Name(id="__outrig_echo__", ctx=ast.Load()), last.value)
+        call = ast.Call(func=echo, args=[last.value], keywords=[])
         tree.body[-1] = ast.copy_location(ast.Expr(ast.copy_location(call, last.value)), last)
-        ast.fix_missing_locations(tree)
     return compile(
         tree, "<execution>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT, dont_inherit=True
     )
